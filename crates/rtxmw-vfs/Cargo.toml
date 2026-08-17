@@ -1,0 +1,16 @@
+[package]
+name = "rtxmw-vfs"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+# Exposes synthetic BSA construction so downstream crates can test against archives without
+# shipping game data.
+internals = []
+
+[lints]
+workspace = true
+
+[dependencies]

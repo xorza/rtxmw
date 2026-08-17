@@ -28,5 +28,6 @@ pub use crate::validation_log::{ValidationLog, ValidationMessage};
 #[cfg(any(test, feature = "internals"))]
 mod testing;
 
-#[cfg(any(test, feature = "internals"))]
+// Only external consumers need the re-export; this crate's own tests use the module path.
+#[cfg(feature = "internals")]
 pub use crate::testing::{golden, render_target::RenderTarget, test_gpu::TestGpu};

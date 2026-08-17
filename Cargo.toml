@@ -9,6 +9,7 @@ license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 rtxmw-gpu = { path = "crates/rtxmw-gpu" }
+rtxmw-vfs = { path = "crates/rtxmw-vfs" }
 
 ash = "0.38"
 ash-window = "0.13"
