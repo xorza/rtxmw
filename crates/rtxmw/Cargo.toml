@@ -1,0 +1,18 @@
+[package]
+name = "rtxmw"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rtxmw-gpu.workspace = true
+
+ash.workspace = true
+bytemuck.workspace = true
+glam.workspace = true
+raw-window-handle.workspace = true
+winit.workspace = true

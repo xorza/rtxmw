@@ -1,0 +1,38 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.97"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+rtxmw-gpu = { path = "crates/rtxmw-gpu" }
+
+ash = "0.38"
+ash-window = "0.13"
+bytemuck = { version = "1", features = ["derive"] }
+dhat = "0.3"
+raw-window-handle = "0.6"
+glam = "0.33"
+half = "2"
+gpu-allocator = { version = "0.28", default-features = false, features = ["std", "vulkan"] }
+png = "0.18"
+winit = "0.30"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[profile.dev]
+debug = "line-tables-only"
+opt-level = 1
+
+# Asset decoding (BSA, NIF, DDS) is unusably slow in a debug build.
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+debug = "line-tables-only"
