@@ -40,7 +40,7 @@ impl Keys {
 
 /// Application state for the winit event loop.
 #[derive(Debug)]
-pub struct App {
+pub(crate) struct App {
     window: Option<Window>,
     renderer: Option<Renderer>,
     camera: Camera,

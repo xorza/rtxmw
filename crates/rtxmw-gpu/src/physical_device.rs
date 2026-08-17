@@ -78,7 +78,8 @@ pub struct RayTracingSupport {
 }
 
 impl PhysicalDevice {
-    /// Picks the first discrete GPU meeting [`REQUIRED`], falling back to any device that does.
+    /// Picks the first discrete GPU meeting the required extension set, falling back to any
+    /// device that does.
     ///
     /// Every rejected candidate is reported, because "no suitable device" without a reason is the
     /// least useful error a renderer can produce.

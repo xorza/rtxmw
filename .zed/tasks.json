@@ -2,7 +2,11 @@
   {
     "label": "run rtxmw (debug)",
     "command": "cargo",
-    "args": ["run", "-p", "rtxmw"],
+    "args": [
+      "run",
+      "-p",
+      "rtxmw"
+    ],
     "env": {
       "RUST_BACKTRACE": "1"
     },
@@ -12,8 +16,8 @@
     "reveal": "always"
   },
   {
-    "label": "verify (fmt + clippy + test)",
-    "command": "cargo fmt --all && cargo clippy --workspace --all-targets --all-features -- -D warnings && cargo test --workspace --lib --bins --all-features",
+    "label": "verify (fmt + clippy + doc + test)",
+    "command": "cargo fmt --all && cargo clippy --workspace --all-targets --all-features -- -D warnings && cargo doc --workspace --all-features --no-deps && cargo test --workspace --all-features",
     "cwd": "$ZED_WORKTREE_ROOT",
     "use_new_terminal": false,
     "allow_concurrent_runs": false,

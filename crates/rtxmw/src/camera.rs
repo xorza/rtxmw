@@ -12,7 +12,7 @@ const PITCH_LIMIT: f32 = std::f32::consts::FRAC_PI_2 - 0.001;
 
 /// A Z-up right-handed fly camera: +X east, +Y north, +Z up, matching Morrowind's convention.
 #[derive(Debug)]
-pub struct Camera {
+pub(crate) struct Camera {
     position: Vec3,
     /// Rotation about +Z. Zero looks along +X (east).
     yaw: f32,
@@ -27,12 +27,12 @@ pub struct Camera {
 
 /// Which way the camera is being asked to move this frame, in camera-relative axes.
 #[derive(Debug, Clone, Copy)]
-pub struct Movement {
-    pub forward: f32,
-    pub right: f32,
-    pub up: f32,
+pub(crate) struct Movement {
+    pub(crate) forward: f32,
+    pub(crate) right: f32,
+    pub(crate) up: f32,
     /// Multiplier applied to [`Camera::speed`], for a sprint modifier.
-    pub boost: f32,
+    pub(crate) boost: f32,
 }
 
 // Derived `Default` would leave `boost` at zero, which would mean "stand still" rather than
@@ -50,7 +50,7 @@ impl Default for Movement {
 
 impl Camera {
     /// A camera at `position` looking east along +X.
-    pub fn new(position: Vec3) -> Self {
+    pub(crate) fn new(position: Vec3) -> Self {
         Self {
             position,
             yaw: 0.0,
@@ -61,14 +61,14 @@ impl Camera {
     }
 
     /// Applies mouse look. Deltas are in pixels; the scale is radians per pixel.
-    pub fn look(&mut self, delta_x: f32, delta_y: f32) {
+    pub(crate) fn look(&mut self, delta_x: f32, delta_y: f32) {
         const RADIANS_PER_PIXEL: f32 = 0.0022;
         self.yaw -= delta_x * RADIANS_PER_PIXEL;
         self.pitch = (self.pitch - delta_y * RADIANS_PER_PIXEL).clamp(-PITCH_LIMIT, PITCH_LIMIT);
     }
 
     /// Integrates `movement` over `dt` seconds.
-    pub fn fly(&mut self, movement: Movement, dt: f32) {
+    pub(crate) fn fly(&mut self, movement: Movement, dt: f32) {
         let distance = self.speed * movement.boost * UNITS_PER_METRE * dt;
 
         let forward = self.forward();
@@ -80,7 +80,7 @@ impl Camera {
     }
 
     /// Unit vector the camera is looking along.
-    pub fn forward(&self) -> Vec3 {
+    pub(crate) fn forward(&self) -> Vec3 {
         let (sin_pitch, cos_pitch) = self.pitch.sin_cos();
         let (sin_yaw, cos_yaw) = self.yaw.sin_cos();
         Vec3::new(cos_pitch * cos_yaw, cos_pitch * sin_yaw, sin_pitch)
@@ -91,7 +91,7 @@ impl Camera {
     /// Unused until ray generation exists at M3; kept because its convention is pinned by tests and
     /// getting it wrong later is expensive to debug.
     #[allow(dead_code)]
-    pub fn view(&self) -> Mat4 {
+    pub(crate) fn view(&self) -> Mat4 {
         glam::camera::rh::view::look_to_mat4(self.position, self.forward(), Vec3::Z)
     }
 
@@ -100,7 +100,7 @@ impl Camera {
     /// Reverse-Z distributes float depth precision far better than a conventional near/far mapping
     /// and costs nothing to adopt now, while retrofitting it later would touch every depth compare.
     #[allow(dead_code)]
-    pub fn projection(&self, aspect: f32) -> Mat4 {
+    pub(crate) fn projection(&self, aspect: f32) -> Mat4 {
         glam::camera::rh::proj::vulkan::perspective_infinite_reverse(
             self.fov_y,
             aspect,
@@ -110,22 +110,22 @@ impl Camera {
 
     /// Near plane in world units — 5 cm, well inside anything the player can approach.
     #[allow(dead_code)]
-    pub fn near_plane(&self) -> f32 {
+    pub(crate) fn near_plane(&self) -> f32 {
         0.05 * UNITS_PER_METRE
     }
 
     /// Current position in world units.
-    pub fn position(&self) -> Vec3 {
+    pub(crate) fn position(&self) -> Vec3 {
         self.position
     }
 
     /// Movement speed in metres per second.
-    pub fn speed(&self) -> f32 {
+    pub(crate) fn speed(&self) -> f32 {
         self.speed
     }
 
     /// Scales the movement speed, clamped to a usable range.
-    pub fn scale_speed(&mut self, factor: f32) {
+    pub(crate) fn scale_speed(&mut self, factor: f32) {
         self.speed = (self.speed * factor).clamp(0.5, 2000.0);
     }
 }

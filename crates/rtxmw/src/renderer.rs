@@ -12,7 +12,7 @@ use rtxmw_gpu::{
 /// Field order is load-bearing: fields drop in declaration order, and every device-owned object
 /// must be destroyed before the device itself.
 #[derive(Debug)]
-pub struct Renderer {
+pub(crate) struct Renderer {
     frames: Frames,
     swapchain: Swapchain,
     surface: Surface,
@@ -27,7 +27,7 @@ pub struct Renderer {
 
 impl Renderer {
     /// Brings up Vulkan for `window` and allocates the frame ring.
-    pub fn new<W>(window: &W, width: u32, height: u32) -> rtxmw_gpu::Result<Self>
+    pub(crate) fn new<W>(window: &W, width: u32, height: u32) -> rtxmw_gpu::Result<Self>
     where
         W: HasDisplayHandle + HasWindowHandle,
     {
@@ -62,7 +62,7 @@ impl Renderer {
     }
 
     /// Name of the physical device in use.
-    pub fn device_name(&self) -> &str {
+    pub(crate) fn device_name(&self) -> &str {
         self.physical.name()
     }
 
@@ -70,7 +70,7 @@ impl Renderer {
     ///
     /// Worth printing at startup rather than only in a debugger: these limits decide shader binding
     /// table layout and acceleration structure budgets, and they differ across drivers.
-    pub fn capability_report(&self) -> String {
+    pub(crate) fn capability_report(&self) -> String {
         let support = self.physical.support();
         let limits = self.physical.limits();
         let extent = self.swapchain.extent();
@@ -104,20 +104,25 @@ impl Renderer {
     ///
     /// Unused until the camera's projection feeds ray generation at M3.
     #[allow(dead_code)]
-    pub fn aspect_ratio(&self) -> f32 {
+    pub(crate) fn aspect_ratio(&self) -> f32 {
         let extent = self.swapchain.extent();
         extent.width as f32 / extent.height.max(1) as f32
     }
 
     /// Flags the swapchain as stale, e.g. after the window is resized.
-    pub fn invalidate_swapchain(&mut self) {
+    pub(crate) fn invalidate_swapchain(&mut self) {
         self.needs_recreate = true;
     }
 
     /// Records and submits one frame, clearing the swapchain image.
     ///
     /// Returns without drawing when the surface has zero area, which happens while minimised.
-    pub fn draw(&mut self, width: u32, height: u32, clear: [f32; 4]) -> rtxmw_gpu::Result<()> {
+    pub(crate) fn draw(
+        &mut self,
+        width: u32,
+        height: u32,
+        clear: [f32; 4],
+    ) -> rtxmw_gpu::Result<()> {
         if width == 0 || height == 0 {
             return Ok(());
         }

@@ -25,7 +25,7 @@ impl std::fmt::Debug for Surface {
 impl Surface {
     /// Creates a surface for `window`.
     ///
-    /// The instance must already have the extensions returned by [`required_extensions`] enabled.
+    /// The instance must already have the extensions returned by [`Self::required_extensions`] enabled.
     pub fn new<W>(instance: &Instance, window: &W) -> Result<Self>
     where
         W: HasDisplayHandle + HasWindowHandle,

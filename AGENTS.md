@@ -27,6 +27,21 @@ unusably slow in an unoptimized build.
 Every dependency is declared once in `[workspace.dependencies]` in the root `Cargo.toml`; crate
 manifests reference them as `name.workspace = true`, never with an inline version.
 
+Lints are workspace-wide and denied, not warned: `unsafe_op_in_unsafe_fn`,
+`missing_debug_implementations`, `unreachable_pub`, and the rustdoc link lints. **`cargo doc` is part
+of the verification chain** — the rustdoc lints fire nowhere else, so clippy passing says nothing
+about them:
+
+```
+cargo fmt --all
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo doc --workspace --all-features --no-deps
+cargo test --workspace --all-features
+```
+
+`unreachable_pub` means the binary crate uses `pub(crate)` throughout — nothing in a binary is
+externally reachable, so `pub` there is always a lie.
+
 The renderer targets **raw Vulkan via `ash`**, with shaders in **GLSL** compiled by `glslc` from
 `build.rs` and validated with `spirv-val`. Licence is MIT OR Apache-2.0.
 
