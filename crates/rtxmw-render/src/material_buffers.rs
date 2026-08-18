@@ -7,6 +7,14 @@ use rtxmw_scene::{AlphaMode, Material};
 
 use crate::geometry_buffers::GeometryBuffers;
 
+/// The cutoff a blended surface is treated with until real transparency exists.
+///
+/// Morrowind does its foliage, grates and banners with `NiAlphaProperty` *blending* over a texture
+/// whose alpha is very nearly binary — 539 of the shipped library's 4,593 materials are blended
+/// against only 72 explicitly masked. Committing those as opaque draws every tree as a rectangle,
+/// so they run the same cutout path until ordered transparency arrives to replace it.
+const BLEND_CUTOFF: f32 = 0.5;
+
 /// Stands in for a material with no base colour texture.
 ///
 /// A sentinel rather than a separate flag bit: the shader has to branch on it either way, and a
@@ -52,11 +60,12 @@ impl GpuMaterial {
             diffuse: material.diffuse.to_array(),
             opacity: material.opacity,
             emissive: material.emissive.to_array(),
-            // Blended surfaces have no cutout, so zero means "keep every texel" rather than being
-            // an absent value the shader has to special-case.
+            // Zero means "keep every texel", which is what an opaque surface wants and what makes
+            // the shader's test a single comparison with no mode to branch on.
             alpha_cutoff: match material.alpha {
                 AlphaMode::Mask(threshold) => threshold,
-                AlphaMode::Opaque | AlphaMode::Blend => 0.0,
+                AlphaMode::Blend => BLEND_CUTOFF,
+                AlphaMode::Opaque => 0.0,
             },
             base_colour: material.base_colour.map_or(NO_TEXTURE, |id| id.0),
             padding: [0; 3],
@@ -170,21 +179,28 @@ mod tests {
     }
 
     #[test]
-    fn only_a_masked_material_carries_a_cutoff() {
+    fn every_non_opaque_material_carries_a_cutoff() {
+        // A masked surface keeps the threshold the NIF gave it.
         let masked = GpuMaterial::new(Material {
             alpha: AlphaMode::Mask(0.25),
             ..Material::default()
         });
         assert_eq!(masked.alpha_cutoff, 0.25);
 
-        // Blended and opaque surfaces keep every texel, so the cutoff is zero rather than absent.
-        for alpha in [AlphaMode::Opaque, AlphaMode::Blend] {
-            let other = GpuMaterial::new(Material {
-                alpha,
-                ..Material::default()
-            });
-            assert_eq!(other.alpha_cutoff, 0.0, "{alpha:?}");
-        }
+        // A blended one gets the stand-in, because the geometry it describes is foliage far more
+        // often than it is glass, and drawing foliage solid is the worse of the two errors.
+        let blended = GpuMaterial::new(Material {
+            alpha: AlphaMode::Blend,
+            ..Material::default()
+        });
+        assert_eq!(blended.alpha_cutoff, BLEND_CUTOFF);
+
+        // Only an opaque surface keeps every texel unconditionally.
+        let opaque = GpuMaterial::new(Material {
+            alpha: AlphaMode::Opaque,
+            ..Material::default()
+        });
+        assert_eq!(opaque.alpha_cutoff, 0.0);
 
         // The colours survive the flattening.
         let lit = GpuMaterial::new(Material {

@@ -528,6 +528,31 @@ every missed ray wrote a transparent pixel that a viewer composited as white. Ha
 blown out and I went looking for a sampling bug that did not exist. The pixel values were
 `[13, 18, 25, 0]`, the background, all along. The dump now forces alpha opaque.
 
+**M4d — done.** The alpha cutout runs in the candidate loop. `gl_RayFlagsOpaqueEXT` is gone from the
+ray query, so the per-geometry `OPAQUE` bits the build sets from each material are what decide
+whether traversal asks at all — forcing the flag at the query overrode them and put the rectangles
+back regardless of what the build said.
+
+The survey that shaped this is worth recording, because the obvious reading of the data is wrong.
+Across the 4,593 materials in the shipped library:
+
+| mode | count |
+|---|---|
+| Opaque | 3,982 |
+| **Blend** | **539** |
+| Mask | 72 |
+
+Only 72 materials are *explicitly* alpha-tested, which looks like the cutout barely matters. It is
+the 539 blended ones that carry Morrowind's foliage, grates and banners: the game draws them with
+`NiAlphaProperty` blending over a texture whose alpha is very nearly binary, not with a threshold.
+Treating blend as opaque — which is faster, and which the flag would honestly describe today —
+renders every tree as a rectangle. So blended materials get a stand-in cutoff of 0.5 and run the
+same cutout path until ordered transparency replaces it. That takes 611 of 4,593 materials off the
+fast path, which is the right shape; marking only the 72 would have looked correct and been wrong.
+
+Seyda Neen's office runs the cutout on 14 of its 119 materials. The mask thresholds the data
+actually uses are 100 and 192 out of 255, plus two materials at zero.
+
 ### M5 — Direct lighting
 Sun as a directional light with a real angular diameter (so shadows are soft), shadow rays, cell
 ambient, `LIGH` point lights with shadow rays and a defensible attenuation model, emissive surfaces.

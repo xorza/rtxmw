@@ -13,8 +13,10 @@ use rtxmw_render::{
     FrameConstants, GeometryBuffers, MaterialBuffers, SceneAcceleration, TextureArray,
     VisibilityPass,
 };
-use rtxmw_scene::{Instance, Material, Mesh, MeshId, ModelIndex, StaticScene, Submesh};
-use rtxmw_texture::Texture;
+use rtxmw_scene::{
+    AlphaMode, Instance, Material, Mesh, MeshId, ModelIndex, StaticScene, Submesh, TextureId,
+};
+use rtxmw_texture::{Texture, TextureFormat};
 use rtxmw_vfs::{DATA_DIR_VAR, morrowind_archives, morrowind_data_dir};
 
 const CELL: &str = "Seyda Neen, Census and Excise Office";
@@ -414,6 +416,113 @@ fn an_instance_transform_moves_the_geometry_it_places() {
     assert!(both > 0);
 }
 
+/// A quad with UVs spanning the whole texture, so a texel's alpha maps to a screen region.
+fn uv_wall(x: f32, y: std::ops::Range<f32>, z: std::ops::Range<f32>) -> Mesh {
+    let mut mesh = wall(x, y, z);
+    // Corner order matches `wall`: (y0,z0), (y1,z0), (y1,z1), (y0,z1).
+    mesh.uvs = vec![
+        Vec2::new(0.0, 1.0),
+        Vec2::new(1.0, 1.0),
+        Vec2::new(1.0, 0.0),
+        Vec2::new(0.0, 0.0),
+    ];
+    mesh
+}
+
+/// A 2x1 texture: opaque white on the left texel, fully transparent on the right.
+fn half_transparent() -> Texture {
+    Texture::from_pixels(
+        TextureFormat::Rgba8,
+        2,
+        1,
+        vec![255, 255, 255, 255, 255, 255, 255, 0],
+    )
+}
+
+#[test]
+fn a_transparent_texel_is_traced_through_rather_than_hit() {
+    // The alpha test in the candidate loop. Half the texture is transparent, so half the quad must
+    // not register a hit at all — the ray passes through and reaches the background. Marking the
+    // geometry opaque, or dropping the candidate loop, fills the whole quad instead.
+    let meshes = [uv_wall(100.0, -60.0..60.0, -60.0..60.0)];
+    let materials = [Material {
+        base_colour: Some(TextureId(0)),
+        alpha: AlphaMode::Mask(0.5),
+        ..Material::default()
+    }];
+    let instances = [Instance {
+        mesh: MeshId(0),
+        transform: Affine3A::IDENTITY,
+    }];
+    let pixels = trace_textured(
+        &meshes,
+        &materials,
+        &[Some(half_transparent())],
+        &instances,
+        Vec3::ZERO,
+        Vec3::X,
+    );
+
+    // The quad spans y in [-60, 60] with u running 0..1 across it, and world +Y is screen-left — so
+    // the opaque half (u < 0.5) lands on the *right* of the image.
+    let mut left = 0usize;
+    let mut right = 0usize;
+    for y in 0..HEIGHT {
+        for x in 0..WIDTH {
+            if is_hit(at(&pixels, x, y)) {
+                if x < WIDTH / 2 {
+                    left += 1;
+                } else {
+                    right += 1;
+                }
+            }
+        }
+    }
+
+    assert!(right > 0, "the opaque half of the texture was not drawn");
+    assert_eq!(
+        left, 0,
+        "{left} pixels hit where the texture is transparent — the cutout did not happen"
+    );
+}
+
+#[test]
+fn an_opaque_material_ignores_its_texture_alpha() {
+    // The same transparent texture on an opaque material must draw solid: the build marks that run
+    // `OPAQUE`, traversal commits without asking, and the cutout never runs. This is what keeps the
+    // alpha test off the 3,982 opaque materials that do not need it.
+    let meshes = [uv_wall(100.0, -60.0..60.0, -60.0..60.0)];
+    let materials = [Material {
+        base_colour: Some(TextureId(0)),
+        ..Material::default()
+    }];
+    let instances = [Instance {
+        mesh: MeshId(0),
+        transform: Affine3A::IDENTITY,
+    }];
+    let pixels = trace_textured(
+        &meshes,
+        &materials,
+        &[Some(half_transparent())],
+        &instances,
+        Vec3::ZERO,
+        Vec3::X,
+    );
+
+    let mut left = 0usize;
+    for y in 0..HEIGHT {
+        for x in 0..WIDTH / 2 {
+            if is_hit(at(&pixels, x, y)) {
+                left += 1;
+            }
+        }
+    }
+    assert!(
+        left > 0,
+        "an opaque material was cut out by its texture alpha"
+    );
+}
+
 #[test]
 fn a_real_interior_traces_to_a_recognisable_image() {
     let Some(data) = morrowind_data_dir() else {
@@ -478,6 +587,16 @@ fn a_real_interior_traces_to_a_recognisable_image() {
     let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("seyda_neen.png");
     rtxmw_gpu::golden::write_png(&path, &opaque, WIDTH, HEIGHT);
 
+    let cutouts = scene
+        .materials
+        .materials()
+        .iter()
+        .filter(|m| !matches!(m.alpha, AlphaMode::Opaque))
+        .count();
+    println!(
+        "  {cutouts} of {} materials run the alpha cutout",
+        scene.materials.materials().len()
+    );
     println!(
         "{CELL}: {hits} of {total} pixels hit ({:.0}%), {} distinct shades from {} textures \
          ({missing} missing), from {eye:?}\n  wrote {}",
