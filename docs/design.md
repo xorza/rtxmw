@@ -601,6 +601,31 @@ visibility is the ratio against the same scene with the occluder removed, which 
 and leaves partial occlusion alone — a point emitter gives zero partly-lit rows, an area one gives a
 band.
 
+### Test harness: the renderer is the thing under test
+
+`Renderer` used to own both the scene and the swapchain, which put it in the binary crate where no
+test could reach it — so `primary_visibility` assembled its own copy of the load-and-trace sequence.
+That replica was a **parallel abstraction**: every assertion was about a reconstruction of the
+engine rather than the engine.
+
+Split along the seam §2 already describes. `rtxmw_render::SceneRenderer` owns the pass, the target
+and the loaded cell; `rtxmw::Renderer` adds surface, swapchain, frame ring and present. The tests
+now drive `SceneRenderer` directly and the replica is gone.
+
+Two things fell out of doing it:
+
+- **The uploader is borrowed, never owned.** Giving each `SceneRenderer` its own made twelve tests
+  submit to one queue concurrently, which Vulkan requires external synchronisation for — every
+  parallel test failed and every serial one passed. An uploader wraps one command pool on one
+  queue, so it is a device-wide resource; the renderer takes `&mut Uploader` everywhere instead.
+- **Image readback moved off `RenderTarget`** and onto `readback::image_to_rgba8`, because the image
+  worth reading back is the renderer's own output, which no test owns.
+
+**`cargo run -- --screenshot <path>`** renders one frame through the same path on a device brought
+up with no surface extensions — no window, works headless, ~0.6 s warm against tens of seconds for
+the windowed binary. Cost of the whole verification loop: **2.9 s of tests plus 0.6 s for a picture**,
+against ~60 s and a window appearing on the user's screen.
+
 ### M5 — Direct lighting
 Sun as a directional light with a real angular diameter (so shadows are soft), shadow rays, cell
 ambient, `LIGH` point lights with shadow rays and a defensible attenuation model, emissive surfaces.

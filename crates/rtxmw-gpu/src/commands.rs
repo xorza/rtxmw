@@ -59,6 +59,11 @@ impl Commands {
         })
     }
 
+    /// The device these commands are recorded against.
+    pub(crate) fn device(&self) -> &ash::Device {
+        &self.device
+    }
+
     /// Records `record` into the command buffer, submits it, and blocks until it completes.
     ///
     /// `&mut self` because the pool and its one buffer are reused: two overlapping calls would

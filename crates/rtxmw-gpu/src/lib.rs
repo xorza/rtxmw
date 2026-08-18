@@ -18,6 +18,8 @@ mod image;
 mod instance;
 mod memory;
 mod physical_device;
+/// Image readback and PNG output, qualified as `readback::image_to_rgba8(..)` at call sites.
+pub mod readback;
 mod surface;
 mod swapchain;
 mod uploader;

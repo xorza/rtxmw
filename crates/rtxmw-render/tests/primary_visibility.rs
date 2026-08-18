@@ -8,13 +8,11 @@
 use ash::vk;
 use glam::{Affine3A, Vec2, Vec3};
 use rtxmw_esm::EsmReader;
-use rtxmw_gpu::{TestGpu, image_barrier, memory_barrier};
-use rtxmw_render::{
-    FrameConstants, GeometryBuffers, LightBuffer, MaterialBuffers, SceneAcceleration, TextureArray,
-    VisibilityPass,
-};
+use rtxmw_gpu::{TestGpu, readback};
+use rtxmw_render::SceneRenderer;
 use rtxmw_scene::{
-    AlphaMode, Instance, Light, Material, Mesh, MeshId, ModelIndex, StaticScene, Submesh, TextureId,
+    AlphaMode, Ambient, Instance, Light, Material, MaterialTable, Mesh, MeshId, ModelIndex,
+    StaticScene, Submesh, TextureId,
 };
 use rtxmw_texture::{Texture, TextureFormat};
 use rtxmw_vfs::{DATA_DIR_VAR, morrowind_archives, morrowind_data_dir};
@@ -57,23 +55,35 @@ fn wall(x: f32, y: std::ops::Range<f32>, z: std::ops::Range<f32>) -> Mesh {
     }
 }
 
+/// Assembles a `StaticScene` from loose parts, so a test can describe one without a content file.
+fn scene_of(meshes: &[Mesh], materials: &[Material], instances: &[Instance]) -> StaticScene {
+    let mut table = MaterialTable::default();
+    for material in materials {
+        table.intern(*material);
+    }
+    StaticScene {
+        meshes: meshes.to_vec(),
+        instances: instances.to_vec(),
+        materials: table,
+        lights: Vec::new(),
+        ambient: None,
+        without_model: Vec::new(),
+    }
+}
+
 /// Traces `instances` from `eye` looking along `forward` and returns the image as 8-bit RGBA.
 fn trace(meshes: &[Mesh], instances: &[Instance], eye: Vec3, forward: Vec3) -> Vec<u8> {
-    trace_with(meshes, &[Material::default()], instances, eye, forward)
+    let mut scene = scene_of(meshes, &[Material::default()], instances);
+    // Full ambient and no lights, so an unlit trace shows albedo unchanged — which is what every
+    // test written before lighting existed is asserting about.
+    scene.ambient = Some(Ambient {
+        colour: Vec3::ONE,
+        ..Ambient::default()
+    });
+    trace_scene(&scene, &[], eye, forward)
 }
 
-/// As [`trace`], with an explicit material table.
-fn trace_with(
-    meshes: &[Mesh],
-    materials: &[Material],
-    instances: &[Instance],
-    eye: Vec3,
-    forward: Vec3,
-) -> Vec<u8> {
-    trace_textured(meshes, materials, &[], instances, eye, forward)
-}
-
-/// As [`trace_with`], with textures for the scene's path list to sample.
+/// As [`trace`], with textures for the scene's path list to sample.
 fn trace_textured(
     meshes: &[Mesh],
     materials: &[Material],
@@ -82,18 +92,12 @@ fn trace_textured(
     eye: Vec3,
     forward: Vec3,
 ) -> Vec<u8> {
-    // Full ambient and no lights, so an unlit trace shows albedo unchanged — which is what every
-    // test written before lighting existed is asserting about.
-    trace_lit(
-        meshes,
-        materials,
-        textures,
-        &[],
-        Vec3::ONE,
-        instances,
-        eye,
-        forward,
-    )
+    let mut scene = scene_of(meshes, materials, instances);
+    scene.ambient = Some(Ambient {
+        colour: Vec3::ONE,
+        ..Ambient::default()
+    });
+    trace_scene(&scene, textures, eye, forward)
 }
 
 /// As [`trace_textured`], with lights and an ambient term.
@@ -108,39 +112,50 @@ fn trace_lit(
     eye: Vec3,
     forward: Vec3,
 ) -> Vec<u8> {
+    let mut scene = scene_of(meshes, materials, instances);
+    scene.lights = lights.to_vec();
+    scene.ambient = Some(Ambient {
+        colour: ambient,
+        ..Ambient::default()
+    });
+    trace_scene(&scene, textures, eye, forward)
+}
+
+/// Renders one frame of `scene` through the production renderer and reads it back.
+///
+/// Deliberately the real `SceneRenderer` rather than a test-local assembly of the same pieces: a
+/// replica would drift from what the engine actually runs, and every one of these assertions is
+/// meant to be about the engine.
+fn trace_scene(
+    scene: &StaticScene,
+    textures: &[Option<Texture>],
+    eye: Vec3,
+    forward: Vec3,
+) -> Vec<u8> {
     let gpu = TestGpu::shared();
-    let mut uploader = gpu.uploader();
-
-    let geometry = GeometryBuffers::upload(&mut uploader, meshes).expect("upload failed");
-    let acceleration = SceneAcceleration::build(
+    let mut renderer = SceneRenderer::new(
         gpu.device(),
-        &mut uploader,
-        gpu.physical().limits(),
-        &geometry,
-        materials,
-        instances,
+        gpu.memory(),
+        vk::Extent2D {
+            width: WIDTH,
+            height: HEIGHT,
+        },
     )
-    .expect("build failed");
+    .expect("renderer should build");
 
-    let tables = MaterialBuffers::upload(&mut uploader, &geometry, materials)
-        .expect("material upload failed");
-
-    let array =
-        TextureArray::upload(gpu.device(), &mut uploader, textures).expect("texture upload failed");
-    let light_buffer = LightBuffer::upload(&mut uploader, lights).expect("light upload failed");
-
-    let target = gpu
-        .create_target(WIDTH, HEIGHT, vk::Format::R16G16B16A16_SFLOAT)
-        .expect("could not create target");
-    let mut pass = VisibilityPass::new(gpu.device(), array.len()).expect("pipeline failed");
-    pass.bind(
-        acceleration.tlas(),
-        target.image(),
-        &geometry,
-        &tables,
-        &light_buffer,
-        &array,
-    );
+    // One uploader for the whole trace, held across load and render. It wraps a single queue, so
+    // the harness serialises every test through it — which is exactly why the renderer borrows one
+    // rather than making its own.
+    let mut uploader = gpu.uploader();
+    renderer
+        .load_scene(
+            gpu.device(),
+            &mut uploader,
+            gpu.physical().limits(),
+            scene,
+            textures,
+        )
+        .expect("scene should load");
 
     let view = glam::camera::rh::view::look_to_mat4(eye, forward, Vec3::Z);
     let projection = glam::camera::rh::proj::vulkan::perspective_infinite_reverse(
@@ -148,30 +163,17 @@ fn trace_lit(
         WIDTH as f32 / HEIGHT as f32,
         0.05,
     );
-    let constants = FrameConstants::new(view, projection, eye, ambient, light_buffer.count());
+    let constants = renderer.frame_constants(view, projection, eye);
+    renderer
+        .render_once(&mut uploader, &constants)
+        .expect("trace should run");
 
-    let image = target.image().raw();
-    let extent = target.extent();
-    uploader
-        .submit_and_wait(|device, cmd| {
-            // SAFETY: the command buffer is recording, and the image and pipeline are alive.
-            unsafe {
-                image_barrier::transition(
-                    device,
-                    cmd,
-                    image,
-                    vk::ImageLayout::UNDEFINED,
-                    vk::ImageLayout::GENERAL,
-                );
-                pass.record(cmd, extent, &constants);
-                memory_barrier::full(device, cmd);
-            }
-        })
-        .expect("dispatch failed");
-
-    let pixels = target
-        .read_rgba8(&mut uploader, vk::ImageLayout::GENERAL)
-        .expect("readback failed");
+    let pixels = readback::image_to_rgba8(
+        &mut uploader,
+        renderer.target(),
+        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+    )
+    .expect("readback should succeed");
     drop(uploader);
     gpu.assert_no_validation_errors();
     pixels
@@ -300,7 +302,7 @@ fn two_materials_in_one_mesh_shade_differently() {
         mesh: MeshId(0),
         transform: Affine3A::IDENTITY,
     }];
-    let pixels = trace_with(&[mesh], &materials, &instances, Vec3::ZERO, Vec3::X);
+    let pixels = trace_textured(&[mesh], &materials, &[], &instances, Vec3::ZERO, Vec3::X);
 
     let mut left = std::collections::HashSet::new();
     let mut right = std::collections::HashSet::new();
@@ -792,15 +794,8 @@ fn a_real_interior_traces_to_a_recognisable_image() {
         shades.insert(shade(pixel));
     }
 
-    // Alpha carries the hit flag, so a miss is alpha zero — which a PNG viewer composites as
-    // transparent and shows as whatever is behind it. For a picture to look at, the flag has to be
-    // dropped, or half the image reads as blown-out white when it is really background.
-    let mut opaque = pixels.clone();
-    for pixel in opaque.chunks_exact_mut(4) {
-        pixel[3] = 0xFF;
-    }
     let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("seyda_neen.png");
-    rtxmw_gpu::golden::write_png(&path, &opaque, WIDTH, HEIGHT);
+    readback::write_png_opaque(&path, &pixels, WIDTH, HEIGHT);
 
     let cutouts = scene
         .materials

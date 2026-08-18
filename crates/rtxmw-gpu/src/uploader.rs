@@ -34,6 +34,11 @@ impl Uploader {
         })
     }
 
+    /// The device this uploader submits on, for a caller recording its own commands.
+    pub fn device(&self) -> &ash::Device {
+        self.commands.device()
+    }
+
     /// The allocator these transfers stage through, for callers creating their own buffers.
     pub fn memory(&self) -> &Memory {
         &self.memory

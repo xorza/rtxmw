@@ -132,12 +132,12 @@ impl TestGpu {
 
     /// Creates an offscreen colour target to render into.
     pub fn create_target(
-        &'static self,
+        &self,
         width: u32,
         height: u32,
         format: vk::Format,
     ) -> Result<RenderTarget> {
-        RenderTarget::new(self, width, height, format)
+        RenderTarget::new(&self.memory, width, height, format)
     }
 }
 

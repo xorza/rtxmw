@@ -5,32 +5,6 @@ use std::path::{Path, PathBuf};
 /// Set this environment variable to rewrite baselines instead of failing.
 const UPDATE_VAR: &str = "UPDATE_GOLDEN";
 
-/// Writes `pixels` (8-bit RGBA, row-major) to `path` as a PNG, creating parent directories.
-pub fn write_png(path: &Path, pixels: &[u8], width: u32, height: u32) {
-    assert_eq!(
-        pixels.len(),
-        (width * height * 4) as usize,
-        "pixel buffer is {} bytes, expected {} for {width}x{height} RGBA",
-        pixels.len(),
-        width * height * 4
-    );
-
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).expect("could not create output directory");
-    }
-    let file = std::fs::File::create(path)
-        .unwrap_or_else(|e| panic!("could not create {}: {e}", path.display()));
-
-    let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), width, height);
-    encoder.set_color(png::ColorType::Rgba);
-    encoder.set_depth(png::BitDepth::Eight);
-    encoder
-        .write_header()
-        .expect("could not write PNG header")
-        .write_image_data(pixels)
-        .expect("could not write PNG data");
-}
-
 /// Reads an 8-bit RGBA PNG back into a pixel buffer.
 fn read_png(path: &Path) -> ImageData {
     let file = std::fs::File::open(path)
@@ -86,14 +60,14 @@ pub fn assert_matches(name: &str, pixels: &[u8], width: u32, height: u32) {
     let baseline = golden_dir().join(format!("{name}.png"));
 
     if std::env::var_os(UPDATE_VAR).is_some() {
-        write_png(&baseline, pixels, width, height);
+        crate::readback::write_png(&baseline, pixels, width, height);
         eprintln!("{UPDATE_VAR} set: wrote {}", baseline.display());
         return;
     }
 
     if !baseline.exists() {
         let actual = golden_dir().join(format!("{name}.actual.png"));
-        write_png(&actual, pixels, width, height);
+        crate::readback::write_png(&actual, pixels, width, height);
         panic!(
             "no baseline at {}\nwrote the current render to {}\nre-run with {UPDATE_VAR}=1 to \
              accept it",
@@ -117,7 +91,7 @@ pub fn assert_matches(name: &str, pixels: &[u8], width: u32, height: u32) {
     }
 
     let actual = golden_dir().join(format!("{name}.actual.png"));
-    write_png(&actual, pixels, width, height);
+    crate::readback::write_png(&actual, pixels, width, height);
     panic!(
         "render does not match baseline {name}\n  \
          differing pixels   {} of {}\n  \
@@ -211,7 +185,7 @@ mod tests {
         let pixels: Vec<u8> = (0..width * height * 4).map(|i| i as u8).collect();
 
         let path = std::env::temp_dir().join("rtxmw-golden-roundtrip.png");
-        write_png(&path, &pixels, width, height);
+        crate::readback::write_png(&path, &pixels, width, height);
         let read = read_png(&path);
         std::fs::remove_file(&path).ok();
 

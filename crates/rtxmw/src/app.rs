@@ -11,8 +11,6 @@ use winit::window::{CursorGrabMode, Window, WindowId};
 
 use crate::camera::{Camera, Movement};
 use crate::renderer::Renderer;
-use rtxmw_render::FrameConstants;
-
 use crate::scene_loader;
 
 /// Starting resolution — the internal render target from the design's performance budget.
@@ -248,12 +246,10 @@ impl ApplicationHandler for App {
 
                 if let (Some(renderer), Some(window)) = (&mut self.renderer, &self.window) {
                     let size = window.inner_size();
-                    let constants = FrameConstants::new(
+                    let constants = renderer.frame_constants(
                         self.camera.view(),
                         self.camera.projection(renderer.aspect_ratio()),
                         self.camera.position(),
-                        renderer.ambient(),
-                        renderer.light_count(),
                     );
                     if let Err(e) = renderer.draw(size.width, size.height, &constants) {
                         eprintln!("draw failed: {e}");

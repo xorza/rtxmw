@@ -5,13 +5,10 @@ use glam::Vec3;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use rtxmw_gpu::image_barrier::{self, COLOR_RANGE};
 use rtxmw_gpu::{
-    Device, Frames, Image, Instance, Memory, PhysicalDevice, Presentation, Surface, Swapchain,
-    Uploader, Validation, image_blit, memory_barrier,
+    Device, Frames, Instance, Memory, PhysicalDevice, Presentation, Surface, Swapchain, Uploader,
+    Validation, image_blit,
 };
-use rtxmw_render::{
-    FrameConstants, GeometryBuffers, LightBuffer, MaterialBuffers, SceneAcceleration, TextureArray,
-    VisibilityPass,
-};
+use rtxmw_render::{FrameConstants, SceneRenderer, TARGET_FORMAT};
 use rtxmw_scene::StaticScene;
 use rtxmw_texture::Texture;
 
@@ -22,17 +19,6 @@ const RENDER_SIZE: vk::Extent2D = vk::Extent2D {
     height: 1080,
 };
 
-/// Half-float rather than 8-bit: the trace writes linear radiance that tone mapping consumes at M8,
-/// and an 8-bit intermediate would clip highlights before anything got the chance to.
-const RENDER_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
-
-/// Ceiling on the bindless array, sized once at startup because the descriptor set layout is.
-///
-/// A cell uses far fewer — Seyda Neen's office needs 118 — and the whole shipped library holds
-/// 4,311 distinct textures, so this leaves room for a cell far larger than any interior while
-/// staying well inside what the hardware allows for a sampled-image array.
-const MAX_TEXTURES: u32 = 8192;
-
 /// The whole GPU side of the engine.
 ///
 /// Field order is load-bearing: fields drop in declaration order, and every device-owned object
@@ -40,10 +26,8 @@ const MAX_TEXTURES: u32 = 8192;
 /// so everything holding one — the uploader included — must precede `device`.
 #[derive(Debug)]
 pub(crate) struct Renderer {
-    /// The loaded cell, or `None` before one is given.
-    scene: Option<LoadedScene>,
-    pass: VisibilityPass,
-    target: Image,
+    /// Everything that does not care about a window: the pass, the target, the loaded cell.
+    scene: SceneRenderer,
     /// Holds the only `Memory` clone the renderer needs: every buffer and image keeps its own, and
     /// everything that creates one goes through the uploader to reach it.
     uploader: Uploader,
@@ -57,24 +41,6 @@ pub(crate) struct Renderer {
     #[allow(dead_code)]
     instance: Instance,
     needs_recreate: bool,
-}
-
-/// A cell's geometry and the structures traversing it.
-///
-/// Both fields are lifetime anchors, which is why neither is read after `load_scene` returns. The
-/// descriptor set holds the top-level structure's handle, the structures reference their vertex and
-/// index data by device address, and nothing else keeps either alive — so dropping this is what
-/// unloads a cell.
-#[derive(Debug)]
-#[allow(dead_code)]
-struct LoadedScene {
-    geometry: GeometryBuffers,
-    tables: MaterialBuffers,
-    textures: TextureArray,
-    lights: LightBuffer,
-    acceleration: SceneAcceleration,
-    /// Read every frame into the push constants, so it lives with the scene rather than the camera.
-    ambient: Vec3,
 }
 
 impl Renderer {
@@ -104,19 +70,10 @@ impl Renderer {
 
         let memory = Memory::new(&instance, &physical, &device)?;
         let uploader = Uploader::new(&device, &memory, physical.graphics_queue_family())?;
-        let target = Image::new(
-            &memory,
-            "primary visibility target",
-            RENDER_SIZE,
-            RENDER_FORMAT,
-            vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC,
-        )?;
-        let pass = VisibilityPass::new(&device, MAX_TEXTURES)?;
+        let scene = SceneRenderer::new(&device, &memory, RENDER_SIZE)?;
 
         Ok(Self {
-            scene: None,
-            pass,
-            target,
+            scene,
             uploader,
             frames,
             swapchain,
@@ -136,47 +93,24 @@ impl Renderer {
     ) -> rtxmw_gpu::Result<()> {
         // SAFETY: replacing the scene frees structures a queued frame could still be reading.
         unsafe { self.device.raw().device_wait_idle()? };
-        self.scene = None;
-
-        let geometry = GeometryBuffers::upload(&mut self.uploader, &scene.meshes)?;
-        let materials = scene.materials.materials();
-        let tables = MaterialBuffers::upload(&mut self.uploader, &geometry, materials)?;
-        let acceleration = SceneAcceleration::build(
+        self.scene.load_scene(
             &self.device,
             &mut self.uploader,
             self.physical.limits(),
-            &geometry,
-            materials,
-            &scene.instances,
-        )?;
-        let textures = TextureArray::upload(&self.device, &mut self.uploader, textures)?;
-        assert!(
-            textures.len() <= MAX_TEXTURES,
-            "cell needs {} texture slots but the array is built for {MAX_TEXTURES}",
-            textures.len()
-        );
-
-        let lights = LightBuffer::upload(&mut self.uploader, &scene.lights)?;
-
-        self.pass.bind(
-            acceleration.tlas(),
-            &self.target,
-            &geometry,
-            &tables,
-            &lights,
-            &textures,
-        );
-        self.scene = Some(LoadedScene {
-            geometry,
-            tables,
+            scene,
             textures,
-            lights,
-            acceleration,
-            // A cell with no ambient of its own gets none, rather than a guess: an interior that
-            // declares nothing is meant to be lit by what is placed in it.
-            ambient: scene.ambient.map_or(Vec3::ZERO, |a| a.colour),
-        });
-        Ok(())
+        )
+    }
+
+    /// The frame constants for a camera, filled in with the loaded cell's lighting.
+    pub(crate) fn frame_constants(
+        &self,
+        view: glam::Mat4,
+        projection: glam::Mat4,
+        camera_position: Vec3,
+    ) -> FrameConstants {
+        self.scene
+            .frame_constants(view, projection, camera_position)
     }
 
     /// Name of the physical device in use.
@@ -195,18 +129,23 @@ impl Renderer {
         format!(
             "{}\n  \
              swapchain              {:?} {}x{}, {} images\n  \
+             internal target        {:?} {}x{}\n  \
              position fetch         {}\n  \
              rt maintenance1        {}\n  \
              opacity micromap       {}\n  \
              max ray recursion      {}\n  \
              shader group handle    {} bytes, {} byte alignment\n  \
              max BLAS geometries    {}\n  \
-             max TLAS instances     {}",
+             max TLAS instances     {}\n  \
+             scratch alignment      {} bytes",
             self.physical.name(),
             self.swapchain.format(),
             extent.width,
             extent.height,
             self.swapchain.images().len(),
+            TARGET_FORMAT,
+            RENDER_SIZE.width,
+            RENDER_SIZE.height,
             support.position_fetch,
             support.maintenance1,
             support.opacity_micromap,
@@ -215,19 +154,8 @@ impl Renderer {
             limits.shader_group_base_alignment,
             limits.max_geometry_count,
             limits.max_instance_count,
+            limits.min_scratch_offset_alignment,
         )
-    }
-
-    /// The loaded cell's ambient colour, or black when nothing is loaded.
-    pub(crate) fn ambient(&self) -> Vec3 {
-        self.scene
-            .as_ref()
-            .map_or(Vec3::ZERO, |scene| scene.ambient)
-    }
-
-    /// How many lights the loaded cell placed.
-    pub(crate) fn light_count(&self) -> u32 {
-        self.scene.as_ref().map_or(0, |scene| scene.lights.count())
     }
 
     /// Aspect ratio of the offscreen target, which is what the projection must match.
@@ -272,7 +200,7 @@ impl Renderer {
 
         let image = self.swapchain.images()[image_index as usize];
         let raw = self.device.raw();
-        let traced = self.scene.is_some();
+        let traced = self.scene.has_scene();
 
         // SAFETY: the command buffer is not in use — its fence was just waited on — and every
         // image and pipeline referenced below is alive.
@@ -282,27 +210,7 @@ impl Renderer {
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
             raw.begin_command_buffer(frame.command_buffer, &begin)?;
 
-            if traced {
-                // The previous frame left it in TRANSFER_SRC; UNDEFINED discards those contents,
-                // which is what we want since every pixel is about to be rewritten.
-                image_barrier::transition(
-                    raw,
-                    frame.command_buffer,
-                    self.target.raw(),
-                    vk::ImageLayout::UNDEFINED,
-                    vk::ImageLayout::GENERAL,
-                );
-                self.pass
-                    .record(frame.command_buffer, self.target.extent(), constants);
-                memory_barrier::full(raw, frame.command_buffer);
-                image_barrier::transition(
-                    raw,
-                    frame.command_buffer,
-                    self.target.raw(),
-                    vk::ImageLayout::GENERAL,
-                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                );
-            }
+            self.scene.record(raw, frame.command_buffer, constants);
 
             image_barrier::transition(
                 raw,
@@ -316,8 +224,8 @@ impl Renderer {
                 image_blit::stretch(
                     raw,
                     frame.command_buffer,
-                    self.target.raw(),
-                    self.target.extent(),
+                    self.scene.target().raw(),
+                    self.scene.target().extent(),
                     image,
                     self.swapchain.extent(),
                 );

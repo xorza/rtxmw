@@ -8,7 +8,7 @@ license.workspace = true
 [features]
 # Exposes the offscreen test harness. Downstream crates opt in with
 # `rtxmw-gpu = { workspace = true, features = ["internals"] }` as a dev-dependency.
-internals = ["dep:half", "dep:png"]
+internals = []
 
 [lints]
 workspace = true
@@ -17,17 +17,12 @@ workspace = true
 ash.workspace = true
 ash-window.workspace = true
 gpu-allocator.workspace = true
-half = { workspace = true, optional = true }
-png = { workspace = true, optional = true }
-raw-window-handle.workspace = true
-
-# The harness is `cfg(test)`-enabled for this crate's own tests, but its optional deps are only
-# switched on by the `internals` feature — which a crate cannot enable on itself. Listing them here
-# makes them available under `cargo test` without turning the feature on.
-[dev-dependencies]
-dhat.workspace = true
 half.workspace = true
 png.workspace = true
+raw-window-handle.workspace = true
+
+[dev-dependencies]
+dhat.workspace = true
 
 # Needs the offscreen harness, and installs a global allocator — hence its own binary.
 [[test]]

@@ -1,28 +1,27 @@
 //! An offscreen colour target that can be rendered into and read back.
 
 use ash::vk;
-use half::f16;
 
-use crate::buffer::{Buffer, BufferMemory};
 use crate::error::Result;
 use crate::image::Image;
 use crate::image_barrier::{self, COLOR_RANGE};
-use crate::testing::test_gpu::TestGpu;
+use crate::memory::Memory;
+use crate::readback;
 use crate::uploader::Uploader;
 
-/// An offscreen image sized and formatted for one test, with host readback.
+/// An offscreen image a test can fill and read back.
 ///
-/// Cheap relative to device creation, so one per test is fine. The image itself is an ordinary
-/// [`Image`]; what this adds is the readback and clear a test needs and the renderer does not.
+/// Cheap relative to device creation, so one per test is fine. The image is an ordinary [`Image`]
+/// and the readback is the shared [`readback::image_to_rgba8`]; what this adds is the clear, and a
+/// constructor with the usage flags a test target wants.
 #[derive(Debug)]
 pub struct RenderTarget {
-    gpu: &'static TestGpu,
     image: Image,
 }
 
 impl RenderTarget {
     pub(crate) fn new(
-        gpu: &'static TestGpu,
+        memory: &Memory,
         width: u32,
         height: u32,
         format: vk::Format,
@@ -30,7 +29,7 @@ impl RenderTarget {
         // STORAGE so a compute or ray tracing shader can write it; TRANSFER_SRC for readback;
         // COLOR_ATTACHMENT so a raster pass can target it too.
         let image = Image::new(
-            gpu.memory(),
+            memory,
             "test render target",
             vk::Extent2D { width, height },
             format,
@@ -39,24 +38,13 @@ impl RenderTarget {
                 | vk::ImageUsageFlags::TRANSFER_SRC
                 | vk::ImageUsageFlags::TRANSFER_DST,
         )?;
-        Ok(Self { gpu, image })
-    }
-
-    /// The image being rendered into.
-    pub fn image(&self) -> &Image {
-        &self.image
-    }
-
-    /// Size in pixels.
-    pub fn extent(&self) -> vk::Extent2D {
-        self.image.extent()
+        Ok(Self { image })
     }
 
     /// Fills the whole image with `colour`, leaving it in `TRANSFER_DST_OPTIMAL`.
     ///
-    /// Enough to exercise the harness before there is anything to render.
-    /// Takes the uploader rather than reaching for [`TestGpu::submit_and_wait`]: that would lock
-    /// the shared uploader, and a caller already holding the guard would deadlock. Threading it
+    /// Takes the uploader rather than reaching for [`crate::TestGpu::submit_and_wait`]: that locks
+    /// the shared uploader, so a caller already holding the guard would deadlock. Threading it
     /// through makes that impossible to write instead of merely documented.
     pub fn clear(&self, uploader: &mut Uploader, colour: [f32; 4]) -> Result<()> {
         uploader.submit_and_wait(|device, cmd| {
@@ -89,116 +77,14 @@ impl RenderTarget {
         uploader: &mut Uploader,
         current_layout: vk::ImageLayout,
     ) -> Result<Vec<u8>> {
-        let pixel = PixelFormat::of(self.image.format());
-        let extent = self.image.extent();
-        let pixels = (extent.width * extent.height) as usize;
-        let size = (pixels * pixel.bytes_per_pixel()) as vk::DeviceSize;
-
-        let readback = Buffer::new(
-            self.gpu.memory(),
-            "render target readback",
-            size,
-            vk::BufferUsageFlags::TRANSFER_DST,
-            BufferMemory::Readback,
-        )?;
-        let destination = readback.raw();
-
-        uploader.submit_and_wait(|device, cmd| {
-            // SAFETY: the command buffer is recording and both resources are alive.
-            unsafe {
-                image_barrier::transition(
-                    device,
-                    cmd,
-                    self.image.raw(),
-                    current_layout,
-                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                );
-                let region = vk::BufferImageCopy::default()
-                    .image_subresource(
-                        vk::ImageSubresourceLayers::default()
-                            .aspect_mask(vk::ImageAspectFlags::COLOR)
-                            .layer_count(1),
-                    )
-                    .image_extent(vk::Extent3D {
-                        width: extent.width,
-                        height: extent.height,
-                        depth: 1,
-                    });
-                device.cmd_copy_image_to_buffer(
-                    cmd,
-                    self.image.raw(),
-                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                    destination,
-                    &[region],
-                );
-            }
-        })?;
-
-        let bytes = readback
-            .mapped()
-            .expect("readback memory is host-visible by construction");
-        Ok(pixel.to_rgba8(&bytes[..size as usize], pixels))
-    }
-}
-
-/// How to turn raw target bytes into 8-bit RGBA.
-#[derive(Debug, Clone, Copy)]
-enum PixelFormat {
-    /// Already 8-bit RGBA.
-    Rgba8,
-    /// 8-bit BGRA, needing a channel swap.
-    Bgra8,
-    /// Half-float RGBA, needing a linear-to-8-bit conversion.
-    Rgba16Float,
-}
-
-impl PixelFormat {
-    fn of(format: vk::Format) -> Self {
-        match format {
-            vk::Format::R8G8B8A8_UNORM | vk::Format::R8G8B8A8_SRGB => Self::Rgba8,
-            vk::Format::B8G8R8A8_UNORM | vk::Format::B8G8R8A8_SRGB => Self::Bgra8,
-            vk::Format::R16G16B16A16_SFLOAT => Self::Rgba16Float,
-            other => panic!("readback is not implemented for {other:?}"),
-        }
-    }
-
-    fn bytes_per_pixel(self) -> usize {
-        match self {
-            Self::Rgba8 | Self::Bgra8 => 4,
-            Self::Rgba16Float => 8,
-        }
-    }
-
-    fn to_rgba8(self, bytes: &[u8], pixels: usize) -> Vec<u8> {
-        let mut out = Vec::with_capacity(pixels * 4);
-        match self {
-            Self::Rgba8 => out.extend_from_slice(bytes),
-            Self::Bgra8 => {
-                for chunk in bytes.chunks_exact(4) {
-                    out.extend_from_slice(&[chunk[2], chunk[1], chunk[0], chunk[3]]);
-                }
-            }
-            Self::Rgba16Float => {
-                for chunk in bytes.chunks_exact(2) {
-                    let value = f16::from_le_bytes([chunk[0], chunk[1]]).to_f32();
-                    out.push((value.clamp(0.0, 1.0) * 255.0 + 0.5) as u8);
-                }
-            }
-        }
-        out
+        readback::image_to_rgba8(uploader, &self.image, current_layout)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn bgra_readback_swaps_channels_and_keeps_alpha() {
-        let bytes = [10u8, 20, 30, 40];
-        let rgba = PixelFormat::Bgra8.to_rgba8(&bytes, 1);
-        assert_eq!(rgba, vec![30, 20, 10, 40]);
-    }
+    use crate::testing::test_gpu::TestGpu;
 
     /// Chosen so the UNORM encode is exact: 0.2*255 = 51, 0.6*255 = 153, 0.8*255 = 204, 1.0 = 255.
     /// Values like 0.5 would land on 127.5, where the rounding direction is implementation-defined.
@@ -290,16 +176,5 @@ mod tests {
             }
         }
         gpu.assert_no_validation_errors();
-    }
-
-    #[test]
-    fn half_float_readback_clamps_and_quantises() {
-        // 1.0, 0.0, 2.0 (clamps to 1.0), 0.5 -> 255, 0, 255, 128
-        let bytes: Vec<u8> = [0x3c00u16, 0x0000, 0x4000, 0x3800]
-            .iter()
-            .flat_map(|h| h.to_le_bytes())
-            .collect();
-        let rgba = PixelFormat::Rgba16Float.to_rgba8(&bytes, 1);
-        assert_eq!(rgba, vec![255, 0, 255, 128]);
     }
 }

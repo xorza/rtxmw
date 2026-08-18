@@ -112,6 +112,25 @@ Tests reach this through `rtxmw_vfs::morrowind_data_dir()`, which prefers the pr
 over `.env`. A machine without the game **skips** those tests; a path that is set but wrong
 **panics**, because a silent skip is indistinguishable from a pass.
 
+### Seeing the renderer's output without a window
+
+`SceneRenderer` in `rtxmw-render` owns the pass, the target and the loaded cell and knows nothing
+about surfaces or presentation; the binary's `Renderer` adds swapchain and present around it. That
+split is what makes the renderer testable: `crates/rtxmw-render/tests/primary_visibility.rs` drives
+the same `SceneRenderer` the engine runs rather than a replica of it, headlessly, in under a second.
+
+**Do not run the windowed binary to check a change.** `cargo run` opens a window on the user's
+screen and costs tens of seconds; almost everything it would confirm is already covered:
+
+```
+cargo run -- --screenshot out.png    # one frame, no window, no swapchain, ~0.6 s warm
+```
+
+That path brings up a device with no surface extensions at all, so it works over ssh and in a
+script, and it reports the fraction of rays that hit geometry — enough to tell "the cell rendered"
+from "the camera was pointed at nothing" without opening the file. Only swapchain acquire and
+present remain untested, and they need a real surface.
+
 ### Cross-checking a format implementation
 
 OpenMW's CLI tools decode the same files and can be diffed against. Build them from `.refs/openmw`,
