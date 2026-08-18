@@ -140,13 +140,20 @@ impl Swapchain {
         Ok(())
     }
 
-    /// Prefers a non-linear sRGB target so the presentation engine does the encode.
+    /// Prefers a `UNORM` target in the sRGB colour space, so the presentation engine passes the
+    /// bytes through untouched.
+    ///
+    /// **Not `_SRGB`, and that is the point.** The tonemap pass encodes sRGB itself, because it
+    /// writes through a storage image and sRGB formats expose no storage capability. Presenting
+    /// those already-encoded bytes through an `_SRGB` swapchain would encode them a second time and
+    /// wash the whole frame out. The colour space is still `SRGB_NONLINEAR`, which is what tells
+    /// the display how to read them.
     fn choose_format(available: &[vk::SurfaceFormatKHR]) -> vk::SurfaceFormatKHR {
         available
             .iter()
             .copied()
             .find(|f| {
-                f.format == vk::Format::B8G8R8A8_SRGB
+                f.format == vk::Format::B8G8R8A8_UNORM
                     && f.color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR
             })
             .unwrap_or_else(|| {

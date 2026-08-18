@@ -8,7 +8,7 @@ use rtxmw_gpu::{
     Device, Frames, Instance, Memory, PhysicalDevice, Presentation, Surface, Swapchain, Uploader,
     Validation, image_blit,
 };
-use rtxmw_render::{FrameConstants, SceneRenderer, TARGET_FORMAT};
+use rtxmw_render::{FrameConstants, OUTPUT_FORMAT, SceneRenderer, TARGET_FORMAT};
 use rtxmw_scene::StaticScene;
 use rtxmw_texture::Texture;
 
@@ -130,6 +130,7 @@ impl Renderer {
             "{}\n  \
              swapchain              {:?} {}x{}, {} images\n  \
              internal target        {:?} {}x{}\n  \
+             tonemapped output      {:?}\n  \
              position fetch         {}\n  \
              rt maintenance1        {}\n  \
              opacity micromap       {}\n  \
@@ -146,6 +147,7 @@ impl Renderer {
             TARGET_FORMAT,
             RENDER_SIZE.width,
             RENDER_SIZE.height,
+            OUTPUT_FORMAT,
             support.position_fetch,
             support.maintenance1,
             support.opacity_micromap,
@@ -224,8 +226,8 @@ impl Renderer {
                 image_blit::stretch(
                     raw,
                     frame.command_buffer,
-                    self.scene.target().raw(),
-                    self.scene.target().extent(),
+                    self.scene.output().raw(),
+                    self.scene.output().extent(),
                     image,
                     self.swapchain.extent(),
                 );

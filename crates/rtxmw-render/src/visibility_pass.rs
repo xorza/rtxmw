@@ -3,7 +3,7 @@
 use ash::vk;
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3};
-use rtxmw_gpu::{Device, Image};
+use rtxmw_gpu::{Binding, ComputePipeline, Device, Image};
 
 use crate::acceleration_structure::AccelerationStructure;
 use crate::geometry_buffers::GeometryBuffers;
@@ -76,29 +76,14 @@ impl FrameConstants {
     }
 }
 
-/// Compute pipeline and descriptors for tracing primary rays.
+/// Descriptors for tracing primary rays, over a compute pipeline.
 ///
 /// A compute shader with inline ray queries rather than a ray tracing pipeline: there is one
 /// material path and no recursion, so a shader binding table would add a build step and a dispatch
 /// indirection for nothing. Revisit when a hit needs to launch further rays it cannot inline.
+#[derive(Debug)]
 pub struct VisibilityPass {
-    /// A handle copy, not an owner: the real `Device` outlives this by construction.
-    device: ash::Device,
-    descriptor_layout: vk::DescriptorSetLayout,
-    pool: vk::DescriptorPool,
-    set: vk::DescriptorSet,
-    pipeline_layout: vk::PipelineLayout,
-    pipeline: vk::Pipeline,
-}
-
-// `ash::Device` is a table of function pointers and implements no `Debug`.
-impl std::fmt::Debug for VisibilityPass {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("VisibilityPass")
-            .field("pipeline", &self.pipeline)
-            .field("set", &self.set)
-            .finish_non_exhaustive()
-    }
+    pipeline: ComputePipeline,
 }
 
 /// Matches `local_size_x`/`local_size_y` in `primary_visibility.comp`.
@@ -108,153 +93,31 @@ impl std::fmt::Debug for VisibilityPass {
 const WORKGROUP: u32 = 8;
 
 impl VisibilityPass {
-    /// Creates the layout, pool, descriptor set and pipeline.
+    /// Creates the descriptor set and pipeline.
     ///
     /// `max_textures` sizes the bindless array's binding. It is a ceiling rather than a count: the
     /// set is allocated with room for it and each scene writes as many slots as it actually has.
     pub fn new(device: &Device, max_textures: u32) -> rtxmw_gpu::Result<Self> {
-        assert!(
-            max_textures > 0,
-            "the texture array needs at least a fallback slot"
-        );
-        let raw = device.raw();
-
-        let bindings = [
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(0)
-                .descriptor_type(vk::DescriptorType::ACCELERATION_STRUCTURE_KHR)
-                .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::COMPUTE),
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(1)
-                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
-                .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::COMPUTE),
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(2)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::COMPUTE),
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(3)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::COMPUTE),
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(4)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::COMPUTE),
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(5)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::COMPUTE),
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(6)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::COMPUTE),
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(7)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::COMPUTE),
-            // Last, because Vulkan allows a variable descriptor count only on a set's final
-            // binding. Adding anything after this one moves it — validation rejects the set
-            // outright, which is how this was caught.
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(8)
-                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                .descriptor_count(max_textures)
-                .stage_flags(vk::ShaderStageFlags::COMPUTE),
-        ];
-        // Only the texture array is variable and partially bound: a cell that uses 118 textures
-        // writes 118 descriptors into a binding declared for far more, and the rest are never read.
-        // Declaring them all bound would mean uploading placeholder views for slots no ray reaches.
-        let mut flags = [vk::DescriptorBindingFlags::empty(); 9];
-        flags[8] = vk::DescriptorBindingFlags::PARTIALLY_BOUND
-            | vk::DescriptorBindingFlags::VARIABLE_DESCRIPTOR_COUNT;
-        let mut binding_flags =
-            vk::DescriptorSetLayoutBindingFlagsCreateInfo::default().binding_flags(&flags);
-        let layout_info = vk::DescriptorSetLayoutCreateInfo::default()
-            .bindings(&bindings)
-            .push_next(&mut binding_flags);
-        // SAFETY: `layout_info` is fully initialised and the device is alive.
-        let descriptor_layout = unsafe { raw.create_descriptor_set_layout(&layout_info, None)? };
-
-        let sizes = [
-            vk::DescriptorPoolSize::default()
-                .ty(vk::DescriptorType::ACCELERATION_STRUCTURE_KHR)
-                .descriptor_count(1),
-            vk::DescriptorPoolSize::default()
-                .ty(vk::DescriptorType::STORAGE_IMAGE)
-                .descriptor_count(1),
-            vk::DescriptorPoolSize::default()
-                .ty(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(6),
-            vk::DescriptorPoolSize::default()
-                .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                .descriptor_count(max_textures),
-        ];
-        let pool_info = vk::DescriptorPoolCreateInfo::default()
-            .pool_sizes(&sizes)
-            .max_sets(1);
-        // SAFETY: same.
-        let pool = unsafe { raw.create_descriptor_pool(&pool_info, None)? };
-
-        let layouts = [descriptor_layout];
-        let counts = [max_textures];
-        let mut variable_count = vk::DescriptorSetVariableDescriptorCountAllocateInfo::default()
-            .descriptor_counts(&counts);
-        let allocate = vk::DescriptorSetAllocateInfo::default()
-            .descriptor_pool(pool)
-            .set_layouts(&layouts)
-            .push_next(&mut variable_count);
-        // SAFETY: the pool was just created with room for exactly this set.
-        let set = unsafe { raw.allocate_descriptor_sets(&allocate)? }[0];
-
-        let ranges = [vk::PushConstantRange::default()
-            .stage_flags(vk::ShaderStageFlags::COMPUTE)
-            .offset(0)
-            .size(size_of::<FrameConstants>() as u32)];
-        let pipeline_layout_info = vk::PipelineLayoutCreateInfo::default()
-            .set_layouts(&layouts)
-            .push_constant_ranges(&ranges);
-        // SAFETY: same.
-        let pipeline_layout = unsafe { raw.create_pipeline_layout(&pipeline_layout_info, None)? };
-
-        let module_info = vk::ShaderModuleCreateInfo::default().code(shaders::primary_visibility());
-        // SAFETY: the build script only emits modules `spirv-val` accepted.
-        let module = unsafe { raw.create_shader_module(&module_info, None)? };
-
-        let stage = vk::PipelineShaderStageCreateInfo::default()
-            .stage(vk::ShaderStageFlags::COMPUTE)
-            .module(module)
-            .name(c"main");
-        let pipeline_info = vk::ComputePipelineCreateInfo::default()
-            .stage(stage)
-            .layout(pipeline_layout);
-        // SAFETY: every referenced object is alive.
-        let pipeline = unsafe {
-            raw.create_compute_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
-        };
-        // The module is baked into the pipeline, so it can go regardless of the outcome.
-        // SAFETY: pipeline creation has returned, and nothing else references the module.
-        unsafe { raw.destroy_shader_module(module, None) };
-
-        let pipeline = match pipeline {
-            Ok(pipelines) => pipelines[0],
-            Err((_, e)) => return Err(e.into()),
-        };
-
         Ok(Self {
-            device: raw.clone(),
-            descriptor_layout,
-            pool,
-            set,
-            pipeline_layout,
-            pipeline,
+            pipeline: ComputePipeline::new(
+                device,
+                &[
+                    Binding::acceleration_structure(0),
+                    Binding::storage_image(1),
+                    Binding::storage_buffer(2),
+                    Binding::storage_buffer(3),
+                    Binding::storage_buffer(4),
+                    Binding::storage_buffer(5),
+                    Binding::storage_buffer(6),
+                    Binding::storage_buffer(7),
+                    // Last, because Vulkan allows a variable descriptor count only on a set's final
+                    // binding. Adding anything after this one moves it — validation rejects the set
+                    // outright, which is how this was caught.
+                    Binding::variable_samplers(8, max_textures),
+                ],
+                size_of::<FrameConstants>() as u32,
+                shaders::primary_visibility(),
+            )?,
         })
     }
 
@@ -279,7 +142,7 @@ impl VisibilityPass {
         // struct, and no builder method bridges the two. It must be non-zero: the write is rejected
         // outright otherwise, rather than binding nothing.
         let mut scene_write = vk::WriteDescriptorSet::default()
-            .dst_set(self.set)
+            .dst_set(self.pipeline.set())
             .dst_binding(0)
             .descriptor_type(vk::DescriptorType::ACCELERATION_STRUCTURE_KHR)
             .push_next(&mut acceleration);
@@ -289,7 +152,7 @@ impl VisibilityPass {
             .image_view(target.view())
             .image_layout(vk::ImageLayout::GENERAL)];
         let image_write = vk::WriteDescriptorSet::default()
-            .dst_set(self.set)
+            .dst_set(self.pipeline.set())
             .dst_binding(1)
             .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
             .image_info(&images);
@@ -298,7 +161,7 @@ impl VisibilityPass {
             .buffer(tables.geometries().raw())
             .range(vk::WHOLE_SIZE)];
         let geometry_write = vk::WriteDescriptorSet::default()
-            .dst_set(self.set)
+            .dst_set(self.pipeline.set())
             .dst_binding(2)
             .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
             .buffer_info(&geometry_info);
@@ -307,14 +170,14 @@ impl VisibilityPass {
             .buffer(tables.materials().raw())
             .range(vk::WHOLE_SIZE)];
         let material_write = vk::WriteDescriptorSet::default()
-            .dst_set(self.set)
+            .dst_set(self.pipeline.set())
             .dst_binding(3)
             .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
             .buffer_info(&material_info);
 
         let texture_infos = textures.descriptors();
         let texture_write = vk::WriteDescriptorSet::default()
-            .dst_set(self.set)
+            .dst_set(self.pipeline.set())
             .dst_binding(8)
             .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
             .image_info(&texture_infos);
@@ -323,7 +186,7 @@ impl VisibilityPass {
             .buffer(geometry.positions().raw())
             .range(vk::WHOLE_SIZE)];
         let position_write = vk::WriteDescriptorSet::default()
-            .dst_set(self.set)
+            .dst_set(self.pipeline.set())
             .dst_binding(7)
             .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
             .buffer_info(&position_info);
@@ -332,7 +195,7 @@ impl VisibilityPass {
             .buffer(lights.buffer().raw())
             .range(vk::WHOLE_SIZE)];
         let light_write = vk::WriteDescriptorSet::default()
-            .dst_set(self.set)
+            .dst_set(self.pipeline.set())
             .dst_binding(6)
             .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
             .buffer_info(&light_info);
@@ -341,7 +204,7 @@ impl VisibilityPass {
             .buffer(geometry.indices().raw())
             .range(vk::WHOLE_SIZE)];
         let index_write = vk::WriteDescriptorSet::default()
-            .dst_set(self.set)
+            .dst_set(self.pipeline.set())
             .dst_binding(4)
             .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
             .buffer_info(&index_info);
@@ -350,14 +213,14 @@ impl VisibilityPass {
             .buffer(geometry.attributes().raw())
             .range(vk::WHOLE_SIZE)];
         let attribute_write = vk::WriteDescriptorSet::default()
-            .dst_set(self.set)
+            .dst_set(self.pipeline.set())
             .dst_binding(5)
             .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
             .buffer_info(&attribute_info);
 
         // SAFETY: every write names this pass's own set, and no dispatch using it is in flight.
         unsafe {
-            self.device.update_descriptor_sets(
+            self.pipeline.device().update_descriptor_sets(
                 &[
                     scene_write,
                     image_write,
@@ -390,48 +253,15 @@ impl VisibilityPass {
     ) {
         // SAFETY: the caller guarantees the command buffer is recording and the set is bound.
         unsafe {
-            self.device.cmd_bind_pipeline(
+            self.pipeline.dispatch(
                 command_buffer,
-                vk::PipelineBindPoint::COMPUTE,
-                self.pipeline,
-            );
-            self.device.cmd_bind_descriptor_sets(
-                command_buffer,
-                vk::PipelineBindPoint::COMPUTE,
-                self.pipeline_layout,
-                0,
-                &[self.set],
-                &[],
-            );
-            self.device.cmd_push_constants(
-                command_buffer,
-                self.pipeline_layout,
-                vk::ShaderStageFlags::COMPUTE,
-                0,
+                [
+                    extent.width.div_ceil(WORKGROUP),
+                    extent.height.div_ceil(WORKGROUP),
+                    1,
+                ],
                 bytemuck::bytes_of(constants),
             );
-            self.device.cmd_dispatch(
-                command_buffer,
-                extent.width.div_ceil(WORKGROUP),
-                extent.height.div_ceil(WORKGROUP),
-                1,
-            );
-        }
-    }
-}
-
-impl Drop for VisibilityPass {
-    fn drop(&mut self) {
-        // SAFETY: the caller waits for device idle before dropping the renderer, and every test
-        // submission blocks on a fence.
-        unsafe {
-            self.device.destroy_pipeline(self.pipeline, None);
-            self.device
-                .destroy_pipeline_layout(self.pipeline_layout, None);
-            // Frees the set with it.
-            self.device.destroy_descriptor_pool(self.pool, None);
-            self.device
-                .destroy_descriptor_set_layout(self.descriptor_layout, None);
         }
     }
 }

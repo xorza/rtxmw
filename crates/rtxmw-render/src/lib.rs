@@ -3,12 +3,14 @@
 pub mod shaders;
 
 mod acceleration_structure;
+mod auto_exposure;
 mod geometry_buffers;
 mod light_buffer;
 mod material_buffers;
 mod scene_acceleration;
 mod scene_renderer;
 mod texture_array;
+mod tonemap;
 mod visibility_pass;
 
 pub use crate::acceleration_structure::AccelerationStructure;
@@ -18,4 +20,5 @@ pub use crate::material_buffers::{GpuGeometry, GpuMaterial, MaterialBuffers, NO_
 pub use crate::scene_acceleration::SceneAcceleration;
 pub use crate::scene_renderer::{SceneRenderer, TARGET_FORMAT};
 pub use crate::texture_array::TextureArray;
+pub use crate::tonemap::OUTPUT_FORMAT;
 pub use crate::visibility_pass::{FrameConstants, VisibilityPass};

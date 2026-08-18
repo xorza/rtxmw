@@ -23,9 +23,24 @@ macro_rules! include_spirv {
     }};
 }
 
-/// Primary visibility: one ray query per pixel, writing false colour to a storage image.
+/// Primary visibility: one ray query per pixel, writing linear radiance to a storage image.
 pub fn primary_visibility() -> &'static [u32] {
     include_spirv!("primary_visibility.comp")
+}
+
+/// Bins the frame's log luminance, for auto-exposure to reduce.
+pub fn luminance_histogram() -> &'static [u32] {
+    include_spirv!("luminance_histogram.comp")
+}
+
+/// Reduces that histogram to one exposure multiplier.
+pub fn exposure() -> &'static [u32] {
+    include_spirv!("exposure.comp")
+}
+
+/// Exposure, tone curve and sRGB encoding, from linear radiance to display bytes.
+pub fn tonemap() -> &'static [u32] {
+    include_spirv!("tonemap.comp")
 }
 
 #[cfg(test)]
@@ -36,12 +51,18 @@ mod tests {
     const MAGIC: u32 = 0x0723_0203;
 
     #[test]
-    fn the_embedded_module_is_spirv_and_correctly_aligned() {
-        let module = primary_visibility();
-        assert!(!module.is_empty());
-        assert_eq!(module[0], MAGIC, "not a SPIR-V module");
-        // A misaligned cast would be undefined behaviour rather than a wrong value, so assert the
-        // property directly instead of trusting that it happened to work.
-        assert_eq!(module.as_ptr().addr() % align_of::<u32>(), 0);
+    fn every_embedded_module_is_spirv_and_correctly_aligned() {
+        for (name, module) in [
+            ("primary_visibility", primary_visibility()),
+            ("luminance_histogram", luminance_histogram()),
+            ("exposure", exposure()),
+            ("tonemap", tonemap()),
+        ] {
+            assert!(!module.is_empty(), "{name} is empty");
+            assert_eq!(module[0], MAGIC, "{name} is not a SPIR-V module");
+            // A misaligned cast would be undefined behaviour rather than a wrong value, so assert
+            // the property directly instead of trusting that it happened to work.
+            assert_eq!(module.as_ptr().addr() % align_of::<u32>(), 0, "{name}");
+        }
     }
 }

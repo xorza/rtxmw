@@ -56,9 +56,11 @@ pub(crate) fn screenshot(
     );
     renderer.render_once(&mut uploader, &constants)?;
 
+    // The tonemapped output rather than the raw radiance, so the file holds exactly the bytes the
+    // window would show — the whole verification loop rests on the screenshot being that.
     let pixels = readback::image_to_rgba8(
         &mut uploader,
-        renderer.target(),
+        renderer.output(),
         vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
     )?;
 

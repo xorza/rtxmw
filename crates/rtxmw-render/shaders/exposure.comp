@@ -1,0 +1,75 @@
+#version 460
+
+// Reduces the luminance histogram to the exposure the frame should be scaled by.
+//
+// One workgroup of exactly `BINS` threads: the whole job is a 256-element weighted sum, and
+// dispatching it separately from the tonemap is what stops every tonemap workgroup redoing it.
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer Histogram {
+    uint bins[];
+};
+layout(set = 0, binding = 1) buffer Exposure {
+    float exposure;
+};
+
+layout(push_constant) uniform Frame {
+    float min_log_luminance;
+    // The span the histogram covers, in stops. The reciprocal is what the binning pass wants; this
+    // pass needs the span itself to undo it.
+    float log_range;
+    // Total pixels binned, so the black bin can be discounted from the divisor.
+    uint pixels;
+} frame;
+
+const uint BINS = 256u;
+
+// The luminance a correctly exposed mid grey sits at. 18% is the photographic convention, and it is
+// what makes "average scene" land in the middle of the tone curve rather than at either end.
+const float KEY = 0.18;
+
+// Exposure is clamped rather than trusted: a frame that is entirely black would otherwise divide by
+// something near zero and hand back an exposure that turns the next frame's noise into a snowstorm.
+const float MIN_EXPOSURE = 0.05;
+const float MAX_EXPOSURE = 200.0;
+
+shared uint weighted[BINS];
+
+void main() {
+    uint index = gl_LocalInvocationIndex;
+    uint count = bins[index];
+    // Weighted by the bin's own index: summed and divided by the population this gives the mean
+    // bin, which is the mean *log* luminance because the bins are logarithmic.
+    weighted[index] = count * index;
+    barrier();
+
+    // Tree reduction over the workgroup: 256 values to one in eight steps.
+    for (uint stride = BINS / 2u; stride > 0u; stride >>= 1u) {
+        if (index < stride) {
+            weighted[index] += weighted[index + stride];
+        }
+        barrier();
+    }
+
+    if (index != 0u) {
+        return;
+    }
+
+    // Bin zero holds the pixels too dark to bin, and they are excluded from the divisor as well as
+    // contributing nothing to the sum — an interior is mostly them, and counting them would pull
+    // the average onto the floor and open the exposure until the lit parts blew out.
+    float lit = max(float(frame.pixels - bins[0]), 1.0);
+    float mean_bin = float(weighted[0]) / lit;
+    // Undo the binning: bin one is the darkest resolved value, so the scale spans `BINS - 2`.
+    float mean_log = (mean_bin - 1.0) / float(BINS - 2u) * frame.log_range
+                   + frame.min_log_luminance;
+    float mean_luminance = exp2(mean_log);
+
+    // Nothing was bright enough to bin, so there is nothing to expose for.
+    if (frame.pixels == bins[0]) {
+        exposure = 1.0;
+        return;
+    }
+    exposure = clamp(KEY / max(mean_luminance, 1e-6), MIN_EXPOSURE, MAX_EXPOSURE);
+}

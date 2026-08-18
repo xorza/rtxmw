@@ -32,6 +32,12 @@ const WARMUP_FRAMES: usize = 16;
 
 /// Frames measured. Large enough that a single stray allocation is unambiguous, small enough to
 /// stay fast.
+///
+/// The count barely affects the runtime: measured at 32, 128, 256 and 512 frames the test takes
+/// 1.53, 1.56, 1.71 and 1.84 seconds. Nearly all of that is bringing up a device, decoding the cell
+/// and building its acceleration structures; a measured frame at this size costs about 0.6 ms. So
+/// there is no speed to buy by lowering this, and the run when the whole suite is executing is
+/// faster still, because the device is already up.
 const MEASURED_FRAMES: usize = 256;
 
 /// Allocations permitted across the whole measured window, not per frame.

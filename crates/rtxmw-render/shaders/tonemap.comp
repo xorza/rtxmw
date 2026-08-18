@@ -1,0 +1,76 @@
+#version 460
+
+// Exposure, tone curve and sRGB encoding: everything between the linear radiance the trace produces
+// and the bytes a display wants.
+//
+// The output is written already sRGB-encoded into an 8-bit image, so what reaches the swapchain and
+// what reaches a PNG are the same bytes. Encoding here rather than letting an sRGB swapchain format
+// do it costs a few instructions and buys that identity — which matters when the whole verification
+// loop is looking at a screenshot and believing it is what the window shows.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0, rgba16f) uniform readonly image2D source;
+layout(set = 0, binding = 1, rgba8) uniform writeonly image2D target;
+layout(set = 0, binding = 2) readonly buffer Exposure {
+    float exposure;
+};
+
+// The Khronos PBR Neutral tone mapper.
+//
+// Chosen over a filmic curve because of what this has to be judged against: the milestone's
+// done-when is that an original Morrowind screenshot and a render of the same viewpoint compare
+// without a gamma mismatch, and the original applied no tone curve at all. This one is the identity
+// below `START` and only rolls off above it, so the midtones it is compared on are untouched, while
+// a filmic curve would darken and twist every one of them.
+//
+// The desaturation term is what keeps a bright torch flame reading as orange going white rather
+// than clipping channel by channel, which turns it yellow then green on its way.
+const float START = 0.8 - 0.04;
+const float DESATURATION = 0.15;
+
+vec3 tone_map(vec3 colour) {
+    // Lift the darkest channel off zero, which is what stops a colour with one channel at zero from
+    // staying fully saturated as it brightens.
+    float darkest = min(colour.r, min(colour.g, colour.b));
+    float offset = darkest < 0.08 ? darkest - 6.25 * darkest * darkest : 0.04;
+    colour -= offset;
+
+    float peak = max(colour.r, max(colour.g, colour.b));
+    if (peak < START) {
+        return colour;
+    }
+    float headroom = 1.0 - START;
+    float compressed = 1.0 - headroom * headroom / (peak + headroom - START);
+    colour *= compressed / peak;
+    float towards_white = 1.0 - 1.0 / (DESATURATION * (peak - compressed) + 1.0);
+    return mix(colour, vec3(compressed), towards_white);
+}
+
+// Linear to sRGB, the piecewise standard rather than a plain 2.2 power.
+//
+// The linear segment near black is not a detail: a pure power curve has infinite slope at zero and
+// the two disagree by several 8-bit steps in exactly the near-black range an unlit interior lives
+// in.
+vec3 encode_srgb(vec3 linear) {
+    bvec3 small = lessThanEqual(linear, vec3(0.0031308));
+    vec3 low = linear * 12.92;
+    vec3 high = 1.055 * pow(linear, vec3(1.0 / 2.4)) - 0.055;
+    return mix(high, low, vec3(small));
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(pixel, imageSize(source)))) {
+        return;
+    }
+
+    vec4 traced = imageLoad(source, pixel);
+    // Negative radiance is not a thing, and a negative here would survive the tone curve and come
+    // out of `pow` as a NaN.
+    vec3 colour = max(traced.rgb * exposure, vec3(0.0));
+    vec3 encoded = encode_srgb(clamp(tone_map(colour), 0.0, 1.0));
+    // Alpha carries the trace's hit flag, and it is passed through rather than encoded: it is a
+    // flag, not a colour, and every test that reads it expects one or zero.
+    imageStore(target, pixel, vec4(encoded, traced.a));
+}

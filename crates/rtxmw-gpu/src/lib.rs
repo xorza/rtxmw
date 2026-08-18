@@ -11,6 +11,7 @@ pub mod memory_barrier;
 
 mod buffer;
 mod commands;
+mod compute_pipeline;
 mod device;
 mod error;
 mod frames;
@@ -26,6 +27,7 @@ mod uploader;
 mod validation_log;
 
 pub use crate::buffer::{Buffer, BufferMemory};
+pub use crate::compute_pipeline::{Binding, ComputePipeline};
 pub use crate::device::Device;
 pub use crate::error::{GpuError, Result};
 pub use crate::frames::{Frame, Frames};

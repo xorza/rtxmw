@@ -773,6 +773,69 @@ there is no exposure or tone mapping anywhere in the pipeline yet, which is M8.
 **Not done:** `StaticScene` does not carry the doors a cell places. That is the one line travel
 needs and nothing consumes it yet, so it waits for the thing that activates a door.
 
+### M8 — exposure, tone curve and sRGB — **core done**
+
+Everything before this wrote linear radiance and then clamped it to `0..1` on the way out. An
+interior traces at about three hundredths of mid grey, so the whole cell arrived at a display as
+near-black — and the frame that finally showed the room is the same trace, unchanged, with only the
+output path fixed. Nothing about the lighting moved.
+
+**Auto-exposure is measured from a log histogram, not an average.** The scene that makes the case is
+the one being rendered: thirteen candle flames at a luminance above one, in a room sitting at 0.02.
+A linear mean of that is dominated by whichever population has more pixels — for a frame that is
+five sixths dark and one sixth bright, the mean is 1.7 and exposing for it puts the room at 0.002,
+which is zero after encoding. The mean of the *logs* is 2⁻⁴·¹, which exposes the room to something
+visible and lets the flames roll off. Both numbers are asserted in `tests/output.rs`.
+
+Two dispatches, because a reduction cannot see every pixel's contribution until every workgroup has
+finished writing it and a dispatch boundary is the only barrier that wide:
+
+- `luminance_histogram.comp` bins log luminance into 256 bins spanning 2⁻¹⁰ to 2⁶. It tallies into
+  shared memory first, so the global buffer sees one atomic per bin per workgroup rather than one
+  per pixel. The buffer is cleared with `vkCmdFillBuffer` rather than by the shader — anything
+  zeroing it from inside the same dispatch would race the accumulation.
+- **Bin zero is reserved for pixels with no light on them at all**, and they are excluded from the
+  divisor as well as the sum. Counting them halves the mean bin, which reads as two stops darker
+  than the truth and opens the exposure until everything lit is white. Measured on a half-black
+  frame: 103 correct, 230 with them counted.
+- `exposure.comp` reduces the bins in one workgroup of exactly 256 threads and divides mid grey by
+  the result.
+
+**The tone curve is Khronos PBR Neutral**, chosen against the milestone's own done-when rather than
+by taste: the test is that an original Morrowind screenshot and a render of the same viewpoint
+compare without a gamma mismatch, and the original applied no tone curve at all. This one is the
+identity below 0.76 and only rolls off above it, so the midtones the comparison rests on are
+untouched — where a filmic curve like ACES would darken and twist every one of them. Its
+desaturation term is what keeps a torch flame going white instead of clipping channel by channel
+through yellow.
+
+**sRGB is encoded in the shader, and the swapchain was changed to `UNORM` to stop it happening
+twice.** sRGB formats expose no storage capability, so a compute shader cannot write one; the
+alternatives were to encode in the shader or to leave a *linear* 8-bit intermediate for the
+presentation engine to encode, which bands badly in exactly the near-black range an interior lives
+in. Encoding here has a second payoff that is worth more than it sounds: **the screenshot is now
+byte-identical to what the window shows**, which matters when the entire verification loop is
+looking at a PNG and believing it.
+
+The whole chain is pinned by one hand-computable number. A flat frame of *any* radiance should reach
+the file at 103: auto-exposure puts it on the 0.18 key, the curve's shadow lift takes 0.04 off it
+leaving 0.14, which is below the compression threshold and passes through, and sRGB-encoding 0.14
+gives 0.404. Measured: 103, and unchanged across a hundredfold change in scene radiance. The same
+assertion catches a missing encode (36), a double one (172) and a missing tone curve (118).
+
+`rtxmw-gpu` gained `ComputePipeline` on the way. Three new passes would each have repeated the
+eighty lines of descriptor layout, pool, set, pipeline layout and pipeline that `VisibilityPass`
+already had; that pass keeps its own because its bindless texture array needs a variable descriptor
+count, which is the one thing the helper deliberately does not do.
+
+**What it exposed:** with the room visible, the dominant artefact is now unmistakably the indirect
+lighting's noise — the thing M7 exists to remove, and which was invisible while the frame was black.
+That is the argument for having done this first.
+
+**Not done:** bloom, colour grading and sharpening; exposure adaptation over time, which needs a
+frame delta this renderer does not yet plumb through and which is only observable once the camera
+moves between a lit and an unlit space; and HDR output.
+
 ### M5 — Direct lighting
 Sun as a directional light with a real angular diameter (so shadows are soft), shadow rays, cell
 ambient, `LIGH` point lights with shadow rays and a defensible attenuation model, emissive surfaces.

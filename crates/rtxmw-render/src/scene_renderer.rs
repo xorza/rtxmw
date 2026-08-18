@@ -11,11 +11,13 @@ use rtxmw_gpu::{Device, Image, Memory, RayTracingLimits, Uploader, image_barrier
 use rtxmw_scene::StaticScene;
 use rtxmw_texture::Texture;
 
+use crate::auto_exposure::AutoExposure;
 use crate::geometry_buffers::GeometryBuffers;
 use crate::light_buffer::LightBuffer;
 use crate::material_buffers::MaterialBuffers;
 use crate::scene_acceleration::SceneAcceleration;
 use crate::texture_array::TextureArray;
+use crate::tonemap::Tonemap;
 use crate::visibility_pass::{FrameConstants, VisibilityPass};
 
 /// Half-float rather than 8-bit: the trace writes linear radiance that tone mapping consumes at M8,
@@ -35,9 +37,11 @@ const MAX_TEXTURES: u32 = 8192;
 /// to one at M7, where the denoiser is what turns a single sample into a smooth field.
 const DEFAULT_BOUNCE_SAMPLES: u32 = 4;
 
-/// A loaded cell and the pass that traces it.
+/// A loaded cell and the passes that turn it into a picture.
 pub struct SceneRenderer {
     pass: VisibilityPass,
+    exposure: AutoExposure,
+    tonemap: Tonemap,
     target: Image,
     scene: Option<LoadedScene>,
     bounce_samples: u32,
@@ -75,15 +79,25 @@ impl SceneRenderer {
     /// command pool on one queue, and a queue may not be submitted to from two places at once. A
     /// renderer that kept its own would make two renderers on a device a data race.
     pub fn new(device: &Device, memory: &Memory, extent: vk::Extent2D) -> rtxmw_gpu::Result<Self> {
+        let target = Image::new(
+            memory,
+            "primary visibility target",
+            extent,
+            TARGET_FORMAT,
+            vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC,
+        )?;
+        let mut exposure = AutoExposure::new(device, memory)?;
+        let mut tonemap = Tonemap::new(device, memory, extent)?;
+        // The post passes read the target and each other's buffers, none of which a scene change
+        // touches — so unlike the trace's descriptors these are written once, here.
+        exposure.bind(&target);
+        tonemap.bind(&target, exposure.buffer());
+
         Ok(Self {
             pass: VisibilityPass::new(device, MAX_TEXTURES)?,
-            target: Image::new(
-                memory,
-                "primary visibility target",
-                extent,
-                TARGET_FORMAT,
-                vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC,
-            )?,
+            exposure,
+            tonemap,
+            target,
             scene: None,
             bounce_samples: DEFAULT_BOUNCE_SAMPLES,
         })
@@ -154,9 +168,20 @@ impl SceneRenderer {
         Ok(())
     }
 
-    /// The image traced into, in `TRANSFER_SRC_OPTIMAL` once [`SceneRenderer::record`] has run.
+    /// The linear radiance the trace produced, in `TRANSFER_SRC_OPTIMAL` once
+    /// [`SceneRenderer::record`] has run.
+    ///
+    /// Scene-referred and unbounded, which is what a test asserting on hand-computed radiance wants
+    /// and what M7's denoiser will consume. Anything going to a screen wants
+    /// [`SceneRenderer::output`] instead.
     pub fn target(&self) -> &Image {
         &self.target
+    }
+
+    /// The exposed, tone-mapped, sRGB-encoded image, ready to blit to a swapchain or write to a
+    /// PNG unchanged.
+    pub fn output(&self) -> &Image {
+        self.tonemap.output()
     }
 
     /// Whether a cell is loaded. With none, [`SceneRenderer::record`] does nothing.
@@ -218,13 +243,31 @@ impl SceneRenderer {
             self.pass
                 .record(command_buffer, self.target.extent(), constants);
             memory_barrier::full(device, command_buffer);
+
+            // The output starts undefined every frame for the same reason the target does: the
+            // tonemap writes every pixel of it, so preserving the last frame's would cost a
+            // transition and buy nothing.
             image_barrier::transition(
                 device,
                 command_buffer,
-                self.target.raw(),
+                self.tonemap.output().raw(),
+                vk::ImageLayout::UNDEFINED,
                 vk::ImageLayout::GENERAL,
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
             );
+            self.exposure
+                .record(device, command_buffer, self.target.extent());
+            self.tonemap.record(command_buffer, self.target.extent());
+            memory_barrier::full(device, command_buffer);
+
+            for image in [self.target.raw(), self.tonemap.output().raw()] {
+                image_barrier::transition(
+                    device,
+                    command_buffer,
+                    image,
+                    vk::ImageLayout::GENERAL,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                );
+            }
         }
     }
 
