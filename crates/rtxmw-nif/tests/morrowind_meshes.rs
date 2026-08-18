@@ -7,26 +7,11 @@
 use std::collections::BTreeMap;
 
 use rtxmw_nif::{Block, NifFile};
-use rtxmw_vfs::{DATA_DIR_VAR, Vfs, morrowind_data_dir};
-
-/// Indexes every archive the game ships, in load order.
-fn game_files() -> Option<Vfs> {
-    let data = morrowind_data_dir()?;
-    let mut vfs = Vfs::new();
-    for archive in ["Morrowind.bsa", "Tribunal.bsa", "Bloodmoon.bsa"] {
-        let path = data.join(archive);
-        if path.is_file() {
-            vfs.add_bsa(&path)
-                .unwrap_or_else(|e| panic!("could not open {archive}: {e}"));
-        }
-    }
-    vfs.add_directory(&data).expect("loose files should index");
-    Some(vfs)
-}
+use rtxmw_vfs::{DATA_DIR_VAR, morrowind_archives};
 
 #[test]
 fn every_shipped_mesh_parses() {
-    let Some(vfs) = game_files() else {
+    let Some(vfs) = morrowind_archives() else {
         eprintln!("skipping: {DATA_DIR_VAR} is not configured (set it, or add it to .env)");
         return;
     };
@@ -111,7 +96,7 @@ fn every_shipped_mesh_parses() {
 
 #[test]
 fn geometry_indices_stay_inside_their_vertex_buffers() {
-    let Some(vfs) = game_files() else {
+    let Some(vfs) = morrowind_archives() else {
         eprintln!("skipping: {DATA_DIR_VAR} is not configured (set it, or add it to .env)");
         return;
     };

@@ -26,6 +26,25 @@ pub fn morrowind_data_dir() -> Option<PathBuf> {
     Some(raw)
 }
 
+/// The shipped archives plus loose files, indexed in load order, or `None` without the game.
+///
+/// Load order is base game, expansions, then loose files — so a replacer in `Data Files` wins, the
+/// same precedence the original engine applies.
+pub fn morrowind_archives() -> Option<crate::vfs::Vfs> {
+    let data = morrowind_data_dir()?;
+    let mut vfs = crate::vfs::Vfs::new();
+    for archive in ["Morrowind.bsa", "Tribunal.bsa", "Bloodmoon.bsa"] {
+        let path = data.join(archive);
+        if path.is_file() {
+            vfs.add_bsa(&path)
+                .unwrap_or_else(|e| panic!("could not open {archive}: {e}"));
+        }
+    }
+    vfs.add_directory(&data)
+        .expect("the data directory should index");
+    Some(vfs)
+}
+
 /// Reads the key out of the nearest `.env`, without touching the process environment.
 ///
 /// Deliberately does not use `dotenvy::dotenv`: that mutates the environment through

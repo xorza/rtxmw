@@ -11,6 +11,7 @@ license = "MIT OR Apache-2.0"
 rtxmw-esm = { path = "crates/rtxmw-esm" }
 rtxmw-gpu = { path = "crates/rtxmw-gpu" }
 rtxmw-nif = { path = "crates/rtxmw-nif" }
+rtxmw-scene = { path = "crates/rtxmw-scene" }
 rtxmw-vfs = { path = "crates/rtxmw-vfs" }
 
 ash = "0.38"

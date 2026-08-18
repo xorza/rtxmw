@@ -4,26 +4,14 @@
 //! proves it handles the format as Bethesda actually wrote it. Skips with a note when
 //! the game is not installed (see `.env`), so the suite still runs on a machine without the game.
 
-use rtxmw_vfs::{DATA_DIR_VAR, Vfs, morrowind_data_dir};
+use rtxmw_vfs::{BsaArchive, DATA_DIR_VAR, morrowind_archives, morrowind_data_dir};
 
 #[test]
 fn reads_the_shipped_archives() {
-    let Some(data) = morrowind_data_dir() else {
+    let Some(vfs) = morrowind_archives() else {
         eprintln!("skipping: {DATA_DIR_VAR} is not configured (set it, or add it to .env)");
         return;
     };
-
-    let mut vfs = Vfs::new();
-    // Load order: the expansions override the base game, loose files override everything.
-    for archive in ["Morrowind.bsa", "Tribunal.bsa", "Bloodmoon.bsa"] {
-        let path = data.join(archive);
-        if path.is_file() {
-            vfs.add_bsa(&path)
-                .unwrap_or_else(|e| panic!("could not open {archive}: {e}"));
-        }
-    }
-    vfs.add_directory(&data)
-        .expect("could not index loose files");
 
     // Morrowind.bsa alone holds thousands of entries; anything far below this means the directory
     // was misparsed rather than merely differing between installs.
@@ -82,7 +70,7 @@ fn every_indexed_path_in_morrowind_bsa_reads_back_at_its_stated_size() {
         return;
     }
 
-    let archive = rtxmw_vfs::BsaArchive::open(&path).expect("could not open Morrowind.bsa");
+    let archive = BsaArchive::open(&path).expect("could not open Morrowind.bsa");
     assert!(!archive.is_empty());
 
     // Reading all 300 MB would dominate the suite, so sample across the whole directory instead —

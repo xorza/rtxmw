@@ -1303,6 +1303,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rtxmw-scene"
+version = "0.1.0"
+dependencies = [
+ "glam",
+ "rtxmw-esm",
+ "rtxmw-nif",
+ "rtxmw-vfs",
+]
+
+[[package]]
 name = "rtxmw-vfs"
 version = "0.1.0"
 dependencies = [

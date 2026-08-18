@@ -19,4 +19,4 @@ pub use crate::vfs::Vfs;
 #[cfg(any(test, feature = "internals"))]
 pub use crate::bsa_archive::internals as bsa_internals;
 #[cfg(any(test, feature = "internals"))]
-pub use crate::game_data::{DATA_DIR_VAR, morrowind_data_dir};
+pub use crate::game_data::{DATA_DIR_VAR, morrowind_archives, morrowind_data_dir};
