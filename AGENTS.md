@@ -4,18 +4,22 @@ A Morrowind game engine in Rust with a hardware-raytraced renderer. It is not a 
 rasterizer — it is a new renderer against the same game data. OpenMW is a reference for data formats
 and game rules, not an architecture to copy.
 
-Status: **M0 complete.** A winit window presents a cleared swapchain with a free noclip camera, on
-`ash` with the ray tracing device features enabled and validation aborting on error in debug builds.
-There is an offscreen test harness with golden-image comparison. Nothing is read from Morrowind data
-yet — M1 (VFS, BSA, ESM cell enumeration) is next; see `docs/design.md` for the milestone plan.
+**This file describes intent and conventions, not progress.** For what is built, what is next and
+why any of it was decided that way, read `docs/design.md` — that is where the milestone plan and the
+record of decisions live. Keep status out of here so this file stays worth trusting.
 
 Everything under "OpenMW reference" below is research about `.refs/openmw`, not about code here.
 
 ## Repository structure
 
-A Cargo workspace, edition 2024, resolver 3. Members are `crates/*`: `rtxmw` is the binary (window,
-input, noclip camera) and `rtxmw-gpu` owns everything Vulkan, including the `internals`-gated
-offscreen test harness.
+A Cargo workspace, edition 2024, resolver 3. Members are `crates/*`, one crate per layer, named
+`rtxmw-<layer>`; `rtxmw` itself is the binary. The seam that matters is that nothing below
+`rtxmw-scene` knows about Vulkan and nothing above it knows about ESM records — see `docs/design.md`
+§2 for the intended split and why.
+
+Test-only helpers that other crates need live behind an `internals` feature, exported from `lib.rs`
+under `#[cfg(any(test, feature = "internals"))]`. The gate on the re-export must match the gate on
+the module, or `unreachable_pub` will rightly reject it.
 
 `[profile.dev]` is `opt-level = 1` with all dependencies at `opt-level = 3` — BSA/NIF/DDS decoding is
 unusably slow in an unoptimized build.
@@ -43,10 +47,8 @@ cargo test --workspace --all-features
 externally reachable, so `pub` there is always a lie.
 
 The renderer targets **raw Vulkan via `ash`**, with shaders in **GLSL** compiled by `glslc` from
-`build.rs` and validated with `spirv-val`. Licence is MIT OR Apache-2.0.
-
-Runtime: `ash`, `ash-window`, `raw-window-handle`, `gpu-allocator`, `winit`, `glam`, `bytemuck`.
-Behind the `internals` feature, for the test harness only: `png`, `half`. Dev-only: `dhat`.
+`build.rs` and validated with `spirv-val`. Licence is MIT OR Apache-2.0. The current dependency set
+is whatever the root `Cargo.toml` says; it is not duplicated here.
 
 **wgpu was evaluated and rejected** — see `docs/design.md` §1. Short version: inline ray queries work
 well there, but BLAS refit is silently ignored, opacity micromaps and SER are unreachable, and ray
@@ -98,12 +100,17 @@ window, so fold them in once there is a headless path through the real frame loo
 
 The engine reads an unmodified Morrowind GOTY install — `Morrowind.esm`, `Tribunal.esm`,
 `Bloodmoon.esm` and the three matching `.bsa`. Its location belongs in `.env` at the repo root, which
-is gitignored and must be created by hand:
+is gitignored and must be created by hand. **Quote any value containing a space**; dotenv format
+requires it and the parser rejects the line otherwise:
 
 ```
-MORROWIND_DIR=/path/to/Morrowind
-MORROWIND_DATA_DIR=/path/to/Morrowind/Data Files
+MORROWIND_DIR="/path/to/Morrowind"
+MORROWIND_DATA_DIR="/path/to/Morrowind/Data Files"
 ```
+
+Tests reach this through `rtxmw_vfs::morrowind_data_dir()`, which prefers the process environment
+over `.env`. A machine without the game **skips** those tests; a path that is set but wrong
+**panics**, because a silent skip is indistinguishable from a pass.
 
 ### Cross-checking a format implementation
 
