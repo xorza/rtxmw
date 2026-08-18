@@ -7,6 +7,7 @@ use crate::commands::Commands;
 use crate::device::Device;
 use crate::error::Result;
 use crate::memory::Memory;
+use crate::memory_barrier;
 
 /// Staged transfers into device-local buffers, plus the one-shot queue they ride on.
 ///
@@ -29,6 +30,11 @@ impl Uploader {
             commands: Commands::new(device, queue_family)?,
             staging: None,
         })
+    }
+
+    /// The allocator these transfers stage through, for callers creating their own buffers.
+    pub fn memory(&self) -> &Memory {
+        &self.memory
     }
 
     /// Copies `bytes` to the start of `destination` and waits for the copy to complete.
@@ -60,7 +66,7 @@ impl Uploader {
             // SAFETY: the command buffer is recording and both buffers belong to this device.
             unsafe {
                 device.cmd_copy_buffer(cmd, from, to, &[region]);
-                barrier_after_transfer(device, cmd);
+                memory_barrier::full(device, cmd);
             }
         })
     }
@@ -89,25 +95,6 @@ impl Uploader {
         )?);
         Ok(())
     }
-}
-
-/// Makes a transfer's writes visible to everything submitted afterwards.
-///
-/// The fence wait in `submit_and_wait` orders the *host* against the copy but says nothing about a
-/// later submission reading the same memory on the device, so the dependency has to be recorded.
-///
-/// # Safety
-/// `command_buffer` must be in the recording state.
-unsafe fn barrier_after_transfer(device: &ash::Device, command_buffer: vk::CommandBuffer) {
-    let barrier = vk::MemoryBarrier2::default()
-        .src_stage_mask(vk::PipelineStageFlags2::ALL_TRANSFER)
-        .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-        .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
-        .dst_access_mask(vk::AccessFlags2::MEMORY_READ);
-    let barriers = [barrier];
-    let dependency = vk::DependencyInfo::default().memory_barriers(&barriers);
-    // SAFETY: the caller guarantees the command buffer is recording.
-    unsafe { device.cmd_pipeline_barrier2(command_buffer, &dependency) };
 }
 
 #[cfg(any(test, feature = "internals"))]

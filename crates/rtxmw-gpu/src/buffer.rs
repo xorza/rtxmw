@@ -50,6 +50,22 @@ impl Buffer {
         usage: vk::BufferUsageFlags,
         kind: BufferMemory,
     ) -> Result<Self> {
+        Self::with_alignment(memory, name, size, usage, kind, 1)
+    }
+
+    /// Creates a buffer whose device address is a multiple of `alignment`.
+    ///
+    /// For the cases where Vulkan demands more than the buffer's natural requirement — an
+    /// acceleration structure build's scratch address is the one that matters here, and on current
+    /// NVIDIA it wants 128 where the buffer alone would settle for 16.
+    pub fn with_alignment(
+        memory: &Memory,
+        name: &str,
+        size: vk::DeviceSize,
+        usage: vk::BufferUsageFlags,
+        kind: BufferMemory,
+        alignment: vk::DeviceSize,
+    ) -> Result<Self> {
         assert!(size > 0, "`{name}`: Vulkan rejects a zero-sized buffer");
 
         let info = vk::BufferCreateInfo::default()
@@ -60,7 +76,11 @@ impl Buffer {
         let raw = unsafe { memory.device().create_buffer(&info, None)? };
 
         // SAFETY: `raw` was just created on this device.
-        let requirements = unsafe { memory.device().get_buffer_memory_requirements(raw) };
+        let mut requirements = unsafe { memory.device().get_buffer_memory_requirements(raw) };
+        // Raising the requirement is how the address gets aligned: the allocator honours it for the
+        // suballocation offset, and a `VkDeviceMemory` base is always more aligned than anything
+        // asked for here.
+        requirements.alignment = requirements.alignment.max(alignment);
         let allocation = memory.lock().allocate(&AllocationCreateDesc {
             name,
             requirements,
@@ -98,6 +118,19 @@ impl Buffer {
                 .device()
                 .bind_buffer_memory(raw, device_memory, offset)?
         };
+
+        // Checked rather than assumed. Raising `requirements.alignment` is an indirect way to align
+        // an address, and a heap layout that satisfies it by luck today would stop doing so under
+        // fragmentation — at which point the failure is a validation error deep inside a build,
+        // nowhere near the buffer that caused it.
+        if alignment > 1 && usage.contains(vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS) {
+            let address = buffer.device_address();
+            assert_eq!(
+                address % alignment,
+                0,
+                "`{name}`: address {address:#x} is not {alignment}-aligned"
+            );
+        }
 
         Ok(buffer)
     }
@@ -179,6 +212,32 @@ mod tests {
         // Device-local memory is not mapped, so reaching for a host pointer must come back empty
         // rather than handing out one that cannot be written.
         assert!(buffer.mapped().is_none());
+        gpu.assert_no_validation_errors();
+    }
+
+    #[test]
+    fn a_requested_alignment_reaches_the_device_address() {
+        let gpu = TestGpu::shared();
+        // 256 exceeds what a small storage buffer needs naturally, so this only holds because the
+        // raised memory requirement carried through to the address. An acceleration structure
+        // build's scratch depends on exactly that.
+        for size in [1u64, 17, 4096] {
+            let buffer = Buffer::with_alignment(
+                gpu.memory(),
+                "alignment test",
+                size,
+                vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+                BufferMemory::Device,
+                256,
+            )
+            .expect("could not create buffer");
+            let address = buffer.device_address();
+            assert_eq!(
+                address % 256,
+                0,
+                "{size} byte buffer landed at {address:#x}"
+            );
+        }
         gpu.assert_no_validation_errors();
     }
 

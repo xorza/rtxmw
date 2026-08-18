@@ -4,6 +4,8 @@
 
 /// Image layout transitions, qualified as `image_barrier::transition(..)` at call sites.
 pub mod image_barrier;
+/// Resource-independent barriers, qualified as `memory_barrier::full(..)` at call sites.
+pub mod memory_barrier;
 
 mod buffer;
 mod commands;

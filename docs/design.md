@@ -356,7 +356,33 @@ so the upload path the engine uses is the one the tests exercise. The one-shot `
 `pub(crate)`: uploads and acceleration structure builds happen at load time, where blocking on a
 fence is the simplest correct thing, and nothing outside the crate should reach for that.
 
-Not yet wired into `Renderer` — nothing in the frame loop needs geometry until M3d builds from it.
+**M3d — done.** `AccelerationStructure` and `SceneAcceleration` in `rtxmw-render`. The same interior
+builds **104 BLAS over 17,835 triangles and a 261-instance TLAS**; compaction takes the bottom level
+from **1.31 MiB to 0.58 MiB, a 56% saving**, which is why `ALLOW_COMPACTION` is on by default rather
+than being an option. Top level is 79 KiB.
+
+- **One `cmd_build_acceleration_structures` call for all 104**, each with its own scratch region cut
+  from a single buffer, and the compaction-size query rides in the same submission behind a barrier.
+  The alternative — one shared scratch plus a barrier between builds — is simpler to write and
+  serialises work that is independent by construction.
+- **Scratch alignment is `minAccelerationStructureScratchOffsetAlignment`, 128 on this device**, and
+  it is *not* satisfied by the buffer's natural memory requirement. `Buffer::with_alignment` raises
+  the requirement and then asserts the resulting address, because raising a requirement is an
+  indirect way to align an address and a heap that satisfies it by luck would stop under
+  fragmentation.
+- **Instances use `TRIANGLE_FACING_CULL_DISABLE`.** Morrowind authors single-sided planes and relies
+  on seeing them from both faces, and winding is inconsistent across the mesh library.
+- **`instance_custom_index` carries the mesh index**, which is what the material lookup at M4 is
+  built on.
+- **Geometry flag is `OPAQUE`, pairing with `gl_RayFlagsOpaqueEXT` in the shader.** Both change
+  together at M4; either one alone is wrong.
+
+What M3d does *not* prove is that the triangles inside a structure are the right ones. The build
+range triple — `first_vertex`, `primitive_offset`, `max_vertex` — could be wrong in a way that still
+builds and still validates, because validation cannot inspect index contents on the device. If the
+first image at M3e is recognisable-but-scrambled, that triple is where to look.
+
+Not yet wired into `Renderer` — nothing in the frame loop needs any of this until M3e traces it.
 Note when it is: `Memory` hands out clones that must all drop before the `Device`, so it belongs
 *before* the device in `Renderer`'s field order.
 

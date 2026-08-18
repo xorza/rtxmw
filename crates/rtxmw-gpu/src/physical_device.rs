@@ -64,6 +64,9 @@ pub struct RayTracingLimits {
     pub shader_group_base_alignment: u32,
     pub max_geometry_count: u64,
     pub max_instance_count: u64,
+    /// Alignment a build's scratch address must satisfy. Unlike most Vulkan alignments this one is
+    /// not a power-of-two the allocator would give for free — on current NVIDIA it is 128.
+    pub min_scratch_offset_alignment: u32,
 }
 
 /// Which optional ray tracing capabilities this device offers.
@@ -228,6 +231,8 @@ impl PhysicalDevice {
                     .shader_group_base_alignment,
                 max_geometry_count: acceleration_structure_properties.max_geometry_count,
                 max_instance_count: acceleration_structure_properties.max_instance_count,
+                min_scratch_offset_alignment: acceleration_structure_properties
+                    .min_acceleration_structure_scratch_offset_alignment,
             },
         })
     }
