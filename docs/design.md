@@ -731,8 +731,19 @@ The remaining pieces are conventions worth writing down because neither is guess
 - **Yaw is a compass bearing.** The stored rotation turns about the **negated** Z axis, so zero
   faces `+Y` (north) and a quarter turn faces `+X` (east) — the opposite handedness to what a maths
   library gives by default. OpenMW spells the same rotation out at `mwmechanics/combat.cpp:695`.
-- **The arrival is the traveller's feet.** The eye sits 124 units above it, about 1.77 m at
-  Morrowind's scale; OpenMW carries the same offset as `MWRender::Camera::mHeight`.
+- **The arrival is not the traveller's feet, and its height is approximate.** Measured against the
+  floor directly beneath it — sixteen arrivals across twelve interiors — it sits a median of 89
+  units up, ranging from 22 to 144. It is an authored marker at roughly an actor's centre, and the
+  original engine drops the player to the ground on arrival, which is why the height is allowed to
+  be loose. Taking the median as a half-height, the eye goes about nine tenths of one above the
+  centre, the ratio a human has and the point OpenMW measures line of sight from
+  (`mwphysics/mtphysics.cpp:767`) — 80 units above the arrival, or 81% of the way up a 194-unit
+  door, which is where a person's eyes are in a doorway.
+
+  The first version of this used `MWRender::Camera::mHeight`, 124, on the assumption that the
+  arrival was a standing position. That constant is the *third-person* orbit pivot — `camera.cpp:97`
+  applies it only `if (mMode != Mode::FirstPerson)` — and adding it to a marker that already
+  included a body offset put the camera at 394 in a room whose ceiling is at 420.
 
 **What this exposed:** with the camera inside the room rather than looking out through the roof, the
 frame is nearly black. That is not a regression — it is the §5.1 darkness the old viewpoint was

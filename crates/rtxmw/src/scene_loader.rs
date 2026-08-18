@@ -26,12 +26,19 @@ pub(crate) fn describe(name: &str, cell: &LoadedCell) -> String {
     )
 }
 
-/// How far above an actor's position its eyes are, in world units.
+/// How far above a door's arrival point the traveller's eyes are, in world units.
 ///
-/// About 1.77 m at Morrowind's scale. A door's arrival point is where the traveller *stands*, and a
-/// camera left there looks out of their ankles. OpenMW carries the same offset as
-/// `MWRender::Camera::mHeight` (`apps/openmw/mwrender/camera.cpp:63`).
-const EYE_HEIGHT: f32 = 124.0;
+/// **The arrival is not where the traveller's feet go.** Measured against the floor directly
+/// beneath it, across sixteen arrivals in twelve interiors, it sits a median of 89 units up with a
+/// spread of 22 to 144 — an authored marker at roughly an actor's centre, not a standing position.
+/// The original engine drops the player to the ground on arrival and the height is only ever
+/// approximate, which is why it varies.
+///
+/// Taking the median as an actor's half-height, the eyes sit about nine tenths of one above the
+/// centre — the ratio a human has, and the point OpenMW measures line of sight from
+/// (`mwphysics/mtphysics.cpp:767`). That puts the eye 80 units above the arrival, or 81% of the way
+/// up a 194-unit `Ex_nord_door_01`, which is where a person's eyes are in a doorway.
+const EYE_ABOVE_ARRIVAL: f32 = 80.0;
 
 /// Where to stand in a freshly loaded cell, and which way to look.
 #[derive(Debug, Clone, Copy)]
@@ -53,7 +60,7 @@ impl Viewpoint {
     pub(crate) fn entering(cell: &LoadedCell) -> Self {
         match cell.entrances.first() {
             Some(door) => Self {
-                position: door.arrival + Vec3::Z * EYE_HEIGHT,
+                position: door.arrival + Vec3::Z * EYE_ABOVE_ARRIVAL,
                 forward: door.facing,
             },
             // Nothing leads into this cell, so there is no authored answer — fall back on the
