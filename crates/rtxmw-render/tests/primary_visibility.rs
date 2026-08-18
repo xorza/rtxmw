@@ -670,6 +670,73 @@ fn an_occluder_between_light_and_surface_casts_a_shadow() {
 }
 
 #[test]
+fn a_shadow_edge_is_soft_rather_than_binary() {
+    // Counting brightness levels across the boundary does not work: with no ambient, the lit wall
+    // already varies row to row through attenuation and the cosine term, so a *hard* shadow also
+    // produces many levels. What isolates the shadow is the ratio against the same scene without
+    // the occluder — that cancels the shading entirely and leaves visibility alone.
+    let lit_wall = wall(200.0, -150.0..150.0, -150.0..150.0);
+    let occluder = wall(150.0, -30.0..30.0, 20.0..80.0);
+    let materials = [Material::default()];
+    let light = Light {
+        position: Vec3::new(100.0, 0.0, 100.0),
+        colour: Vec3::ONE,
+        radius: 400.0,
+    };
+    let place = |mesh: u32| Instance {
+        mesh: MeshId(mesh),
+        transform: Affine3A::IDENTITY,
+    };
+    let trace = |meshes: &[Mesh], instances: &[Instance]| {
+        trace_lit(
+            meshes,
+            &materials,
+            &[],
+            std::slice::from_ref(&light),
+            Vec3::ZERO,
+            instances,
+            Vec3::ZERO,
+            Vec3::X,
+        )
+    };
+
+    let clear = trace(std::slice::from_ref(&lit_wall), &[place(0)]);
+    let blocked = trace(&[lit_wall, occluder], &[place(0), place(1)]);
+
+    // Walk the middle column and record how much of the light each row still receives.
+    let mut penumbra = 0usize;
+    let mut fully_lit = 0usize;
+    let mut fully_dark = 0usize;
+    for y in 0..HEIGHT {
+        let open = at(&clear, WIDTH / 2, y);
+        let shut = at(&blocked, WIDTH / 2, y);
+        if !is_hit(open) || !is_hit(shut) {
+            continue;
+        }
+        let sum = |p: &[u8]| (p[0] as f32 + p[1] as f32 + p[2] as f32).max(1.0);
+        let visibility = sum(shut) / sum(open);
+        if visibility > 0.9 {
+            fully_lit += 1;
+        } else if visibility < 0.1 {
+            fully_dark += 1;
+        } else {
+            penumbra += 1;
+        }
+    }
+
+    assert!(
+        fully_lit > 0 && fully_dark > 0,
+        "the column never crossed the shadow: {fully_lit} lit, {fully_dark} dark"
+    );
+    // A point light gives at most the one row that straddles the edge. An emitter with area gives a
+    // band of rows that see part of it, and that band is the penumbra.
+    assert!(
+        penumbra >= 3,
+        "only {penumbra} partly-lit rows — the shadow edge is hard"
+    );
+}
+
+#[test]
 fn a_real_interior_traces_to_a_recognisable_image() {
     let Some(data) = morrowind_data_dir() else {
         eprintln!("skipping: {DATA_DIR_VAR} is not configured (set it, or add it to .env)");

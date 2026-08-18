@@ -14,7 +14,8 @@ pub struct GpuLight {
     pub radius: f32,
     /// Linear RGB, already scaled by the intensity the record does not carry.
     pub colour: [f32; 3],
-    pub padding: f32,
+    /// How large the emitter itself is, which is what gives its shadows a penumbra.
+    pub source_radius: f32,
 }
 
 /// Converts Morrowind's radius into radiant intensity.
@@ -28,6 +29,21 @@ pub struct GpuLight {
 /// these is fighting illumination that is already in the texture. See `docs/design.md` §5.1 — the
 /// de-lighting spike is what makes this number mean anything.
 const INTENSITY: f32 = 0.25;
+
+/// The emitter's own size, as a fraction of its reach.
+///
+/// Morrowind records no such thing — a light is a point with a falloff curve, and its shadows in
+/// the original engine were whatever the shadow-blob decal looked like. A real emitter has area,
+/// and that area is the only reason a shadow has a soft edge, so one has to be invented. A fraction
+/// of reach rather than a constant keeps a lantern's penumbra wider than a candle's, which is the
+/// relationship the sizes would have had.
+const SOURCE_FRACTION: f32 = 0.08;
+
+/// Floor on the emitter size, in world units.
+///
+/// About 14 cm at Morrowind's scale — roughly a candle flame. Without it the smallest lights would
+/// come out as points again and their shadows would snap back to hard edges.
+const MIN_SOURCE_RADIUS: f32 = 10.0;
 
 /// A cell's lights, uploaded once.
 #[derive(Debug)]
@@ -79,7 +95,7 @@ impl GpuLight {
             position: light.position.to_array(),
             radius: light.radius,
             colour: (light.colour * scale).to_array(),
-            padding: 0.0,
+            source_radius: (light.radius * SOURCE_FRACTION).max(MIN_SOURCE_RADIUS),
         }
     }
 }
@@ -121,5 +137,25 @@ mod tests {
         });
         assert_eq!(warm.colour[1] / warm.colour[0], 0.5);
         assert_eq!(warm.radius, 64.0);
+    }
+
+    #[test]
+    fn the_emitter_size_follows_reach_but_never_reaches_zero() {
+        let of = |radius: f32| {
+            GpuLight::new(Light {
+                position: Vec3::ZERO,
+                colour: Vec3::ONE,
+                radius,
+            })
+            .source_radius
+        };
+
+        // A lantern's emitter is wider than a candle's, so its penumbra is softer.
+        assert!(of(512.0) > of(256.0));
+        assert_eq!(of(512.0), 512.0 * SOURCE_FRACTION);
+
+        // Below the floor the fraction would shrink to a point and the shadows would snap hard.
+        assert_eq!(of(64.0), MIN_SOURCE_RADIUS);
+        assert!(of(1.0) > 0.0);
     }
 }

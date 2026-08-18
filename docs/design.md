@@ -582,6 +582,25 @@ pre-lit albedo *and* a flat ambient to carry a room's illumination, so lighting 
 leaves it looking underlit rather than double-lit. `INTENSITY` is tuned by eye and provisional —
 the de-lighting spike is what would make any value here mean something.
 
+**Soft shadows.** The milestone's done-when is a torch casting a *soft* shadow, so each light is
+sampled as a sphere over eight shadow rays rather than as a point over one — visibility becomes the
+fraction of the emitter that can be seen, and that fraction is the penumbra. The emitter size is
+invented, because Morrowind records none: a light there is a point with a falloff curve, and its
+shadows were a decal. It is derived as 8% of reach with a 10-unit floor, so a lantern's penumbra
+stays wider than a candle's while the smallest lights do not collapse back to points.
+
+The sample pattern is a **stable** per-pixel hash rather than a per-frame one. Without temporal
+accumulation, reseeding each frame turns the penumbra into crawling noise; a fixed pattern dithers
+instead, and holds still. That changes at M7, where a denoiser wants the opposite.
+
+The test for this took two attempts, and the first was wrong in an instructive way. Counting distinct
+brightness levels across the shadow boundary *passed with a point light*: with no ambient, the lit
+wall already varies row to row through attenuation and the cosine term, so a hard shadow produces
+plenty of levels too. Only the fault injection showed it. The measure that actually isolates
+visibility is the ratio against the same scene with the occluder removed, which cancels the shading
+and leaves partial occlusion alone — a point emitter gives zero partly-lit rows, an area one gives a
+band.
+
 ### M5 — Direct lighting
 Sun as a directional light with a real angular diameter (so shadows are soft), shadow rays, cell
 ambient, `LIGH` point lights with shadow rays and a defensible attenuation model, emissive surfaces.
