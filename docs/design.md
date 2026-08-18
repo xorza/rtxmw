@@ -895,6 +895,56 @@ constants are already at 100 of Vulkan's guaranteed 128 push-constant bytes — 
 not fit, so they need a small per-frame buffer written with `vkCmdUpdateBuffer`. That is
 straightforward, but nothing reads a motion vector until temporal reuse exists, which is M7 proper.
 
+### Frame timing — the first measurement against §5.3
+
+Every performance decision so far had been made blind. There were no GPU timers at all: the only
+number anywhere was a frames-per-second counter in the window title, which requires opening a window
+— and twice during M6 and M8 a question about what something cost had to be answered with "below
+run-to-run noise", because nothing could resolve it.
+
+A timestamp query pool now brackets each stage. **Device time, not wall clock**: a timestamp is
+written when everything recorded before it has completed, so the gap between two is what the GPU
+spent, which is what a budget is written in. It means anything only because the stages are already
+separated by full barriers — without them the device would overlap adjacent work and a per-stage
+figure would be a fiction.
+
+Measured on the shipped cell, an RTX 4090 Laptop, with four bounce samples and four à-trous passes.
+Medians of five runs, because single figures are not trustworthy here — see the note on spread below:
+
+| internal resolution | total (median) | range | trace | denoise | composite | exposure | tonemap |
+|---|---|---|---|---|---|---|---|
+| 1280×720 | 1.40 ms | 1.39–1.41 | 0.96 | 0.39 | 0.02 | 0.02 | 0.01 |
+| **1920×1080** | **3.43 ms** | 3.31–4.69 | 2.41 | 0.83 | 0.04 | 0.03 | 0.02 |
+| 2560×1440 | 5.96 ms | 4.85–9.35 | 4.35 | 1.62 | 0.09 | 0.04 | 0.04 |
+
+**Against the §5.3 budget there is room, though less than a single lucky run suggests.** The target
+is 1920×1080 internal upscaled to 3840×2160 at 60 fps — 16.7 ms a frame — with 8 to 9 of those
+reserved for DLSS Ray Reconstruction. That leaves roughly 8 ms for everything else, and an interior
+uses about 3.4 of it. The à-trous filter's 0.83 ms is also returned when DLSS-RR replaces it.
+
+**Take the spread seriously; it is the measurement's own caveat.** This is a laptop GPU whose clocks
+move with thermals and recent load. At 720p five runs agree to within 0.02 ms, at 1080p they span
+1.4 ms, and at 1440p nearly two to one. A single run taken straight after the test suite read 5.77
+ms at 1080p — 1.7 times the median — so anything measured cold, or immediately after other GPU work,
+is not comparable to anything else.
+
+Scaling is close to linear in pixels but not exactly: 2.25 times the pixels from 720p to 1080p cost
+2.45 times the time, and 1.78 times again to 1440p cost 1.74. Near enough that there is no hidden
+fixed cost to grow into, not so exact that a figure can be extrapolated rather than measured.
+
+And it is an *interior*: 260 instances and 13 lights, every ray terminating on a wall a few metres
+away. Exteriors are the case this budget will actually be decided by, and M9 is where that is
+tested.
+
+`--screenshot <path> [WIDTHxHEIGHT]` takes a resolution now, because the budget cannot be checked at
+the 720p the flag defaulted to.
+
+What the tests can assert about timings is narrow, and deliberately so: no wall-clock threshold,
+which would be flaky, but that four filter passes are timed at something and zero passes at nothing,
+that the trace outweighs the composite, and — as a pure function, since this machine's queue reports
+all 64 bits valid and so never exercises it — that a duration masks off the bits a queue does not
+promise, including across a wrap.
+
 ### M5 — Direct lighting
 Sun as a directional light with a real angular diameter (so shadows are soft), shadow rays, cell
 ambient, `LIGH` point lights with shadow rays and a defensible attenuation model, emissive surfaces.

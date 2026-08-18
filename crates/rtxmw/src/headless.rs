@@ -32,7 +32,7 @@ pub(crate) fn screenshot(
     let mut uploader = Uploader::new(&device, &memory, physical.graphics_queue_family())?;
 
     let extent = vk::Extent2D { width, height };
-    let mut renderer = SceneRenderer::new(&device, &memory, extent)?;
+    let mut renderer = SceneRenderer::new(&device, &physical, &memory, extent)?;
 
     let cell = LoadedCell::load_interior(scene_loader::DEFAULT_CELL)?
         .ok_or("no game data configured — set MORROWIND_DATA_DIR, or put it in .env")?;
@@ -55,6 +55,13 @@ pub(crate) fn screenshot(
         camera.position(),
     );
     renderer.render_once(&mut uploader, &constants)?;
+
+    // Zero everywhere means the queue cannot write timestamps, which is worth saying nothing about
+    // rather than reporting as a frame that took no time.
+    let timings = renderer.timings()?;
+    if timings.total() > 0.0 {
+        println!("  {timings}");
+    }
 
     // The tonemapped output rather than the raw radiance, so the file holds exactly the bytes the
     // window would show — the whole verification loop rests on the screenshot being that.

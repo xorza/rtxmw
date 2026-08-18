@@ -102,6 +102,7 @@ fn trace_scene(
     let gpu = TestGpu::shared();
     let mut renderer = SceneRenderer::new(
         gpu.device(),
+        gpu.physical(),
         gpu.memory(),
         vk::Extent2D {
             width: WIDTH,

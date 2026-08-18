@@ -8,7 +8,7 @@
 use ash::vk;
 use glam::{Affine3A, Vec2, Vec3};
 use rtxmw_gpu::{TestGpu, readback};
-use rtxmw_render::SceneRenderer;
+use rtxmw_render::{FrameTimings, SceneRenderer};
 use rtxmw_scene::{Instance, Light, Material, Mesh, MeshId, StaticScene, Submesh};
 
 mod common;
@@ -89,14 +89,21 @@ fn split_wall() -> StaticScene {
     )
 }
 
-/// Renders with `passes` of filtering, reading the linear radiance rather than the display bytes.
-///
-/// The raw target, because tone mapping is a curve: it would compress the very differences these
-/// assertions are about, and differently at each brightness.
-fn trace(scene: &StaticScene, passes: u32) -> Vec<u8> {
+/// One render's pixels and what the device spent producing them.
+#[derive(Debug)]
+struct Rendered {
+    /// Linear radiance rather than display bytes: tone mapping is a curve, and it would compress
+    /// the very differences these assertions are about, differently at each brightness.
+    pixels: Vec<u8>,
+    timings: FrameTimings,
+}
+
+/// Renders with `passes` of filtering.
+fn trace(scene: &StaticScene, passes: u32) -> Rendered {
     let gpu = TestGpu::shared();
     let mut renderer = SceneRenderer::new(
         gpu.device(),
+        gpu.physical(),
         gpu.memory(),
         vk::Extent2D {
             width: WIDTH,
@@ -126,6 +133,7 @@ fn trace(scene: &StaticScene, passes: u32) -> Vec<u8> {
         .render_once(&mut uploader, &constants)
         .expect("trace should run");
 
+    let timings = renderer.timings().expect("timings should read back");
     let pixels = readback::image_to_rgba8(
         &mut uploader,
         renderer.target(),
@@ -134,7 +142,7 @@ fn trace(scene: &StaticScene, passes: u32) -> Vec<u8> {
     .expect("readback should succeed");
     drop(uploader);
     gpu.assert_no_validation_errors();
-    pixels
+    Rendered { pixels, timings }
 }
 
 fn red_at(pixels: &[u8], x: u32, y: u32) -> f32 {
@@ -160,8 +168,40 @@ fn roughness(pixels: &[u8], x: std::ops::Range<u32>, rows: std::ops::Range<u32>)
 #[test]
 fn filtering_smooths_the_light_and_leaves_the_albedo_edge_alone() {
     let scene = split_wall();
-    let raw = trace(&scene, 0);
-    let filtered = trace(&scene, 4);
+    let unfiltered = trace(&scene, 0);
+    let refined = trace(&scene, 4);
+
+    // The device timings have to track the work actually recorded, which is the only claim about
+    // them a test can make without measuring a wall clock: four à-trous passes cost something, no
+    // passes cost nothing, and the trace dwarfs both.
+    println!(
+        "device time: {:.2} ms unfiltered ({:.2} filtering), {:.2} ms with four passes ({:.2})",
+        unfiltered.timings.total(),
+        unfiltered.timings.denoise,
+        refined.timings.total(),
+        refined.timings.denoise,
+    );
+    // A ratio, not a threshold. Zero passes is not timed at exactly zero — the two timestamps
+    // bracketing it cost a fraction of a microsecond to write — and demanding that it was made this
+    // assertion fail the moment the machine was busy. Four passes measure around 0.05 ms against
+    // that 0.0008, so sixty times over; ten is the claim.
+    assert!(
+        refined.timings.denoise > unfiltered.timings.denoise * 10.0,
+        "four à-trous passes ({}) cost no more than none ({}), so the timestamps are not tracking \
+         the work",
+        refined.timings.denoise,
+        unfiltered.timings.denoise
+    );
+    assert!(
+        refined.timings.trace > refined.timings.composite,
+        "the trace ({}) came out cheaper than the composite ({}), which would mean the timestamps \
+         are attributed to the wrong stages",
+        refined.timings.trace,
+        refined.timings.composite
+    );
+
+    let raw = unfiltered.pixels;
+    let filtered = refined.pixels;
 
     // A band well clear of the seam, where the only variation is the indirect estimate's dither.
     let rough_raw = roughness(&raw, 30..110, 60..200);

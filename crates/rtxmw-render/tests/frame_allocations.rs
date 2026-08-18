@@ -108,6 +108,7 @@ fn steady_state_rendering_does_not_allocate() {
 
     let mut renderer = SceneRenderer::new(
         gpu.device(),
+        gpu.physical(),
         gpu.memory(),
         vk::Extent2D {
             width: WIDTH,

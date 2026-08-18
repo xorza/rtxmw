@@ -23,6 +23,7 @@ mod physical_device;
 pub mod readback;
 mod surface;
 mod swapchain;
+mod timestamps;
 mod uploader;
 mod validation_log;
 
@@ -35,10 +36,11 @@ pub use crate::image::Image;
 pub use crate::instance::{Instance, Validation};
 pub use crate::memory::Memory;
 pub use crate::physical_device::{
-    PhysicalDevice, Presentation, RayTracingLimits, RayTracingSupport,
+    PhysicalDevice, Presentation, RayTracingLimits, RayTracingSupport, TimestampSupport,
 };
 pub use crate::surface::Surface;
 pub use crate::swapchain::Swapchain;
+pub use crate::timestamps::Timestamps;
 pub use crate::uploader::Uploader;
 pub use crate::validation_log::{ValidationLog, ValidationMessage};
 

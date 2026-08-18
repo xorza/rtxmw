@@ -70,7 +70,7 @@ impl Renderer {
 
         let memory = Memory::new(&instance, &physical, &device)?;
         let uploader = Uploader::new(&device, &memory, physical.graphics_queue_family())?;
-        let scene = SceneRenderer::new(&device, &memory, RENDER_SIZE)?;
+        let scene = SceneRenderer::new(&device, &physical, &memory, RENDER_SIZE)?;
 
         Ok(Self {
             scene,

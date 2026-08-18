@@ -49,6 +49,7 @@ pub struct PhysicalDevice {
     /// the enable list cannot drift out of step with the capability flags.
     optional_extensions: Vec<&'static std::ffi::CStr>,
     limits: RayTracingLimits,
+    timestamps: TimestampSupport,
 }
 
 /// Device limits that acceleration structure and shader binding table layout depend on.
@@ -67,6 +68,18 @@ pub struct RayTracingLimits {
     /// Alignment a build's scratch address must satisfy. Unlike most Vulkan alignments this one is
     /// not a power-of-two the allocator would give for free — on current NVIDIA it is 128.
     pub min_scratch_offset_alignment: u32,
+}
+
+/// What the device's timestamp counter can measure.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct TimestampSupport {
+    /// Nanoseconds one tick of the counter represents. Zero means the queue cannot time anything.
+    pub period_ns: f32,
+    /// How many low bits of a written timestamp are meaningful, for the graphics queue.
+    ///
+    /// The spec allows a queue to write fewer than 64, and the rest are undefined rather than zero
+    /// — so a difference taken without masking them off is noise, not a duration.
+    pub valid_bits: u32,
 }
 
 /// Which optional ray tracing capabilities this device offers.
@@ -194,6 +207,10 @@ impl PhysicalDevice {
             })
             .ok_or_else(|| reject(RejectionReason::NoGraphicsQueue))?
             as u32;
+        let timestamps = TimestampSupport {
+            period_ns: properties.limits.timestamp_period,
+            valid_bits: families[graphics_queue_family as usize].timestamp_valid_bits,
+        };
 
         let mut acceleration_structure_properties =
             vk::PhysicalDeviceAccelerationStructurePropertiesKHR::default();
@@ -234,6 +251,7 @@ impl PhysicalDevice {
                 min_scratch_offset_alignment: acceleration_structure_properties
                     .min_acceleration_structure_scratch_offset_alignment,
             },
+            timestamps,
         })
     }
 
@@ -273,5 +291,10 @@ impl PhysicalDevice {
     /// Limits that acceleration structure and shader binding table layout depend on.
     pub fn limits(&self) -> RayTracingLimits {
         self.limits
+    }
+
+    /// What the graphics queue's timestamp counter can measure.
+    pub fn timestamps(&self) -> TimestampSupport {
+        self.timestamps
     }
 }

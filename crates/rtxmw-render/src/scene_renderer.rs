@@ -7,7 +7,10 @@
 
 use ash::vk;
 use glam::Vec3;
-use rtxmw_gpu::{Device, Image, Memory, RayTracingLimits, Uploader, image_barrier, memory_barrier};
+use rtxmw_gpu::{
+    Device, Image, Memory, PhysicalDevice, RayTracingLimits, Timestamps, Uploader, image_barrier,
+    memory_barrier,
+};
 use rtxmw_scene::StaticScene;
 use rtxmw_texture::Texture;
 
@@ -40,6 +43,65 @@ const MAX_TEXTURES: u32 = 8192;
 /// to one at M7, where the denoiser is what turns a single sample into a smooth field.
 const DEFAULT_BOUNCE_SAMPLES: u32 = 4;
 
+/// How long the device spent on each stage of a frame, in milliseconds.
+///
+/// Device time, not wall clock: what the GPU was busy for, which is the number `docs/design.md`
+/// §5.3's budget is written in. Every field is zero on a device whose queue cannot write
+/// timestamps.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct FrameTimings {
+    /// The ray traced pass: primary visibility, shadow rays and the diffuse bounce.
+    pub trace: f32,
+    /// Every à-trous pass together.
+    pub denoise: f32,
+    pub composite: f32,
+    /// Histogram and the reduction over it.
+    pub exposure: f32,
+    /// Tone curve and sRGB encoding.
+    pub tonemap: f32,
+}
+
+impl FrameTimings {
+    /// How many stages a frame is measured in, and so how many timestamps it writes.
+    const STAGES: usize = 5;
+
+    /// Everything the device spent on the frame.
+    pub fn total(&self) -> f32 {
+        self.trace + self.denoise + self.composite + self.exposure + self.tonemap
+    }
+
+    /// Reads the durations back in the order [`SceneRenderer::record`] wrote them.
+    fn from_durations(durations: [f32; Self::STAGES]) -> Self {
+        Self {
+            trace: durations[0],
+            denoise: durations[1],
+            composite: durations[2],
+            exposure: durations[3],
+            tonemap: durations[4],
+        }
+    }
+}
+
+impl std::fmt::Display for FrameTimings {
+    /// One diagnostic line, totals first.
+    ///
+    /// Here rather than at the caller so that adding a stage does not silently stop being reported:
+    /// a new field would otherwise have to be remembered in every place that prints one.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "device time {:.2} ms: trace {:.2}, denoise {:.2}, composite {:.2}, exposure {:.2}, \
+             tonemap {:.2}",
+            self.total(),
+            self.trace,
+            self.denoise,
+            self.composite,
+            self.exposure,
+            self.tonemap,
+        )
+    }
+}
+
 /// A loaded cell and the passes that turn it into a picture.
 pub struct SceneRenderer {
     pass: VisibilityPass,
@@ -52,6 +114,7 @@ pub struct SceneRenderer {
     scene: Option<LoadedScene>,
     bounce_samples: u32,
     denoise_passes: u32,
+    timestamps: Timestamps,
 }
 
 impl std::fmt::Debug for SceneRenderer {
@@ -85,7 +148,12 @@ impl SceneRenderer {
     /// The uploader is borrowed rather than owned, here and in every other method: it wraps one
     /// command pool on one queue, and a queue may not be submitted to from two places at once. A
     /// renderer that kept its own would make two renderers on a device a data race.
-    pub fn new(device: &Device, memory: &Memory, extent: vk::Extent2D) -> rtxmw_gpu::Result<Self> {
+    pub fn new(
+        device: &Device,
+        physical: &PhysicalDevice,
+        memory: &Memory,
+        extent: vk::Extent2D,
+    ) -> rtxmw_gpu::Result<Self> {
         let target = Image::new(
             memory,
             "primary visibility target",
@@ -116,6 +184,8 @@ impl SceneRenderer {
             scene: None,
             bounce_samples: DEFAULT_BOUNCE_SAMPLES,
             denoise_passes: DEFAULT_PASSES,
+            // One more than the stages, since a duration needs a timestamp either side of it.
+            timestamps: Timestamps::new(device, physical, FrameTimings::STAGES as u32 + 1)?,
         })
     }
 
@@ -245,6 +315,17 @@ impl SceneRenderer {
         )
     }
 
+    /// What the device spent on the last recorded frame.
+    ///
+    /// Blocks until the queries resolve, so the frame must already have been submitted. All zeroes
+    /// on a device whose queue cannot write timestamps.
+    pub fn timings(&self) -> rtxmw_gpu::Result<FrameTimings> {
+        // A stack array, so asking what a frame cost is not itself something a frame pays for.
+        let mut durations = [0.0; FrameTimings::STAGES];
+        self.timestamps.read(&mut durations)?;
+        Ok(FrameTimings::from_durations(durations))
+    }
+
     /// Records the trace into `command_buffer`, leaving the target ready to copy from.
     ///
     /// Does nothing without a loaded cell, so a caller need not branch on it.
@@ -281,21 +362,34 @@ impl SceneRenderer {
                 );
             }
 
+            // A timestamp between every stage. They mean something here only because the stages
+            // are separated by full barriers anyway — without those the device would overlap them
+            // and a per-stage figure would be invented.
+            self.timestamps.reset(command_buffer);
+            self.timestamps.write(command_buffer, 0);
+
             self.pass.record(command_buffer, extent, constants);
             memory_barrier::full(device, command_buffer);
+            self.timestamps.write(command_buffer, 1);
 
             // The filter leaves the lighting back in the G-buffer's first illumination image, which
             // is the one the composite is bound to.
             self.denoiser
                 .record(device, command_buffer, extent, self.denoise_passes);
+            self.timestamps.write(command_buffer, 2);
+
             self.composite.record(command_buffer, extent);
             memory_barrier::full(device, command_buffer);
+            self.timestamps.write(command_buffer, 3);
 
             // Exposure is measured on the composed frame, so it has to follow the composite rather
             // than run alongside the trace.
             self.exposure.record(device, command_buffer, extent);
+            self.timestamps.write(command_buffer, 4);
+
             self.tonemap.record(command_buffer, extent);
             memory_barrier::full(device, command_buffer);
+            self.timestamps.write(command_buffer, 5);
 
             for image in [self.target.raw(), self.tonemap.output().raw()] {
                 image_barrier::transition(
@@ -319,5 +413,28 @@ impl SceneRenderer {
             // SAFETY: the command buffer is recording and every object is alive.
             unsafe { self.record(device, cmd, constants) };
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_device_that_wrote_no_timestamps_reports_nothing_rather_than_zeroes_it_invented() {
+        // `Timestamps::read` returns an empty slice on a queue that cannot time anything, and the
+        // caller has to be able to tell that from a frame that genuinely took no time.
+        assert_eq!(
+            FrameTimings::from_durations([0.0; FrameTimings::STAGES]),
+            FrameTimings::default()
+        );
+
+        // In the order `record` writes them. The array's width is the type's guarantee that a
+        // caller cannot hand over a stage count that disagrees with the pool's.
+        let timings = FrameTimings::from_durations([1.0, 2.0, 4.0, 8.0, 16.0]);
+        assert_eq!(timings.trace, 1.0);
+        assert_eq!(timings.denoise, 2.0);
+        assert_eq!(timings.tonemap, 16.0);
+        assert_eq!(timings.total(), 31.0);
     }
 }

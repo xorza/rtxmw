@@ -21,6 +21,6 @@ mod visibility_pass;
 // outside; publishing it was letting `unreachable_pub` pass on types nothing could reach.
 pub use crate::geometry_buffers::{GeometryBuffers, MeshRange, VertexAttributes};
 pub use crate::scene_acceleration::SceneAcceleration;
-pub use crate::scene_renderer::{SceneRenderer, TARGET_FORMAT};
+pub use crate::scene_renderer::{FrameTimings, SceneRenderer, TARGET_FORMAT};
 pub use crate::tonemap::OUTPUT_FORMAT;
 pub use crate::visibility_pass::FrameConstants;
