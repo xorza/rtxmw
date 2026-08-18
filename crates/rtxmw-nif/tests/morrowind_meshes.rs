@@ -151,3 +151,72 @@ fn geometry_indices_stay_inside_their_vertex_buffers() {
     assert!(with_geometry > 5_000, "only {with_geometry} had triangles");
     println!("validated {with_geometry} geometry blocks across {checked} meshes");
 }
+
+#[test]
+fn the_transform_on_a_models_outermost_node_is_discarded() {
+    // **The original engine ignores it**, and a renderer that does not turns those models against
+    // everything around them. Seyda Neen's fireplace is the case that shows it: its outermost node
+    // carries a half turn about Z, and honoured, the hearth faces the wall while the fire the cell
+    // places burns behind the stack.
+    //
+    // A rig's `bip01` is the exception — that is an animation root the skeleton is posed against,
+    // not a stray placement — and so is a model whose outermost block is geometry rather than a
+    // node.
+    let Some(vfs) = morrowind_archives() else {
+        eprintln!("skipping: {DATA_DIR_VAR} is not configured (set it, or add it to .env)");
+        return;
+    };
+    const IDENTITY: [[f32; 3]; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+
+    let root_of = |path: &str| {
+        let bytes = vfs
+            .read(path)
+            .unwrap_or_else(|_| panic!("{path} should read"));
+        let nif = NifFile::parse(&bytes).unwrap_or_else(|_| panic!("{path} should parse"));
+        match nif.blocks().first().expect("a first block") {
+            Block::Node(node) => (node.av.net.name.clone(), node.av.transform),
+            Block::Geometry(geometry) => (geometry.av.net.name.clone(), geometry.av.transform),
+            other => panic!("{path} starts with {other:?}"),
+        }
+    };
+
+    // The fireplace, whose file really does carry a half turn there.
+    let (name, transform) = root_of("meshes/i/in_nord_fireplace_01.nif");
+    assert_eq!(name, "In_nord_fireplace_01");
+    assert_eq!(
+        transform.rotation, IDENTITY,
+        "the outermost node's half turn survived the read"
+    );
+
+    // A rig keeps its animation root. 259 of the shipped models are rooted at `bip01` and 255 of
+    // those carry a real transform there — it is what the skeleton is posed against, so discarding
+    // it would flatten every piece of armour and clothing in the game.
+    let (name, transform) = root_of("meshes/a/a_m_imperialchain_cuirass.nif");
+    assert!(name.eq_ignore_ascii_case("bip01"));
+    assert_ne!(
+        transform.rotation, IDENTITY,
+        "a rig's animation root was discarded along with the stray placements"
+    );
+
+    // Nothing was thrown away wholesale: across the shipped library the rule reaches only the first
+    // block, so the models that carry a turn deeper down still have it.
+    let mut deeper = 0;
+    for path in vfs.paths().filter(|p| p.extension() == Some("nif")) {
+        let name = path.as_str().to_owned();
+        let Ok(bytes) = vfs.read(&name) else { continue };
+        let Ok(nif) = NifFile::parse(&bytes) else {
+            continue;
+        };
+        if nif.blocks().iter().skip(1).any(|block| match block {
+            Block::Node(node) => node.av.transform.rotation != IDENTITY,
+            Block::Geometry(geometry) => geometry.av.transform.rotation != IDENTITY,
+            _ => false,
+        }) {
+            deeper += 1;
+        }
+    }
+    assert!(
+        deeper > 500,
+        "only {deeper} models keep a turn below their outermost node"
+    );
+}

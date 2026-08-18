@@ -1,6 +1,6 @@
 //! A parsed NIF: its blocks and its roots.
 
-use crate::block::Block;
+use crate::block::{Block, Transform};
 use crate::cursor::{Cursor, Link};
 use crate::error::{NifError, Result};
 
@@ -79,7 +79,34 @@ impl NifFile {
             }
         }
 
-        Ok(Self { blocks, roots })
+        let mut file = Self { blocks, roots };
+        file.discard_root_transform();
+        Ok(file)
+    }
+
+    /// Resets the transform on block zero, when that block is a node.
+    ///
+    /// **A model's outermost node carries a transform the original engine ignores.** Roughly one
+    /// Morrowind mesh in sixteen has a non-identity one, and honouring it turns those models
+    /// against everything around them — Seyda Neen's fireplace is built with a half turn there, and
+    /// applied it presents its back to the room while the fire the cell places burns behind it.
+    ///
+    /// Only block zero, and only a node: a mesh whose outermost block is geometry keeps its
+    /// transform, as does a rig's `bip01`, which is an animation root that the skeleton is defined
+    /// against rather than a stray placement.
+    ///
+    /// This is the same rule, and the same exception, that OpenMW applies while reading
+    /// (`components/nif/node.cpp:182`), where the comment calls it a stopgap and the wrong layer to
+    /// do it in. It is kept here for the same reason it is there: it is a property of how the
+    /// content must be read, so every caller should get it rather than each remembering to.
+    fn discard_root_transform(&mut self) {
+        let Some(Block::Node(node)) = self.blocks.first_mut() else {
+            return;
+        };
+        if node.av.net.name.eq_ignore_ascii_case("bip01") {
+            return;
+        }
+        node.av.transform = Transform::default();
     }
 
     /// Every block, in file order.

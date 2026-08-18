@@ -3,30 +3,64 @@
 //! Skips when the game is not installed.
 
 use rtxmw_esm::{CellId, CellIndex, EsmReader};
-use rtxmw_scene::{CellStreamer, Door, LoadedCell, MaterialTable, Mesh, ModelIndex, StaticScene};
-use rtxmw_vfs::{DATA_DIR_VAR, morrowind_archives, morrowind_data_dir};
+use rtxmw_scene::{
+    CellStreamer, Door, Light, LoadedCell, MaterialTable, Mesh, ModelIndex, StaticScene,
+};
+use rtxmw_vfs::{DATA_DIR_VAR, Vfs, morrowind_archives, morrowind_data_dir};
 
 const CELL: &str = "Seyda Neen, Census and Excise Office";
 
 /// Seyda Neen's shore, which has the trees, the boat and the silt strider on it.
 const SHORE: CellId = CellId::Exterior { x: -2, y: -9 };
 
-#[test]
-fn a_known_interior_assembles_into_meshes_and_instances() {
+/// `Morrowind.esm`'s bytes, or nothing when the game is not installed.
+///
+/// Separate from [`Content`] because [`EsmReader`] borrows what it reads, so the reader and the
+/// bytes it points into cannot be handed back together.
+fn game_bytes() -> Option<Vec<u8>> {
     let Some(data) = morrowind_data_dir() else {
         eprintln!("skipping: {DATA_DIR_VAR} is not configured (set it, or add it to .env)");
-        return;
+        return None;
     };
-    let vfs = morrowind_archives().expect("the game is available");
-    let bytes = std::fs::read(data.join("Morrowind.esm")).expect("Morrowind.esm should read");
-    let esm = EsmReader::new(&bytes).expect("should parse");
+    Some(std::fs::read(data.join("Morrowind.esm")).expect("Morrowind.esm should read"))
+}
 
-    let models = ModelIndex::build(&esm).expect("model index should build");
-    assert!(models.len() > 2_000, "only {} models indexed", models.len());
+/// The shipped content, indexed and ready to load a cell out of.
+#[derive(Debug)]
+struct Content<'a> {
+    esm: EsmReader<'a>,
+    models: ModelIndex,
+    index: CellIndex,
+    vfs: Vfs,
+}
 
-    let index = CellIndex::build(&esm).expect("cell index should build");
-    let scene = StaticScene::load_cell(&esm, &index, &models, &vfs, &CellId::Interior(CELL.into()))
-        .expect("cell should load");
+impl<'a> Content<'a> {
+    fn open(bytes: &'a [u8]) -> Self {
+        let esm = EsmReader::new(bytes).expect("Morrowind.esm should parse");
+        Self {
+            models: ModelIndex::build(&esm).expect("model index should build"),
+            index: CellIndex::build(&esm).expect("cell index should build"),
+            vfs: morrowind_archives().expect("the game is available"),
+            esm,
+        }
+    }
+
+    fn cell(&self, id: &CellId) -> StaticScene {
+        StaticScene::load_cell(&self.esm, &self.index, &self.models, &self.vfs, id)
+            .expect("cell should load")
+    }
+}
+
+#[test]
+fn a_known_interior_assembles_into_meshes_and_instances() {
+    let Some(bytes) = game_bytes() else { return };
+    let content = Content::open(&bytes);
+    assert!(
+        content.models.len() > 2_000,
+        "only {} models indexed",
+        content.models.len()
+    );
+    let scene = content.cell(&CellId::Interior(CELL.into()));
 
     assert!(
         !scene.instances.is_empty(),
@@ -86,7 +120,7 @@ fn a_known_interior_assembles_into_meshes_and_instances() {
     // the surface samples whatever descriptor happened to be there.
     let mut missing = Vec::new();
     for path in scene.materials.textures() {
-        if vfs.read(path).is_err() {
+        if content.vfs.read(path).is_err() {
             missing.push(path.clone());
         }
     }
@@ -279,20 +313,13 @@ fn flattening_preserves_geometry_and_resolves_every_material() {
 
 #[test]
 fn the_doors_leading_into_a_cell_land_a_traveller_inside_it() {
-    let Some(data) = morrowind_data_dir() else {
-        eprintln!("skipping: {DATA_DIR_VAR} is not configured (set it, or add it to .env)");
-        return;
-    };
-    let vfs = morrowind_archives().expect("the game is available");
-    let bytes = std::fs::read(data.join("Morrowind.esm")).expect("Morrowind.esm should read");
-    let esm = EsmReader::new(&bytes).expect("should parse");
-    let models = ModelIndex::build(&esm).expect("model index should build");
+    let Some(bytes) = game_bytes() else { return };
+    let content = Content::open(&bytes);
 
     let destination = CellId::Interior(CELL.into());
-    let doors = Door::leading_to(&esm, &models, &destination).expect("scan should succeed");
-    let index = CellIndex::build(&esm).expect("cell index should build");
-    let scene = StaticScene::load_cell(&esm, &index, &models, &vfs, &CellId::Interior(CELL.into()))
-        .expect("cell should load");
+    let doors =
+        Door::leading_to(&content.esm, &content.models, &destination).expect("scan should succeed");
+    let scene = content.cell(&destination);
     let bounds = scene.bounds().expect("a furnished cell has geometry");
     println!("{} doors lead into {CELL}, bounds {bounds:?}", doors.len());
     for door in &doors {
@@ -333,13 +360,15 @@ fn the_doors_leading_into_a_cell_land_a_traveller_inside_it() {
     // Editor markers place no geometry either: they are the original engine's placement aids and
     // it never drew them. This cell places a `NorthMarker`, so the count is the assertion.
     assert!(
-        models.is_editor_marker("PrisonMarker") && models.is_editor_marker("NorthMarker"),
+        content.models.is_editor_marker("PrisonMarker")
+            && content.models.is_editor_marker("NorthMarker"),
         "the marker meshes are no longer being recognised"
     );
-    assert!(!models.is_editor_marker("ex_nord_door_01"));
+    assert!(!content.models.is_editor_marker("ex_nord_door_01"));
     // Compared against the mesh itself rather than a guess at its shape: the marker is a solid
     // arrow 160 units tall, not something a bounding box would tell apart from the furniture.
-    let marker_nif = vfs
+    let marker_nif = content
+        .vfs
         .read("meshes/Marker_North.nif")
         .expect("the marker mesh ships");
     let marker = Mesh::from_nif(
@@ -376,20 +405,12 @@ fn the_doors_leading_into_a_cell_land_a_traveller_inside_it() {
 
 #[test]
 fn an_exterior_cell_carries_its_terrain_as_well_as_its_objects() {
-    let Some(data) = morrowind_data_dir() else {
-        eprintln!("skipping: {DATA_DIR_VAR} is not configured (set it, or add it to .env)");
-        return;
-    };
-    let vfs = morrowind_archives().expect("the game is available");
-    let bytes = std::fs::read(data.join("Morrowind.esm")).expect("Morrowind.esm should read");
-    let esm = EsmReader::new(&bytes).expect("should parse");
-    let models = ModelIndex::build(&esm).expect("model index should build");
+    let Some(bytes) = game_bytes() else { return };
+    let content = Content::open(&bytes);
 
     // Seyda Neen, where the game opens.
     let (x, y) = (-2, -9);
-    let index = CellIndex::build(&esm).expect("cell index should build");
-    let scene = StaticScene::load_cell(&esm, &index, &models, &vfs, &CellId::Exterior { x, y })
-        .expect("cell should load");
+    let scene = content.cell(&CellId::Exterior { x, y });
 
     // The terrain is the one mesh with a vertex per point of the 65×65 grid.
     let terrain = scene
@@ -541,17 +562,9 @@ fn a_streamed_cell_is_the_same_cell_the_direct_path_loads() {
 
 #[test]
 fn the_shipped_models_that_are_cloth_are_the_ones_marked_as_sheets() {
-    let Some(data) = morrowind_data_dir() else {
-        eprintln!("skipping: {DATA_DIR_VAR} is not configured (set it, or add it to .env)");
-        return;
-    };
-    let vfs = morrowind_archives().expect("the game is available");
-    let bytes = std::fs::read(data.join("Morrowind.esm")).expect("Morrowind.esm should read");
-    let esm = EsmReader::new(&bytes).expect("should parse");
-    let models = ModelIndex::build(&esm).expect("model index should build");
-    let index = CellIndex::build(&esm).expect("cell index should build");
-    let scene = StaticScene::load_cell(&esm, &index, &models, &vfs, &CellId::Interior(CELL.into()))
-        .expect("cell should load");
+    let Some(bytes) = game_bytes() else { return };
+    let content = Content::open(&bytes);
+    let scene = content.cell(&CellId::Interior(CELL.into()));
 
     let sheets_in = |name: &str| {
         let position = scene
@@ -598,22 +611,15 @@ fn the_shipped_meshes_wind_their_triangles_to_agree_with_their_normals() {
     //
     // So it is measured. A triangle disagrees when its plane, taken from the order of its corners,
     // points opposite to the normals its vertices carry.
-    let Some(data) = morrowind_data_dir() else {
-        eprintln!("skipping: {DATA_DIR_VAR} is not configured (set it, or add it to .env)");
-        return;
-    };
-    let vfs = morrowind_archives().expect("the game is available");
-    let bytes = std::fs::read(data.join("Morrowind.esm")).expect("Morrowind.esm should read");
-    let esm = EsmReader::new(&bytes).expect("should parse");
-    let models = ModelIndex::build(&esm).expect("model index should build");
-    let index = CellIndex::build(&esm).expect("cell index should build");
+    let Some(bytes) = game_bytes() else { return };
+    let content = Content::open(&bytes);
 
     let mut disagree = 0usize;
     let mut total = 0usize;
     // An interior of furniture and cloth, and a stretch of shore with trees, rocks and a boat —
     // between them most of the shapes the game is built out of.
     for cell in [CellId::Interior(CELL.into()), SHORE] {
-        let scene = StaticScene::load_cell(&esm, &index, &models, &vfs, &cell).expect("cell loads");
+        let scene = content.cell(&cell);
         for mesh in &scene.meshes {
             for triangle in mesh.indices.chunks_exact(3) {
                 let corner = |at: usize| mesh.positions[triangle[at] as usize];
@@ -651,16 +657,9 @@ fn a_trees_foliage_is_cloth_and_its_trunk_is_not() {
     //
     // The alpha says otherwise, and it is authored rather than inferred: Morrowind sets a cutout on
     // foliage, thatch, banners and glass, and on nothing solid.
-    let Some(data) = morrowind_data_dir() else {
-        eprintln!("skipping: {DATA_DIR_VAR} is not configured (set it, or add it to .env)");
-        return;
-    };
-    let vfs = morrowind_archives().expect("the game is available");
-    let bytes = std::fs::read(data.join("Morrowind.esm")).expect("Morrowind.esm should read");
-    let esm = EsmReader::new(&bytes).expect("should parse");
-    let models = ModelIndex::build(&esm).expect("model index should build");
-    let index = CellIndex::build(&esm).expect("cell index should build");
-    let scene = StaticScene::load_cell(&esm, &index, &models, &vfs, &SHORE).expect("cell loads");
+    let Some(bytes) = game_bytes() else { return };
+    let content = Content::open(&bytes);
+    let scene = content.cell(&SHORE);
 
     let position = scene
         .mesh_sources
@@ -688,5 +687,129 @@ fn a_trees_foliage_is_cloth_and_its_trunk_is_not() {
     assert!(
         solid_triangles > 300,
         "only {solid_triangles} solid triangles"
+    );
+}
+
+#[test]
+fn the_fireplace_opens_toward_the_fire_burning_in_it() {
+    // **A hearth and the fire inside it are placed separately**, so the fire is ground truth for
+    // which way the stack faces — no screenshot needed, and nothing to eyeball.
+    //
+    // Seyda Neen's fireplace is the model that catches a transform the original engine discards:
+    // its outermost node carries a half turn about Z, and honoured, the stack presents its back to
+    // the room while the fire burns behind it. Every other model in this room has an identity
+    // there, which is why the room looked right while this one alone was backwards.
+    let Some(bytes) = game_bytes() else { return };
+    let content = Content::open(&bytes);
+    let scene = content.cell(&CellId::Interior(CELL.into()));
+
+    let placed = scene
+        .instances
+        .iter()
+        .find(|instance| {
+            scene.mesh_sources[instance.mesh.0 as usize]
+                .to_lowercase()
+                .contains("fireplace")
+        })
+        .expect("the office has a fireplace");
+    let mesh = &scene.meshes[placed.mesh.0 as usize];
+    let origin = glam::Vec3::from(placed.transform.translation);
+
+    // The hearth slab is the lowest slice of the model, and it juts out on the open side.
+    let low = mesh
+        .positions
+        .iter()
+        .map(|p| p.z)
+        .fold(f32::INFINITY, f32::min);
+    let high = mesh
+        .positions
+        .iter()
+        .map(|p| p.z)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let slab: Vec<glam::Vec3> = mesh
+        .positions
+        .iter()
+        .filter(|p| p.z <= low + (high - low) * 0.08)
+        .map(|p| placed.transform.transform_point3(*p))
+        .collect();
+    assert!(!slab.is_empty(), "the model has no hearth slab");
+    let hearth = slab.iter().sum::<glam::Vec3>() / slab.len() as f32;
+
+    // Nearest in plan rather than in space, and for the same reason the check below is: the
+    // reference's own origin sits high up the chimney while the fire is down at the hearth, a
+    // couple of hundred units apart in height and a stride apart on the floor. Sorted by distance
+    // in space, a lamp on a nearer wall could come first.
+    let across_from = |light: &Light| (light.position - origin).truncate().length();
+    let fire = scene
+        .lights
+        .iter()
+        .min_by(|a, b| across_from(a).total_cmp(&across_from(b)))
+        .expect("the office lights its fire");
+    let across = across_from(fire);
+    assert!(
+        across < 100.0,
+        "the nearest light is {across} units away in plan, too far to be this fire"
+    );
+
+    // Both measured from the fireplace's own origin, so this is about facing and not about where
+    // in the room either of them sits.
+    let toward_hearth = (hearth - origin).truncate().normalize();
+    let toward_fire = (fire.position - origin).truncate().normalize();
+    let agreement = toward_hearth.dot(toward_fire);
+    assert!(
+        agreement > 0.9,
+        "the hearth points {toward_hearth:?} and the fire sits {toward_fire:?} — the stack is \
+         turned away from its own fire"
+    );
+}
+
+#[test]
+fn a_book_stands_on_the_same_shelf_as_the_cups_beside_it() {
+    // **Which Euler angle is applied first is not something the file says**, and it moves only the
+    // references that turn about more than one axis — 22 of this cell's 268. The rest of a room is
+    // unmoved either way, so the mistake hides among the props: this book ends up sunk through the
+    // board it stands on and out through the side of the cupboard.
+    //
+    // The cups beside it turn about Z alone and so land in the same place under either order, which
+    // makes them a ruler. Two things on one shelf rest on one board.
+    let Some(bytes) = game_bytes() else { return };
+    let content = Content::open(&bytes);
+    let scene = content.cell(&CellId::Interior(CELL.into()));
+
+    // The lowest point of every instance of a named model, near the cupboard at the far end.
+    let bases_of = |needle: &str| -> Vec<f32> {
+        scene
+            .instances
+            .iter()
+            .filter(|instance| {
+                scene.mesh_sources[instance.mesh.0 as usize]
+                    .to_lowercase()
+                    .contains(needle)
+                    && (glam::Vec3::from(instance.transform.translation)
+                        - glam::Vec3::new(420.0, 976.0, 300.0))
+                    .length()
+                        < 120.0
+            })
+            .map(|instance| {
+                scene.meshes[instance.mesh.0 as usize]
+                    .positions
+                    .iter()
+                    .map(|p| instance.transform.transform_point3(*p).z)
+                    .fold(f32::INFINITY, f32::min)
+            })
+            .collect()
+    };
+
+    let books = bases_of("text_octavo_03");
+    let cups = bases_of("misc_com_metal_goblet_01");
+    assert_eq!(books.len(), 1, "expected the one book on this cupboard");
+    assert!(cups.len() >= 4, "expected the row of cups beside it");
+
+    let board = cups.iter().copied().fold(f32::INFINITY, f32::min);
+    let book = books[0];
+    assert!(
+        book > board - 2.0,
+        "the book's base is at {book} and the shelf it shares with the cups at {board} — it is \
+         standing through the board"
     );
 }

@@ -482,13 +482,13 @@ fn terrain_materials(
 
 /// Builds a reference's model-to-world transform.
 ///
-/// Rotations are radians applied about the **negated** axes in Z, Y, X order — the convention the
-/// original engine used, and not one any maths library will produce by default.
+/// Rotations are radians about the **negated** axes, applied **Z first, then Y, then X** — the
+/// convention the original engine used, and not one any maths library will produce by default.
 fn world_transform(cell_ref: &CellRef) -> Affine3A {
     let [x, y, z] = cell_ref.position.rotation;
-    let rotation = Quat::from_axis_angle(Vec3::NEG_Z, z)
+    let rotation = Quat::from_axis_angle(Vec3::NEG_X, x)
         * Quat::from_axis_angle(Vec3::NEG_Y, y)
-        * Quat::from_axis_angle(Vec3::NEG_X, x);
+        * Quat::from_axis_angle(Vec3::NEG_Z, z);
     Affine3A::from_mat3_translation(
         Mat3::from_quat(rotation) * cell_ref.scale,
         Vec3::from_array(cell_ref.position.translation),
@@ -654,6 +654,34 @@ mod tests {
         // A unit step along X lands two units away, scaled but not rotated.
         assert!(
             (transform.transform_point3(Vec3::X) - Vec3::new(12.0, 20.0, 30.0)).length() < 1e-4
+        );
+    }
+
+    #[test]
+    fn rotations_apply_z_first_and_x_last() {
+        // **Which Euler angle is applied first is not something the file says**, and getting it
+        // backwards moves only the references that turn about more than one axis — 22 of one
+        // interior's 268 — so a room looks broadly right either way and the error hides among the
+        // props. A book ends up through the side of the cupboard it stands in; a rock lies at an
+        // angle no one placed it at.
+        //
+        // OpenMW composes it as `Quat(z, -Z) * Quat(y, -Y) * Quat(x, -X)`
+        // (`components/misc/convert.hpp:50`), which reads like X first — and is not, because OSG's
+        // quaternion product is written in the opposite order to the usual one. The proof is in
+        // OpenMW's own pair: `Misc::toEulerAnglesZYX` recovers the angles that `makeOsgQuat` was
+        // given, and it only inverts it if that product is read reversed. Transcribed both ways and
+        // run over random angles, the reversed reading round-trips exactly and the ordinary one is
+        // out by up to two units of a unit vector.
+        //
+        // So Z is applied first and X last. A quarter turn about each, watched from +Y, tells the
+        // two apart: this way lands on +X, the other on -Z.
+        let quarter = std::f32::consts::FRAC_PI_2;
+        let cell_ref = reference([0.0; 3], [quarter, 0.0, quarter], 1.0);
+
+        let turned = world_transform(&cell_ref).transform_point3(Vec3::Y);
+        assert!(
+            (turned - Vec3::X).length() < 1e-4,
+            "expected +X, got {turned:?} — the angles are being applied in the wrong order"
         );
     }
 

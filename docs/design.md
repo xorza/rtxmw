@@ -1765,6 +1765,54 @@ Together they mark 47 of the shore's 419 runs and 50 of the Census Office's 308.
 3 runs of 5, the other two being the trunk and boughs, which hold most of its triangles. Backlit
 foliage is 27% brighter with no measurable change in noise.
 
+### 7.13 A model's outermost node transform is discarded
+
+Seyda Neen's fireplace presented its back to the room, with the fire the cell places burning behind
+the stack. Every other object around it was right, which is what made it hard: a wrong *convention*
+would have turned the whole room, so whatever was wrong had to be per-model.
+
+It was. `in_nord_fireplace_01.nif` carries a half turn about Z on its outermost node, and **the
+original engine ignores that transform**. OpenMW discards it while reading
+(`components/nif/node.cpp:182`, whose own comment calls it a stopgap in the wrong layer), for block
+zero only, only when that block is a node, and never for one named `bip01`. 455 of the 7,317 shipped
+models carry a turn there and 423 a translation or scale; 259 are rooted at `bip01`, 255 of those
+with a real transform — so the exception is as load-bearing as the rule, since discarding a rig's
+animation root would flatten every piece of armour in the game.
+
+What broke it open was finding an anchor that needed no screenshot: **a hearth and the fire inside
+it are placed as separate references**, so the fire says which way the stack faces. Measured from the
+fireplace's own origin, the hearth slab pointed at −0.99 against the fire — almost exactly opposite —
+and at +0.99 once the rule was in. That is the regression test.
+
+Two variants were tried and rejected on the way: taking the reference's axes unnegated fixes the
+fireplace and breaks the room, and skipping whichever node the walk starts from would discard the 423
+roots that legitimately translate.
+
+### 7.14 A reference's Euler angles apply Z first
+
+The other half of the same report — a book standing through the side of the cupboard it is in, a rock
+lying at an angle no one placed it at — was the composition order, and it took a wrong turn worth
+recording.
+
+OpenMW composes the reference's rotation as `Quat(z, -Z) * Quat(y, -Y) * Quat(x, -X)`
+(`components/misc/convert.hpp:50`), which reads as X-first and was transcribed that way. It is not.
+**OSG writes its quaternion product in the opposite order to everyone else**, so that expression
+means Z first and X last. The tell is a page away in OpenMW's own source: `Misc::toEulerAnglesZYX`
+recovers the angles `makeOsgQuat` was given, and it only inverts it under the reversed reading —
+transcribed both ways and run over four thousand random angles, reversed round-trips to zero and the
+ordinary reading is out by up to two units of a unit vector.
+
+The argument that delayed this was a bad one and is worth naming so it is not made again: OpenMW
+writes the *same* order for Bullet a few lines below, Bullet's product is the ordinary one, and the
+two were assumed to agree because physics ought to match graphics. They do not agree — that is a
+latent inconsistency in OpenMW, not evidence about OSG.
+
+It moves only the references that turn about more than one axis, 22 of one interior's 268, which is
+why a room looks broadly right either way. Worse, the obvious measurements are blind to it: a plate's
+tilt out of horizontal is *identical* under both orders whenever the Y angle is zero, and only the
+azimuth differs. What separates them is that things stop resting where they were put — the book's
+base sits 8 units below the board its cups stand on, which is the test.
+
 ### 7.8 Costs and risks
 
 - **Water pixels cost roughly twice.** Two rays instead of one, each spawning its own shadow rays.
