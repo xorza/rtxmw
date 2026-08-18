@@ -9,7 +9,7 @@ use glam::{Affine3A, Vec2, Vec3};
 use rtxmw_esm::EsmReader;
 use rtxmw_gpu::TestGpu;
 use rtxmw_render::{GeometryBuffers, SceneAcceleration};
-use rtxmw_scene::{Instance, Mesh, MeshId, ModelIndex, StaticScene};
+use rtxmw_scene::{Instance, Mesh, MeshId, ModelIndex, StaticScene, Submesh};
 use rtxmw_vfs::{DATA_DIR_VAR, morrowind_archives, morrowind_data_dir};
 
 const CELL: &str = "Seyda Neen, Census and Excise Office";
@@ -26,6 +26,11 @@ fn quad(offset: f32) -> Mesh {
         normals: vec![Vec3::Z; 4],
         uvs: vec![Vec2::ZERO, Vec2::X, Vec2::ONE, Vec2::Y],
         indices: vec![0, 1, 2, 0, 2, 3],
+        submeshes: vec![Submesh {
+            first_index: 0,
+            index_count: 6,
+            material: 0,
+        }],
     }
 }
 

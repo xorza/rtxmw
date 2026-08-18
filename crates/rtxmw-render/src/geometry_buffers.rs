@@ -230,6 +230,7 @@ fn pack(meshes: &[Mesh]) -> Packed {
 mod tests {
     use super::*;
     use glam::{Vec2, Vec3};
+    use rtxmw_scene::Submesh;
 
     /// A mesh whose vertices and normals are distinguishable by index.
     fn mesh(vertices: u32, indices: &[u32]) -> Mesh {
@@ -238,6 +239,11 @@ mod tests {
             normals: (0..vertices).map(|i| Vec3::X * i as f32).collect(),
             uvs: (0..vertices).map(|i| Vec2::splat(i as f32 * 0.5)).collect(),
             indices: indices.to_vec(),
+            submeshes: vec![Submesh {
+                first_index: 0,
+                index_count: indices.len() as u32,
+                material: 0,
+            }],
         }
     }
 

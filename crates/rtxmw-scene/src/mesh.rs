@@ -3,6 +3,9 @@
 use glam::{Mat3, Vec2, Vec3};
 use rtxmw_nif::{Block, GeometryData, Link, NifFile, Transform};
 
+use crate::material::Properties;
+use crate::material_table::MaterialTable;
+
 /// Nodes whose subtrees never reach the renderer.
 ///
 /// `RootCollisionNode` holds the collision hull, which is separate geometry that would double every
@@ -29,14 +32,46 @@ pub struct Mesh {
     /// Always parallel to `positions`. Zero where the source block carried no texture coordinates.
     pub uvs: Vec<Vec2>,
     pub indices: Vec<u32>,
+    /// Runs of `indices` sharing one material, covering the whole buffer with no gaps.
+    ///
+    /// A model is one mesh but rarely one surface — a lantern is glass and metal — so the split has
+    /// to survive flattening. Each of these becomes a separate geometry within the model's
+    /// acceleration structure, which is what lets a hit name the material it landed on.
+    pub submeshes: Vec<Submesh>,
+}
+
+/// One run of a mesh's indices drawn with a single material.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Submesh {
+    pub first_index: u32,
+    pub index_count: u32,
+    /// Index into the scene's [`MaterialTable`].
+    pub material: u32,
+}
+
+impl Submesh {
+    /// Triangles in this run.
+    pub fn triangle_count(&self) -> usize {
+        self.index_count as usize / 3
+    }
 }
 
 impl Mesh {
-    /// Flattens every visible geometry block in `nif` into one mesh.
-    pub fn from_nif(nif: &NifFile) -> Self {
+    /// Flattens every visible geometry block in `nif` into one mesh, interning its materials.
+    ///
+    /// The table is shared across the whole scene rather than per model, so the indices in
+    /// [`Submesh::material`] are already the ones the GPU will use.
+    pub fn from_nif(nif: &NifFile, materials: &mut MaterialTable) -> Self {
         let mut mesh = Self::default();
         for &root in nif.roots() {
-            mesh.visit(nif, root, Placement::IDENTITY, 0);
+            mesh.visit(
+                nif,
+                root,
+                Placement::IDENTITY,
+                Properties::default(),
+                materials,
+                0,
+            );
         }
         mesh
     }
@@ -69,7 +104,15 @@ impl Mesh {
     ///
     /// `depth` guards against a malformed file whose links form a cycle: the format allows any
     /// block to reference any other, and nothing in it forbids a loop.
-    fn visit(&mut self, nif: &NifFile, link: Link, parent: Placement, depth: u32) {
+    fn visit(
+        &mut self,
+        nif: &NifFile,
+        link: Link,
+        parent: Placement,
+        inherited: Properties,
+        materials: &mut MaterialTable,
+        depth: u32,
+    ) {
         const MAX_DEPTH: u32 = 64;
         if depth > MAX_DEPTH {
             return;
@@ -84,8 +127,9 @@ impl Mesh {
                     return;
                 }
                 let here = parent.then(&node.av.transform);
+                let properties = inherited.overridden_by(nif, &node.av.properties);
                 for &child in &node.children {
-                    self.visit(nif, child, here, depth + 1);
+                    self.visit(nif, child, here, properties, materials, depth + 1);
                 }
             }
             Block::Geometry(geometry) => {
@@ -95,18 +139,22 @@ impl Mesh {
                 let Some(Block::GeometryData(data)) = nif.resolve(geometry.data) else {
                     return;
                 };
-                self.append(data, parent.then(&geometry.av.transform));
+                let properties = inherited.overridden_by(nif, &geometry.av.properties);
+                let resolved = properties.resolve(nif, materials);
+                let material = materials.intern(resolved);
+                self.append(data, parent.then(&geometry.av.transform), material);
             }
             _ => {}
         }
     }
 
-    /// Appends one geometry block, transformed into model space.
-    fn append(&mut self, data: &GeometryData, placement: Placement) {
+    /// Appends one geometry block, transformed into model space and tagged with its material.
+    fn append(&mut self, data: &GeometryData, placement: Placement, material: u32) {
         if data.vertices.is_empty() || data.triangles.is_empty() {
             return;
         }
         let base = self.positions.len() as u32;
+        let first_index = self.indices.len() as u32;
 
         self.positions.reserve(data.vertices.len());
         for &vertex in &data.vertices {
@@ -147,6 +195,29 @@ impl Mesh {
             for &index in triangle {
                 self.indices.push(base + u32::from(index));
             }
+        }
+
+        self.push_run(
+            first_index,
+            self.indices.len() as u32 - first_index,
+            material,
+        );
+    }
+
+    /// Extends the last run when it shares `material`, or starts a new one.
+    ///
+    /// Adjacent blocks with the same material merge; non-adjacent ones do not. Models are authored
+    /// with their pieces grouped, so this collapses most of them and keeps the geometry count in
+    /// the acceleration structure down — and it does so without reordering indices, which would
+    /// invalidate the ranges a build reads.
+    fn push_run(&mut self, first_index: u32, index_count: u32, material: u32) {
+        match self.submeshes.last_mut() {
+            Some(last) if last.material == material => last.index_count += index_count,
+            _ => self.submeshes.push(Submesh {
+                first_index,
+                index_count,
+                material,
+            }),
         }
     }
 }
@@ -283,6 +354,43 @@ mod tests {
         assert!(!is_skippable("Tri Chest"));
         // A name merely containing the word is still real geometry.
         assert!(!is_skippable("MyEditorMarkerShelf"));
+    }
+
+    #[test]
+    fn adjacent_blocks_sharing_a_material_become_one_submesh() {
+        let mut mesh = Mesh::default();
+        // Two runs of material 0, then material 1, then material 0 again. Only the adjacent pair
+        // may merge — collapsing the other two would need reordering, which breaks the index ranges
+        // an acceleration structure builds from.
+        mesh.push_run(0, 3, 0);
+        mesh.push_run(3, 3, 0);
+        mesh.push_run(6, 3, 1);
+        mesh.push_run(9, 3, 0);
+
+        assert_eq!(
+            mesh.submeshes,
+            vec![
+                Submesh {
+                    first_index: 0,
+                    index_count: 6,
+                    material: 0
+                },
+                Submesh {
+                    first_index: 6,
+                    index_count: 3,
+                    material: 1
+                },
+                Submesh {
+                    first_index: 9,
+                    index_count: 3,
+                    material: 0
+                },
+            ]
+        );
+        assert_eq!(mesh.submeshes[0].triangle_count(), 2);
+        // The runs must tile the index buffer with no gap, or geometry vanishes at build time.
+        let covered: u32 = mesh.submeshes.iter().map(|s| s.index_count).sum();
+        assert_eq!(covered, 12);
     }
 
     #[test]

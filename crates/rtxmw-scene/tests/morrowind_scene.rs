@@ -77,6 +77,61 @@ fn a_known_interior_assembles_into_meshes_and_instances() {
         "the room spans {size:?}, which is degenerate"
     );
 
+    // Every texture the cell's materials name must exist, or the bindless array binds nothing and
+    // the surface samples whatever descriptor happened to be there.
+    let mut missing = Vec::new();
+    for path in scene.materials.textures() {
+        if vfs.read(path).is_err() {
+            missing.push(path.clone());
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "{} of {} texture paths are not in the VFS, e.g. {:?}",
+        missing.len(),
+        scene.materials.textures().len(),
+        &missing[..missing.len().min(5)]
+    );
+
+    // Submeshes must tile each mesh's index buffer exactly: a gap drops triangles from the build,
+    // an overlap builds them twice.
+    for (id, mesh) in scene.meshes.iter().enumerate() {
+        let mut cursor = 0u32;
+        for sub in &mesh.submeshes {
+            assert_eq!(sub.first_index, cursor, "mesh {id} submesh gap");
+            assert_eq!(sub.index_count % 3, 0, "mesh {id} partial triangle");
+            assert!(
+                (sub.material as usize) < scene.materials.materials().len(),
+                "mesh {id} names material {} of {}",
+                sub.material,
+                scene.materials.materials().len()
+            );
+            cursor += sub.index_count;
+        }
+        assert_eq!(
+            cursor as usize,
+            mesh.indices.len(),
+            "mesh {id} submesh coverage"
+        );
+    }
+
+    let textured = scene
+        .materials
+        .materials()
+        .iter()
+        .filter(|m| m.base_colour.is_some())
+        .count();
+    println!(
+        "  {} materials ({textured} textured), {} distinct textures, {} submeshes",
+        scene.materials.materials().len(),
+        scene.materials.textures().len(),
+        scene
+            .meshes
+            .iter()
+            .map(|m| m.submeshes.len())
+            .sum::<usize>(),
+    );
+
     println!(
         "{CELL}: {} meshes, {} instances, {} unique triangles, {} placed, {} refs without a model",
         scene.meshes.len(),
@@ -89,7 +144,7 @@ fn a_known_interior_assembles_into_meshes_and_instances() {
 }
 
 #[test]
-fn flattening_preserves_every_visible_triangle() {
+fn flattening_preserves_geometry_and_resolves_every_material() {
     let Some(vfs) = morrowind_archives() else {
         eprintln!("skipping: {DATA_DIR_VAR} is not configured (set it, or add it to .env)");
         return;
@@ -103,6 +158,8 @@ fn flattening_preserves_every_visible_triangle() {
     // Vertices whose source block carried no normal, so a shader must derive one from the face.
     let mut degenerate_normals = 0usize;
     let mut total_vertices = 0usize;
+    let mut submeshes = 0usize;
+    let mut materials = rtxmw_scene::MaterialTable::default();
 
     for path in vfs.paths().filter(|p| p.extension() == Some("nif")) {
         let Ok(bytes) = vfs.read(path.as_str()) else {
@@ -111,7 +168,7 @@ fn flattening_preserves_every_visible_triangle() {
         let Ok(nif) = rtxmw_nif::NifFile::parse(&bytes) else {
             continue;
         };
-        let mesh = Mesh::from_nif(&nif);
+        let mesh = Mesh::from_nif(&nif, &mut materials);
 
         assert_eq!(
             mesh.positions.len(),
@@ -130,6 +187,17 @@ fn flattening_preserves_every_visible_triangle() {
                 mesh.positions.len()
             );
         }
+
+        // Submeshes must cover the whole index buffer for every model in the library, not just the
+        // ones one cell happens to place.
+        let covered: u32 = mesh.submeshes.iter().map(|s| s.index_count).sum();
+        assert_eq!(
+            covered as usize,
+            mesh.indices.len(),
+            "{path}: submeshes cover {covered} of {} indices",
+            mesh.indices.len()
+        );
+        submeshes += mesh.submeshes.len();
 
         meshes += 1;
         flattened += mesh.triangle_count();
@@ -154,9 +222,40 @@ fn flattening_preserves_every_visible_triangle() {
         "only {:.1}% of triangles survived flattening",
         kept * 100.0
     );
+    // Almost every texture name has to resolve, because the fixups that turn one into a path —
+    // forcing `.dds`, prepending the directory — are guesses about the original data until the
+    // corpus agrees with them. Not *every* one: the shipped meshes carry a tail of references to
+    // textures Bethesda removed, so a rate is the honest assertion and the renderer needs a
+    // fallback rather than a panic.
+    let mut missing = Vec::new();
+    for path in materials.textures() {
+        if vfs.read(path).is_err() {
+            missing.push(path.clone());
+        }
+    }
+
     println!(
-        "flattened {meshes} meshes: {flattened} of {parsed} triangles kept ({:.1}%); \
-         {degenerate_normals} of {total_vertices} vertices have no normal",
+        "flattened {meshes} meshes into {submeshes} submeshes: {flattened} of {parsed} triangles \
+         kept ({:.1}%); {degenerate_normals} of {total_vertices} vertices have no normal",
         kept * 100.0
+    );
+    println!(
+        "  {} materials over {} distinct textures, {} unresolved",
+        materials.materials().len(),
+        materials.textures().len(),
+        missing.len()
+    );
+    for path in missing.iter().take(10) {
+        println!("    missing {path}");
+    }
+
+    let unresolved = missing.len() as f64 / materials.textures().len() as f64;
+    assert!(
+        unresolved < 0.02,
+        "{} of {} texture paths do not exist ({:.1}%), which is past what dangling references in \
+         the shipped data explain — suspect the path fixups",
+        missing.len(),
+        materials.textures().len(),
+        unresolved * 100.0
     );
 }

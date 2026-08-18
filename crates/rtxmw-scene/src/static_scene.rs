@@ -8,6 +8,7 @@ use rtxmw_nif::NifFile;
 use rtxmw_vfs::Vfs;
 
 use crate::error::{Result, SceneError};
+use crate::material_table::MaterialTable;
 use crate::mesh::{Bounds, Mesh};
 
 /// Index of a mesh within [`StaticScene::meshes`].
@@ -75,6 +76,8 @@ impl ModelIndex {
 pub struct StaticScene {
     pub meshes: Vec<Mesh>,
     pub instances: Vec<Instance>,
+    /// Every distinct material and texture the cell's meshes name, shared across all of them.
+    pub materials: MaterialTable,
     /// References skipped because their record had no model, for reporting.
     pub without_model: Vec<String>,
 }
@@ -126,7 +129,9 @@ impl StaticScene {
                         source,
                     })?;
                     let id = MeshId(scene.meshes.len() as u32);
-                    scene.meshes.push(Mesh::from_nif(&nif));
+                    scene
+                        .meshes
+                        .push(Mesh::from_nif(&nif, &mut scene.materials));
                     by_path.insert(path.to_owned(), id);
                     id
                 }

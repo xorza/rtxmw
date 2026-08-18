@@ -456,6 +456,30 @@ which a decoder that *drops* a level still satisfies. Deleting one mip passed cl
 asserts that header plus data accounts for the whole file, which ties the decode back to its source
 and catches it.
 
+**M4b (host half) — done.** `Material`, `AlphaMode` and `MaterialTable` in `rtxmw-scene`; `Mesh`
+gains `submeshes`. Across the whole library: **7,319 meshes flatten into 26,869 submeshes drawing
+4,593 distinct materials over 4,311 distinct textures**. Seyda Neen's office alone resolves 119
+materials, 118 of them textured, across 309 submeshes.
+
+- **A model is one mesh but rarely one surface.** A lantern is glass and metal, so flattening now
+  keeps runs of indices tagged by material. Adjacent blocks sharing a material merge; non-adjacent
+  ones do not, because collapsing those would need reordering and the index ranges are what a build
+  reads. Each run becomes a geometry within the model's BLAS, which is how a hit names its material.
+- **NIF properties are inherited**, so resolution carries a property stack down the node graph
+  alongside the transform — a whole building shares one texture property set on its root.
+- **The material table is scene-wide, not per mesh**, because that is the granularity the GPU wants:
+  one bindless array and one material buffer per cell. Meshes intern into it as they are built, so
+  `Submesh::material` is already the index the shader will use.
+- **Two path fixups the original data needs**, both quirks rather than conventions: a texture name is
+  relative to `textures/`, and it routinely claims an extension the shipped file does not have —
+  the art was converted to DDS and the references were never updated.
+
+**45 of 4,311 texture references resolve to nothing.** They are dangling in the shipped data, not a
+decoding error: `tx_moon`, `tx_lavacrust00` and `tx_hlaalu_wall1_02` exist nowhere in the archives.
+So the upload needs a fallback texture rather than treating a miss as fatal, and the corpus test
+asserts a *rate* (under 2%) instead of perfection — a broken path fixup pushes it far past that,
+which is what the assertion is really for.
+
 ### M5 — Direct lighting
 Sun as a directional light with a real angular diameter (so shadows are soft), shadow rays, cell
 ambient, `LIGH` point lights with shadow rays and a defensible attenuation model, emissive surfaces.

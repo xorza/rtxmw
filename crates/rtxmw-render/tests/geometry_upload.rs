@@ -8,7 +8,7 @@ use glam::{Vec2, Vec3};
 use rtxmw_esm::EsmReader;
 use rtxmw_gpu::TestGpu;
 use rtxmw_render::{GeometryBuffers, MeshRange, VertexAttributes};
-use rtxmw_scene::{Mesh, ModelIndex, StaticScene};
+use rtxmw_scene::{Mesh, ModelIndex, StaticScene, Submesh};
 use rtxmw_vfs::{DATA_DIR_VAR, morrowind_archives, morrowind_data_dir};
 
 const CELL: &str = "Seyda Neen, Census and Excise Office";
@@ -26,6 +26,11 @@ fn distinct_mesh(offset: f32, vertices: u32, indices: &[u32]) -> Mesh {
             .map(|i| Vec2::new(i as f32 * 0.25, offset))
             .collect(),
         indices: indices.to_vec(),
+        submeshes: vec![Submesh {
+            first_index: 0,
+            index_count: indices.len() as u32,
+            material: 0,
+        }],
     }
 }
 
