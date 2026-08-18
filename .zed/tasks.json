@@ -16,7 +16,7 @@
     "reveal": "always"
   },
   {
-    "label": "run rtxmw seyda need",
+    "label": "run rtxmw seyda neen",
     "command": "cargo",
     "args": [
       "run",
