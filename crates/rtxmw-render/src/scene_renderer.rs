@@ -157,7 +157,16 @@ impl SceneRenderer {
             .scene
             .as_ref()
             .map_or((Vec3::ZERO, 0), |s| (s.ambient, s.light_count));
-        FrameConstants::new(view, projection, camera_position, ambient, lights)
+        FrameConstants::new(
+            view,
+            projection,
+            camera_position,
+            ambient,
+            lights,
+            // From the renderer's own target height, so the mip a surface samples follows the
+            // resolution it is being traced at.
+            FrameConstants::cone_spread_from(projection, self.target.extent().height),
+        )
     }
 
     /// Records the trace into `command_buffer`, leaving the target ready to copy from.

@@ -26,8 +26,12 @@ pub struct FrameConstants {
     /// The cell's fixed lighting, standing in for every bounce the original engine could not
     /// compute. Interiors are mostly this.
     ambient: [f32; 3],
-    /// The block is a multiple of 16 bytes with this; the shader ignores it.
-    padding: u32,
+    /// How fast a pixel's ray cone widens with distance, in world units per unit travelled.
+    ///
+    /// A rasterizer gets its texture level from screen-space derivatives, which a compute shader
+    /// does not have. This is what replaces them: the cone's width at the hit is its footprint on
+    /// the surface, and the mip that matches that footprint is the one to sample.
+    cone_spread: f32,
 }
 
 impl FrameConstants {
@@ -41,14 +45,26 @@ impl FrameConstants {
         camera_position: Vec3,
         ambient: Vec3,
         light_count: u32,
+        cone_spread: f32,
     ) -> Self {
         Self {
             inverse_view_projection: (projection * view).inverse().to_cols_array(),
             camera_position: camera_position.to_array(),
             light_count,
             ambient: ambient.to_array(),
-            padding: 0,
+            cone_spread,
         }
+    }
+
+    /// How wide one pixel's ray cone grows per unit of distance.
+    ///
+    /// Two pixels' worth of vertical field of view divided by the height, which is the angle one
+    /// pixel subtends. Derived from the projection rather than passed separately so it cannot
+    /// disagree with the matrix the same frame is unprojected with.
+    pub fn cone_spread_from(projection: Mat4, height: u32) -> f32 {
+        // The projection's [1][1] is `1 / tan(fov_y / 2)`, negated by the Vulkan Y flip.
+        let cot_half_fov = projection.y_axis.y.abs();
+        2.0 / (cot_half_fov * height as f32)
     }
 }
 
@@ -131,10 +147,16 @@ impl VisibilityPass {
                 .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::COMPUTE),
-            // Last, because Vulkan allows a variable descriptor count only on a set's final
-            // binding. Adding anything after this one moves it.
             vk::DescriptorSetLayoutBinding::default()
                 .binding(7)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+            // Last, because Vulkan allows a variable descriptor count only on a set's final
+            // binding. Adding anything after this one moves it — validation rejects the set
+            // outright, which is how this was caught.
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(8)
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                 .descriptor_count(max_textures)
                 .stage_flags(vk::ShaderStageFlags::COMPUTE),
@@ -142,8 +164,8 @@ impl VisibilityPass {
         // Only the texture array is variable and partially bound: a cell that uses 118 textures
         // writes 118 descriptors into a binding declared for far more, and the rest are never read.
         // Declaring them all bound would mean uploading placeholder views for slots no ray reaches.
-        let mut flags = [vk::DescriptorBindingFlags::empty(); 8];
-        flags[7] = vk::DescriptorBindingFlags::PARTIALLY_BOUND
+        let mut flags = [vk::DescriptorBindingFlags::empty(); 9];
+        flags[8] = vk::DescriptorBindingFlags::PARTIALLY_BOUND
             | vk::DescriptorBindingFlags::VARIABLE_DESCRIPTOR_COUNT;
         let mut binding_flags =
             vk::DescriptorSetLayoutBindingFlagsCreateInfo::default().binding_flags(&flags);
@@ -162,7 +184,7 @@ impl VisibilityPass {
                 .descriptor_count(1),
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(5),
+                .descriptor_count(6),
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                 .descriptor_count(max_textures),
@@ -285,9 +307,18 @@ impl VisibilityPass {
         let texture_infos = textures.descriptors();
         let texture_write = vk::WriteDescriptorSet::default()
             .dst_set(self.set)
-            .dst_binding(7)
+            .dst_binding(8)
             .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
             .image_info(&texture_infos);
+
+        let position_info = [vk::DescriptorBufferInfo::default()
+            .buffer(geometry.positions().raw())
+            .range(vk::WHOLE_SIZE)];
+        let position_write = vk::WriteDescriptorSet::default()
+            .dst_set(self.set)
+            .dst_binding(7)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(&position_info);
 
         let light_info = [vk::DescriptorBufferInfo::default()
             .buffer(lights.buffer().raw())
@@ -328,6 +359,7 @@ impl VisibilityPass {
                     index_write,
                     attribute_write,
                     light_write,
+                    position_write,
                 ],
                 &[],
             )
@@ -405,6 +437,19 @@ mod tests {
         // Vulkan promises 128 bytes and no more; exceeding it works on this GPU and fails elsewhere.
         assert!(size_of::<FrameConstants>() <= 128);
         assert_eq!(size_of::<FrameConstants>(), 96);
+
+        // One pixel of a 90-degree, 100-pixel-tall view subtends 2*tan(45)/100 = 0.02 units per
+        // unit of distance.
+        let projection = glam::camera::rh::proj::vulkan::perspective_infinite_reverse(
+            std::f32::consts::FRAC_PI_2,
+            1.0,
+            0.05,
+        );
+        let spread = FrameConstants::cone_spread_from(projection, 100);
+        assert!((spread - 0.02).abs() < 1e-4, "got {spread}");
+        // Twice the pixels, half the angle each.
+        let finer = FrameConstants::cone_spread_from(projection, 200);
+        assert!((finer - spread / 2.0).abs() < 1e-5);
     }
 
     #[test]
@@ -418,7 +463,7 @@ mod tests {
             16.0 / 9.0,
             0.05,
         );
-        let constants = FrameConstants::new(view, projection, eye, Vec3::ZERO, 0);
+        let constants = FrameConstants::new(view, projection, eye, Vec3::ZERO, 0, 0.0);
 
         // Round-trip a world point through the forward transform and back through the stored
         // inverse. Anything that transposed or reordered the matrix survives multiplication but

@@ -68,10 +68,14 @@ layout(set = 0, binding = 6, scalar) readonly buffer Lights {
     Light lights[];
 };
 
+layout(set = 0, binding = 7, scalar) readonly buffer Positions {
+    vec3 positions[];
+};
+
 // Last binding, and the only runtime-sized one: Vulkan allows a variable descriptor count only on
 // the final element of a set. Slot zero is the fallback, so a material's texture id addresses
 // `id + 1`.
-layout(set = 0, binding = 7) uniform sampler2D textures[];
+layout(set = 0, binding = 8) uniform sampler2D textures[];
 
 // Stands in for a material with no base colour texture. Declared as `NO_TEXTURE` in
 // `material_buffers.rs` too, and pinned there by a test, because a shader cannot see a Rust
@@ -86,7 +90,7 @@ layout(push_constant) uniform Frame {
     vec3 camera_position;
     uint light_count;
     vec3 ambient;
-    uint _pad;
+    float cone_spread;
 } frame;
 
 // A raytracer has no near plane — that is a rasterization artefact. This is only large enough to
@@ -108,42 +112,79 @@ const float SHADOW_BIAS = 1.5;
 //
 // Takes the pieces rather than the ray query itself so the candidate loop and the committed hit can
 // share it — they read the same values through different accessors.
-void surface_at(Geometry geom, uint primitive, vec2 bary, out vec2 uv, out vec3 normal) {
-    // `first_index` locates the run inside the shared index buffer and `first_vertex` rebases the
-    // mesh-local index values onto the shared attribute stream — the same two offsets the
-    // acceleration structure was built with.
+// The three shared-stream vertex indices of a hit triangle.
+//
+// `first_index` locates the run inside the shared index buffer and `first_vertex` rebases the
+// mesh-local index values onto the shared attribute and position streams — the same two offsets the
+// acceleration structure was built with.
+uvec3 triangle_vertices(Geometry geom, uint primitive) {
     uint triangle = geom.first_index + 3u * primitive;
-    uint i0 = geom.first_vertex + indices[triangle];
-    uint i1 = geom.first_vertex + indices[triangle + 1u];
-    uint i2 = geom.first_vertex + indices[triangle + 2u];
-
-    // Barycentrics come back as the second and third weights; the first is what is left.
-    vec3 weights = vec3(1.0 - bary.x - bary.y, bary.x, bary.y);
-    uv = attributes[i0].uv * weights.x
-       + attributes[i1].uv * weights.y
-       + attributes[i2].uv * weights.z;
-    normal = attributes[i0].normal * weights.x
-           + attributes[i1].normal * weights.y
-           + attributes[i2].normal * weights.z;
+    return uvec3(geom.first_vertex + indices[triangle],
+                 geom.first_vertex + indices[triangle + 1u],
+                 geom.first_vertex + indices[triangle + 2u]);
 }
 
-// Just the texture coordinate, for the alpha cutout — which has no use for a normal.
-vec2 surface_uv(Geometry geom, uint primitive, vec2 bary) {
-    vec2 uv;
-    vec3 normal;
-    surface_at(geom, primitive, bary, uv, normal);
-    return uv;
+// A hit's three corner weights. Barycentrics come back as the second and third; the first is what
+// is left.
+vec3 corner_weights(vec2 bary) {
+    return vec3(1.0 - bary.x - bary.y, bary.x, bary.y);
+}
+
+vec2 interpolate_uv(uvec3 verts, vec3 weights) {
+    return attributes[verts.x].uv * weights.x
+         + attributes[verts.y].uv * weights.y
+         + attributes[verts.z].uv * weights.z;
+}
+
+vec3 interpolate_normal(uvec3 verts, vec3 weights) {
+    return attributes[verts.x].normal * weights.x
+         + attributes[verts.y].normal * weights.y
+         + attributes[verts.z].normal * weights.z;
+}
+
+// Mip level for a hit, from the ray cone's footprint on the surface.
+//
+// A rasterizer takes this from screen-space derivatives, which a compute shader does not have, so
+// the level is reconstructed instead: the cone one pixel subtends has width `t * spread` at the
+// hit, spread further by the angle the surface is seen at, and the mip whose texels match that
+// width is the one to sample. Without it every surface samples mip zero, and anything dense or
+// grazing turns to static.
+//
+// This is Akenine-Möller's ray-cone method, minus the curvature term, which needs a second
+// derivative the primary ray has no cheap way to get.
+float cone_lod(uvec3 verts, mat4x3 to_world, vec3 direction, vec3 world_normal, float t,
+               uint texture_slot) {
+    // World space throughout. The footprint below is a world-space length, so an object-space area
+    // here would be wrong by the instance's scale — silently, and only for scaled instances.
+    vec3 p0 = to_world * vec4(positions[verts.x], 1.0);
+    vec3 p1 = to_world * vec4(positions[verts.y], 1.0);
+    vec3 p2 = to_world * vec4(positions[verts.z], 1.0);
+    float world_area = length(cross(p1 - p0, p2 - p0));
+    vec2 t0 = attributes[verts.x].uv;
+    vec2 t1 = attributes[verts.y].uv;
+    vec2 t2 = attributes[verts.z].uv;
+    float uv_area = abs((t1.x - t0.x) * (t2.y - t0.y) - (t2.x - t0.x) * (t1.y - t0.y));
+    if (world_area <= 0.0 || uv_area <= 0.0) {
+        return 0.0;
+    }
+
+    // How much of the texture one world unit covers, in texels.
+    vec2 size = vec2(textureSize(textures[nonuniformEXT(texture_slot)], 0));
+    float texels_per_unit = sqrt(uv_area / world_area) * max(size.x, size.y);
+
+    // Cone footprint, widened as the surface tilts away: at grazing incidence a pixel covers far
+    // more surface, which is exactly where the aliasing is worst.
+    float footprint = t * frame.cone_spread / max(abs(dot(world_normal, direction)), 0.02);
+    return max(0.0, log2(footprint * texels_per_unit));
 }
 
 // The material's base colour texel at `uv`.
 //
 // Slot zero of the array is the fallback, so a material's texture id addresses `id + 1`.
 // `nonuniformEXT` because neighbouring rays in a warp land on different materials, and an index
-// that varies across the warp is undefined without it. Explicit level rather than `texture()`:
-// implicit LOD needs screen-space derivatives, which a compute shader does not have — level zero
-// aliases at distance, and the real fix is ray differentials carrying the pixel footprint.
-vec4 base_colour(Material material, vec2 uv) {
-    return textureLod(textures[nonuniformEXT(material.base_colour + 1u)], uv, 0.0);
+// that varies across the warp is undefined without it.
+vec4 base_colour(Material material, vec2 uv, float lod) {
+    return textureLod(textures[nonuniformEXT(material.base_colour + 1u)], uv, lod);
 }
 
 // Whether a candidate intersection survives its material's alpha cutout.
@@ -156,7 +197,12 @@ bool alpha_passes(uint slot, uint primitive, vec2 bary) {
     if (material.alpha_cutoff <= 0.0 || material.base_colour == NO_TEXTURE) {
         return true;
     }
-    float alpha = base_colour(material, surface_uv(geom, primitive, bary)).a;
+    // Only the texture coordinate: this runs per non-opaque candidate, which is the busiest of
+    // the three paths, and a normal it would discard costs three more buffer reads each time.
+    vec2 uv = interpolate_uv(triangle_vertices(geom, primitive), corner_weights(bary));
+    // Level zero for the cutout: a mip average blurs a leaf's edge into partial alpha, and the
+    // test would then keep or drop texels the artist put there as fully one or the other.
+    float alpha = base_colour(material, uv, 0.0).a;
     return alpha >= material.alpha_cutoff;
 }
 
@@ -270,25 +316,29 @@ void main() {
                   + rayQueryGetIntersectionGeometryIndexEXT(query, true);
         Geometry geom = geometries[slot];
         Material material = materials[geom.material];
-        vec2 uv;
-        vec3 object_normal;
-        surface_at(geom,
-                   rayQueryGetIntersectionPrimitiveIndexEXT(query, true),
-                   rayQueryGetIntersectionBarycentricsEXT(query, true),
-                   uv, object_normal);
+        uint primitive = rayQueryGetIntersectionPrimitiveIndexEXT(query, true);
+        float hit_t = rayQueryGetIntersectionTEXT(query, true);
+        // Fetched once and shared: the texture level needs the same three vertices the shading
+        // attributes come from.
+        uvec3 verts = triangle_vertices(geom, primitive);
 
-        vec3 albedo = material.diffuse;
-        if (material.base_colour != NO_TEXTURE) {
-            albedo *= base_colour(material, uv).rgb;
-        }
+        vec3 weights = corner_weights(rayQueryGetIntersectionBarycentricsEXT(query, true));
+        vec2 uv = interpolate_uv(verts, weights);
+        vec3 object_normal = interpolate_normal(verts, weights);
 
         // The normal is interpolated in object space, so it needs the instance's own transform.
         // Morrowind scales uniformly, which is why the plain matrix works here — a non-uniform
         // scale would need the inverse transpose instead.
         mat4x3 to_world = rayQueryGetIntersectionObjectToWorldEXT(query, true);
         vec3 world_normal = normalize(mat3(to_world) * object_normal);
-        vec3 position = frame.camera_position
-                      + direction * rayQueryGetIntersectionTEXT(query, true);
+        vec3 position = frame.camera_position + direction * hit_t;
+
+        vec3 albedo = material.diffuse;
+        if (material.base_colour != NO_TEXTURE) {
+            float lod = cone_lod(verts, to_world, direction, world_normal, hit_t,
+                                 material.base_colour + 1u);
+            albedo *= base_colour(material, uv, lod).rgb;
+        }
 
         // Ambient stands in for every bounce there is no path tracer for yet.
         colour = albedo * frame.ambient;

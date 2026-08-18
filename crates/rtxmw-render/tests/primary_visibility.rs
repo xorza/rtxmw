@@ -724,6 +724,60 @@ fn a_shadow_edge_is_soft_rather_than_binary() {
 }
 
 #[test]
+fn an_unoccluded_lit_wall_is_smooth() {
+    // Nothing can block this wall, so visibility is 1.0 everywhere and the only variation should be
+    // the falloff. Speckle here would mean shadow rays hitting the surface they started on.
+    let meshes = [wall(200.0, -150.0..150.0, -150.0..150.0)];
+    let materials = [Material::default()];
+    let instances = [Instance {
+        mesh: MeshId(0),
+        transform: Affine3A::IDENTITY,
+    }];
+    let light = Light {
+        position: Vec3::new(100.0, 0.0, 0.0),
+        colour: Vec3::ONE,
+        radius: 300.0,
+    };
+    let pixels = trace_lit(
+        &meshes,
+        &materials,
+        &[],
+        std::slice::from_ref(&light),
+        Vec3::ZERO,
+        &instances,
+        Vec3::ZERO,
+        Vec3::X,
+    );
+
+    // Neighbour-to-neighbour brightness jumps along the centre row. A smooth falloff changes by a
+    // few units per pixel; self-occlusion makes it jump by the full lit value at random pixels.
+    let sum = |p: &[u8]| p[0] as i32 + p[1] as i32 + p[2] as i32;
+    let mut worst = 0;
+    let mut jumps = 0;
+    let mut prev: Option<i32> = None;
+    for x in 0..WIDTH {
+        let p = at(&pixels, x, HEIGHT / 2);
+        if !is_hit(p) {
+            continue;
+        }
+        let v = sum(p);
+        if let Some(q) = prev {
+            let d = (v - q).abs();
+            worst = worst.max(d);
+            if d > 20 {
+                jumps += 1;
+            }
+        }
+        prev = Some(v);
+    }
+    println!("centre row: worst neighbour jump {worst}, {jumps} jumps over 20");
+    assert!(
+        jumps == 0,
+        "{jumps} discontinuities on an unoccludable surface"
+    );
+}
+
+#[test]
 fn a_real_interior_traces_to_a_recognisable_image() {
     let Some(cell) = LoadedCell::load_interior(CELL).expect("cell should load") else {
         eprintln!("skipping: {DATA_DIR_VAR} is not configured (set it, or add it to .env)");
