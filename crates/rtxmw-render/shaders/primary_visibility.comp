@@ -189,16 +189,26 @@ const float WATER_F0 = 0.02;
 
 // Extinction per world unit, per channel — how fast water swallows light along a path through it.
 //
-// Coastal rather than open-ocean values: dissolved organic matter absorbs blue hardest and lets
-// green through furthest, which is *why* Vvardenfell's shallows read green while a deep ocean reads
-// blue. Quoted in the literature per metre — here 0.45, 0.10 and 0.16 — and divided by the game's
-// 69.99 units to the metre. Provisional in the way `INTENSITY` is: the shape is physical, the
-// magnitude is a coastal water type picked by eye.
-const vec3 WATER_EXTINCTION = vec3(0.00643, 0.001429, 0.002286);
+// Red goes first and the rest goes slowly: every water absorbs red within a metre or two, which is
+// the one thing about water's colour that is not a matter of taste. Green and blue are held close
+// together here and both low, which is what keeps the water clear and only faintly tinted rather
+// than a coloured filter over the seabed. Quoted per metre — 0.32, 0.05 and 0.08 — and divided by
+// the game's 69.99 units to the metre.
+const vec3 WATER_EXTINCTION = vec3(0.004572, 0.000714, 0.001143);
 
-// The fraction of extinction that was scattering rather than absorption, which is the part the
-// water gives back as its own glow instead of swallowing.
-const vec3 WATER_SCATTER = vec3(0.06, 0.32, 0.28);
+// The single-scattering albedo: the fraction of extinction that was scattering rather than
+// absorption, and so the part the water hands back as its own colour instead of swallowing.
+//
+// **This is what decides whether deep water is dark.** Absorption takes light out of the scene;
+// scattering returns it, and a channel whose scattering albedo approaches one settles at a bright
+// colour however deep it gets — a milky sheet rather than a channel. Clear tropical water really
+// does behave that way, because molecular scattering dominates its blue. A tannin-stained coastal
+// swamp does not: dissolved matter absorbs far more than the water scatters, so it stays
+// transparent close in and goes dark where the bottom falls away.
+//
+// Provisional in the way `INTENSITY` is — the shape is physical, the magnitudes are a water type
+// chosen by eye, and §5.1 could move them.
+const vec3 WATER_SCATTER = vec3(0.012, 0.042, 0.040);
 
 // Waves, as a sum of trochoidal components: `xy` is the direction they travel, `z` the wavelength
 // in world units, `w` the amplitude.
@@ -578,6 +588,21 @@ float caustic(vec2 p, float depth, float time, float footprint) {
     return min(1.0 / max(abs(determinant), 1.0 / CAUSTIC_MAX), CAUSTIC_MAX);
 }
 
+// How much of the sky's own light survives the trip down to a point.
+//
+// **The sun was attenuated on its way down and the sky was not.** An underwater surface was being
+// lit by a full-strength sky alongside a dimmed sun — brighter than either would allow and
+// inconsistent between them, which is most of why the water read as clearer from above than from
+// within it. Outdoors the sky is the larger of the two terms, so this is the one that decides how
+// dark it gets down there.
+vec3 daylight_reaching(vec3 position) {
+    float depth = frame.water_level - position.z;
+    if (!(depth > 0.0)) {
+        return vec3(1.0);
+    }
+    return exp(-WATER_EXTINCTION * depth);
+}
+
 // What the sun's light has left, and how it is gathered, by the time it reaches a point under water.
 //
 // Two things happen on the way down and neither was modelled before: the water absorbs along the
@@ -836,7 +861,8 @@ vec3 water_ray(vec3 origin, vec3 direction, float footprint, float lobe, uvec2 p
     if (!hit.hit) {
         return sky_seen_through(direction, lobe);
     }
-    return shade(hit, frame.ambient, pixel, salt, BOUNCE_SHADOW_SAMPLES);
+    return shade(hit, frame.ambient * daylight_reaching(hit.position), pixel, salt,
+                 BOUNCE_SHADOW_SAMPLES);
 }
 
 // The surface normal at a point, from the gradient of the wave height field.
@@ -873,7 +899,13 @@ vec3 water_normal(vec2 p, float time, float footprint, out float unresolved) {
 // partly returns as its own colour, which is why a deep channel is not simply darker but bluer.
 vec3 absorbed_by_water(vec3 radiance, float path) {
     vec3 transmittance = exp(-WATER_EXTINCTION * path);
-    return radiance * transmittance + WATER_SCATTER * (1.0 - transmittance) * frame.ambient;
+    // **Light that scatters toward the eye had to get down there first.** Attenuating only the way
+    // back — `1 - T` — lets deep water asymptote to the scattering colour at full sky brightness,
+    // which is the milky sheet a real channel is not. Integrating both legs along the path turns
+    // that into `(1 - T^2) / 2`: the same answer in the shallows, half as bright where it settles,
+    // and markedly less red, because squaring the transmittance costs red twice over.
+    vec3 in_scattered = (1.0 - transmittance * transmittance) * 0.5;
+    return radiance * transmittance + WATER_SCATTER * in_scattered * frame.ambient;
 }
 
 // Radiance leaving a water surface toward whatever traced it.
@@ -966,8 +998,12 @@ vec3 water_shade(Surface surface, vec3 incident, uvec2 pixel) {
 // flat `albedo * ambient` fill the original engine applied unconditionally. With rays, geometry
 // occludes that fill where it should and replaces it with what the surroundings actually reflect.
 vec3 gather_indirect(Surface surface, uvec2 pixel) {
+    // The sky as it arrives here rather than as it leaves the clouds, which under water is less of
+    // it. Taken at the shading point for every ray of the gather: a bounce escaping from three
+    // metres down has had to climb the same three metres.
+    vec3 ambient = frame.ambient * daylight_reaching(surface.position);
     if (frame.bounce_samples == 0u) {
-        return frame.ambient;
+        return ambient;
     }
     vec3 origin = surface.position + surface.normal * SHADOW_BIAS;
     vec3 total = vec3(0.0);
@@ -980,13 +1016,13 @@ vec3 gather_indirect(Surface surface, uvec2 pixel) {
         // sky reflected off it or the ground through it — both far closer to the ambient this
         // terminates with than to nothing at all.
         if (!bounce.hit || bounce.water) {
-            total += frame.ambient;
+            total += ambient;
             continue;
         }
         // Terminated with a flat ambient rather than a second bounce: the next order is ambient
         // against an albedo below one against a cosine, so it lands under a tenth of this one, and
         // the traversal it costs buys nothing visible.
-        total += shade(bounce, frame.ambient, pixel, STREAM_INDIRECT + b, BOUNCE_SHADOW_SAMPLES);
+        total += shade(bounce, ambient, pixel, STREAM_INDIRECT + b, BOUNCE_SHADOW_SAMPLES);
     }
     return total / float(frame.bounce_samples);
 }

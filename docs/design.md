@@ -1602,6 +1602,36 @@ how Cox and Munk measured sea roughness from photographs in 1954. The disc is wi
 and dimmed by the same factor, so a rougher sea spreads the sun without adding any light to the
 scene.
 
+**Deep water was a milky sheet, and the cause was the scattering albedo rather than the colour.**
+Absorption takes light out of the scene; scattering hands it back, so a channel whose scattering
+albedo approaches one settles at a bright colour however deep it gets. Clear tropical water really
+does behave that way — molecular scattering dominates its blue — but a tannin-stained coastal swamp
+does not, and Vvardenfell is the second. Halving the albedo is what makes the deep go dark while
+lowering the extinction keeps the shallows transparent: the two complaints pull on different terms.
+
+The in-scattering integral was wrong as well, in the direction that made it worse. Light scattered
+toward the eye had to reach the point it scattered from, and only the return leg was being
+attenuated. Integrating both replaces `1 - T` with `(1 - T^2) / 2`: identical in the shallows, half
+as bright where it settles, and markedly less red, because squaring the transmittance costs red
+twice over.
+
+**The sun was attenuated on its way down and the sky was not.** An underwater surface was lit by a
+dimmed sun alongside a full-strength sky — brighter than either would allow, inconsistent between
+them, and flat with depth, since the larger of the two terms outdoors did not know how deep it was.
+It is the same `exp(-sigma * depth)` now for both.
+
+That was found by measuring an invariant rather than by looking: the same column of water seen from
+ten units above the surface and ten below has to agree, because the only difference is those twenty
+units. It does, to 3%. At a *slant* the two legitimately differ by 11% and the reason is refraction —
+entering at 53 degrees a ray is bent to 37 and reaches a floor 200 units down in 250 units of water,
+where the same look from below costs 317. **Water really is clearer from a boat than from under it**,
+and that asymmetry is now pinned by a test rather than mistaken for a bug.
+
+The extinction and scattering coefficients are art direction resting on physics, and were tuned by
+eye across several passes. The tests derive every expectation from a single `EXTINCTION` constant so
+that a tuning pass is one line rather than five pieces of arithmetic that quietly stop describing the
+shader.
+
 **M10 is done.** Standing on Seyda Neen's shore: the seabed is visible through moving water, the
 surface reflects the sky and the coast, caustics play on the bottom, and the frame is inside §5.3.
 **No absolute frame rate from this machine is worth quoting.** Measurements across the session

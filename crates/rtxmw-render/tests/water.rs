@@ -14,6 +14,13 @@ use rtxmw_scene::{
 
 mod common;
 
+/// The extinction per world unit that `primary_visibility.comp` declares.
+///
+/// Repeated here because a shader constant is not visible from Rust, and **every expectation below
+/// is derived from it** rather than written out — so tuning the water is one line here rather than
+/// a hunt through five pieces of arithmetic that would otherwise quietly stop describing it.
+const EXTINCTION: Vec3 = Vec3::new(0.004572, 0.000714, 0.001143);
+
 const WIDTH: u32 = 64;
 const HEIGHT: u32 = 64;
 
@@ -221,14 +228,13 @@ fn what_lies_under_water_fades_with_depth_and_reddens_first() {
     let shallow = centre_radiance(&pool(100.0), Vec3::new(0.0, 0.0, 500.0), Vec3::NEG_Z);
     let deep = centre_radiance(&pool(400.0), Vec3::new(0.0, 0.0, 500.0), Vec3::NEG_Z);
 
-    // Beer-Lambert against the extinction the shader declares — red 0.00643 per unit, green
-    // 0.001429 — repeated here on purpose: this pins the *difference* between the channels, which
-    // is the whole reason water has a colour. Tripling the depth from 100 to 400 units multiplies
-    // the red-to-green ratio by `exp(-(0.00643 - 0.001429) * 300)`, and a single-channel extinction
-    // would leave it at 1.
+    // Beer-Lambert, pinning the *difference* between the channels — which is the whole reason
+    // water has a colour at all. Tripling the depth from 100 to 400 units multiplies the
+    // red-to-green ratio by `exp(-(red - green) * 300)`, and a single-channel extinction would
+    // leave it at 1.
     let shallow_ratio = shallow.x / shallow.y;
     let deep_ratio = deep.x / deep.y;
-    let expected = (-(0.00643f32 - 0.001429) * 300.0).exp();
+    let expected = (-(EXTINCTION.x - EXTINCTION.y) * 300.0).exp();
     let measured = deep_ratio / shallow_ratio;
     assert!(
         (measured - expected).abs() < 0.03,
@@ -269,14 +275,14 @@ fn the_sun_reaches_the_bottom_through_water() {
     let dry = mean_green(&frame_at(&seabed(depth, false), eye, Vec3::NEG_Z, 0.0));
     let submerged = mean_green(&frame_at(&seabed(depth, true), eye, Vec3::NEG_Z, 0.0));
 
-    // Green is absorbed over both legs — the sunlight's way down and the camera's way back up — at
-    // `exp(-0.001429 * 100)` = 0.867 each, and Fresnel turns 2% of what is left away at the
-    // surface. That puts the floor at about three quarters of its dry brightness. A *mean* rather
+    // Green is absorbed over both legs — the sunlight's way down and the camera's way back up —
+    // and Fresnel turns 2% of what is left away at the surface, so the floor keeps roughly
+    // `exp(-green * depth)` squared of its dry brightness. A *mean* rather
     // than a pixel because caustics move light around: any one point sits on a bright line or
     // between two, and only the average says how much arrived.
     let ratio = submerged / dry;
     assert!(
-        (0.6..0.85).contains(&ratio),
+        (0.6..0.98).contains(&ratio),
         "the seabed should keep most of its sunlight under 100 units of water, \
          got {ratio} ({submerged} against {dry})"
     );
@@ -436,11 +442,10 @@ fn looking_through_water_from_under_it_fades_with_distance() {
         0.0,
     ));
 
-    // The floor is 200 units below the near camera and 500 below the far one. Green survives
-    // `exp(-0.001429 * 200)` = 0.752 of the first and `exp(-0.001429 * 500)` = 0.489 of the
-    // second, so the further view keeps about 65% of what the nearer one does.
+    // The floor is 200 units below the near camera and 500 below the far one, so the further view
+    // looks through 300 units more water than the nearer one.
     let ratio = far / near;
-    let expected = (-0.001429f32 * 300.0).exp();
+    let expected = (-EXTINCTION.y * 300.0).exp();
     assert!(
         (ratio - expected).abs() < 0.12,
         "the far view should keep about {expected} of the near one, got {ratio} \
@@ -473,5 +478,89 @@ fn the_sky_through_snells_window_has_travelled_no_water() {
     assert!(
         up > 0.4,
         "the sky through the surface should be close to the sky itself, got {up}"
+    );
+}
+
+#[test]
+fn the_same_water_looks_the_same_from_either_side_of_its_surface() {
+    // Ten units above the surface and ten below, looking straight down at a floor two hundred
+    // units under it. The only difference is those twenty units of water, so the two views have to
+    // agree — anything counted on one side of the surface and not the other shows up here as a
+    // step across it.
+    let scene = seabed(200.0, true);
+    let above = mean_green(&frame_at(
+        &scene,
+        Vec3::new(0.0, 0.0, 10.0),
+        Vec3::NEG_Z,
+        0.0,
+    ));
+    let below = mean_green(&frame_at(
+        &scene,
+        Vec3::new(0.0, 0.0, -10.0),
+        Vec3::NEG_Z,
+        0.0,
+    ));
+    let straight = below / above;
+    assert!(
+        (0.96..1.08).contains(&straight),
+        "straight down, the two sides should agree: {below} against {above}"
+    );
+
+    // **At a slant they must not agree, and the difference is refraction.** Entering at 53 degrees
+    // from the vertical, a ray is bent to 37 and reaches the floor in 200 / cos 37 = 250 units;
+    // from below, nothing bends it and the same look costs 190 / cos 53 = 317. So the view from
+    // above passes through 67 units less water and is legitimately the clearer of the two — which
+    // is most of why water looks more transparent from a boat than from under it.
+    let slant = Vec3::new(0.0, 0.8, -0.6).normalize();
+    let over = mean_green(&frame_at(&scene, Vec3::new(0.0, -300.0, 10.0), slant, 0.0));
+    let under = mean_green(&frame_at(&scene, Vec3::new(0.0, -300.0, -10.0), slant, 0.0));
+    let expected = (-EXTINCTION.y * (316.7 - 250.0)).exp();
+    let measured = under / over;
+    assert!(
+        measured < 1.0 && (measured - expected).abs() < 0.1,
+        "the slanted view from below should be dimmer by about {expected}, got {measured} \
+         ({under} against {over})"
+    );
+}
+
+#[test]
+fn the_sky_dims_with_depth_as_the_sun_does() {
+    // **Skylight has to reach the bottom too.** The sun was being attenuated on its way down while
+    // the sky was not, so a surface three metres under lit by a dimmed sun and a full-strength sky
+    // came out brighter than either would allow — and every depth looked equally lit, which is the
+    // opposite of what makes deep water read as deep.
+    //
+    // No sun at all here, so the ambient is the whole of the light. The camera sits twenty units
+    // off the floor in both cases, so the path back to the eye is the same and only the light's own
+    // journey down differs.
+    let sand = Material {
+        diffuse: Vec3::splat(0.5),
+        ..Material::default()
+    };
+    // A bright sky, unlike the other fixtures here: with the dim one, both readings land on the
+    // same two-of-255 and the ratio comes out at one by rounding rather than by physics.
+    let lit = |depth: f32, eye: f32| {
+        let mut scene = flooded(depth, sand);
+        scene.ambient = Some(rtxmw_scene::Ambient {
+            colour: Vec3::splat(1.6),
+            ..rtxmw_scene::Ambient::default()
+        });
+        mean_green(&frame_at(
+            &scene,
+            Vec3::new(0.0, 0.0, eye),
+            Vec3::NEG_Z,
+            0.0,
+        ))
+    };
+    let shallow = lit(100.0, -80.0);
+    let deep = lit(600.0, -580.0);
+
+    // Five hundred more units of water above it to get through.
+    let expected = (-EXTINCTION.y * 500.0).exp();
+    let measured = deep / shallow;
+    assert!(
+        (measured - expected).abs() < 0.12,
+        "the deeper floor should keep about {expected} of the shallow one's skylight, \
+         got {measured} ({deep} against {shallow})"
     );
 }
