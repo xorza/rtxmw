@@ -40,6 +40,13 @@ pub struct Buffer {
 }
 
 impl Buffer {
+    /// Smallest buffer this will create.
+    ///
+    /// Vulkan rejects a zero-sized buffer, but a scene with no geometry — or no materials — still
+    /// needs valid handles to bind, so callers clamp an empty payload up to this rather than
+    /// special-casing the descriptor.
+    pub const MIN_SIZE: vk::DeviceSize = 4;
+
     /// Creates a buffer of `size` bytes and binds memory to it.
     ///
     /// `name` appears in allocator diagnostics and in the panic message when the size is zero.

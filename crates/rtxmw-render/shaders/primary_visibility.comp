@@ -1,5 +1,6 @@
 #version 460
 #extension GL_EXT_ray_query : require
+#extension GL_EXT_scalar_block_layout : require
 
 // Primary visibility by inline ray query.
 //
@@ -12,6 +13,34 @@ layout(local_size_x = 8, local_size_y = 8) in;
 
 layout(set = 0, binding = 0) uniform accelerationStructureEXT scene;
 layout(set = 0, binding = 1, rgba16f) uniform writeonly image2D target;
+
+// One entry per acceleration structure geometry, addressed by the two halves a hit reports.
+struct Geometry {
+    uint first_index;
+    uint first_vertex;
+    uint material;
+    uint padding;
+};
+
+struct Material {
+    vec3 diffuse;
+    float opacity;
+    vec3 emissive;
+    float alpha_cutoff;
+    uint base_colour;
+    uint padding0;
+    uint padding1;
+    uint padding2;
+};
+
+// Scalar layout so these match the host structs field for field. Under the default std430 rules a
+// `vec3` would be padded to sixteen bytes and every entry after the first would be misread.
+layout(set = 0, binding = 2, scalar) readonly buffer Geometries {
+    Geometry geometries[];
+};
+layout(set = 0, binding = 3, scalar) readonly buffer Materials {
+    Material materials[];
+};
 
 // 80 bytes. Vulkan only guarantees 128 bytes of push constants, so sending separate inverse view
 // and projection matrices (144 with the camera) would work on this GPU and fail the guarantee.
@@ -54,11 +83,27 @@ void main() {
     while (rayQueryProceedEXT(query)) {}
 
     vec3 colour = vec3(0.05, 0.07, 0.10);
+    // Alpha carries whether anything was hit at all. Inferring it from the colour worked while the
+    // output was barycentric and every hit was bright, but a material can legitimately be dark —
+    // so the flag is written rather than guessed at.
+    float hit = 0.0;
     if (rayQueryGetIntersectionTypeEXT(query, true) != gl_RayQueryCommittedIntersectionNoneEXT) {
-        // False colour by barycentrics until materials exist: it shows triangle layout directly,
-        // so a desynced index buffer or a mirrored transform is visible rather than merely dark.
-        vec2 bary = rayQueryGetIntersectionBarycentricsEXT(query, true);
-        colour = vec3(1.0 - bary.x - bary.y, bary.x, bary.y);
+        hit = 1.0;
+        // The custom index is where this instance's mesh starts in the flat geometry table, and the
+        // geometry index is which of its runs was hit. Their sum is the entry, with no indirection.
+        uint slot = rayQueryGetIntersectionInstanceCustomIndexEXT(query, true)
+                  + rayQueryGetIntersectionGeometryIndexEXT(query, true);
+        uint id = geometries[slot].material;
+        Material material = materials[id];
+
+        // False colour by material until textures exist. Hashing the index rather than showing the
+        // diffuse colour is deliberate: vanilla materials are almost all white, so a diffuse view
+        // would be a blank image whether or not the lookup worked.
+        vec3 tint = vec3(float((id * 37u) % 255u), float((id * 91u) % 255u),
+                         float((id * 151u) % 255u)) / 255.0;
+        // Modulated by the material's own diffuse so both tables are genuinely read: a misaligned
+        // material buffer shows up as wrong colour rather than being optimised away unnoticed.
+        colour = max(tint, vec3(0.08)) * material.diffuse;
     }
-    imageStore(target, pixel, vec4(colour, 1.0));
+    imageStore(target, pixel, vec4(colour, hit));
 }

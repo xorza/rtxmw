@@ -26,18 +26,40 @@ pub struct VertexAttributes {
 /// mesh's index data does not depend on where in the buffer it landed, which is what keeps meshes
 /// relocatable once cells start streaming.
 ///
-/// Host-side only. The per-geometry struct a hit shader reads is `GeometryRef` at M4, which carries
-/// a material alongside these offsets; nothing uploads this one, so its layout is not pinned.
+/// Host-side only. The per-geometry struct a hit shader reads is [`crate::GpuGeometry`], which
+/// carries a material alongside its offsets; nothing uploads this one, so its layout is not pinned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MeshRange {
     pub first_vertex: u32,
     pub vertex_count: u32,
     pub first_index: u32,
     pub index_count: u32,
+    /// Range into [`GeometryBuffers::submeshes`] — one entry per acceleration structure geometry.
+    pub first_submesh: u32,
+    pub submesh_count: u32,
 }
 
 impl MeshRange {
     /// Triangles in this mesh.
+    pub fn triangle_count(&self) -> u32 {
+        self.index_count / 3
+    }
+}
+
+/// One material-uniform run of a mesh, addressed against the shared index buffer.
+///
+/// The scene's [`rtxmw_scene::Submesh`] counts from the start of its own mesh; this counts from the
+/// start of the buffer every mesh was packed into, which is what a build range and a shader both
+/// want. Kept flat across all meshes so a hit can index it directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubmeshRange {
+    pub first_index: u32,
+    pub index_count: u32,
+    pub material: u32,
+}
+
+impl SubmeshRange {
+    /// Triangles in this run.
     pub fn triangle_count(&self) -> u32 {
         self.index_count / 3
     }
@@ -54,6 +76,7 @@ pub struct GeometryBuffers {
     attributes: Buffer,
     indices: Buffer,
     ranges: Vec<MeshRange>,
+    submeshes: Vec<SubmeshRange>,
 }
 
 impl GeometryBuffers {
@@ -77,14 +100,14 @@ impl GeometryBuffers {
         let positions = Buffer::new(
             memory,
             "scene positions",
-            buffer_size(position_bytes.len()),
+            (position_bytes.len() as vk::DeviceSize).max(Buffer::MIN_SIZE),
             build_input_usage(),
             BufferMemory::Device,
         )?;
         let attributes = Buffer::new(
             memory,
             "scene vertex attributes",
-            buffer_size(attribute_bytes.len()),
+            (attribute_bytes.len() as vk::DeviceSize).max(Buffer::MIN_SIZE),
             // Never read by a build, only at a hit, so no build-input usage.
             geometry_usage(),
             BufferMemory::Device,
@@ -92,7 +115,7 @@ impl GeometryBuffers {
         let indices = Buffer::new(
             memory,
             "scene indices",
-            buffer_size(index_bytes.len()),
+            (index_bytes.len() as vk::DeviceSize).max(Buffer::MIN_SIZE),
             build_input_usage(),
             BufferMemory::Device,
         )?;
@@ -106,6 +129,7 @@ impl GeometryBuffers {
             attributes,
             indices,
             ranges: packed.ranges,
+            submeshes: packed.submeshes,
         })
     }
 
@@ -127,6 +151,20 @@ impl GeometryBuffers {
     /// Where each mesh sits, in the order the meshes were given.
     pub fn ranges(&self) -> &[MeshRange] {
         &self.ranges
+    }
+
+    /// The runs belonging to one mesh.
+    pub fn submeshes_of(&self, range: &MeshRange) -> &[SubmeshRange] {
+        let start = range.first_submesh as usize;
+        &self.submeshes[start..start + range.submesh_count as usize]
+    }
+
+    /// Every material-uniform run across every mesh, in mesh order.
+    ///
+    /// One acceleration structure geometry is built per entry, so a hit's `geometry_index` added to
+    /// its mesh's `first_submesh` lands back here — which is how a surface finds its material.
+    pub fn submeshes(&self) -> &[SubmeshRange] {
+        &self.submeshes
     }
 
     /// Vertices across every mesh.
@@ -165,11 +203,6 @@ fn build_input_usage() -> vk::BufferUsageFlags {
     geometry_usage() | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR
 }
 
-/// Vulkan rejects a zero-sized buffer, and a cell with no geometry still needs valid handles.
-fn buffer_size(bytes: usize) -> vk::DeviceSize {
-    bytes.max(4) as vk::DeviceSize
-}
-
 /// The host-side streams, before they become buffers.
 #[derive(Debug)]
 struct Packed {
@@ -177,6 +210,7 @@ struct Packed {
     attributes: Vec<VertexAttributes>,
     indices: Vec<u32>,
     ranges: Vec<MeshRange>,
+    submeshes: Vec<SubmeshRange>,
 }
 
 /// Concatenates every mesh into the three parallel streams, recording where each landed.
@@ -188,6 +222,7 @@ fn pack(meshes: &[Mesh]) -> Packed {
     let mut attributes = Vec::with_capacity(vertices);
     let mut indices = Vec::with_capacity(index_total);
     let mut ranges = Vec::with_capacity(meshes.len());
+    let mut submeshes = Vec::with_capacity(meshes.iter().map(|m| m.submeshes.len()).sum());
 
     for mesh in meshes {
         debug_assert_eq!(
@@ -201,12 +236,22 @@ fn pack(meshes: &[Mesh]) -> Packed {
             "flattening should leave UVs parallel to positions"
         );
 
+        let first_index = indices.len() as u32;
         ranges.push(MeshRange {
             first_vertex: positions.len() as u32,
             vertex_count: mesh.positions.len() as u32,
-            first_index: indices.len() as u32,
+            first_index,
             index_count: mesh.indices.len() as u32,
+            first_submesh: submeshes.len() as u32,
+            submesh_count: mesh.submeshes.len() as u32,
         });
+        // Rebased onto the shared buffer. The scene counts a submesh from the start of its own
+        // mesh, which is the right thing there and the wrong thing for a build range.
+        submeshes.extend(mesh.submeshes.iter().map(|sub| SubmeshRange {
+            first_index: first_index + sub.first_index,
+            index_count: sub.index_count,
+            material: sub.material,
+        }));
 
         positions.extend(mesh.positions.iter().map(|p| p.to_array()));
         attributes.extend(mesh.normals.iter().zip(&mesh.uvs).map(|(normal, uv)| {
@@ -223,6 +268,7 @@ fn pack(meshes: &[Mesh]) -> Packed {
         attributes,
         indices,
         ranges,
+        submeshes,
     }
 }
 
@@ -239,11 +285,17 @@ mod tests {
             normals: (0..vertices).map(|i| Vec3::X * i as f32).collect(),
             uvs: (0..vertices).map(|i| Vec2::splat(i as f32 * 0.5)).collect(),
             indices: indices.to_vec(),
-            submeshes: vec![Submesh {
-                first_index: 0,
-                index_count: indices.len() as u32,
-                material: 0,
-            }],
+            // Empty in, empty out: flattening only opens a run when a block contributes triangles,
+            // so a mesh with no geometry has no submeshes rather than one covering nothing.
+            submeshes: if indices.is_empty() {
+                Vec::new()
+            } else {
+                vec![Submesh {
+                    first_index: 0,
+                    index_count: indices.len() as u32,
+                    material: 0,
+                }]
+            },
         }
     }
 
@@ -256,6 +308,7 @@ mod tests {
             attributes,
             indices,
             ranges,
+            submeshes,
         } = pack(&meshes);
 
         assert_eq!(
@@ -266,12 +319,16 @@ mod tests {
                     vertex_count: 3,
                     first_index: 0,
                     index_count: 3,
+                    first_submesh: 0,
+                    submesh_count: 1,
                 },
                 MeshRange {
                     first_vertex: 3,
                     vertex_count: 4,
                     first_index: 3,
                     index_count: 6,
+                    first_submesh: 1,
+                    submesh_count: 1,
                 },
             ]
         );
@@ -283,6 +340,23 @@ mod tests {
         // The second mesh starts at vertex 3, but its indices are unchanged — 0..3, not 3..6. A
         // rebased buffer would read the first mesh's vertices instead.
         assert_eq!(&indices[3..], &[0, 1, 2, 1, 2, 3]);
+        // Submesh offsets, unlike the indices, *are* rebased onto the shared buffer — a build range
+        // addresses the whole buffer, so the second mesh's run starts at 3 rather than 0.
+        assert_eq!(
+            submeshes,
+            vec![
+                SubmeshRange {
+                    first_index: 0,
+                    index_count: 3,
+                    material: 0
+                },
+                SubmeshRange {
+                    first_index: 3,
+                    index_count: 6,
+                    material: 0
+                },
+            ]
+        );
         // Its vertices did move, so position 3 is the second mesh's vertex 0.
         assert_eq!(positions[3], [0.0, 0.0, 0.0]);
         assert_eq!(positions[6], [3.0, 3.0, 3.0]);
@@ -321,6 +395,8 @@ mod tests {
                 vertex_count: 0,
                 first_index: 3,
                 index_count: 0,
+                first_submesh: 1,
+                submesh_count: 0,
             }
         );
         assert_eq!(ranges[2].first_vertex, 3);

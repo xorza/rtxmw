@@ -56,12 +56,16 @@ fn every_uploaded_stream_reads_back_byte_for_byte() {
                 vertex_count: 3,
                 first_index: 0,
                 index_count: 3,
+                first_submesh: 0,
+                submesh_count: 1,
             },
             MeshRange {
                 first_vertex: 3,
                 vertex_count: 4,
                 first_index: 3,
                 index_count: 6,
+                first_submesh: 1,
+                submesh_count: 1,
             },
         ]
     );

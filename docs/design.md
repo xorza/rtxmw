@@ -480,6 +480,27 @@ So the upload needs a fallback texture rather than treating a miss as fatal, and
 asserts a *rate* (under 2%) instead of perfection — a broken path fixup pushes it far past that,
 which is what the assertion is really for.
 
+**M4b (device half) — done**, minus the texture array. One acceleration structure geometry per
+submesh, a flat `GpuGeometry` table and a `GpuMaterial` table, and a shader that resolves a hit to
+its material. The interior renders with surfaces coloured by material identity.
+
+- **`instance_custom_index` carries the mesh's `first_submesh`,** not the mesh index. A hit adds its
+  own `geometry_index` and lands directly on the geometry entry — one indexed read, no per-mesh
+  indirection to chase first. That is the whole reason the submesh table is flat.
+- **Geometry opacity now follows the material.** `OPAQUE` lets traversal commit without invoking a
+  shader, which is right for a wall and catastrophic for a grate; the flag is decided per submesh
+  from its `AlphaMode` rather than set once for everything.
+- **The shader declares `scalar` block layout.** Under default std430 a `vec3` pads to sixteen bytes
+  and every table entry after the first is misread — the kind of failure that renders as plausible
+  nonsense.
+- **Alpha carries an explicit hit flag.** Tests used to infer "did this ray hit" from brightness,
+  which worked only while the output was barycentric; a material can legitimately be dark, so the
+  shader writes the flag rather than leaving it to be guessed at.
+
+The test that matters is `two_materials_in_one_mesh_shade_differently`: both halves live in the
+*same* mesh, so they share an instance and a custom index and only `geometry_index` separates them.
+Dropping that term from the shader still fills exactly the same pixels — and fails only this test.
+
 ### M5 — Direct lighting
 Sun as a directional light with a real angular diameter (so shadows are soft), shadow rays, cell
 ambient, `LIGH` point lights with shadow rays and a defensible attenuation model, emissive surfaces.

@@ -6,6 +6,7 @@ use glam::{Mat4, Vec3};
 use rtxmw_gpu::{Device, Image};
 
 use crate::acceleration_structure::AccelerationStructure;
+use crate::material_buffers::MaterialBuffers;
 use crate::shaders;
 
 /// What the shader needs to turn a pixel into a ray, as its push constant block.
@@ -83,6 +84,16 @@ impl VisibilityPass {
                 .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::COMPUTE),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(2)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(3)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
         ];
         let layout_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
         // SAFETY: `layout_info` is fully initialised and the device is alive.
@@ -95,6 +106,9 @@ impl VisibilityPass {
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::STORAGE_IMAGE)
                 .descriptor_count(1),
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(2),
         ];
         let pool_info = vk::DescriptorPoolCreateInfo::default()
             .pool_sizes(&sizes)
@@ -158,7 +172,12 @@ impl VisibilityPass {
     /// Takes `&mut self` because it rewrites the one descriptor set the pass owns, which must not
     /// happen while a dispatch using it is in flight. One set is deliberate: the scene changes per
     /// cell, not per frame.
-    pub fn bind(&mut self, scene: &AccelerationStructure, target: &Image) {
+    pub fn bind(
+        &mut self,
+        scene: &AccelerationStructure,
+        target: &Image,
+        tables: &MaterialBuffers,
+    ) {
         let structures = [scene.raw()];
         let mut acceleration = vk::WriteDescriptorSetAccelerationStructureKHR::default()
             .acceleration_structures(&structures);
@@ -181,10 +200,30 @@ impl VisibilityPass {
             .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
             .image_info(&images);
 
-        // SAFETY: both writes name this pass's own set, and no dispatch using it is in flight.
+        let geometry_info = [vk::DescriptorBufferInfo::default()
+            .buffer(tables.geometries().raw())
+            .range(vk::WHOLE_SIZE)];
+        let geometry_write = vk::WriteDescriptorSet::default()
+            .dst_set(self.set)
+            .dst_binding(2)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(&geometry_info);
+
+        let material_info = [vk::DescriptorBufferInfo::default()
+            .buffer(tables.materials().raw())
+            .range(vk::WHOLE_SIZE)];
+        let material_write = vk::WriteDescriptorSet::default()
+            .dst_set(self.set)
+            .dst_binding(3)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(&material_info);
+
+        // SAFETY: every write names this pass's own set, and no dispatch using it is in flight.
         unsafe {
-            self.device
-                .update_descriptor_sets(&[scene_write, image_write], &[])
+            self.device.update_descriptor_sets(
+                &[scene_write, image_write, geometry_write, material_write],
+                &[],
+            )
         };
     }
 

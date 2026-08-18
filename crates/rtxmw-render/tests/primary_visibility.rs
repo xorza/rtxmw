@@ -9,8 +9,10 @@ use ash::vk;
 use glam::{Affine3A, Vec2, Vec3};
 use rtxmw_esm::EsmReader;
 use rtxmw_gpu::{TestGpu, image_barrier, memory_barrier};
-use rtxmw_render::{FrameConstants, GeometryBuffers, SceneAcceleration, VisibilityPass};
-use rtxmw_scene::{Instance, Mesh, MeshId, ModelIndex, StaticScene, Submesh};
+use rtxmw_render::{
+    FrameConstants, GeometryBuffers, MaterialBuffers, SceneAcceleration, VisibilityPass,
+};
+use rtxmw_scene::{Instance, Material, Mesh, MeshId, ModelIndex, StaticScene, Submesh};
 use rtxmw_vfs::{DATA_DIR_VAR, morrowind_archives, morrowind_data_dir};
 
 const CELL: &str = "Seyda Neen, Census and Excise Office";
@@ -18,13 +20,17 @@ const WIDTH: u32 = 256;
 const HEIGHT: u32 = 256;
 const FOV_Y: f32 = 75.0;
 
-/// Whether a pixel is a barycentric hit rather than the miss colour.
+/// Whether a ray hit anything, from the flag the shader writes into alpha.
 ///
-/// Barycentrics sum to one, so a hit's channels total about 255 where the background totals 57.
-/// The gap is wide enough that half-float quantisation cannot blur the two together.
+/// Read from alpha rather than inferred from the colour: material colours can be arbitrarily dark,
+/// so brightness stopped being evidence of a hit the moment the output stopped being barycentric.
 fn is_hit(pixel: &[u8]) -> bool {
-    let total = pixel[0] as u32 + pixel[1] as u32 + pixel[2] as u32;
-    total > 150
+    pixel[3] > 128
+}
+
+/// The colour of a pixel, ignoring the hit flag.
+fn shade(pixel: &[u8]) -> [u8; 3] {
+    [pixel[0], pixel[1], pixel[2]]
 }
 
 /// An axis-aligned quad in the world's YZ plane, facing back down -X toward a camera at the origin.
@@ -49,6 +55,17 @@ fn wall(x: f32, y: std::ops::Range<f32>, z: std::ops::Range<f32>) -> Mesh {
 
 /// Traces `instances` from `eye` looking along `forward` and returns the image as 8-bit RGBA.
 fn trace(meshes: &[Mesh], instances: &[Instance], eye: Vec3, forward: Vec3) -> Vec<u8> {
+    trace_with(meshes, &[Material::default()], instances, eye, forward)
+}
+
+/// As [`trace`], with an explicit material table.
+fn trace_with(
+    meshes: &[Mesh],
+    materials: &[Material],
+    instances: &[Instance],
+    eye: Vec3,
+    forward: Vec3,
+) -> Vec<u8> {
     let gpu = TestGpu::shared();
     let mut uploader = gpu.uploader();
 
@@ -59,15 +76,19 @@ fn trace(meshes: &[Mesh], instances: &[Instance], eye: Vec3, forward: Vec3) -> V
         &mut uploader,
         gpu.physical().limits(),
         &geometry,
+        materials,
         instances,
     )
     .expect("build failed");
+
+    let tables = MaterialBuffers::upload(gpu.memory(), &mut uploader, &geometry, materials)
+        .expect("material upload failed");
 
     let target = gpu
         .create_target(WIDTH, HEIGHT, vk::Format::R16G16B16A16_SFLOAT)
         .expect("could not create target");
     let mut pass = VisibilityPass::new(gpu.device()).expect("pipeline failed");
-    pass.bind(acceleration.tlas(), target.image());
+    pass.bind(acceleration.tlas(), target.image(), &tables);
 
     let view = glam::camera::rh::view::look_to_mat4(eye, forward, Vec3::Z);
     let projection = glam::camera::rh::proj::vulkan::perspective_infinite_reverse(
@@ -189,6 +210,64 @@ fn geometry_to_the_north_appears_on_the_left_of_the_image() {
 
     assert!(left > 0, "nothing was hit at all");
     assert_eq!(right, 0, "{right} pixels hit on the right of the image");
+}
+
+#[test]
+fn two_materials_in_one_mesh_shade_differently() {
+    // The direct test of the hit-to-material chain. Both halves are in the *same* mesh, so they
+    // share an instance and a custom index — only `geometry_index` distinguishes them. If it were
+    // ignored, or the submesh table were not flat, both halves would resolve to the same entry and
+    // come back one colour while still filling exactly the same pixels.
+    let mut mesh = wall(100.0, 20.0..90.0, -40.0..40.0);
+    let south = wall(100.0, -90.0..-20.0, -40.0..40.0);
+    let base = mesh.positions.len() as u32;
+    mesh.positions.extend(south.positions);
+    mesh.normals.extend(south.normals);
+    mesh.uvs.extend(south.uvs);
+    mesh.indices.extend(south.indices.iter().map(|i| i + base));
+    mesh.submeshes.push(Submesh {
+        first_index: 6,
+        index_count: 6,
+        material: 1,
+    });
+
+    // Two materials that differ only in identity, so any colour difference is the lookup working.
+    let materials = [Material::default(), Material::default()];
+    let instances = [Instance {
+        mesh: MeshId(0),
+        transform: Affine3A::IDENTITY,
+    }];
+    let pixels = trace_with(&[mesh], &materials, &instances, Vec3::ZERO, Vec3::X);
+
+    let mut left = std::collections::HashSet::new();
+    let mut right = std::collections::HashSet::new();
+    for y in 0..HEIGHT {
+        for x in 0..WIDTH {
+            let pixel = at(&pixels, x, y);
+            if is_hit(pixel) {
+                if x < WIDTH / 2 {
+                    left.insert(shade(pixel));
+                } else {
+                    right.insert(shade(pixel));
+                }
+            }
+        }
+    }
+
+    assert_eq!(
+        left.len(),
+        1,
+        "the north wall is not one material: {left:?}"
+    );
+    assert_eq!(
+        right.len(),
+        1,
+        "the south wall is not one material: {right:?}"
+    );
+    assert_ne!(
+        left, right,
+        "both submeshes resolved to the same material, so the geometry index was ignored"
+    );
 }
 
 #[test]
@@ -322,17 +401,22 @@ fn a_real_interior_traces_to_a_recognisable_image() {
         .expect("a furnished cell has geometry")
         .centre();
 
-    let pixels = trace(&scene.meshes, &scene.instances, eye, Vec3::X);
+    let pixels = trace_with(
+        &scene.meshes,
+        scene.materials.materials(),
+        &scene.instances,
+        eye,
+        Vec3::X,
+    );
     let hits = hit_count(&pixels);
     let total = (WIDTH * HEIGHT) as usize;
 
-    // "Recognisable" is really a claim about structure, so count how many distinct colours the hits
-    // came back as. Barycentrics vary continuously across a triangle, so a view of real geometry
-    // produces hundreds of shades; a single wrongly-placed triangle filling the view would produce
-    // a smooth ramp of far fewer, and a broken traversal none at all.
+    // Each distinct colour is a distinct material, so this counts how many surfaces are in view.
+    // One would mean every hit resolved to the same table entry, which is exactly what a constant
+    // geometry index or a misread custom index produces — and it would still fill the screen.
     let mut shades: std::collections::HashSet<[u8; 3]> = std::collections::HashSet::new();
     for pixel in pixels.chunks_exact(4).filter(|p| is_hit(p)) {
-        shades.insert([pixel[0], pixel[1], pixel[2]]);
+        shades.insert(shade(pixel));
     }
 
     let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("seyda_neen.png");
@@ -352,8 +436,14 @@ fn a_real_interior_traces_to_a_recognisable_image() {
         "only {hits} of {total} pixels hit from inside the room"
     );
     assert!(
-        shades.len() > 200,
-        "only {} distinct shades — the view is not resolving separate triangles",
+        shades.len() > 2,
+        "only {} distinct material colours in view — the hit is not resolving its geometry",
         shades.len()
+    );
+    assert!(
+        shades.len() <= scene.materials.materials().len(),
+        "{} colours from {} materials",
+        shades.len(),
+        scene.materials.materials().len()
     );
 }

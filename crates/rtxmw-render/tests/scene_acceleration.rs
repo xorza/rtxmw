@@ -9,7 +9,7 @@ use glam::{Affine3A, Vec2, Vec3};
 use rtxmw_esm::EsmReader;
 use rtxmw_gpu::TestGpu;
 use rtxmw_render::{GeometryBuffers, SceneAcceleration};
-use rtxmw_scene::{Instance, Mesh, MeshId, ModelIndex, StaticScene, Submesh};
+use rtxmw_scene::{Instance, Material, Mesh, MeshId, ModelIndex, StaticScene, Submesh};
 use rtxmw_vfs::{DATA_DIR_VAR, morrowind_archives, morrowind_data_dir};
 
 const CELL: &str = "Seyda Neen, Census and Excise Office";
@@ -54,6 +54,7 @@ fn a_small_scene_builds_one_structure_per_mesh_and_one_instance_per_placement() 
         },
     ];
 
+    let materials = [Material::default()];
     let mut uploader = gpu.uploader();
     let geometry =
         GeometryBuffers::upload(gpu.memory(), &mut uploader, &meshes).expect("upload failed");
@@ -62,6 +63,7 @@ fn a_small_scene_builds_one_structure_per_mesh_and_one_instance_per_placement() 
         &mut uploader,
         gpu.physical().limits(),
         &geometry,
+        &materials,
         &instances,
     )
     .expect("build failed");
@@ -90,6 +92,7 @@ fn a_mesh_that_flattened_to_nothing_gets_no_structure() {
         transform: Affine3A::IDENTITY,
     }];
 
+    let materials = [Material::default()];
     let mut uploader = gpu.uploader();
     let geometry =
         GeometryBuffers::upload(gpu.memory(), &mut uploader, &meshes).expect("upload failed");
@@ -98,6 +101,7 @@ fn a_mesh_that_flattened_to_nothing_gets_no_structure() {
         &mut uploader,
         gpu.physical().limits(),
         &geometry,
+        &materials,
         &instances,
     )
     .expect("build failed");
@@ -114,6 +118,7 @@ fn an_empty_cell_still_produces_a_traversable_top_level() {
     let gpu = TestGpu::shared();
     let mut uploader = gpu.uploader();
 
+    let materials: [Material; 0] = [];
     let geometry =
         GeometryBuffers::upload(gpu.memory(), &mut uploader, &[]).expect("upload failed");
     let acceleration = SceneAcceleration::build(
@@ -121,6 +126,7 @@ fn an_empty_cell_still_produces_a_traversable_top_level() {
         &mut uploader,
         gpu.physical().limits(),
         &geometry,
+        &materials,
         &[],
     )
     .expect("build failed");
@@ -149,6 +155,7 @@ fn a_real_interior_builds_and_compacts() {
 
     let gpu = TestGpu::shared();
     let mut uploader = gpu.uploader();
+    let materials = scene.materials.materials();
     let geometry =
         GeometryBuffers::upload(gpu.memory(), &mut uploader, &scene.meshes).expect("upload failed");
     let acceleration = SceneAcceleration::build(
@@ -156,6 +163,7 @@ fn a_real_interior_builds_and_compacts() {
         &mut uploader,
         gpu.physical().limits(),
         &geometry,
+        materials,
         &scene.instances,
     )
     .expect("build failed");

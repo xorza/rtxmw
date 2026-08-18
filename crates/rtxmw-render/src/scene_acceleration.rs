@@ -2,7 +2,7 @@
 
 use ash::vk;
 use rtxmw_gpu::{Buffer, BufferMemory, Device, RayTracingLimits, Uploader, memory_barrier};
-use rtxmw_scene::Instance;
+use rtxmw_scene::{AlphaMode, Instance, Material};
 
 use crate::acceleration_structure::AccelerationStructure;
 use crate::geometry_buffers::GeometryBuffers;
@@ -35,6 +35,7 @@ impl SceneAcceleration {
         uploader: &mut Uploader,
         limits: RayTracingLimits,
         geometry: &GeometryBuffers,
+        materials: &[Material],
         instances: &[Instance],
     ) -> rtxmw_gpu::Result<Self> {
         let BuiltBottomLevel {
@@ -42,10 +43,11 @@ impl SceneAcceleration {
             by_mesh,
             uncompacted_bytes,
             compacted_sizes,
-        } = build_bottom_level(device, uploader, limits, geometry)?;
+        } = build_bottom_level(device, uploader, limits, geometry, materials)?;
         let blas = compact(device, uploader, structures, &compacted_sizes)?;
 
-        let instance_data = describe_instances(&by_mesh, &blas, instances);
+        let first_submesh: Vec<u32> = geometry.ranges().iter().map(|r| r.first_submesh).collect();
+        let instance_data = describe_instances(&by_mesh, &blas, &first_submesh, instances);
         let instance_buffer = Buffer::with_alignment(
             uploader.memory(),
             "tlas instances",
@@ -123,57 +125,74 @@ fn build_bottom_level(
     uploader: &mut Uploader,
     limits: RayTracingLimits,
     geometry: &GeometryBuffers,
+    materials: &[Material],
 ) -> rtxmw_gpu::Result<BuiltBottomLevel> {
+    if let Some(worst) = geometry.submeshes().iter().map(|s| s.material).max() {
+        assert!(
+            (worst as usize) < materials.len(),
+            "geometry names material {worst} but the table holds {}",
+            materials.len()
+        );
+    }
+
     let loader = device.acceleration_structure();
     let positions = geometry.positions().device_address();
     let indices = geometry.indices().device_address();
 
     // Kept in one flat vector rather than one per structure: every build info points into it, so it
     // must not move while the infos are alive.
-    let mut geometries = Vec::with_capacity(geometry.ranges().len());
-    let mut ranges = Vec::with_capacity(geometry.ranges().len());
-    let mut primitive_counts = Vec::with_capacity(geometry.ranges().len());
+    let mut geometries = Vec::with_capacity(geometry.submeshes().len());
+    let mut ranges = Vec::with_capacity(geometry.submeshes().len());
+    let mut primitive_counts = Vec::with_capacity(geometry.submeshes().len());
     let mut by_mesh = Vec::with_capacity(geometry.ranges().len());
+    // Which slice of `geometries` each structure is built from.
+    let mut geometry_spans: Vec<std::ops::Range<u32>> = Vec::new();
 
     for range in geometry.ranges() {
-        if range.index_count == 0 {
+        if range.submesh_count == 0 {
             by_mesh.push(NO_BLAS);
             continue;
         }
-        by_mesh.push(geometries.len() as u32);
+        by_mesh.push(geometry_spans.len() as u32);
 
-        let triangles = vk::AccelerationStructureGeometryTrianglesDataKHR::default()
-            .vertex_format(vk::Format::R32G32B32_SFLOAT)
-            .vertex_data(vk::DeviceOrHostAddressConstKHR {
-                device_address: positions,
-            })
-            .vertex_stride(GeometryBuffers::POSITION_STRIDE)
-            // The highest vertex this build will address. Indices are mesh-local and `first_vertex`
-            // is added to them, so the ceiling is where this mesh ends, not where it starts.
-            .max_vertex(range.first_vertex + range.vertex_count - 1)
-            .index_type(vk::IndexType::UINT32)
-            .index_data(vk::DeviceOrHostAddressConstKHR {
-                device_address: indices,
-            });
-        geometries.push(
-            vk::AccelerationStructureGeometryKHR::default()
-                .geometry_type(vk::GeometryTypeKHR::TRIANGLES)
-                .geometry(vk::AccelerationStructureGeometryDataKHR { triangles })
-                // Pairs with `gl_RayFlagsOpaqueEXT` in the visibility shader. Both change together
-                // at M4, when alpha-tested foliage needs the any-hit path.
-                .flags(vk::GeometryFlagsKHR::OPAQUE),
-        );
-        ranges.push(
-            vk::AccelerationStructureBuildRangeInfoKHR::default()
-                .primitive_count(range.triangle_count())
-                // Byte offset into the index buffer, against `first_vertex` added to each index.
-                .primitive_offset(range.first_index * size_of::<u32>() as u32)
-                .first_vertex(range.first_vertex),
-        );
-        primitive_counts.push(range.triangle_count());
+        // One geometry per material-uniform run rather than one per mesh. A hit reports which it
+        // landed on as `geometry_index`, and that is the only thing that lets a lantern's glass
+        // shade differently from its metal.
+        let first_geometry = geometries.len() as u32;
+        for submesh in geometry.submeshes_of(range) {
+            let triangles = vk::AccelerationStructureGeometryTrianglesDataKHR::default()
+                .vertex_format(vk::Format::R32G32B32_SFLOAT)
+                .vertex_data(vk::DeviceOrHostAddressConstKHR {
+                    device_address: positions,
+                })
+                .vertex_stride(GeometryBuffers::POSITION_STRIDE)
+                // The highest vertex this build will address. Indices are mesh-local and
+                // `first_vertex` is added to them, so the ceiling is where the mesh ends.
+                .max_vertex(range.first_vertex + range.vertex_count - 1)
+                .index_type(vk::IndexType::UINT32)
+                .index_data(vk::DeviceOrHostAddressConstKHR {
+                    device_address: indices,
+                });
+            geometries.push(
+                vk::AccelerationStructureGeometryKHR::default()
+                    .geometry_type(vk::GeometryTypeKHR::TRIANGLES)
+                    .geometry(vk::AccelerationStructureGeometryDataKHR { triangles })
+                    .flags(geometry_flags(materials[submesh.material as usize])),
+            );
+            ranges.push(
+                vk::AccelerationStructureBuildRangeInfoKHR::default()
+                    .primitive_count(submesh.triangle_count())
+                    // Byte offset into the shared index buffer, against `first_vertex` added to
+                    // each index value.
+                    .primitive_offset(submesh.first_index * size_of::<u32>() as u32)
+                    .first_vertex(range.first_vertex),
+            );
+            primitive_counts.push(submesh.triangle_count());
+        }
+        geometry_spans.push(first_geometry..geometries.len() as u32);
     }
 
-    if geometries.is_empty() {
+    if geometry_spans.is_empty() {
         return Ok(BuiltBottomLevel {
             structures: Vec::new(),
             by_mesh,
@@ -184,24 +203,25 @@ fn build_bottom_level(
 
     // Sizes first: the structures cannot be created until the driver has been asked how large they
     // need to be, and scratch cannot be allocated until every build's share is known.
-    let mut structures = Vec::with_capacity(geometries.len());
-    let mut scratch_offsets = Vec::with_capacity(geometries.len());
+    let mut structures = Vec::with_capacity(geometry_spans.len());
+    let mut scratch_offsets = Vec::with_capacity(geometry_spans.len());
     let mut scratch_total = 0;
     let mut uncompacted_bytes = 0;
 
-    for (index, count) in primitive_counts.iter().enumerate() {
+    for slice in &geometry_spans {
+        let span = slice.start as usize..slice.end as usize;
         let sizing = vk::AccelerationStructureBuildGeometryInfoKHR::default()
             .ty(vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL)
             .flags(blas_flags())
             .mode(vk::BuildAccelerationStructureModeKHR::BUILD)
-            .geometries(&geometries[index..=index]);
+            .geometries(&geometries[span.clone()]);
         let mut sizes = vk::AccelerationStructureBuildSizesInfoKHR::default();
         // SAFETY: `sizing` is fully initialised and the counts array matches its geometry count.
         unsafe {
             loader.get_acceleration_structure_build_sizes(
                 vk::AccelerationStructureBuildTypeKHR::DEVICE,
                 &sizing,
-                &[*count],
+                &primitive_counts[span],
                 &mut sizes,
             )
         };
@@ -234,21 +254,25 @@ fn build_bottom_level(
     )?;
     let scratch_base = scratch.device_address();
 
-    let infos: Vec<vk::AccelerationStructureBuildGeometryInfoKHR<'_>> = (0..geometries.len())
-        .map(|index| {
+    let infos: Vec<vk::AccelerationStructureBuildGeometryInfoKHR<'_>> = geometry_spans
+        .iter()
+        .enumerate()
+        .map(|(index, slice)| {
             vk::AccelerationStructureBuildGeometryInfoKHR::default()
                 .ty(vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL)
                 .flags(blas_flags())
                 .mode(vk::BuildAccelerationStructureModeKHR::BUILD)
                 .dst_acceleration_structure(structures[index].raw())
-                .geometries(&geometries[index..=index])
+                .geometries(&geometries[slice.start as usize..slice.end as usize])
                 .scratch_data(vk::DeviceOrHostAddressKHR {
                     device_address: scratch_base + scratch_offsets[index],
                 })
         })
         .collect();
-    let range_slices: Vec<&[vk::AccelerationStructureBuildRangeInfoKHR]> =
-        ranges.iter().map(std::slice::from_ref).collect();
+    let range_slices: Vec<&[vk::AccelerationStructureBuildRangeInfoKHR]> = geometry_spans
+        .iter()
+        .map(|slice| &ranges[slice.start as usize..slice.end as usize])
+        .collect();
 
     // The compacted-size query rides along in the build's own submission, behind a barrier. Split
     // across two submissions it would depend on ordering that a fence wait does not establish for
@@ -303,6 +327,18 @@ fn build_bottom_level(
         uncompacted_bytes,
         compacted_sizes,
     })
+}
+
+/// Whether a geometry can skip the any-hit path.
+///
+/// `OPAQUE` lets traversal commit the first hit without ever invoking a shader. Marking an
+/// alpha-tested surface opaque is what turns Morrowind's foliage and grates into solid rectangles,
+/// so the flag has to follow the material rather than being set once for everything.
+fn geometry_flags(material: Material) -> vk::GeometryFlagsKHR {
+    match material.alpha {
+        AlphaMode::Opaque => vk::GeometryFlagsKHR::OPAQUE,
+        AlphaMode::Mask(_) | AlphaMode::Blend => vk::GeometryFlagsKHR::empty(),
+    }
 }
 
 /// `PREFER_FAST_TRACE` because static scenery is built once and traversed forever; `ALLOW_COMPACTION`
@@ -371,6 +407,7 @@ fn compact(
 fn describe_instances(
     by_mesh: &[u32],
     blas: &[AccelerationStructure],
+    first_submesh: &[u32],
     instances: &[Instance],
 ) -> Vec<vk::AccelerationStructureInstanceKHR> {
     let mut out = Vec::with_capacity(instances.len());
@@ -386,9 +423,13 @@ fn describe_instances(
 
         out.push(vk::AccelerationStructureInstanceKHR {
             transform: row_major_transform(&instance.transform),
-            // The custom index is how a hit finds its mesh again, which is what the material lookup
-            // at M4 is built on.
-            instance_custom_index_and_mask: vk::Packed24_8::new(instance.mesh.0, 0xFF),
+            // Where this mesh's geometries start in the flat submesh table. A hit adds its own
+            // `geometry_index` to it and lands exactly on its own entry, which is what makes the
+            // material lookup a single indexed read with no per-mesh indirection.
+            instance_custom_index_and_mask: vk::Packed24_8::new(
+                first_submesh[instance.mesh.0 as usize],
+                0xFF,
+            ),
             instance_shader_binding_table_record_offset_and_flags: vk::Packed24_8::new(
                 0,
                 // Morrowind authors single-sided planes and relies on them being visible from both

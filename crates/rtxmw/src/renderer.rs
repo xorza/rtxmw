@@ -7,7 +7,9 @@ use rtxmw_gpu::{
     Device, Frames, Image, Instance, Memory, PhysicalDevice, Presentation, Surface, Swapchain,
     Uploader, Validation, image_blit, memory_barrier,
 };
-use rtxmw_render::{FrameConstants, GeometryBuffers, SceneAcceleration, VisibilityPass};
+use rtxmw_render::{
+    FrameConstants, GeometryBuffers, MaterialBuffers, SceneAcceleration, VisibilityPass,
+};
 use rtxmw_scene::StaticScene;
 
 /// Rendering resolution, independent of the window. The design budgets for 1920x1080 internal
@@ -56,6 +58,7 @@ pub(crate) struct Renderer {
 #[allow(dead_code)]
 struct LoadedScene {
     geometry: GeometryBuffers,
+    tables: MaterialBuffers,
     acceleration: SceneAcceleration,
 }
 
@@ -118,16 +121,21 @@ impl Renderer {
         self.scene = None;
 
         let geometry = GeometryBuffers::upload(&self.memory, &mut self.uploader, &scene.meshes)?;
+        let materials = scene.materials.materials();
+        let tables =
+            MaterialBuffers::upload(&self.memory, &mut self.uploader, &geometry, materials)?;
         let acceleration = SceneAcceleration::build(
             &self.device,
             &mut self.uploader,
             self.physical.limits(),
             &geometry,
+            materials,
             &scene.instances,
         )?;
-        self.pass.bind(acceleration.tlas(), &self.target);
+        self.pass.bind(acceleration.tlas(), &self.target, &tables);
         self.scene = Some(LoadedScene {
             geometry,
+            tables,
             acceleration,
         });
         Ok(())
