@@ -380,7 +380,8 @@ fn an_exterior_cell_carries_its_terrain_as_well_as_its_objects() {
 
     // Seyda Neen, where the game opens.
     let (x, y) = (-2, -9);
-    let scene = StaticScene::load_exterior(&esm, &models, &vfs, x, y).expect("cell should load");
+    let scene =
+        StaticScene::load_exterior_grid(&esm, &models, &vfs, x, y, 0).expect("cell should load");
 
     // The terrain is the one mesh with a vertex per point of the 65×65 grid.
     let terrain = scene

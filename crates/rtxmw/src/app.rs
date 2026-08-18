@@ -84,13 +84,13 @@ impl App {
         else {
             return;
         };
+        let Some(renderer) = self.renderer.as_mut() else {
+            return;
+        };
 
         let started = Instant::now();
         match LoadedCell::load_exterior_grid(x, y, scene_loader::GRID_RADIUS) {
             Ok(Some(cell)) => {
-                let Some(renderer) = self.renderer.as_mut() else {
-                    return;
-                };
                 if let Err(e) = renderer.load_scene(&cell.scene, &cell.textures) {
                     eprintln!("could not upload {}: {e}", cell.id);
                     return;

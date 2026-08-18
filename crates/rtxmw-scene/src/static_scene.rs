@@ -157,7 +157,8 @@ impl StaticScene {
                 continue;
             }
             let mut scene = Self::default();
-            scene.append_cell(&record, models, vfs, &mut HashMap::new())?;
+            let mut by_path = HashMap::new();
+            scene.append_cell(&record, models, vfs, &mut by_path)?;
             scene.ambient = cell.ambient.map(|a| Ambient {
                 colour: srgb::to_linear(a.ambient),
                 sunlight: srgb::to_linear(a.sunlight),
@@ -168,18 +169,7 @@ impl StaticScene {
         Err(SceneError::NoSuchCell(cell_name.to_owned()))
     }
 
-    /// Loads the exterior cell at grid position `(x, y)`, terrain included.
-    pub fn load_exterior(
-        esm: &EsmReader<'_>,
-        models: &ModelIndex,
-        vfs: &Vfs,
-        x: i32,
-        y: i32,
-    ) -> Result<Self> {
-        Self::load_exterior_grid(esm, models, vfs, x, y, 0)
-    }
-
-    /// Loads every exterior cell within `radius` of `(x, y)` as one scene.
+    /// Loads every exterior cell within `radius` of `(x, y)` as one scene, terrain included.
     ///
     /// **One pass over the file for the whole block**, not one per cell. A cell's records are
     /// scattered through a 79 MB stream and finding them costs a full walk, so loading a 7×7 grid
@@ -286,7 +276,6 @@ impl StaticScene {
         vfs: &Vfs,
         by_path: &mut HashMap<String, MeshId>,
     ) -> Result<()> {
-        let scene = self;
         for cell_ref in Cell::references(record) {
             let cell_ref = cell_ref?;
             // An editor marker has a model and is deliberately not drawn with it: these are the
@@ -297,7 +286,7 @@ impl StaticScene {
                 continue;
             }
             let Some(path) = models.model_of(&cell_ref.object_id) else {
-                scene.without_model.push(cell_ref.object_id.clone());
+                self.without_model.push(cell_ref.object_id.clone());
                 continue;
             };
 
@@ -309,9 +298,9 @@ impl StaticScene {
                         path: path.to_owned(),
                         source,
                     })?;
-                    let id = MeshId(scene.meshes.len() as u32);
-                    let mesh = Mesh::from_nif(&nif, &mut scene.materials);
-                    scene.meshes.push(mesh);
+                    let id = MeshId(self.meshes.len() as u32);
+                    let mesh = Mesh::from_nif(&nif, &mut self.materials);
+                    self.meshes.push(mesh);
                     by_path.insert(path.to_owned(), id);
                     id
                 }
@@ -322,7 +311,7 @@ impl StaticScene {
             if let Some(light) = models.light_of(&cell_ref.object_id)
                 && light.is_placeable()
             {
-                scene.lights.push(Light {
+                self.lights.push(Light {
                     position: Vec3::from_array(cell_ref.position.translation),
                     colour: srgb::to_linear(light.colour),
                     radius: light.radius as f32,
@@ -330,10 +319,10 @@ impl StaticScene {
             }
 
             // A mesh with nothing visible — a pure collision proxy, say — places no instance.
-            if scene.meshes[mesh.0 as usize].is_empty() {
+            if self.meshes[mesh.0 as usize].is_empty() {
                 continue;
             }
-            scene.instances.push(Instance {
+            self.instances.push(Instance {
                 mesh,
                 transform: world_transform(&cell_ref),
             });

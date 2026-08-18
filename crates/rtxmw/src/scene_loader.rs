@@ -25,8 +25,8 @@ pub(crate) const GRID_HYSTERESIS: f32 = 683.0;
 /// file reading and an acceleration structure rebuild.
 pub(crate) fn next_centre(position: Vec3, loaded: &CellId) -> Option<CellId> {
     let settled = CellId::settled_in(position.x, position.y, GRID_HYSTERESIS)?;
-    // An interior never streams, and a block already centred here has nowhere to move to.
-    (matches!(settled, CellId::Exterior { .. }) && settled != *loaded).then_some(settled)
+    // A block already centred here has nowhere to move to.
+    (settled != *loaded).then_some(settled)
 }
 
 /// The cell the engine opens in when the command line names none.
@@ -166,7 +166,9 @@ mod tests {
         assert_eq!(at(8192.0 + 10.0, 4000.0), None);
         assert_eq!(at(8192.0 - 10.0, 4000.0), None);
 
-        // An interior is never a destination: nothing streams into one, a door is the way in.
+        // Stepping out of a building recentres from wherever the camera was: the loaded cell
+        // being an interior is not a reason to stay there. Indoors nothing streams at all, so this
+        // is the function being total rather than a case the engine reaches.
         assert_eq!(
             next_centre(
                 Vec3::new(12000.0, 4000.0, 0.0),

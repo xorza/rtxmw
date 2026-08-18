@@ -47,10 +47,15 @@ impl LoadedCell {
         }
     }
 
-    /// Loads the block of exterior cells within `radius` of `(x, y)`.
+    /// Loads the block of exterior cells within `radius` of `(x, y)`, or `None` when no game data
+    /// is configured.
     ///
     /// Its entrances are the doors leading into the *centre* cell, since that is where a traveller
-    /// stepping outside arrives; the surrounding cells are there to be seen and walked into.
+    /// stepping outside arrives; the surrounding cells are there to be seen and walked into. They
+    /// come from the same search an interior's does: a door leading outside names no cell, so the
+    /// grid square its arrival point falls in identifies one — which [`Door::leading_to`] already
+    /// resolves. Standing where the game would put someone stepping out of a building is as good a
+    /// viewpoint outdoors as in.
     pub fn load_exterior_grid(x: i32, y: i32, radius: i32) -> Result<Option<Self>> {
         Self::load(CellId::Exterior { x, y }, |esm, models, vfs| {
             StaticScene::load_exterior_grid(esm, models, vfs, x, y, radius)
@@ -59,9 +64,10 @@ impl LoadedCell {
 
     /// Loads the named interior from the installed game, or `None` when none is configured.
     ///
-    /// Reads the whole of `Morrowind.esm` each call, so loading several cells this way rereads a
-    /// 79 MB file each time. That is fine for opening one cell at startup and wrong for streaming;
-    /// when cells start streaming, the reader wants hoisting above this.
+    /// Reads the whole of `Morrowind.esm` each call, and so does every other way in here. That was
+    /// fine while one cell was opened at startup; now that a block streams in as the camera moves,
+    /// it is the larger part of the ~30 ms hitch crossing a boundary costs. Hoisting the reader
+    /// above this is what removes it.
     pub fn load_interior(cell_name: &str) -> Result<Option<Self>> {
         Self::load(
             CellId::Interior(cell_name.to_owned()),
@@ -111,16 +117,6 @@ impl LoadedCell {
             textures,
             entrances,
         }))
-    }
-
-    /// Loads the exterior cell at grid position `(x, y)`, or `None` when none is configured.
-    ///
-    /// Its entrances come from the same search an interior's do: a door leading outside names no
-    /// cell, so the grid square its arrival point falls in identifies one — which
-    /// [`Door::leading_to`] already resolves. Standing where the game would put someone stepping
-    /// out of a building is as good a viewpoint outdoors as in.
-    pub fn load_exterior(x: i32, y: i32) -> Result<Option<Self>> {
-        Self::load_exterior_grid(x, y, 0)
     }
 
     /// How many of the cell's texture references resolved to nothing.
