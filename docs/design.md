@@ -1194,8 +1194,10 @@ the 3×3 active cell grid, distant statics.
 would have become the bottleneck.
 
 ### M10 — Water
-Per-cell water plane, RT reflection and refraction, absorption and scattering. OpenMW's tuned
-constants (`files/shaders/compatibility/water.frag:13-51`) are a good starting point.
+Per-cell water plane, RT reflection and refraction, absorption and scattering.
+**Done when:** standing on Seyda Neen's shore, the seabed is visible through moving water, the
+surface reflects the sky and the coast, and the frame still fits §5.3.
+**Proposal and plan:** §7.
 
 ---
 
@@ -1348,3 +1350,150 @@ Approved. `wgpu` is removed.
 
 Not yet added, needed later: an NGX binding for DLSS-RR at M7 (hand-written FFI against the C
 header), and an image decoder for DDS/TGA at M4.
+
+---
+
+## 7. M10 water: proposal and plan
+
+Not yet built. This is the design to argue with before any of it is written.
+
+### 7.1 What the data says
+
+Measured over `Morrowind.esm`, because the shape of the water decides the technique:
+
+| | |
+|---|---|
+| exterior cells | 1,404, **none carrying a `WHGT`** |
+| interiors | 1,134, of which **193 are flagged as having water** |
+| interiors carrying a water height | **all 1,134** |
+| land cells whose terrain crosses z = 0 | **533 of 1,292** |
+| lowest terrain vertex in the game | **−2,152 units**, about 31 m |
+
+Four things follow, and they are the whole brief:
+
+1. **Sea level is z = 0 everywhere outdoors.** No per-cell lookup, no interpolation across a
+   boundary, one constant. Vvardenfell is one body of water.
+2. **The flag is the gate, not the value.** Every interior carries a water height whether or not it
+   has water, so reading `WHGT` and testing for presence would flood 941 dry rooms. `has_water()`
+   is `(flags & 0x02) || is_exterior()`, matching `loadcell.hpp:164`.
+3. **Water is shallow.** Thirty-one metres at the deepest point in the game, and the Bitter Coast is
+   a fraction of that. The seabed is *visible through the surface almost everywhere*, which is what
+   makes caustics worth having rather than a detail nobody sees.
+4. **The shoreline is the most-seen feature.** 41% of land cells contain one. Whatever happens where
+   water meets sand is on screen more than anything else about the water.
+
+### 7.2 What that rules out
+
+**Not an FFT ocean.** Tessendorf's spectrum is the right answer for deep water at kilometre scale
+with a horizon: it sums thousands of components for free by doing the sum in frequency space. We
+have coastal shallows and interior pools. It would cost a compute pass and three textures a frame to
+simulate a spectrum whose defining feature — long deep-water swell — does not belong in a swamp.
+
+**A sum of trochoidal (Gerstner) waves instead**, four to six of them, plus a procedural detail
+normal. Analytic, stateless, no texture. Critically it is also **differentiable in closed form**,
+which §7.5 needs: caustics come out of the derivative of the surface, so a surface we can
+differentiate on paper is worth more here than one that is merely prettier.
+
+### 7.3 The surface, as geometry
+
+One unit quad, instanced once per water cell with the level in its transform. This falls out of the
+residency work: water is the *ideal* shared asset — every cell's water is the same mesh, unlike
+terrain, which is per-cell by nature. One mesh, N instances, keyed `water`.
+
+It goes in the acceleration structure rather than being intersected analytically in the shader so
+that reflections, shadows and the refraction ray all see it without a second code path. A ray that
+happens to hit water inside a bounce is then handled by the same branch as a primary hit.
+
+### 7.4 Shading it
+
+On a water hit, with `n` the wave normal and `η = 1/1.333`:
+
+- **Fresnel**, Schlick with `F0 = 0.02`. At grazing angles water is a mirror; head-on it is a
+  window. This one term is most of what reads as "water".
+- **A reflection ray**, `reflect(d, n)`, traced and shaded — sky above the horizon, the coast below
+  it.
+- **A refraction ray**, `refract(d, n, η)`, traced to the seabed and shaded, then attenuated.
+- **Beer–Lambert absorption** along the underwater path: `T = exp(−σ · depth)`, with σ from a
+  **Jerlov coastal water type** rather than a hand-picked blue. Water absorbs red within a metre or
+  two and passes green-blue furthest, which is *why* shallow water reads green and deep water blue —
+  falling out of the physics rather than being painted in.
+- **Single scattering** added back as `σs/σ · (1 − T) · L`, so what the water absorbs it partly
+  returns as its own glow.
+- **Sun glint**, GGX against the wave normal, with the sun's real angular radius already in the
+  frame constants from M5.
+
+**Why this dodges the denoiser.** The à-trous filter is demodulated by albedo — it filters light
+arriving at a surface, and water has no albedo. But a mirror reflection and a refraction are
+*deterministic*: one ray each, no sampling, no noise. So water shades into the emissive/sky channel
+that already bypasses the denoiser, and needs no filtering at all. This is the argument for
+perfectly specular water first: it is not a simplification to be undone later, it is the thing that
+makes water compose with the denoiser we have.
+
+### 7.5 Caustics, two ways
+
+The seabed is visible nearly everywhere (§7.1), so caustics are not a garnish here.
+
+**First: analytic, from the Jacobian.** Caustics are ray-density change. With an analytic height
+field, the refracted direction at any surface point is known in closed form, so the convergence of
+the refracted bundle at depth `d` is the determinant of the Jacobian of that map, and intensity is
+`1/|det J|`. No photons, no buffer, no filtering — a few ALU per underwater hit, evaluated where the
+seabed is already being shaded. This is the same quantity Evan Wallace's light-front mesh computes
+with `dFdx`/`dFdy`, and the same stationarity condition the optics literature defines caustics by;
+the difference is that a single analytic layer lets it be evaluated pointwise instead of meshed.
+
+It is exact for what we have — **one water layer, one sun, a height field we wrote ourselves** — and
+that is precisely the case where the expensive method buys nothing.
+
+**Second, if that disappoints: photon-splatted caustic maps**, the *Ray Tracing Gems II* chapter 30
+approach as shipped in UE4's RTX branch. Generate photons through the surface toward the light,
+trace them, splat each as a decal sized by photon differentials, filter, composite. Reported at
+0.5–2 ms on RTX hardware, roughly halved at half resolution. Our version would generate photons with
+ray queries rather than rasterising a caustic map, since we already have the structure to trace
+against. Held in reserve: it is the general answer, and generality is exactly what we do not need
+yet.
+
+### 7.6 Underwater
+
+Below the surface the same model runs inverted: Beer–Lambert on every primary ray rather than on the
+refraction ray, total internal reflection looking up past the critical angle (48.6°, and the reason
+the surface from below is a mirror ringed by a bright disc of sky), and the sun's colour filtered by
+depth before it lights anything. Sun shafts are a later want, not part of this.
+
+### 7.7 Plan
+
+Four stages, each independently verifiable, each leaving the tree green.
+
+**Stage 1 — the plane exists.** `has_water`/`water_height` reach `StaticScene`; the shared quad and
+its per-cell instance; a water kind on `Material` (`GpuMaterial` has spare padding for the flag);
+the shader branch doing Fresnel, one reflection ray, one refraction ray, Beer–Lambert, written to
+the emissive channel. Flat — no waves.
+*Tests:* a headless quad over a coloured floor pins Fresnel at normal versus grazing incidence,
+absorption exact at a hand-computed depth, and the reflection showing what is above. Plus a data
+test pinning §7.1's two load-bearing facts: no exterior carries a `WHGT`, and interiors carry a
+height whether or not they have water.
+*Done when:* Seyda Neen's shore has a sea, with the seabed visible through it.
+
+**Stage 2 — waves.** Four to six trochoidal components plus a detail normal.
+*Blocked on one thing:* the push-constant block is **exactly 128 bytes and full**, and waves need
+`time`. That forces the frame constants into a uniform buffer — which M7 needs anyway for motion
+vectors, so the blocker is work already owed rather than new work.
+*Tests:* height at t = 0 reproducible; normals average to vertical over a tile; two amplitudes
+produce measurably different surfaces.
+
+**Stage 3 — caustics.** The Jacobian term on the refraction path.
+*Tests:* a flat surface gives exactly 1, and the caustic term averages to ~1 over a tile — energy
+conservation, which is the property that catches a wrong derivative.
+
+**Stage 4 — shore and underwater.** Depth fade where water meets land, underwater fog, total
+internal reflection, optionally foam. Last because it is refinement, first in visibility.
+
+### 7.8 Costs and risks
+
+- **Water pixels cost roughly twice.** Two rays instead of one, each spawning its own shadow rays.
+  On a coastal view perhaps 30% of the frame is water, so budget 1–2 ms and measure before tuning
+  anything else. The 16-sun-sample count identified in M9 is the lever if it overruns.
+- **No new dependency.** Everything here is shader work plus one mesh.
+- **The 128-byte block is a hard stop for stage 2**, and nothing before it.
+- **The largest unknown is the shoreline**, not the deep water: 533 cells have one, and a hard
+  intersection line between a water plane and terrain is the classic tell. Depth-fading the
+  absorption toward zero at the intersection is the standard answer and is stage 4 for that reason.
