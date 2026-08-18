@@ -13,6 +13,7 @@ rtxmw-gpu = { path = "crates/rtxmw-gpu" }
 rtxmw-nif = { path = "crates/rtxmw-nif" }
 rtxmw-render = { path = "crates/rtxmw-render" }
 rtxmw-scene = { path = "crates/rtxmw-scene" }
+rtxmw-texture = { path = "crates/rtxmw-texture" }
 rtxmw-vfs = { path = "crates/rtxmw-vfs" }
 
 ash = "0.38"

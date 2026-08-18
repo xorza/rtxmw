@@ -1,6 +1,7 @@
 # rtxmw — renderer design proposal
 
-Status: decisions settled, nothing built yet. Written 2026-08-18.
+Written 2026-08-18. The decisions below are settled; §4 carries what is built and what each
+milestone measured.
 
 Immediate goal: **render static Morrowind locations with a free noclip camera**, with hardware ray
 tracing as the primary rendering mode rather than an effect layered on a rasterizer.
@@ -417,10 +418,43 @@ fixed internal resolution and is stretched to whatever the window is, so a proje
 window would distort as soon as the two differed.
 
 ### M4 — Textures and bindless materials
-DDS/TGA decode, BCn transcode where needed, mip generation, bindless texture array, `GeometryRef`
-and material buffers, attribute interpolation at the hit, alpha-test in the candidate loop.
+DDS/TGA decode, bindless texture array, `GeometryRef` and material buffers, attribute interpolation
+at the hit, alpha-test in the candidate loop.
 **Done when:** the cell renders with correct albedo and alpha-tested geometry reads correctly, no
 unbound-descriptor validation errors.
+
+**M4a — done.** `rtxmw-texture`, a new crate beside `rtxmw-nif` on the same one-format-one-crate
+rule. All **6,256** shipped textures decode: 190.8 MiB across 4,181 BC1, 1,971 BC2, 93 uncompressed
+BGRA8 and 11 TGA.
+
+A survey of the shipped data cut the scope before any of it was written, and is worth recording
+because the plan above was wrong in three ways:
+
+- **There is no DXT5.** The library is DXT1 and DXT3 only, so BC3 never appears. The corpus test
+  asserts that, because a replacer pack introducing it would otherwise render as noise.
+- **"BCn transcode where needed" was not needed at all.** DXT1 and DXT3 *are* BC1 and BC2, which
+  every target GPU samples natively — decoding is parsing a header and handing the blocks on. The
+  scope item is struck from the milestone above. Likewise "mip generation": the files already carry
+  their chains, up to eleven levels deep.
+- **TGA is 11 files**, all uncompressed 24-bit, against 6,245 DDS. Run-length encoding and colour
+  maps are rejected rather than implemented, since no shipped asset exercises them and untested
+  format code is worse than an error.
+
+Three decisions worth keeping:
+
+- **`TextureFormat` is not a `VkFormat`,** and says nothing about colour space. The same BC1 bytes
+  are sRGB as albedo and UNORM as a replacer pack's normal map, so the consumer chooses and the
+  decoder only reports what the bytes are.
+- **DXT1 maps to BC1 *with* alpha.** Morrowind uses its one-bit alpha for exactly the foliage and
+  grates the alpha test at M4d needs; reading it as RGB-only would discard that.
+- **Mip levels share one buffer with a range table beside it**, never `Vec<Vec<u8>>` — eleven-deep
+  chains across 6,256 textures would be an allocation each, and it is already the shape
+  `vkCmdCopyBufferToImage` wants: one staging buffer, one region per level.
+
+The corpus test initially had a hole worth noting: it checked that the level table tiled the buffer,
+which a decoder that *drops* a level still satisfies. Deleting one mip passed cleanly. It now also
+asserts that header plus data accounts for the whole file, which ties the decode back to its source
+and catches it.
 
 ### M5 — Direct lighting
 Sun as a directional light with a real angular diameter (so shadows are soft), shadow rays, cell
