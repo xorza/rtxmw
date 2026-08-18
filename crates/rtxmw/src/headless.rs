@@ -35,7 +35,7 @@ pub(crate) fn screenshot(
     let extent = vk::Extent2D { width, height };
     let mut renderer = SceneRenderer::new(&device, &physical, &memory, extent)?;
 
-    let cell = LoadedCell::load_at(cell)?
+    let cell = LoadedCell::load_at(cell, scene_loader::GRID_RADIUS)?
         .ok_or("no game data configured — set MORROWIND_DATA_DIR, or put it in .env")?;
     renderer.load_scene(
         &device,

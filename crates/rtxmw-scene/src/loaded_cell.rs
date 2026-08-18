@@ -37,11 +37,24 @@ impl LoadedCell {
     ///
     /// The dispatch a caller holding a `CellId` wants: an interior is found by name and an exterior
     /// by grid position, and nothing above here should have to know which of those it is holding.
-    pub fn load_at(id: CellId) -> Result<Option<Self>> {
+    ///
+    /// `radius` widens an exterior into the block of cells around it and is ignored for an
+    /// interior, which has no neighbours to stream — a door is the only way out of one.
+    pub fn load_at(id: CellId, radius: i32) -> Result<Option<Self>> {
         match id {
             CellId::Interior(name) => Self::load_interior(&name),
-            CellId::Exterior { x, y } => Self::load_exterior(x, y),
+            CellId::Exterior { x, y } => Self::load_exterior_grid(x, y, radius),
         }
+    }
+
+    /// Loads the block of exterior cells within `radius` of `(x, y)`.
+    ///
+    /// Its entrances are the doors leading into the *centre* cell, since that is where a traveller
+    /// stepping outside arrives; the surrounding cells are there to be seen and walked into.
+    pub fn load_exterior_grid(x: i32, y: i32, radius: i32) -> Result<Option<Self>> {
+        Self::load(CellId::Exterior { x, y }, |esm, models, vfs| {
+            StaticScene::load_exterior_grid(esm, models, vfs, x, y, radius)
+        })
     }
 
     /// Loads the named interior from the installed game, or `None` when none is configured.
@@ -107,9 +120,7 @@ impl LoadedCell {
     /// [`Door::leading_to`] already resolves. Standing where the game would put someone stepping
     /// out of a building is as good a viewpoint outdoors as in.
     pub fn load_exterior(x: i32, y: i32) -> Result<Option<Self>> {
-        Self::load(CellId::Exterior { x, y }, |esm, models, vfs| {
-            StaticScene::load_exterior(esm, models, vfs, x, y)
-        })
+        Self::load_exterior_grid(x, y, 0)
     }
 
     /// How many of the cell's texture references resolved to nothing.

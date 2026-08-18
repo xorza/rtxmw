@@ -5,6 +5,30 @@ use rtxmw_scene::{CellId, LoadedCell};
 
 use crate::camera::Camera;
 
+/// Cells loaded either side of the one the camera is in.
+///
+/// Radius 3 is a 7x7 block of 49 cells — about six across, and odd so the camera's own cell is the
+/// middle one rather than a corner between four. Morrowind's own active grid is radius 1, which is
+/// what its draw distance could afford.
+pub(crate) const GRID_RADIUS: i32 = 3;
+
+/// How far inside a cell the camera must be before the grid recentres on it, in world units.
+///
+/// A twelfth of a cell. Without it the loaded block would follow every step across a boundary and
+/// every step back, reloading the world each time; with it the camera has to commit.
+pub(crate) const GRID_HYSTERESIS: f32 = 683.0;
+
+/// Where the loaded block should recentre, or `None` to leave it where it is.
+///
+/// Separated from the loading it triggers because the two fail differently: this is a decision
+/// about a position and can be checked exactly, while what follows it is thirty milliseconds of
+/// file reading and an acceleration structure rebuild.
+pub(crate) fn next_centre(position: Vec3, loaded: &CellId) -> Option<CellId> {
+    let settled = CellId::settled_in(position.x, position.y, GRID_HYSTERESIS)?;
+    // An interior never streams, and a block already centred here has nowhere to move to.
+    (matches!(settled, CellId::Exterior { .. }) && settled != *loaded).then_some(settled)
+}
+
 /// The cell the engine opens in when the command line names none.
 pub(crate) const DEFAULT_CELL: &str = "Seyda Neen, Census and Excise Office";
 
@@ -119,6 +143,38 @@ impl Viewpoint {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_block_recentres_only_once_the_camera_has_committed() {
+        let here = CellId::Exterior { x: 0, y: 0 };
+        let at = |x: f32, y: f32| next_centre(Vec3::new(x, y, 0.0), &here);
+
+        // Well inside the cell it is already centred on: nothing to do.
+        assert_eq!(at(4000.0, 4000.0), None);
+        // Well inside the next one along: move.
+        assert_eq!(at(12000.0, 4000.0), Some(CellId::Exterior { x: 1, y: 0 }));
+        assert_eq!(at(-4000.0, 4000.0), Some(CellId::Exterior { x: -1, y: 0 }));
+        // Diagonally, too.
+        assert_eq!(
+            at(-4000.0, -4000.0),
+            Some(CellId::Exterior { x: -1, y: -1 })
+        );
+
+        // **Straddling the boundary commits to neither.** Without that the block would reload on
+        // every step across and every step back, which at thirty milliseconds a load is a stall
+        // per footfall.
+        assert_eq!(at(8192.0 + 10.0, 4000.0), None);
+        assert_eq!(at(8192.0 - 10.0, 4000.0), None);
+
+        // An interior is never a destination: nothing streams into one, a door is the way in.
+        assert_eq!(
+            next_centre(
+                Vec3::new(12000.0, 4000.0, 0.0),
+                &CellId::Interior("a room".into())
+            ),
+            Some(CellId::Exterior { x: 1, y: 0 })
+        );
+    }
 
     #[test]
     fn a_pair_of_integers_is_an_exterior_and_anything_else_is_a_name() {

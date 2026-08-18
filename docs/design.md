@@ -1053,6 +1053,52 @@ makes one sample a frame viable. Against the ~8 ms §5.3 allowance there is stil
 mid-morning. The colour is a warm white scaled by a constant chosen for its *ratio* to the sky —
 about five to one, as on a clear day — and is provisional in exactly the way `INTENSITY` is.
 
+### M9 — streaming a block of cells
+
+The camera now flies across a 7×7 block of exterior cells and the block follows it. What that
+measurement turned up is the interesting part.
+
+**The grid is nearly free past 5×5.** Measured at 1920×1080 on the shipped cell, with four bounce
+samples, four à-trous passes and sixteen sun rays:
+
+| radius | grid | cells | instances | frame | trace |
+|---|---|---|---|---|---|
+| 0 | 1×1 | 1 | 289 | 3.12 ms | 2.52 |
+| 1 | 3×3 | 9 | 1,700 | 6.93 ms | 6.13 |
+| 2 | 5×5 | 25 | 3,888 | 8.03 ms | 7.15 |
+| 3 | 7×7 | 49 | 6,406 | 8.16 ms | 7.30 |
+| 4 | 9×9 | 81 | 10,545 | 8.15 ms | 7.33 |
+
+Tripling the cells from 5×5 to 9×9 — 2.7 times the instances — costs **0.12 ms**. The extra cells are
+beyond anything a ray reaches: the top-level structure dismisses them in log time and the rays that
+would have visited them terminated long before. The expensive step is the *first* neighbour, 1×1 to
+3×3, which nearly doubles the frame — not because of instance count but because rays that used to
+escape to the sky now hit terrain and spawn shadow and bounce rays of their own.
+
+So draw distance is not what this budget is spent on. **Ray termination is.** That reframes what to
+tune: sixteen sun samples a pixel, not the size of the world.
+
+Against §5.3's roughly 8 ms allowance the frame is now at 8.16 — over, slightly, and the sun's
+sample count is the obvious place to spend it down once M7's temporal reuse makes fewer samples
+viable.
+
+**One pass over the file for the whole block**, not one per cell: a cell's records are scattered
+through a 79 MB stream and finding them costs a full walk, so a 7×7 grid loaded a cell at a time
+would read the file forty-nine times. Loading 49 cells takes 32 ms against 20 for one. The mesh
+cache spans the block too, which is what turns the same rock repeated across forty-nine cells into
+one mesh with many instances — **378 meshes for 6,406 instances**.
+
+**Recentring waits for the camera to commit.** `CellId::settled_in` withholds an answer within a
+twelfth of a cell of any boundary, so standing on an edge does not reload the world on every step
+across and every step back. The decision is separated from the loading it triggers because the two
+fail differently: one is arithmetic on a position and can be checked exactly, the other is thirty
+milliseconds of file reading and an acceleration structure rebuild.
+
+**Still hitching.** The reload is synchronous — about 30 ms of file work plus the structure rebuild,
+on the frame that crosses the boundary. M9's done-when says *no hitching*, and that needs the load
+off the main thread with the new block swapped in when it is ready. That is the remaining piece,
+along with distant statics and terrain layer blending.
+
 ### M5 — Direct lighting
 Sun as a directional light with a real angular diameter (so shadows are soft), shadow rays, cell
 ambient, `LIGH` point lights with shadow rays and a defensible attenuation model, emissive surfaces.

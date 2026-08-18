@@ -156,7 +156,8 @@ impl StaticScene {
             if cell.name != cell_name || !cell.is_interior() {
                 continue;
             }
-            let mut scene = Self::from_cell(&record, models, vfs)?;
+            let mut scene = Self::default();
+            scene.append_cell(&record, models, vfs, &mut HashMap::new())?;
             scene.ambient = cell.ambient.map(|a| Ambient {
                 colour: srgb::to_linear(a.ambient),
                 sunlight: srgb::to_linear(a.sunlight),
@@ -168,13 +169,6 @@ impl StaticScene {
     }
 
     /// Loads the exterior cell at grid position `(x, y)`, terrain included.
-    ///
-    /// Two records make a cell out of doors: the `CELL` that places its objects and the `LAND` that
-    /// shapes the ground under them. They are not adjacent in the file, so this walks it once and
-    /// takes whichever it meets.
-    ///
-    /// A cell with no `LAND`, or one whose record carries no heightmap, is legal — a hundred of
-    /// them ship — and comes back as its objects over flat ground at the default height.
     pub fn load_exterior(
         esm: &EsmReader<'_>,
         models: &ModelIndex,
@@ -182,12 +176,47 @@ impl StaticScene {
         x: i32,
         y: i32,
     ) -> Result<Self> {
+        Self::load_exterior_grid(esm, models, vfs, x, y, 0)
+    }
+
+    /// Loads every exterior cell within `radius` of `(x, y)` as one scene.
+    ///
+    /// **One pass over the file for the whole block**, not one per cell. A cell's records are
+    /// scattered through a 79 MB stream and finding them costs a full walk, so loading a 7×7 grid
+    /// a cell at a time would read the file forty-nine times over.
+    ///
+    /// The block is a square in Chebyshev distance, which is how Morrowind's own active grid is
+    /// shaped: everything within `radius` cells in either axis, so `radius` 1 is the 3×3 the
+    /// original engine kept resident.
+    ///
+    /// A cell with no `LAND`, or one whose record carries no heightmap, is legal — a hundred of
+    /// them ship — and contributes its objects over no ground at all. A grid position with no
+    /// `CELL` record is simply absent, which is what the sea beyond the island's edge is.
+    pub fn load_exterior_grid(
+        esm: &EsmReader<'_>,
+        models: &ModelIndex,
+        vfs: &Vfs,
+        x: i32,
+        y: i32,
+        radius: i32,
+    ) -> Result<Self> {
+        assert!(
+            radius >= 0,
+            "a grid radius counts cells outward from the centre"
+        );
+        let inside =
+            |cell_x: i32, cell_y: i32| (cell_x - x).abs() <= radius && (cell_y - y).abs() <= radius;
+
         let cell_tag = RecordName::new(b"CELL");
         let land_tag = RecordName::new(b"LAND");
         let texture_tag = RecordName::new(b"LTEX");
-        let mut scene: Option<Self> = None;
-        let mut land: Option<LandRecord> = None;
+        let mut scene = Self::default();
+        let mut by_path: HashMap<String, MeshId> = HashMap::new();
         let mut palette: Vec<String> = Vec::new();
+        // Terrain is built after the pass rather than during it: the texture palette is spread
+        // through the file and a cell met early would resolve its layers against half of it.
+        let mut lands: Vec<LandRecord> = Vec::new();
+        let mut found = false;
 
         for record in esm.records() {
             let record = record?;
@@ -201,23 +230,27 @@ impl StaticScene {
                 palette[index] = entry.texture;
             } else if record.name() == cell_tag {
                 let cell = Cell::parse(&record)?;
-                if !cell.is_interior() && cell.grid_x == x && cell.grid_y == y {
-                    scene = Some(Self::from_cell(&record, models, vfs)?);
+                if !cell.is_interior() && inside(cell.grid_x, cell.grid_y) {
+                    found = true;
+                    scene.append_cell(&record, models, vfs, &mut by_path)?;
                 }
             } else if record.name() == land_tag
                 && let Some(parsed) = LandRecord::parse(&record)?
-                && (parsed.grid_x, parsed.grid_y) == (x, y)
+                && inside(parsed.grid_x, parsed.grid_y)
             {
-                land = Some(parsed);
+                lands.push(parsed);
             }
         }
 
-        let mut scene =
-            scene.ok_or_else(|| SceneError::NoSuchCell(CellId::Exterior { x, y }.to_string()))?;
+        if !found {
+            return Err(SceneError::NoSuchCell(
+                CellId::Exterior { x, y }.to_string(),
+            ));
+        }
+
         // An exterior carries no `AMBI`: out of doors the ambient *is* the sky, which the original
         // engine drove from weather and time of day. Until that exists this is a fixed overcast
-        // daylight, and it is the only thing lighting an exterior at all — there is no sun yet
-        // either. Blue-shifted because sky light is, and bright enough that auto-exposure has
+        // daylight. Blue-shifted because sky light is, and bright enough that auto-exposure has
         // something to work from.
         scene.ambient = Some(Ambient {
             colour: Vec3::new(0.35, 0.42, 0.55),
@@ -225,10 +258,11 @@ impl StaticScene {
         });
         // Fixed for now: the orbit is a function of time of day, and nothing tracks that yet.
         scene.sun = Some(Sun::default_daylight());
-        if let Some(land) = land {
-            let tile_materials = terrain_materials(&land, &palette, &mut scene.materials);
+
+        for land in &lands {
+            let tile_materials = terrain_materials(land, &palette, &mut scene.materials);
             let mesh = MeshId(scene.meshes.len() as u32);
-            scene.meshes.push(Mesh::from_land(&land, &tile_materials));
+            scene.meshes.push(Mesh::from_land(land, &tile_materials));
             // No transform: `Mesh::from_land` places its vertices in the world already, because a
             // heightmap belongs to exactly one cell and could never be instanced elsewhere.
             scene.instances.push(Instance {
@@ -239,11 +273,20 @@ impl StaticScene {
         Ok(scene)
     }
 
-    /// Builds a scene from an already-located cell record.
-    fn from_cell(record: &Record<'_>, models: &ModelIndex, vfs: &Vfs) -> Result<Self> {
-        let mut scene = Self::default();
-        let mut by_path: HashMap<String, MeshId> = HashMap::new();
-
+    /// Adds everything one cell record places to this scene.
+    ///
+    /// `by_path` is the caller's, not this function's, and that is the point: a block of exterior
+    /// cells is mostly the *same* rocks and trees repeated, so a cache spanning the whole block
+    /// turns 49 copies of a mesh into one mesh with 49 instances — which is the split an
+    /// acceleration structure wants anyway.
+    fn append_cell(
+        &mut self,
+        record: &Record<'_>,
+        models: &ModelIndex,
+        vfs: &Vfs,
+        by_path: &mut HashMap<String, MeshId>,
+    ) -> Result<()> {
+        let scene = self;
         for cell_ref in Cell::references(record) {
             let cell_ref = cell_ref?;
             // An editor marker has a model and is deliberately not drawn with it: these are the
@@ -267,9 +310,8 @@ impl StaticScene {
                         source,
                     })?;
                     let id = MeshId(scene.meshes.len() as u32);
-                    scene
-                        .meshes
-                        .push(Mesh::from_nif(&nif, &mut scene.materials));
+                    let mesh = Mesh::from_nif(&nif, &mut scene.materials);
+                    scene.meshes.push(mesh);
                     by_path.insert(path.to_owned(), id);
                     id
                 }
@@ -296,7 +338,7 @@ impl StaticScene {
                 transform: world_transform(&cell_ref),
             });
         }
-        Ok(scene)
+        Ok(())
     }
 
     /// Triangles across every instance, counting each placement separately.

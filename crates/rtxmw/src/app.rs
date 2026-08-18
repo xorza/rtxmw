@@ -54,6 +54,9 @@ pub(crate) struct App {
     /// same rule one level up.
     renderer: Option<Renderer>,
     window: Option<Window>,
+    /// The exterior block currently resident, so the grid only reloads when the camera leaves it.
+    /// `None` indoors, where there is nothing to stream.
+    loaded_centre: Option<CellId>,
     /// Frames to draw before exiting, for scripting the windowed path.
     exit_after: Option<u32>,
     frames_drawn: u32,
@@ -67,6 +70,47 @@ pub(crate) struct App {
 }
 
 impl App {
+    /// Recentres the loaded block when the camera has settled in a different cell.
+    ///
+    /// Synchronous, so the reload is a visible hitch — about 30 ms of file work plus the
+    /// acceleration structure rebuild. Doing it off the main thread is what M9's "no hitching"
+    /// asks for and is the next piece; this is the part that makes the world traversable at all.
+    fn stream_grid(&mut self) {
+        let Some(centre) = &self.loaded_centre else {
+            return;
+        };
+        let Some(CellId::Exterior { x, y }) =
+            scene_loader::next_centre(self.camera.position(), centre)
+        else {
+            return;
+        };
+
+        let started = Instant::now();
+        match LoadedCell::load_exterior_grid(x, y, scene_loader::GRID_RADIUS) {
+            Ok(Some(cell)) => {
+                let Some(renderer) = self.renderer.as_mut() else {
+                    return;
+                };
+                if let Err(e) = renderer.load_scene(&cell.scene, &cell.textures) {
+                    eprintln!("could not upload {}: {e}", cell.id);
+                    return;
+                }
+                println!(
+                    "streamed to {} in {:.0} ms: {} instances",
+                    cell.id,
+                    started.elapsed().as_secs_f32() * 1000.0,
+                    cell.scene.instances.len()
+                );
+                self.loaded_centre = Some(cell.id);
+            }
+            // Off the edge of the world, where no cell record exists. The block stays where it is
+            // rather than emptying, so flying out to sea leaves the coast behind rather than
+            // nothing at all.
+            Ok(None) => {}
+            Err(e) => eprintln!("could not stream to ({x}, {y}): {e}"),
+        }
+    }
+
     /// An app configured from the command line.
     ///
     /// The frame limit exists because the shutdown path had no way to be exercised: the crash it
@@ -88,6 +132,7 @@ impl Default for App {
             cell: scene_loader::cell_argument(None),
             renderer: None,
             window: None,
+            loaded_centre: None,
             exit_after: None,
             frames_drawn: 0,
             // Replaced by the loaded cell's own centre in `resumed`; this only matters if no game
@@ -183,7 +228,7 @@ impl ApplicationHandler for App {
         // Content after the device, because uploading needs one. A missing install is not fatal:
         // the window still comes up and reports the device, which is what makes it obvious that the
         // path is what is wrong rather than the GPU.
-        match LoadedCell::load_at(self.cell.clone()) {
+        match LoadedCell::load_at(self.cell.clone(), scene_loader::GRID_RADIUS) {
             Ok(Some(cell)) => {
                 let renderer = self.renderer.as_mut().expect("renderer was just created");
                 if let Err(e) = renderer.load_scene(&cell.scene, &cell.textures) {
@@ -193,6 +238,7 @@ impl ApplicationHandler for App {
                 }
                 println!("{}", scene_loader::describe(&cell));
                 self.camera = scene_loader::Viewpoint::entering(&cell).camera();
+                self.loaded_centre = matches!(cell.id, CellId::Exterior { .. }).then_some(cell.id);
             }
             Ok(None) => eprintln!(
                 "no game data configured — set MORROWIND_DATA_DIR, or put it in .env at the repo root"
@@ -268,6 +314,7 @@ impl ApplicationHandler for App {
                 self.last_frame = Instant::now();
 
                 self.camera.fly(self.keys.movement(), dt);
+                self.stream_grid();
 
                 if let (Some(renderer), Some(window)) = (&mut self.renderer, &self.window) {
                     let size = window.inner_size();
