@@ -328,6 +328,38 @@ through it.
 **Retires:** the whole acceleration-structure pipeline. **This is the milestone that proves the
 project.**
 
+Split into steps, since it is the largest milestone: **M3a** scene assembly ✔, **M3b** the shader
+build and its ray-query pass ✔, **M3c** geometry upload ✔, **M3d** BLAS and TLAS, **M3e** the
+compute pass into an offscreen HDR target and the blit to the swapchain, **M3f** camera into frame
+constants.
+
+**M3c — done.** `Memory`, `Buffer`, `Uploader` in `rtxmw-gpu`; `GeometryBuffers` in `rtxmw-render`.
+Seyda Neen's Census and Excise Office uploads its 104 distinct meshes — 21,113 vertices, 17,835
+triangles — into 0.85 MiB across three buffers. Four things settled here:
+
+- **Positions get their own tightly packed stream** and shading attributes a parallel one, as §3
+  requires. `GeometryBuffers::POSITION_STRIDE` is asserted to be 12, because the stride is a number
+  the build is *told* rather than one it derives: padding the vertex would not fail, it would
+  misplace every triangle.
+- **Indices stay mesh-local**, with `MeshRange::first_vertex` passed to the build as its
+  `firstVertex` and added in the shader before an attribute fetch. Rebasing them into the shared
+  buffer would work equally well today, but it ties a mesh's index data to where it landed, and
+  cells will relocate meshes at M9.
+- **A mesh that flattened to nothing keeps its slot** as a zero-length range, so a `MeshId` stays a
+  direct index.
+- **`gpu-allocator` pads an allocation to the memory requirement's alignment**, so the raw mapped
+  slice is longer than the buffer — an 8-byte buffer maps 16. `Buffer::mapped` trims to the
+  requested size; without that, every readback would return padding as data.
+
+`TestGpu` was rebuilt on the same three types rather than keeping its own allocator and submitter,
+so the upload path the engine uses is the one the tests exercise. The one-shot `Commands` type stays
+`pub(crate)`: uploads and acceleration structure builds happen at load time, where blocking on a
+fence is the simplest correct thing, and nothing outside the crate should reach for that.
+
+Not yet wired into `Renderer` — nothing in the frame loop needs geometry until M3d builds from it.
+Note when it is: `Memory` hands out clones that must all drop before the `Device`, so it belongs
+*before* the device in `Renderer`'s field order.
+
 ### M4 — Textures and bindless materials
 DDS/TGA decode, BCn transcode where needed, mip generation, bindless texture array, `GeometryRef`
 and material buffers, attribute interpolation at the hit, alpha-test in the candidate loop.

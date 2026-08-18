@@ -10,3 +10,13 @@ build = "build.rs"
 workspace = true
 
 [dependencies]
+ash.workspace = true
+bytemuck.workspace = true
+rtxmw-gpu.workspace = true
+rtxmw-scene.workspace = true
+
+[dev-dependencies]
+glam.workspace = true
+rtxmw-esm.workspace = true
+rtxmw-gpu = { workspace = true, features = ["internals"] }
+rtxmw-vfs = { workspace = true, features = ["internals"] }

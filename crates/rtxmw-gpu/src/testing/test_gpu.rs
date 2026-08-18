@@ -3,28 +3,15 @@
 use std::sync::{LazyLock, Mutex, MutexGuard};
 
 use ash::vk;
-use gpu_allocator::vulkan::{Allocator, AllocatorCreateDesc};
 
 use crate::device::Device;
 use crate::error::Result;
 use crate::instance::{Instance, Validation};
+use crate::memory::Memory;
 use crate::physical_device::{PhysicalDevice, Presentation};
 use crate::testing::render_target::RenderTarget;
+use crate::uploader::Uploader;
 use crate::validation_log::ValidationLog;
-
-/// Command pool, buffer and fence for one-shot submissions.
-///
-/// Vulkan command pools are externally synchronised and a `VkQueue` may not be submitted to from
-/// two threads at once, so this is only ever reached through a `Mutex`.
-#[derive(Debug)]
-struct Submitter {
-    /// Owned so the buffer stays valid. Never read: `TestGpu` lives in a `static` and is never
-    /// dropped, so process exit is the teardown.
-    #[allow(dead_code)]
-    pool: vk::CommandPool,
-    command_buffer: vk::CommandBuffer,
-    fence: vk::Fence,
-}
 
 /// A Vulkan device shared by every test in the process.
 ///
@@ -33,8 +20,10 @@ struct Submitter {
 /// resources. This is built once on first use and never torn down — the process exiting is the
 /// teardown.
 pub struct TestGpu {
-    submitter: Mutex<Submitter>,
-    allocator: Mutex<Allocator>,
+    /// Behind a `Mutex` because a command pool is externally synchronised and a `VkQueue` may not
+    /// be submitted to from two threads at once.
+    uploader: Mutex<Uploader>,
+    memory: Memory,
     device: Device,
     physical: PhysicalDevice,
     instance: Instance,
@@ -66,41 +55,12 @@ impl TestGpu {
         let instance = Instance::new(c"rtxmw-test", &[], Validation::Record)?;
         let physical = PhysicalDevice::select(&instance, Presentation::NotNeeded)?;
         let device = Device::new(&instance, &physical)?;
-
-        let allocator = Allocator::new(&AllocatorCreateDesc {
-            instance: instance.raw().clone(),
-            device: device.raw().clone(),
-            physical_device: physical.raw(),
-            debug_settings: Default::default(),
-            buffer_device_address: true,
-            allocation_sizes: Default::default(),
-        })
-        .expect("failed to create the device memory allocator");
-
-        let pool_info = vk::CommandPoolCreateInfo::default()
-            .queue_family_index(physical.graphics_queue_family())
-            .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
-        // SAFETY: the device is alive and `pool_info` is initialised.
-        let pool = unsafe { device.raw().create_command_pool(&pool_info, None)? };
-
-        let alloc_info = vk::CommandBufferAllocateInfo::default()
-            .command_pool(pool)
-            .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(1);
-        // SAFETY: the pool was just created on this device.
-        let command_buffer = unsafe { device.raw().allocate_command_buffers(&alloc_info)? }[0];
-
-        let fence_info = vk::FenceCreateInfo::default();
-        // SAFETY: same.
-        let fence = unsafe { device.raw().create_fence(&fence_info, None)? };
+        let memory = Memory::new(&instance, &physical, &device)?;
+        let uploader = Uploader::new(&device, &memory, physical.graphics_queue_family())?;
 
         Ok(Self {
-            submitter: Mutex::new(Submitter {
-                pool,
-                command_buffer,
-                fence,
-            }),
-            allocator: Mutex::new(allocator),
+            uploader: Mutex::new(uploader),
+            memory,
             device,
             physical,
             instance,
@@ -145,57 +105,29 @@ impl TestGpu {
         );
     }
 
-    /// Locks the allocator for the caller.
-    pub(crate) fn allocator(&self) -> MutexGuard<'_, Allocator> {
-        match self.allocator.lock() {
+    /// The device's memory allocator, for creating buffers and images.
+    pub fn memory(&self) -> &Memory {
+        &self.memory
+    }
+
+    /// Locks the shared uploader for the caller.
+    ///
+    /// Serialised across threads: the queue and command pool are shared, and a test suite gains
+    /// nothing from overlapping submissions. [`TestGpu::submit_and_wait`] takes the same lock, so
+    /// calling it while holding this guard deadlocks — go through the guard instead.
+    pub fn uploader(&self) -> MutexGuard<'_, Uploader> {
+        match self.uploader.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         }
     }
 
     /// Records `record` into a one-shot command buffer, submits it, and blocks until it completes.
-    ///
-    /// Serialised across threads: the queue and command pool are shared, and a test suite gains
-    /// nothing from overlapping submissions.
     pub fn submit_and_wait(
         &self,
         record: impl FnOnce(&ash::Device, vk::CommandBuffer),
     ) -> Result<()> {
-        let submitter = match self.submitter.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        let raw = self.device.raw();
-
-        // SAFETY: the fence and command buffer are idle — any previous submission was waited on
-        // before the lock was released.
-        unsafe {
-            raw.reset_fences(&[submitter.fence])?;
-            raw.reset_command_buffer(
-                submitter.command_buffer,
-                vk::CommandBufferResetFlags::empty(),
-            )?;
-
-            let begin = vk::CommandBufferBeginInfo::default()
-                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-            raw.begin_command_buffer(submitter.command_buffer, &begin)?;
-        }
-
-        record(raw, submitter.command_buffer);
-
-        // SAFETY: the command buffer is recording and every handle is alive.
-        unsafe {
-            raw.end_command_buffer(submitter.command_buffer)?;
-
-            let buffers =
-                [vk::CommandBufferSubmitInfo::default().command_buffer(submitter.command_buffer)];
-            let submit = vk::SubmitInfo2::default().command_buffer_infos(&buffers);
-            raw.queue_submit2(self.device.graphics_queue(), &[submit], submitter.fence)?;
-
-            raw.wait_for_fences(&[submitter.fence], true, u64::MAX)?;
-        }
-
-        Ok(())
+        self.uploader().submit_and_wait(record)
     }
 
     /// Creates an offscreen colour target to render into.

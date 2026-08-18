@@ -5,6 +5,7 @@ use gpu_allocator::MemoryLocation;
 use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc, AllocationScheme};
 use half::f16;
 
+use crate::buffer::{Buffer, BufferMemory};
 use crate::error::Result;
 use crate::image_barrier::{self, COLOR_RANGE};
 use crate::testing::test_gpu::TestGpu;
@@ -68,16 +69,13 @@ impl RenderTarget {
 
         // SAFETY: `image` was just created on this device.
         let requirements = unsafe { device.get_image_memory_requirements(image) };
-        let allocation = gpu
-            .allocator()
-            .allocate(&AllocationCreateDesc {
-                name: "test render target",
-                requirements,
-                location: MemoryLocation::GpuOnly,
-                linear: false,
-                allocation_scheme: AllocationScheme::DedicatedImage(image),
-            })
-            .expect("failed to allocate render target memory");
+        let allocation = gpu.memory().lock().allocate(&AllocationCreateDesc {
+            name: "test render target",
+            requirements,
+            location: MemoryLocation::GpuOnly,
+            linear: false,
+            allocation_scheme: AllocationScheme::DedicatedImage(image),
+        })?;
 
         // SAFETY: the allocation matches the image's requirements.
         unsafe { device.bind_image_memory(image, allocation.memory(), allocation.offset())? };
@@ -154,31 +152,16 @@ impl RenderTarget {
         let pixels = (self.extent.width * self.extent.height) as usize;
         let size = (pixels * pixel.bytes_per_pixel()) as vk::DeviceSize;
 
-        let device = self.gpu.device().raw();
-        let buffer_info = vk::BufferCreateInfo::default()
-            .size(size)
-            .usage(vk::BufferUsageFlags::TRANSFER_DST)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE);
-        // SAFETY: `buffer_info` is initialised and the device is alive.
-        let buffer = unsafe { device.create_buffer(&buffer_info, None)? };
+        let readback = Buffer::new(
+            self.gpu.memory(),
+            "render target readback",
+            size,
+            vk::BufferUsageFlags::TRANSFER_DST,
+            BufferMemory::Readback,
+        )?;
+        let destination = readback.raw();
 
-        // SAFETY: `buffer` was just created on this device.
-        let requirements = unsafe { device.get_buffer_memory_requirements(buffer) };
-        let allocation = self
-            .gpu
-            .allocator()
-            .allocate(&AllocationCreateDesc {
-                name: "render target readback",
-                requirements,
-                location: MemoryLocation::GpuToCpu,
-                linear: true,
-                allocation_scheme: AllocationScheme::DedicatedBuffer(buffer),
-            })
-            .expect("failed to allocate readback memory");
-        // SAFETY: the allocation matches the buffer's requirements.
-        unsafe { device.bind_buffer_memory(buffer, allocation.memory(), allocation.offset())? };
-
-        let copy_result = self.gpu.submit_and_wait(|device, cmd| {
+        self.gpu.submit_and_wait(|device, cmd| {
             // SAFETY: the command buffer is recording and both resources are alive.
             unsafe {
                 image_barrier::transition(
@@ -203,27 +186,16 @@ impl RenderTarget {
                     cmd,
                     self.image,
                     vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                    buffer,
+                    destination,
                     &[region],
                 );
             }
-        });
+        })?;
 
-        let rgba = copy_result.map(|()| {
-            let bytes = allocation
-                .mapped_slice()
-                .expect("readback allocation is not host-visible");
-            pixel.to_rgba8(&bytes[..size as usize], pixels)
-        });
-
-        self.gpu
-            .allocator()
-            .free(allocation)
-            .expect("failed to free readback memory");
-        // SAFETY: the submission completed, so nothing references the buffer.
-        unsafe { device.destroy_buffer(buffer, None) };
-
-        rgba
+        let bytes = readback
+            .mapped()
+            .expect("readback memory is host-visible by construction");
+        Ok(pixel.to_rgba8(&bytes[..size as usize], pixels))
     }
 }
 
@@ -241,7 +213,8 @@ impl Drop for RenderTarget {
         }
         if let Some(allocation) = self.allocation.take() {
             self.gpu
-                .allocator()
+                .memory()
+                .lock()
                 .free(allocation)
                 .expect("failed to free render target memory");
         }

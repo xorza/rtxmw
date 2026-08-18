@@ -1305,6 +1305,15 @@ dependencies = [
 [[package]]
 name = "rtxmw-render"
 version = "0.1.0"
+dependencies = [
+ "ash",
+ "bytemuck",
+ "glam",
+ "rtxmw-esm",
+ "rtxmw-gpu",
+ "rtxmw-scene",
+ "rtxmw-vfs",
+]
 
 [[package]]
 name = "rtxmw-scene"

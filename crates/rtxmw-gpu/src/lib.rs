@@ -5,24 +5,31 @@
 /// Image layout transitions, qualified as `image_barrier::transition(..)` at call sites.
 pub mod image_barrier;
 
+mod buffer;
+mod commands;
 mod device;
 mod error;
 mod frames;
 mod instance;
+mod memory;
 mod physical_device;
 mod surface;
 mod swapchain;
+mod uploader;
 mod validation_log;
 
+pub use crate::buffer::{Buffer, BufferMemory};
 pub use crate::device::Device;
 pub use crate::error::{GpuError, Result};
 pub use crate::frames::{Frame, Frames};
 pub use crate::instance::{Instance, Validation};
+pub use crate::memory::Memory;
 pub use crate::physical_device::{
     PhysicalDevice, Presentation, RayTracingLimits, RayTracingSupport,
 };
 pub use crate::surface::Surface;
 pub use crate::swapchain::Swapchain;
+pub use crate::uploader::Uploader;
 pub use crate::validation_log::{ValidationLog, ValidationMessage};
 
 #[cfg(any(test, feature = "internals"))]

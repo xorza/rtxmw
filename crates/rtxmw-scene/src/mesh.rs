@@ -23,9 +23,10 @@ const MARKER_PREFIXES: &[&str] = &["editormarker", "tri editormarker"];
 #[derive(Debug, Clone, Default)]
 pub struct Mesh {
     pub positions: Vec<Vec3>,
-    /// Empty when the model carries no normals.
+    /// Always parallel to `positions`. Zero where the source block carried no normal, which a
+    /// shader must detect and replace with the face normal.
     pub normals: Vec<Vec3>,
-    /// Empty when the model carries no texture coordinates.
+    /// Always parallel to `positions`. Zero where the source block carried no texture coordinates.
     pub uvs: Vec<Vec2>,
     pub indices: Vec<u32>,
 }

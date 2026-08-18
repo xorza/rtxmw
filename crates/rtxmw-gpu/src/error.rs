@@ -9,6 +9,8 @@ pub enum GpuError {
     LoaderMissing(ash::LoadingError),
     /// A Vulkan call failed.
     Vulkan(vk::Result),
+    /// Device memory could not be allocated for a buffer or image.
+    Allocation(gpu_allocator::AllocationError),
     /// No physical device met the renderer's requirements.
     NoSuitableDevice(Vec<Rejection>),
 }
@@ -39,6 +41,12 @@ impl From<vk::Result> for GpuError {
     }
 }
 
+impl From<gpu_allocator::AllocationError> for GpuError {
+    fn from(value: gpu_allocator::AllocationError) -> Self {
+        Self::Allocation(value)
+    }
+}
+
 impl From<ash::LoadingError> for GpuError {
     fn from(value: ash::LoadingError) -> Self {
         Self::LoaderMissing(value)
@@ -50,6 +58,7 @@ impl std::fmt::Display for GpuError {
         match self {
             Self::LoaderMissing(e) => write!(f, "could not load the Vulkan loader: {e}"),
             Self::Vulkan(e) => write!(f, "vulkan call failed: {e}"),
+            Self::Allocation(e) => write!(f, "could not allocate device memory: {e}"),
             Self::NoSuitableDevice(rejections) => {
                 writeln!(f, "no physical device meets the ray tracing requirements")?;
                 for r in rejections {
