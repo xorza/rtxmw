@@ -379,12 +379,42 @@ than being an option. Top level is 79 KiB.
 
 What M3d does *not* prove is that the triangles inside a structure are the right ones. The build
 range triple — `first_vertex`, `primitive_offset`, `max_vertex` — could be wrong in a way that still
-builds and still validates, because validation cannot inspect index contents on the device. If the
-first image at M3e is recognisable-but-scrambled, that triple is where to look.
+builds and still validates, because validation cannot inspect index contents on the device. M3e
+settles it.
 
-Not yet wired into `Renderer` — nothing in the frame loop needs any of this until M3e traces it.
-Note when it is: `Memory` hands out clones that must all drop before the `Device`, so it belongs
-*before* the device in `Renderer`'s field order.
+**M3e — done.** `Image` and `image_blit` in `rtxmw-gpu`, `VisibilityPass` and `FrameConstants` in
+`rtxmw-render`, and the whole chain wired into `Renderer`. `cargo run` opens Seyda Neen's Census and
+Excise Office and traces it: 1920×1080 offscreen `R16G16B16A16_SFLOAT`, blitted to the swapchain.
+A debug build, whose validation layer aborts on error, runs the frame loop silently.
+
+The milestone's real value is that the pass is verified **headlessly, pixel by pixel**, which
+retires every "silently wrong" risk carried since M3c:
+
+- A wall 100 units ahead covers the centre and misses the corners, with the covered fraction
+  matching what 75° of field of view predicts.
+- Geometry to the **north appears on the left**, geometry **above appears at the top**. That pair
+  pins the whole handedness chain — instance transform, projection convention, Vulkan's Y-down NDC,
+  and the shader's unprojection. A mirror anywhere in it still draws a wall, just in the wrong
+  place, and nothing before M3e could tell.
+- Two meshes in one buffer both render at their own offsets, which is the direct test of the build
+  range triple M3d could not check.
+- An instance behind the camera is not drawn, so instance transforms are applied rather than
+  ignored.
+- The real cell renders with 48% of pixels hitting geometry across 11,854 distinct barycentric
+  shades — structure, not a single wrongly-placed triangle filling the view.
+
+Two things worth recording:
+
+- **`RenderTarget`'s readback used to lock the shared uploader internally**, so a caller holding the
+  guard deadlocked — which is exactly what the first run of the new test did. The methods now take
+  `&mut Uploader`, making it a compile error rather than a hang. The doc comment warning about it,
+  added a milestone earlier, did not prevent it.
+- **Locating the game install is production behaviour**, not a test helper, so `morrowind_data_dir`
+  and friends came out from behind the `internals` feature and `dotenvy` became a normal dependency.
+
+The camera's projection uses the *offscreen* aspect ratio, not the window's — the trace happens at a
+fixed internal resolution and is stretched to whatever the window is, so a projection built for the
+window would distort as soon as the two differed.
 
 ### M4 — Textures and bindless materials
 DDS/TGA decode, BCn transcode where needed, mip generation, bindless texture array, `GeometryRef`

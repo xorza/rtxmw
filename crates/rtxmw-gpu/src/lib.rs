@@ -4,6 +4,8 @@
 
 /// Image layout transitions, qualified as `image_barrier::transition(..)` at call sites.
 pub mod image_barrier;
+/// Image-to-image copies, qualified as `image_blit::stretch(..)` at call sites.
+pub mod image_blit;
 /// Resource-independent barriers, qualified as `memory_barrier::full(..)` at call sites.
 pub mod memory_barrier;
 
@@ -12,6 +14,7 @@ mod commands;
 mod device;
 mod error;
 mod frames;
+mod image;
 mod instance;
 mod memory;
 mod physical_device;
@@ -24,6 +27,7 @@ pub use crate::buffer::{Buffer, BufferMemory};
 pub use crate::device::Device;
 pub use crate::error::{GpuError, Result};
 pub use crate::frames::{Frame, Frames};
+pub use crate::image::Image;
 pub use crate::instance::{Instance, Validation};
 pub use crate::memory::Memory;
 pub use crate::physical_device::{

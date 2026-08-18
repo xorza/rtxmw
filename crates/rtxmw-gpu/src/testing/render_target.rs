@@ -1,34 +1,23 @@
 //! An offscreen colour target that can be rendered into and read back.
 
 use ash::vk;
-use gpu_allocator::MemoryLocation;
-use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc, AllocationScheme};
 use half::f16;
 
 use crate::buffer::{Buffer, BufferMemory};
 use crate::error::Result;
+use crate::image::Image;
 use crate::image_barrier::{self, COLOR_RANGE};
 use crate::testing::test_gpu::TestGpu;
+use crate::uploader::Uploader;
 
-/// An offscreen image plus its view, sized and formatted for one test.
+/// An offscreen image sized and formatted for one test, with host readback.
 ///
-/// Cheap relative to device creation, so one per test is fine.
+/// Cheap relative to device creation, so one per test is fine. The image itself is an ordinary
+/// [`Image`]; what this adds is the readback and clear a test needs and the renderer does not.
+#[derive(Debug)]
 pub struct RenderTarget {
     gpu: &'static TestGpu,
-    image: vk::Image,
-    view: vk::ImageView,
-    allocation: Option<Allocation>,
-    extent: vk::Extent2D,
-    format: vk::Format,
-}
-
-impl std::fmt::Debug for RenderTarget {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RenderTarget")
-            .field("extent", &self.extent)
-            .field("format", &self.format)
-            .finish_non_exhaustive()
-    }
+    image: Image,
 }
 
 impl RenderTarget {
@@ -38,103 +27,51 @@ impl RenderTarget {
         height: u32,
         format: vk::Format,
     ) -> Result<Self> {
-        let extent = vk::Extent2D { width, height };
-        let device = gpu.device().raw();
-
         // STORAGE so a compute or ray tracing shader can write it; TRANSFER_SRC for readback;
         // COLOR_ATTACHMENT so a raster pass can target it too.
-        let image_info = vk::ImageCreateInfo::default()
-            .image_type(vk::ImageType::TYPE_2D)
-            .format(format)
-            .extent(vk::Extent3D {
-                width,
-                height,
-                depth: 1,
-            })
-            .mip_levels(1)
-            .array_layers(1)
-            .samples(vk::SampleCountFlags::TYPE_1)
-            .tiling(vk::ImageTiling::OPTIMAL)
-            .usage(
-                vk::ImageUsageFlags::STORAGE
-                    | vk::ImageUsageFlags::COLOR_ATTACHMENT
-                    | vk::ImageUsageFlags::TRANSFER_SRC
-                    | vk::ImageUsageFlags::TRANSFER_DST,
-            )
-            .sharing_mode(vk::SharingMode::EXCLUSIVE)
-            .initial_layout(vk::ImageLayout::UNDEFINED);
-
-        // SAFETY: `image_info` is fully initialised and the device is alive.
-        let image = unsafe { device.create_image(&image_info, None)? };
-
-        // SAFETY: `image` was just created on this device.
-        let requirements = unsafe { device.get_image_memory_requirements(image) };
-        let allocation = gpu.memory().lock().allocate(&AllocationCreateDesc {
-            name: "test render target",
-            requirements,
-            location: MemoryLocation::GpuOnly,
-            linear: false,
-            allocation_scheme: AllocationScheme::DedicatedImage(image),
-        })?;
-
-        // SAFETY: the allocation matches the image's requirements.
-        unsafe { device.bind_image_memory(image, allocation.memory(), allocation.offset())? };
-
-        let view_info = vk::ImageViewCreateInfo::default()
-            .image(image)
-            .view_type(vk::ImageViewType::TYPE_2D)
-            .format(format)
-            .subresource_range(COLOR_RANGE);
-        // SAFETY: `image` is bound and alive.
-        let view = unsafe { device.create_image_view(&view_info, None)? };
-
-        Ok(Self {
-            gpu,
-            image,
-            view,
-            allocation: Some(allocation),
-            extent,
+        let image = Image::new(
+            gpu.memory(),
+            "test render target",
+            vk::Extent2D { width, height },
             format,
-        })
+            vk::ImageUsageFlags::STORAGE
+                | vk::ImageUsageFlags::COLOR_ATTACHMENT
+                | vk::ImageUsageFlags::TRANSFER_SRC
+                | vk::ImageUsageFlags::TRANSFER_DST,
+        )?;
+        Ok(Self { gpu, image })
     }
 
-    /// The underlying image.
-    pub fn image(&self) -> vk::Image {
-        self.image
-    }
-
-    /// A full-subresource colour view of the image.
-    pub fn view(&self) -> vk::ImageView {
-        self.view
+    /// The image being rendered into.
+    pub fn image(&self) -> &Image {
+        &self.image
     }
 
     /// Size in pixels.
     pub fn extent(&self) -> vk::Extent2D {
-        self.extent
-    }
-
-    /// The format the image was created with.
-    pub fn format(&self) -> vk::Format {
-        self.format
+        self.image.extent()
     }
 
     /// Fills the whole image with `colour`, leaving it in `TRANSFER_DST_OPTIMAL`.
     ///
     /// Enough to exercise the harness before there is anything to render.
-    pub fn clear(&self, colour: [f32; 4]) -> Result<()> {
-        self.gpu.submit_and_wait(|device, cmd| {
+    /// Takes the uploader rather than reaching for [`TestGpu::submit_and_wait`]: that would lock
+    /// the shared uploader, and a caller already holding the guard would deadlock. Threading it
+    /// through makes that impossible to write instead of merely documented.
+    pub fn clear(&self, uploader: &mut Uploader, colour: [f32; 4]) -> Result<()> {
+        uploader.submit_and_wait(|device, cmd| {
             // SAFETY: the command buffer is recording and the image belongs to this device.
             unsafe {
                 image_barrier::transition(
                     device,
                     cmd,
-                    self.image,
+                    self.image.raw(),
                     vk::ImageLayout::UNDEFINED,
                     vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 );
                 device.cmd_clear_color_image(
                     cmd,
-                    self.image,
+                    self.image.raw(),
                     vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                     &vk::ClearColorValue { float32: colour },
                     &[COLOR_RANGE],
@@ -147,9 +84,14 @@ impl RenderTarget {
     ///
     /// `current_layout` is the layout the image is in when this is called; it is transitioned to
     /// `TRANSFER_SRC_OPTIMAL` and left there.
-    pub fn read_rgba8(&self, current_layout: vk::ImageLayout) -> Result<Vec<u8>> {
-        let pixel = PixelFormat::of(self.format);
-        let pixels = (self.extent.width * self.extent.height) as usize;
+    pub fn read_rgba8(
+        &self,
+        uploader: &mut Uploader,
+        current_layout: vk::ImageLayout,
+    ) -> Result<Vec<u8>> {
+        let pixel = PixelFormat::of(self.image.format());
+        let extent = self.image.extent();
+        let pixels = (extent.width * extent.height) as usize;
         let size = (pixels * pixel.bytes_per_pixel()) as vk::DeviceSize;
 
         let readback = Buffer::new(
@@ -161,13 +103,13 @@ impl RenderTarget {
         )?;
         let destination = readback.raw();
 
-        self.gpu.submit_and_wait(|device, cmd| {
+        uploader.submit_and_wait(|device, cmd| {
             // SAFETY: the command buffer is recording and both resources are alive.
             unsafe {
                 image_barrier::transition(
                     device,
                     cmd,
-                    self.image,
+                    self.image.raw(),
                     current_layout,
                     vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                 );
@@ -178,13 +120,13 @@ impl RenderTarget {
                             .layer_count(1),
                     )
                     .image_extent(vk::Extent3D {
-                        width: self.extent.width,
-                        height: self.extent.height,
+                        width: extent.width,
+                        height: extent.height,
                         depth: 1,
                     });
                 device.cmd_copy_image_to_buffer(
                     cmd,
-                    self.image,
+                    self.image.raw(),
                     vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                     destination,
                     &[region],
@@ -196,28 +138,6 @@ impl RenderTarget {
             .mapped()
             .expect("readback memory is host-visible by construction");
         Ok(pixel.to_rgba8(&bytes[..size as usize], pixels))
-    }
-}
-
-impl Drop for RenderTarget {
-    fn drop(&mut self) {
-        let device = self.gpu.device().raw();
-        // No `device_wait_idle` here: it requires external synchronisation of every queue, so
-        // calling it while another test thread submits is itself a threading violation. Every
-        // `submit_and_wait` blocks on a fence before returning, so this target's work is already
-        // complete and nothing else can reference it.
-        // SAFETY: as above — no in-flight work touches this image.
-        unsafe {
-            device.destroy_image_view(self.view, None);
-            device.destroy_image(self.image, None);
-        }
-        if let Some(allocation) = self.allocation.take() {
-            self.gpu
-                .memory()
-                .lock()
-                .free(allocation)
-                .expect("failed to free render target memory");
-        }
     }
 }
 
@@ -292,10 +212,12 @@ mod tests {
             .create_target(8, 4, vk::Format::R8G8B8A8_UNORM)
             .expect("could not create target");
 
-        target.clear(CLEAR).expect("clear failed");
+        let mut uploader = gpu.uploader();
+        target.clear(&mut uploader, CLEAR).expect("clear failed");
         let pixels = target
-            .read_rgba8(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .read_rgba8(&mut uploader, vk::ImageLayout::TRANSFER_DST_OPTIMAL)
             .expect("readback failed");
+        drop(uploader);
 
         assert_eq!(pixels.len(), 8 * 4 * 4);
         for (index, pixel) in pixels.chunks_exact(4).enumerate() {
@@ -311,10 +233,12 @@ mod tests {
             .create_target(16, 16, vk::Format::R8G8B8A8_UNORM)
             .expect("could not create target");
 
-        target.clear(CLEAR).expect("clear failed");
+        let mut uploader = gpu.uploader();
+        target.clear(&mut uploader, CLEAR).expect("clear failed");
         let pixels = target
-            .read_rgba8(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .read_rgba8(&mut uploader, vk::ImageLayout::TRANSFER_DST_OPTIMAL)
             .expect("readback failed");
+        drop(uploader);
 
         crate::testing::golden::assert_matches("cleared_target", &pixels, 16, 16);
         gpu.assert_no_validation_errors();
@@ -327,10 +251,12 @@ mod tests {
             .create_target(2, 2, vk::Format::B8G8R8A8_UNORM)
             .expect("could not create target");
 
-        target.clear(CLEAR).expect("clear failed");
+        let mut uploader = gpu.uploader();
+        target.clear(&mut uploader, CLEAR).expect("clear failed");
         let pixels = target
-            .read_rgba8(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .read_rgba8(&mut uploader, vk::ImageLayout::TRANSFER_DST_OPTIMAL)
             .expect("readback failed");
+        drop(uploader);
 
         // The clear is specified in RGBA regardless of storage order, so readback must agree with
         // the R8G8B8A8 case rather than coming back swapped.
@@ -347,10 +273,12 @@ mod tests {
             .create_target(2, 2, vk::Format::R16G16B16A16_SFLOAT)
             .expect("could not create target");
 
-        target.clear(CLEAR).expect("clear failed");
+        let mut uploader = gpu.uploader();
+        target.clear(&mut uploader, CLEAR).expect("clear failed");
         let pixels = target
-            .read_rgba8(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .read_rgba8(&mut uploader, vk::ImageLayout::TRANSFER_DST_OPTIMAL)
             .expect("readback failed");
+        drop(uploader);
 
         // Half-float cannot hold 0.2 or 0.6 exactly, so allow one 8-bit step of slack.
         for pixel in pixels.chunks_exact(4) {

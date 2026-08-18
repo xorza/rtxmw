@@ -49,15 +49,22 @@ fn steady_state_frame_submission_does_not_allocate() {
         .create_target(64, 64, vk::Format::R8G8B8A8_UNORM)
         .expect("could not create render target");
 
+    // Held across the loop rather than taken per frame, which is how a real frame loop owns it.
+    let mut uploader = gpu.uploader();
     for _ in 0..WARMUP_FRAMES {
-        target.clear(CLEAR).expect("warmup frame failed");
+        target
+            .clear(&mut uploader, CLEAR)
+            .expect("warmup frame failed");
     }
 
     let before = dhat::HeapStats::get();
     for _ in 0..MEASURED_FRAMES {
-        target.clear(CLEAR).expect("measured frame failed");
+        target
+            .clear(&mut uploader, CLEAR)
+            .expect("measured frame failed");
     }
     let after = dhat::HeapStats::get();
+    drop(uploader);
 
     let blocks = after.total_blocks - before.total_blocks;
     let bytes = after.total_bytes - before.total_bytes;

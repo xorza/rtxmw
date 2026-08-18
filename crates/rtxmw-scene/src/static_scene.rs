@@ -8,7 +8,7 @@ use rtxmw_nif::NifFile;
 use rtxmw_vfs::Vfs;
 
 use crate::error::{Result, SceneError};
-use crate::mesh::Mesh;
+use crate::mesh::{Bounds, Mesh};
 
 /// Index of a mesh within [`StaticScene::meshes`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -155,6 +155,30 @@ impl StaticScene {
     /// Triangles across distinct meshes, which is what the acceleration structures hold.
     pub fn unique_triangle_count(&self) -> usize {
         self.meshes.iter().map(Mesh::triangle_count).sum()
+    }
+
+    /// World-space bounds of every placed vertex, or `None` when the cell places nothing.
+    ///
+    /// Walks the geometry rather than the mesh bounds, because an instance may rotate a mesh and
+    /// the rotated box is not the box of the rotated bounds.
+    pub fn bounds(&self) -> Option<Bounds> {
+        let mut bounds: Option<Bounds> = None;
+        for instance in &self.instances {
+            for &position in &self.meshes[instance.mesh.0 as usize].positions {
+                let world = instance.transform.transform_point3(position);
+                bounds = Some(match bounds {
+                    Some(b) => Bounds {
+                        min: b.min.min(world),
+                        max: b.max.max(world),
+                    },
+                    None => Bounds {
+                        min: world,
+                        max: world,
+                    },
+                });
+            }
+        }
+        bounds
     }
 }
 

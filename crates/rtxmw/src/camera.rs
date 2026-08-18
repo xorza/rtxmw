@@ -18,8 +18,6 @@ pub(crate) struct Camera {
     yaw: f32,
     /// Rotation above the horizon, clamped to just short of straight up or down.
     pitch: f32,
-    /// Read only by [`Camera::projection`], which nothing calls until there are rays to generate.
-    #[allow(dead_code)]
     fov_y: f32,
     /// Metres per second; converted to world units on use.
     speed: f32,
@@ -87,10 +85,6 @@ impl Camera {
     }
 
     /// Right-handed view matrix.
-    ///
-    /// Unused until ray generation exists at M3; kept because its convention is pinned by tests and
-    /// getting it wrong later is expensive to debug.
-    #[allow(dead_code)]
     pub(crate) fn view(&self) -> Mat4 {
         glam::camera::rh::view::look_to_mat4(self.position, self.forward(), Vec3::Z)
     }
@@ -99,7 +93,6 @@ impl Camera {
     ///
     /// Reverse-Z distributes float depth precision far better than a conventional near/far mapping
     /// and costs nothing to adopt now, while retrofitting it later would touch every depth compare.
-    #[allow(dead_code)]
     pub(crate) fn projection(&self, aspect: f32) -> Mat4 {
         glam::camera::rh::proj::vulkan::perspective_infinite_reverse(
             self.fov_y,
@@ -109,7 +102,6 @@ impl Camera {
     }
 
     /// Near plane in world units — 5 cm, well inside anything the player can approach.
-    #[allow(dead_code)]
     pub(crate) fn near_plane(&self) -> f32 {
         0.05 * UNITS_PER_METRE
     }

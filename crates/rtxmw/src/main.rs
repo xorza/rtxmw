@@ -3,6 +3,7 @@
 mod app;
 mod camera;
 mod renderer;
+mod scene_loader;
 
 use winit::event_loop::{ControlFlow, EventLoop};
 

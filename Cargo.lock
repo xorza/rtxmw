@@ -1271,7 +1271,11 @@ dependencies = [
  "bytemuck",
  "glam",
  "raw-window-handle",
+ "rtxmw-esm",
  "rtxmw-gpu",
+ "rtxmw-render",
+ "rtxmw-scene",
+ "rtxmw-vfs",
  "winit",
 ]
 

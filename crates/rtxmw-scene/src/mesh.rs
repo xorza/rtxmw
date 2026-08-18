@@ -163,6 +163,11 @@ impl Bounds {
     pub fn size(&self) -> Vec3 {
         self.max - self.min
     }
+
+    /// The midpoint of the box.
+    pub fn centre(&self) -> Vec3 {
+        (self.min + self.max) * 0.5
+    }
 }
 
 /// An accumulated node transform, ready to apply to vertices.

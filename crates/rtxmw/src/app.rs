@@ -11,6 +11,9 @@ use winit::window::{CursorGrabMode, Window, WindowId};
 
 use crate::camera::{Camera, Movement};
 use crate::renderer::Renderer;
+use rtxmw_render::FrameConstants;
+
+use crate::scene_loader;
 
 /// Starting resolution — the internal render target from the design's performance budget.
 const INITIAL_SIZE: (u32, u32) = (1920, 1080);
@@ -58,8 +61,9 @@ impl Default for App {
         Self {
             window: None,
             renderer: None,
-            // Roughly the middle of the Seyda Neen exterior cell, a sane place to start looking.
-            camera: Camera::new(Vec3::new(0.0, 0.0, 500.0)),
+            // Replaced by the loaded cell's own centre in `resumed`; this only matters if no game
+            // data is configured and there is nothing to look at anyway.
+            camera: Camera::new(Vec3::ZERO),
             keys: Keys::default(),
             mouse_captured: false,
             last_frame: now,
@@ -147,6 +151,35 @@ impl ApplicationHandler for App {
             }
         }
 
+        // Content after the device, because uploading needs one. A missing install is not fatal:
+        // the window still comes up and reports the device, which is what makes it obvious that the
+        // path is what is wrong rather than the GPU.
+        match scene_loader::load_default_cell() {
+            Ok(Some(loaded)) => {
+                let renderer = self.renderer.as_mut().expect("renderer was just created");
+                if let Err(e) = renderer.load_scene(&loaded.scene) {
+                    eprintln!("could not upload {}: {e}", loaded.name);
+                    event_loop.exit();
+                    return;
+                }
+                println!(
+                    "{}: {} meshes, {} instances",
+                    loaded.name,
+                    loaded.scene.meshes.len(),
+                    loaded.scene.instances.len()
+                );
+                self.camera = Camera::new(loaded.viewpoint);
+            }
+            Ok(None) => eprintln!(
+                "no game data configured — set MORROWIND_DATA_DIR, or put it in .env at the repo root"
+            ),
+            Err(e) => {
+                eprintln!("could not load the cell: {e}");
+                event_loop.exit();
+                return;
+            }
+        }
+
         self.window = Some(window);
 
         // Device creation takes long enough that a delta measured from `App::default` would make
@@ -214,10 +247,12 @@ impl ApplicationHandler for App {
 
                 if let (Some(renderer), Some(window)) = (&mut self.renderer, &self.window) {
                     let size = window.inner_size();
-                    // Placeholder until there is a scene: a flat sky-ish colour, in linear space
-                    // because the swapchain is sRGB and the presentation engine does the encode.
-                    if let Err(e) = renderer.draw(size.width, size.height, [0.05, 0.07, 0.10, 1.0])
-                    {
+                    let constants = FrameConstants::new(
+                        self.camera.view(),
+                        self.camera.projection(renderer.aspect_ratio()),
+                        self.camera.position(),
+                    );
+                    if let Err(e) = renderer.draw(size.width, size.height, &constants) {
                         eprintln!("draw failed: {e}");
                         event_loop.exit();
                         return;

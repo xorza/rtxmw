@@ -52,8 +52,6 @@ fn a_known_interior_assembles_into_meshes_and_instances() {
 
     // Same fixture, so the placement checks belong here rather than reloading a 79 MB content
     // file and rescanning 48,000 records to assert on the same scene.
-    let mut min = glam::Vec3::splat(f32::INFINITY);
-    let mut max = glam::Vec3::splat(f32::NEG_INFINITY);
     for instance in &scene.instances {
         let mesh = &scene.meshes[instance.mesh.0 as usize];
         for &position in &mesh.positions {
@@ -62,12 +60,12 @@ fn a_known_interior_assembles_into_meshes_and_instances() {
                 world.is_finite(),
                 "a transformed vertex is not finite: {world:?}"
             );
-            min = min.min(world);
-            max = max.max(world);
         }
     }
 
-    let size = max - min;
+    let bounds = scene.bounds().expect("a furnished cell has geometry");
+    let (min, max) = (bounds.min, bounds.max);
+    let size = bounds.size();
     // One exterior cell is 8192 units. An interior room sits far inside that; anything larger means
     // a transform blew up, and anything near zero means everything collapsed onto a point.
     assert!(
