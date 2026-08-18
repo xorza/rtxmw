@@ -12,6 +12,7 @@ workspace = true
 glam.workspace = true
 rtxmw-esm.workspace = true
 rtxmw-nif.workspace = true
+rtxmw-texture.workspace = true
 rtxmw-vfs.workspace = true
 
 [dev-dependencies]

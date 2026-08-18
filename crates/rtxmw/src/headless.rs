@@ -11,6 +11,7 @@ use rtxmw_gpu::{
     Device, Instance, Memory, PhysicalDevice, Presentation, Uploader, Validation, readback,
 };
 use rtxmw_render::SceneRenderer;
+use rtxmw_scene::LoadedCell;
 
 use crate::camera::Camera;
 use crate::scene_loader;
@@ -34,24 +35,21 @@ pub(crate) fn screenshot(
     let extent = vk::Extent2D { width, height };
     let mut renderer = SceneRenderer::new(&device, &memory, extent)?;
 
-    let loaded = scene_loader::load_default_cell()?
+    let cell = LoadedCell::load_interior(scene_loader::DEFAULT_CELL)?
         .ok_or("no game data configured — set MORROWIND_DATA_DIR, or put it in .env")?;
     renderer.load_scene(
         &device,
         &mut uploader,
         physical.limits(),
-        &loaded.scene,
-        &loaded.textures,
+        &cell.scene,
+        &cell.textures,
     )?;
     println!(
-        "{}: {} meshes, {} instances, {} lights",
-        loaded.name,
-        loaded.scene.meshes.len(),
-        loaded.scene.instances.len(),
-        loaded.scene.lights.len()
+        "{}",
+        scene_loader::describe(scene_loader::DEFAULT_CELL, &cell)
     );
 
-    let camera = Camera::new(loaded.viewpoint);
+    let camera = Camera::new(scene_loader::viewpoint(&cell.scene));
     let constants = renderer.frame_constants(
         camera.view(),
         camera.projection(width as f32 / height as f32),

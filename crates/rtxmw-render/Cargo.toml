@@ -19,7 +19,6 @@ rtxmw-texture.workspace = true
 
 [dev-dependencies]
 dhat.workspace = true
-rtxmw-esm.workspace = true
 rtxmw-gpu = { workspace = true, features = ["internals"] }
 rtxmw-vfs = { workspace = true, features = ["internals"] }
 

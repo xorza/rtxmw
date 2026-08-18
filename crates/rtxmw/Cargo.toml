@@ -9,12 +9,10 @@ license.workspace = true
 workspace = true
 
 [dependencies]
-rtxmw-esm.workspace = true
 rtxmw-gpu.workspace = true
 rtxmw-render.workspace = true
 rtxmw-scene.workspace = true
 rtxmw-texture.workspace = true
-rtxmw-vfs.workspace = true
 
 ash.workspace = true
 bytemuck.workspace = true

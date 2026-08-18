@@ -10,7 +10,8 @@ use glam::{Affine3A, Vec2, Vec3};
 use rtxmw_gpu::{TestGpu, readback};
 use rtxmw_render::SceneRenderer;
 use rtxmw_scene::{
-    AlphaMode, Ambient, Instance, Light, Material, Mesh, MeshId, StaticScene, Submesh, TextureId,
+    AlphaMode, Ambient, Instance, Light, LoadedCell, Material, Mesh, MeshId, StaticScene, Submesh,
+    TextureId,
 };
 use rtxmw_texture::{Texture, TextureFormat};
 use rtxmw_vfs::DATA_DIR_VAR;
@@ -724,10 +725,11 @@ fn a_shadow_edge_is_soft_rather_than_binary() {
 
 #[test]
 fn a_real_interior_traces_to_a_recognisable_image() {
-    let Some(cell) = common::load_cell(CELL) else {
+    let Some(cell) = LoadedCell::load_interior(CELL).expect("cell should load") else {
         eprintln!("skipping: {DATA_DIR_VAR} is not configured (set it, or add it to .env)");
         return;
     };
+    let missing = cell.missing_textures();
     let scene = cell.scene;
 
     // The centre of the cell's own geometry, which for this office lands inside the larger room.
@@ -739,7 +741,6 @@ fn a_real_interior_traces_to_a_recognisable_image() {
         .centre();
 
     let textures = cell.textures;
-    let missing = textures.iter().filter(|t| t.is_none()).count();
 
     let pixels = trace_lit(
         &scene.meshes,

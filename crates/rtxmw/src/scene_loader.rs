@@ -1,53 +1,34 @@
-//! Getting a cell out of the game's content files and into memory.
+//! Which cell the engine opens in, where to stand in it, and how to report it.
 
 use glam::Vec3;
-use rtxmw_esm::EsmReader;
-use rtxmw_scene::{ModelIndex, StaticScene};
-use rtxmw_texture::Texture;
-use rtxmw_vfs::morrowind_data_dir;
+use rtxmw_scene::{LoadedCell, StaticScene};
 
 /// The cell the engine opens in until there is a way to choose one.
-const DEFAULT_CELL: &str = "Seyda Neen, Census and Excise Office";
+pub(crate) const DEFAULT_CELL: &str = "Seyda Neen, Census and Excise Office";
 
-/// A loaded cell and where to stand in it.
-#[derive(Debug)]
-pub(crate) struct LoadedCell {
-    pub(crate) name: &'static str,
-    pub(crate) scene: StaticScene,
-    /// One entry per path in the scene's texture list. `None` where the file does not exist, which
-    /// is normal: the shipped meshes carry a tail of references to art that was removed.
-    pub(crate) textures: Vec<Option<Texture>>,
-    /// Centre of the cell's geometry — inside the room for this cell, though there is no general
-    /// rule; a spawn point needs the cell's own markers, which is a later milestone's problem.
-    pub(crate) viewpoint: Vec3,
+/// A one-line summary of what was loaded, for startup output.
+///
+/// Takes the name rather than assuming [`DEFAULT_CELL`]: there is only one cell today, and a
+/// summary that hardcoded its name would start printing the wrong one the moment there are two.
+///
+/// Missing textures are worth naming rather than swallowing: the shipped meshes reference art that
+/// was removed, so a small count is expected and a large one means the path fixups have drifted.
+pub(crate) fn describe(name: &str, cell: &LoadedCell) -> String {
+    let missing = cell.missing_textures();
+    format!(
+        "{name}: {} meshes, {} instances, {} lights, {} textures ({missing} missing)",
+        cell.scene.meshes.len(),
+        cell.scene.instances.len(),
+        cell.scene.lights.len(),
+        cell.textures.len(),
+    )
 }
 
-/// Loads [`DEFAULT_CELL`], or `None` when no install is configured.
-pub(crate) fn load_default_cell() -> Result<Option<LoadedCell>, Box<dyn std::error::Error>> {
-    let Some(data) = morrowind_data_dir() else {
-        return Ok(None);
-    };
-    let vfs = rtxmw_vfs::morrowind_archives().ok_or("archives could not be opened")?;
-    let bytes = std::fs::read(data.join("Morrowind.esm"))?;
-    let esm = EsmReader::new(&bytes)?;
-    let models = ModelIndex::build(&esm)?;
-    let scene = StaticScene::load_interior(&esm, &models, &vfs, DEFAULT_CELL)?;
-
-    let viewpoint = scene.bounds().map_or(Vec3::ZERO, |b| b.centre());
-
-    let mut textures = Vec::with_capacity(scene.materials.textures().len());
-    for path in scene.materials.textures() {
-        textures.push(
-            vfs.read(path)
-                .ok()
-                .and_then(|bytes| Texture::decode(&bytes).ok()),
-        );
-    }
-
-    Ok(Some(LoadedCell {
-        name: DEFAULT_CELL,
-        scene,
-        textures,
-        viewpoint,
-    }))
+/// Where to put the camera in a freshly loaded cell.
+///
+/// The centre of the cell's own geometry, which for the default cell lands inside the larger room.
+/// There is no general rule here — a real spawn point comes from the cell's own markers, which is a
+/// later milestone's problem — so this is a fixture choice that happens to work.
+pub(crate) fn viewpoint(scene: &StaticScene) -> Vec3 {
+    scene.bounds().map_or(Vec3::ZERO, |b| b.centre())
 }

@@ -6,11 +6,10 @@
 //! success, so validation is doing most of the work here.
 
 use glam::{Affine3A, Vec2, Vec3};
-use rtxmw_esm::EsmReader;
 use rtxmw_gpu::TestGpu;
 use rtxmw_render::{GeometryBuffers, SceneAcceleration};
-use rtxmw_scene::{Instance, Material, Mesh, MeshId, ModelIndex, StaticScene, Submesh};
-use rtxmw_vfs::{DATA_DIR_VAR, morrowind_archives, morrowind_data_dir};
+use rtxmw_scene::{Instance, LoadedCell, Material, Mesh, MeshId, Submesh};
+use rtxmw_vfs::DATA_DIR_VAR;
 
 const CELL: &str = "Seyda Neen, Census and Excise Office";
 
@@ -140,15 +139,11 @@ fn an_empty_cell_still_produces_a_traversable_top_level() {
 
 #[test]
 fn a_real_interior_builds_and_compacts() {
-    let Some(data) = morrowind_data_dir() else {
+    let Some(cell) = LoadedCell::load_interior(CELL).expect("cell should load") else {
         eprintln!("skipping: {DATA_DIR_VAR} is not configured (set it, or add it to .env)");
         return;
     };
-    let vfs = morrowind_archives().expect("the game is available");
-    let bytes = std::fs::read(data.join("Morrowind.esm")).expect("Morrowind.esm should read");
-    let esm = EsmReader::new(&bytes).expect("should parse");
-    let models = ModelIndex::build(&esm).expect("model index should build");
-    let scene = StaticScene::load_interior(&esm, &models, &vfs, CELL).expect("cell should load");
+    let scene = cell.scene;
 
     let gpu = TestGpu::shared();
     let mut uploader = gpu.uploader();

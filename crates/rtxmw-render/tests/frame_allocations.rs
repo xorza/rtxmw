@@ -17,7 +17,7 @@ use ash::vk;
 use glam::{Affine3A, Vec2, Vec3};
 use rtxmw_gpu::TestGpu;
 use rtxmw_render::SceneRenderer;
-use rtxmw_scene::{Ambient, Instance, Light, Material, MeshId, Submesh};
+use rtxmw_scene::{Ambient, Instance, Light, LoadedCell, Material, MeshId, Submesh};
 
 mod common;
 
@@ -99,7 +99,7 @@ fn steady_state_rendering_does_not_allocate() {
     // Outside the measured window on purpose: device bring-up, scene decoding and every upload are
     // load-time work, and all of them allocate freely.
     let gpu = TestGpu::shared();
-    let (scene, textures, what) = match common::load_cell(CELL) {
+    let (scene, textures, what) = match LoadedCell::load_interior(CELL).expect("cell should load") {
         Some(cell) => (cell.scene, cell.textures, CELL),
         None => (synthetic_scene(), Vec::new(), "synthetic scene"),
     };

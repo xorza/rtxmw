@@ -9,6 +9,8 @@ use winit::event_loop::ActiveEventLoop;
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowId};
 
+use rtxmw_scene::LoadedCell;
+
 use crate::camera::{Camera, Movement};
 use crate::renderer::Renderer;
 use crate::scene_loader;
@@ -152,22 +154,19 @@ impl ApplicationHandler for App {
         // Content after the device, because uploading needs one. A missing install is not fatal:
         // the window still comes up and reports the device, which is what makes it obvious that the
         // path is what is wrong rather than the GPU.
-        match scene_loader::load_default_cell() {
-            Ok(Some(loaded)) => {
+        match LoadedCell::load_interior(scene_loader::DEFAULT_CELL) {
+            Ok(Some(cell)) => {
                 let renderer = self.renderer.as_mut().expect("renderer was just created");
-                if let Err(e) = renderer.load_scene(&loaded.scene, &loaded.textures) {
-                    eprintln!("could not upload {}: {e}", loaded.name);
+                if let Err(e) = renderer.load_scene(&cell.scene, &cell.textures) {
+                    eprintln!("could not upload {}: {e}", scene_loader::DEFAULT_CELL);
                     event_loop.exit();
                     return;
                 }
                 println!(
-                    "{}: {} meshes, {} instances, {} lights",
-                    loaded.name,
-                    loaded.scene.meshes.len(),
-                    loaded.scene.instances.len(),
-                    loaded.scene.lights.len()
+                    "{}",
+                    scene_loader::describe(scene_loader::DEFAULT_CELL, &cell)
                 );
-                self.camera = Camera::new(loaded.viewpoint);
+                self.camera = Camera::new(scene_loader::viewpoint(&cell.scene));
             }
             Ok(None) => eprintln!(
                 "no game data configured — set MORROWIND_DATA_DIR, or put it in .env at the repo root"

@@ -15,6 +15,8 @@ pub enum SceneError {
     Vfs(VfsError),
     /// A mesh failed to parse.
     Nif { path: String, source: NifError },
+    /// A content file could not be opened or read from disk.
+    Io(std::io::Error),
 }
 
 impl std::fmt::Display for SceneError {
@@ -24,6 +26,7 @@ impl std::fmt::Display for SceneError {
             Self::Esm(e) => write!(f, "content file: {e}"),
             Self::Vfs(e) => write!(f, "virtual file system: {e}"),
             Self::Nif { path, source } => write!(f, "{path}: {source}"),
+            Self::Io(e) => write!(f, "reading the game data: {e}"),
         }
     }
 }
@@ -34,6 +37,7 @@ impl std::error::Error for SceneError {
             Self::Esm(e) => Some(e),
             Self::Vfs(e) => Some(e),
             Self::Nif { source, .. } => Some(source),
+            Self::Io(e) => Some(e),
             Self::NoSuchCell(_) => None,
         }
     }
