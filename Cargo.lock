@@ -1303,6 +1303,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "rtxmw-render"
+version = "0.1.0"
+
+[[package]]
 name = "rtxmw-scene"
 version = "0.1.0"
 dependencies = [
