@@ -996,6 +996,63 @@ replaces with a hard edge per tile; and **the sun**. An exterior carries no `AMB
 there is nothing lighting the world at all — the placeholder is a fixed overcast daylight standing
 in for a sky the weather system will eventually drive.
 
+### The sun — M5's last piece, and what an exterior needed
+
+An exterior carries no `AMBI`, so until now the outdoors was lit by a flat placeholder ambient with
+no direction and no shadows. The sun closes that, and closes the one part of M5 that was never
+built.
+
+**The direction is Morrowind's own hardcoded constant**, `(-400 · orbit, 75, -100)` from
+`apps/openmw/mwworld/weather.cpp:900`, with `orbit` running 1 at sunrise to −1 at dusk. It is not an
+astronomical model: the sun runs east to west at a fixed angle from overhead and sits to the south.
+It is the direction light *travels*, which is why the shader negates it to point at the disc.
+
+**The angular diameter is ours, not Morrowind's.** OpenMW's sun is a pure direction with no size
+anywhere in its codebase, and its shadows are as sharp as the shadow map. Half a degree across is
+the real sun, and it is the only reason a shadow has a penumbra rather than an edge. Shadow rays
+sample the cone it subtends, uniformly over solid angle rather than over the disc, which keeps the
+gradient even instead of bunching samples at its centre.
+
+Measured on a fixture built to show it:
+
+| | penumbra |
+|---|---|
+| sun with a real half-degree disc | **38 rows** |
+| the same light from a point | **0 rows** |
+
+The fixture is an odd shape for a reason worth writing down: **a real sun's penumbra is about one
+pixel wide** when the camera and the blocker are the same distance from the surface. Its angular
+width is `2·tan(r)·d/D`, so seeing it at all means putting the blocker far and the camera close —
+here fifty times closer, which turns one pixel into about seventy-five. Sharp sun shadows are the
+correct answer, and the fixture exists to make the softness measurable rather than to make it large.
+
+The lit value is the whole chain in one number: albedo 0.5, the Lambertian `1/pi`, a sun of 2.0
+straight on — 0.318, or 81 of 255. Four injections are caught, including the sun's direction not
+being negated.
+
+**The push constant block is now exactly 128 bytes — Vulkan's guarantee, in full.** The field order
+is load-bearing rather than cosmetic: std430 aligns a `vec3` to sixteen bytes, so the sun's radius
+sits *between* its direction and its colour to keep both on a boundary. A unit test reads the actual
+field offsets and asserts each is a multiple of sixteen. Anything further has to move the block into
+a buffer, which is also what motion vectors will need.
+
+**The sky comes from the ambient rather than from constants of its own**, brighter overhead than at
+the horizon. That ties the two together so they cannot disagree, and it removes the hardcoded
+blue-grey a missed ray used to return — indoors it now yields the room's own dark fill, which is
+what a ray escaping through a doorway should find. The disc is drawn but is **not** energy-consistent
+with the directional term: a real sun's radiance is its irradiance over the solid angle it subtends,
+some sixty thousand times the value used, and reconciling them means making the directional light an
+area light.
+
+**Cost:** the exterior went from 1.75 ms to 3.5 ms at 1920×1080, nearly all of it in the trace —
+sixteen shadow rays a pixel across a scene where most of them reach the sky unobstructed. That is
+generous, and the first thing to spend down if the budget tightens; temporal reuse at M7 is what
+makes one sample a frame viable. Against the ~8 ms §5.3 allowance there is still room.
+
+`Sun::at(orbit)` takes the time of day the engine does not yet track, so exteriors use a fixed
+mid-morning. The colour is a warm white scaled by a constant chosen for its *ratio* to the sky —
+about five to one, as on a clear day — and is provisional in exactly the way `INTENSITY` is.
+
 ### M5 — Direct lighting
 Sun as a directional light with a real angular diameter (so shadows are soft), shadow rays, cell
 ambient, `LIGH` point lights with shadow rays and a defensible attenuation model, emissive surfaces.

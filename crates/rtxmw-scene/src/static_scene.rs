@@ -16,6 +16,7 @@ use crate::material::{self, Material};
 use crate::material_table::MaterialTable;
 use crate::mesh::{Bounds, Mesh};
 use crate::srgb;
+use crate::sun::Sun;
 
 /// What a terrain tile draws with when its index is zero, or names a palette entry that is absent.
 ///
@@ -131,6 +132,8 @@ pub struct StaticScene {
     pub lights: Vec<Light>,
     /// The cell's fixed lighting. Absent for a cell that declares none.
     pub ambient: Option<Ambient>,
+    /// The sun, for a cell that has a sky. Absent indoors, where there is none.
+    pub sun: Option<Sun>,
     /// References skipped because their record had no model, for reporting.
     pub without_model: Vec<String>,
 }
@@ -220,6 +223,8 @@ impl StaticScene {
             colour: Vec3::new(0.35, 0.42, 0.55),
             ..Ambient::default()
         });
+        // Fixed for now: the orbit is a function of time of day, and nothing tracks that yet.
+        scene.sun = Some(Sun::default_daylight());
         if let Some(land) = land {
             let tile_materials = terrain_materials(&land, &palette, &mut scene.materials);
             let mesh = MeshId(scene.meshes.len() as u32);

@@ -104,6 +104,13 @@ layout(push_constant) uniform Frame {
     uint light_count;
     vec3 ambient;
     float cone_spread;
+    // The direction the sun's light *travels*, so the direction to it is the negation. Its radius
+    // sits between the two vectors because std430 puts a `vec3` on a sixteen-byte boundary, and the
+    // block is exactly the 128 bytes Vulkan guarantees — there is no room to order it prettily.
+    vec3 sun_direction;
+    float sun_cos_radius;
+    // Zero when the cell has no sky, which costs no branch: every term it feeds is a multiply.
+    vec3 sun_colour;
     uint bounce_samples;
 } frame;
 
@@ -113,6 +120,13 @@ layout(push_constant) uniform Frame {
 const float RAY_MIN = 0.01;
 // Far enough to cross an exterior cell, which is 8192 world units.
 const float RAY_MAX = 1.0e6;
+// How many shadow rays the sun gets at the primary hit.
+//
+// More than a lamp's, because its penumbra is the one every outdoor surface is judged by: a disc
+// half a degree across throws an edge that stays sharp for centimetres and softens over metres, and
+// too few samples turn that gradient into banding across a whole hillside.
+const uint SUN_SAMPLES = 16u;
+
 // How many shadow rays each light gets at the primary hit. A point light needs one and gives a hard
 // edge; a light with real size needs several, and the penumbra is exactly the disagreement between
 // them.
@@ -149,6 +163,8 @@ const float BOUNCE_SPREAD = 1.0;
 const uint STREAM_DIRECT = 0u;
 const uint STREAM_BOUNCE = 1u;
 const uint STREAM_INDIRECT = 2u;
+// Added to whichever stream is asking, so the sun's samples never repeat a lamp's.
+const uint STREAM_SUN = 4096u;
 
 // The three shared-stream vertex indices of a hit triangle.
 //
@@ -262,6 +278,28 @@ vec2 unit_pair(uint seed) {
     return vec2(float(seed & 0xFFFFu), float((seed >> 16) & 0xFFFFu)) / 65535.0;
 }
 
+// A direction within `cos_radius` of `axis`, uniform over the cone's solid angle.
+//
+// How an area light is sampled when it is infinitely far away: the sun has no position to aim at,
+// only a direction and a width, so a shadow ray picks a point on the disc it subtends. Uniform over
+// solid angle rather than over the disc, which keeps the penumbra even instead of bunching samples
+// at its centre.
+vec3 cone_direction(vec3 axis, float cos_radius, vec2 u) {
+    float cos_theta = mix(cos_radius, 1.0, u.x);
+    float sin_theta = sqrt(max(0.0, 1.0 - cos_theta * cos_theta));
+    float phi = 6.2831853 * u.y;
+
+    // Branchless orthonormal basis around the axis (Duff et al. 2017). The sign trick is what
+    // avoids the degeneracy a naive cross product has when the axis nears the reference vector.
+    float sign_z = axis.z >= 0.0 ? 1.0 : -1.0;
+    float a = -1.0 / (sign_z + axis.z);
+    float b = axis.x * axis.y * a;
+    vec3 tangent = vec3(1.0 + sign_z * axis.x * axis.x * a, sign_z * b, -sign_z * axis.x);
+    vec3 bitangent = vec3(b, sign_z + axis.y * axis.y * a, -axis.y);
+
+    return tangent * (cos(phi) * sin_theta) + bitangent * (sin(phi) * sin_theta) + axis * cos_theta;
+}
+
 // A point on the unit sphere, from two values in `0..1`.
 vec3 sphere_point(vec2 u) {
     float z = 1.0 - 2.0 * u.x;
@@ -337,6 +375,35 @@ struct Surface {
     bool hit;
 };
 
+// The sun's contribution, before the surface's albedo.
+//
+// No attenuation and no distance: the sun is far enough away that its rays are parallel and its
+// brightness is the same everywhere, so the only questions are which way the surface faces and how
+// much of the disc it can see. That second one is the soft shadow — the same visibility fraction a
+// lamp's sphere gives, over a cone rather than a sphere.
+vec3 sun_light(Surface surface, vec3 origin, uvec2 pixel, uint salt, uint samples) {
+    float facing = dot(surface.normal, -frame.sun_direction);
+    // A black sun is how a cell with no sky says so, and a surface facing away needs no rays.
+    if (facing <= 0.0 || frame.sun_colour == vec3(0.0)) {
+        return vec3(0.0);
+    }
+
+    // The full disc at a primary hit, and whatever the caller asked for anywhere else — a bounce
+    // wants one ray, not sixteen, and its penumbra is invisible under an albedo it is about to be
+    // averaged with. Scaling by the ratio instead gave a bounce *two*, which the comment here used
+    // to claim was one.
+    uint taken = samples >= SHADOW_SAMPLES ? SUN_SAMPLES : samples;
+    float visible = 0.0;
+    for (uint s = 0u; s < taken; ++s) {
+        vec2 u = unit_pair(hash(uvec4(pixel, salt + STREAM_SUN, s)));
+        vec3 towards = cone_direction(-frame.sun_direction, frame.sun_cos_radius, u);
+        if (!occluded(origin, towards, RAY_MAX)) {
+            visible += 1.0;
+        }
+    }
+    return frame.sun_colour * facing * (visible / float(taken));
+}
+
 // Radiance leaving a diffuse surface toward the viewer from the cell's placed lights.
 //
 // Shared by the primary hit and by every bounce hit, which is the whole reason next-event
@@ -353,7 +420,7 @@ struct Surface {
 vec3 direct_light(Surface surface, uvec2 pixel, uint salt, uint samples) {
     // Offset along the normal so the surface does not shadow itself on its own triangle.
     vec3 origin = surface.position + surface.normal * SHADOW_BIAS;
-    vec3 total = vec3(0.0);
+    vec3 total = sun_light(surface, origin, pixel, salt, samples);
     for (uint i = 0u; i < frame.light_count; ++i) {
         Light light = lights[i];
         vec3 to_light = light.position - surface.position;
@@ -396,6 +463,27 @@ vec3 direct_light(Surface surface, uvec2 pixel, uint salt, uint samples) {
 vec3 shade(Surface surface, vec3 incoming, uvec2 pixel, uint salt, uint samples) {
     return surface.emissive
          + surface.albedo * (incoming + direct_light(surface, pixel, salt, samples));
+}
+
+// What a ray that hits nothing sees.
+//
+// Derived from the cell's ambient rather than from constants of its own: outdoors the ambient *is*
+// the sky, so the two cannot disagree, and indoors it stays the dark fill an enclosed room has,
+// which is what a ray escaping through a doorway should find.
+//
+// The disc is drawn but is **not** energy-consistent with the directional term above: a real sun's
+// radiance is its irradiance divided by the solid angle it subtends, which for half a degree is
+// some sixty thousand times the value used here. Making the two agree means turning the directional
+// light into an area light, which is a larger change than drawing a bright circle.
+vec3 sky(vec3 direction) {
+    // Brighter overhead than at the horizon, which is the one feature of a sky worth having before
+    // there is a weather system to ask.
+    float height = clamp(direction.z * 0.5 + 0.5, 0.0, 1.0);
+    vec3 colour = frame.ambient * mix(0.75, 1.35, height);
+    if (dot(direction, -frame.sun_direction) > frame.sun_cos_radius) {
+        colour = frame.sun_colour;
+    }
+    return colour;
 }
 
 // Traces one ray and resolves the material at whatever it hits.
@@ -530,7 +618,7 @@ void main() {
     // it alone. That is not tidiness: the filter reads a neighbourhood, and an untouched pixel
     // holds whatever the last frame or the allocator left there. A zero depth is the flag it tests,
     // since a real hit is always at least `RAY_MIN` away.
-    vec3 emitted = vec3(0.05, 0.07, 0.10);
+    vec3 emitted = sky(direction);
     vec3 lighting = vec3(0.0);
     if (surface.hit) {
         emitted = surface.emissive;

@@ -24,7 +24,7 @@ use crate::material_buffers::MaterialBuffers;
 use crate::scene_acceleration::SceneAcceleration;
 use crate::texture_array::TextureArray;
 use crate::tonemap::Tonemap;
-use crate::visibility_pass::{FrameConstants, SceneBindings, VisibilityPass};
+use crate::visibility_pass::{FrameConstants, Lighting, SceneBindings, VisibilityPass};
 
 /// Half-float rather than 8-bit: the trace writes linear radiance that tone mapping consumes at M8,
 /// and an 8-bit intermediate would clip highlights before anything got the chance to.
@@ -139,8 +139,7 @@ struct LoadedScene {
     textures: TextureArray,
     lights: LightBuffer,
     acceleration: SceneAcceleration,
-    ambient: Vec3,
-    light_count: u32,
+    lighting: Lighting,
 }
 
 impl SceneRenderer {
@@ -262,10 +261,13 @@ impl SceneRenderer {
             textures: array,
             lights,
             acceleration,
-            // A cell that declares no ambient gets none rather than a guess: it is meant to be lit
-            // by what is placed in it.
-            ambient: scene.ambient.map_or(Vec3::ZERO, |a| a.colour),
-            light_count,
+            lighting: Lighting {
+                // A cell that declares no ambient gets none rather than a guess: it is meant to be
+                // lit by what is placed in it.
+                ambient: scene.ambient.map_or(Vec3::ZERO, |a| a.colour),
+                light_count,
+                sun: scene.sun,
+            },
         });
         Ok(())
     }
@@ -298,16 +300,19 @@ impl SceneRenderer {
         projection: glam::Mat4,
         camera_position: Vec3,
     ) -> FrameConstants {
-        let (ambient, lights) = self
-            .scene
-            .as_ref()
-            .map_or((Vec3::ZERO, 0), |s| (s.ambient, s.light_count));
+        let lighting = self.scene.as_ref().map_or(
+            Lighting {
+                ambient: Vec3::ZERO,
+                light_count: 0,
+                sun: None,
+            },
+            |scene| scene.lighting,
+        );
         FrameConstants::new(
             view,
             projection,
             camera_position,
-            ambient,
-            lights,
+            lighting,
             // From the renderer's own target height, so the mip a surface samples follows the
             // resolution it is being traced at.
             FrameConstants::cone_spread_from(projection, self.target.extent().height),

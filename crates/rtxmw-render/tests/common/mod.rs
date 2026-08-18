@@ -32,6 +32,8 @@ pub(crate) fn scene_of(
             colour: ambient,
             ..Ambient::default()
         }),
+        // Set by the caller when a fixture wants one; most are indoors and have none.
+        sun: None,
         without_model: Vec::new(),
     }
 }

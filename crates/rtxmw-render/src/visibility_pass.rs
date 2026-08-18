@@ -4,6 +4,7 @@ use ash::vk;
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3};
 use rtxmw_gpu::{Binding, ComputePipeline, Device, Image};
+use rtxmw_scene::Sun;
 
 use crate::acceleration_structure::AccelerationStructure;
 use crate::gbuffer::GBuffer;
@@ -13,11 +14,28 @@ use crate::material_buffers::MaterialBuffers;
 use crate::shaders;
 use crate::texture_array::TextureArray;
 
+/// Everything lighting a cell, which arrives together and goes stale together.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Lighting {
+    /// Sky light outdoors, the cell's own fixed term indoors.
+    pub(crate) ambient: Vec3,
+    /// How many entries of the light buffer to read.
+    pub(crate) light_count: u32,
+    /// The sun, for a cell with a sky.
+    pub(crate) sun: Option<Sun>,
+}
+
 /// What the shader needs to turn a pixel into a ray, as its push constant block.
 ///
 /// The combined inverse view-projection rather than the two matrices separately: Vulkan guarantees
 /// only 128 bytes of push constants, and sending both plus the camera would need 144. Their product
 /// carries everything unprojection requires.
+///
+/// **This block is now exactly 128 bytes — the guarantee, in full.** The field order is not
+/// cosmetic either: std430 aligns a `vec3` to sixteen bytes, so each one has to land on a multiple
+/// of sixteen or the shader reads the block shifted. That is why the sun's radius sits between its
+/// direction and its colour rather than after both. Anything further has to move the block into a
+/// buffer, which is also what motion vectors will need.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub struct FrameConstants {
@@ -33,6 +51,12 @@ pub struct FrameConstants {
     /// does not have. This is what replaces them: the cone's width at the hit is its footprint on
     /// the surface, and the mip that matches that footprint is the one to sample.
     cone_spread: f32,
+    /// Unit vector the sun's light travels along, from the sky toward the world.
+    sun_direction: [f32; 3],
+    /// Cosine of the sun's angular radius, which is what a shadow ray tests against.
+    sun_cos_radius: f32,
+    /// The sun's radiance. **Zero means no sun**, which is how an interior says it has no sky.
+    sun_colour: [f32; 3],
     /// How many diffuse bounce rays each pixel casts to gather indirect light.
     ///
     /// Zero is not "no indirect light" but "every bounce ray escapes", which is the limit in which
@@ -50,17 +74,26 @@ impl FrameConstants {
         view: Mat4,
         projection: Mat4,
         camera_position: Vec3,
-        ambient: Vec3,
-        light_count: u32,
+        lighting: Lighting,
         cone_spread: f32,
         bounce_samples: u32,
     ) -> Self {
+        // No sun is a black one: every term it feeds is a multiplication, so the shader needs no
+        // flag to branch on and an interior costs nothing for having no sky.
+        let sun = lighting.sun.unwrap_or(Sun {
+            direction: Vec3::NEG_Z,
+            colour: Vec3::ZERO,
+            angular_radius: 0.0,
+        });
         Self {
             inverse_view_projection: (projection * view).inverse().to_cols_array(),
             camera_position: camera_position.to_array(),
-            light_count,
-            ambient: ambient.to_array(),
+            light_count: lighting.light_count,
+            ambient: lighting.ambient.to_array(),
             cone_spread,
+            sun_direction: sun.direction.to_array(),
+            sun_cos_radius: sun.angular_radius.cos(),
+            sun_colour: sun.colour.to_array(),
             bounce_samples,
         }
     }
@@ -287,7 +320,49 @@ mod tests {
     fn the_push_block_fits_the_guaranteed_range() {
         // Vulkan promises 128 bytes and no more; exceeding it works on this GPU and fails elsewhere.
         assert!(size_of::<FrameConstants>() <= 128);
-        assert_eq!(size_of::<FrameConstants>(), 100);
+        // Exactly the guarantee, with nothing to spare. The field order is load-bearing too:
+        // std430 aligns a `vec3` to sixteen bytes, so each has to land on a multiple of sixteen or
+        // the shader reads the whole block shifted.
+        assert_eq!(size_of::<FrameConstants>(), 128);
+        let constants = FrameConstants::new(
+            Mat4::IDENTITY,
+            Mat4::IDENTITY,
+            Vec3::ZERO,
+            Lighting {
+                ambient: Vec3::ZERO,
+                light_count: 0,
+                sun: None,
+            },
+            0.0,
+            0,
+        );
+        let base = std::ptr::from_ref(&constants).cast::<u8>();
+        for (name, field) in [
+            (
+                "camera_position",
+                std::ptr::from_ref(&constants.camera_position).cast::<u8>(),
+            ),
+            (
+                "ambient",
+                std::ptr::from_ref(&constants.ambient).cast::<u8>(),
+            ),
+            (
+                "sun_direction",
+                std::ptr::from_ref(&constants.sun_direction).cast::<u8>(),
+            ),
+            (
+                "sun_colour",
+                std::ptr::from_ref(&constants.sun_colour).cast::<u8>(),
+            ),
+        ] {
+            // SAFETY: both pointers are into the same live value.
+            let at = unsafe { field.offset_from(base) };
+            assert_eq!(
+                at % 16,
+                0,
+                "{name} sits at {at}, where std430 will not look for it"
+            );
+        }
 
         // One pixel of a 90-degree, 100-pixel-tall view subtends 2*tan(45)/100 = 0.02 units per
         // unit of distance.
@@ -314,7 +389,18 @@ mod tests {
             16.0 / 9.0,
             0.05,
         );
-        let constants = FrameConstants::new(view, projection, eye, Vec3::ZERO, 0, 0.0, 0);
+        let constants = FrameConstants::new(
+            view,
+            projection,
+            eye,
+            Lighting {
+                ambient: Vec3::ZERO,
+                light_count: 0,
+                sun: None,
+            },
+            0.0,
+            0,
+        );
 
         // Round-trip a world point through the forward transform and back through the stored
         // inverse. Anything that transposed or reordered the matrix survives multiplication but

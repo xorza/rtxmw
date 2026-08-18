@@ -12,6 +12,7 @@ mod material_table;
 mod mesh;
 mod srgb;
 mod static_scene;
+mod sun;
 
 // Re-exported because `Door` carries one and `Door::leading_to` takes one, so a crate above this
 // seam cannot use either without naming the type — and the layering says nothing above here knows
@@ -27,3 +28,4 @@ pub use crate::material_table::MaterialTable;
 pub use crate::mesh::{Bounds, Mesh, Submesh};
 pub use crate::srgb::to_linear;
 pub use crate::static_scene::{Instance, MeshId, ModelIndex, StaticScene};
+pub use crate::sun::Sun;
