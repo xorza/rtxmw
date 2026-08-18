@@ -279,21 +279,46 @@ recursion depth 31, max BLAS geometries and TLAS instances both 16,777,215.
 The memory allocator (`gpu-allocator`) is wired as a dependency but not yet used — nothing allocates
 device memory until M2 uploads geometry.
 
-### M1 — Data: VFS + BSA + ESM enumeration
+### M1 — Data: VFS + BSA + ESM enumeration — **done**
 `rtxmw-vfs` path normalization and archive layering; the Morrowind BSA reader; enough of `rtxmw-esm`
 to read `CELL`, stream its refs, and resolve `STAT`/`DOOR`/`CONT`/`ACTI`/`LIGH`/`MISC` to model
 paths.
 **Done when:** given an interior cell name, it prints the ref list — refid, model path, position,
-rotation, scale — and the ref count matches `esmtool dump -t CELL` for that cell.
-**Retires:** the format-decode risk, cheaply and headlessly.
+rotation, scale — and the ref count matches `esmtool dump -t CELL` for that cell. ✔
+**Retired:** the format-decode risk.
 
-### M2 — Geometry: NIF
+`esmtool` is not installed and building it from `.refs/openmw` was not worth it, so the cross-check
+is against the file's **own header record count** instead: walking Morrowind.esm yields exactly the
+48,295 records the header declares. That catches the failure that matters — a mis-sized record
+shifting every subsequent offset — at least as well as an external diff would.
+
+Measured: 20,952 VFS paths across the three BSAs plus loose files (7,319 meshes, 6,256 textures);
+1,134 interiors and 1,404 exteriors holding 316,116 references; Seyda Neen's Census and Excise
+Office resolves 261 of its 268 references to meshes, with **zero** model paths missing from the VFS.
+
+### M2 — Geometry: NIF — **done**
 `NiNode` graph traversal with accumulated transforms, `NiTriShape`/`NiTriStrips` → indexed
 triangles, `NiTexturingProperty` base slot, `NiMaterialProperty`, `NiAlphaProperty`, marker and
 `RootCollisionNode` filtering.
 **Done when:** every NIF in `Morrowind.bsa` parses without error or panic (a `niftest` equivalent),
-and triangle/vertex counts for a sample of meshes match `niftest`'s.
-**Retires:** the largest single format risk. Budget accordingly — this is the biggest chunk.
+and triangle/vertex counts for a sample of meshes match `niftest`'s. ✔
+**Retired:** the largest single format risk.
+
+All **7,319** shipped meshes parse: 4,579,361 triangles and 4,631,142 vertices, with 41,702 geometry
+blocks passing index-bounds validation. As with `esmtool`, `niftest` is unavailable, so the
+cross-check is self-consistency: every triangle index inside its vertex buffer, every UV set and
+normal array matching the vertex count, and the block walk landing exactly on the root list.
+
+**Carried into M3, deliberately:** node-graph traversal with accumulated transforms, and marker /
+`RootCollisionNode` filtering. Both are listed in the scope above, and both are about *placing*
+geometry rather than decoding it — they belong with scene assembly, not with the reader.
+
+What made this milestone exacting is worth recording: blocks carry no size at version 4.0.0.2, so a
+parser off by one byte shifts every subsequent block and the failure surfaces far from its cause.
+Four bugs, three of them the same mistake — `bool` is four bytes at this version, but several fields
+that look like booleans are declared `char`/`uint8_t` and are one. The thing that made them findable
+was wrapping every block failure in an error carrying the block's index and type; before that the
+report was "6,601 × read past the end", after it was "6,601 × NiSourceTexture", which named the bug.
 
 ### M3 — First light: RT primary visibility
 One BLAS per mesh, compacted; one TLAS over the cell's instances; a raygen (or ray-query compute)
