@@ -4,7 +4,6 @@ members = ["crates/*"]
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.97"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
@@ -46,11 +45,11 @@ opt-level = 1
 debug = "line-tables-only"
 
 [profile.bench]
+lto = "thin"
 debug = "line-tables-only"
 
 [profile.release]
 lto = "thin"
-codegen-units = 1
 debug = "line-tables-only"
 
 [profile.release-max]

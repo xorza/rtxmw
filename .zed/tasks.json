@@ -24,6 +24,8 @@
       "rtxmw",
       "--profile",
       "release-max",
+      "--",
+      "-2,-9"
     ],
     "env": {
       "RUST_BACKTRACE": "1"
