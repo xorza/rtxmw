@@ -11,18 +11,14 @@ use rtxmw_gpu::{
     Device, Image, Memory, PhysicalDevice, RayTracingLimits, Timestamps, Uploader, image_barrier,
     memory_barrier,
 };
-use rtxmw_scene::StaticScene;
+use rtxmw_scene::{CellId, StaticScene};
 use rtxmw_texture::Texture;
 
 use crate::auto_exposure::AutoExposure;
 use crate::composite::Composite;
 use crate::denoiser::{DEFAULT_PASSES, Denoiser};
 use crate::gbuffer::GBuffer;
-use crate::geometry_buffers::GeometryBuffers;
-use crate::light_buffer::LightBuffer;
-use crate::material_buffers::MaterialBuffers;
-use crate::scene_acceleration::SceneAcceleration;
-use crate::texture_array::TextureArray;
+use crate::scene_residency::SceneResidency;
 use crate::tonemap::Tonemap;
 use crate::visibility_pass::{FrameConstants, Lighting, SceneBindings, VisibilityPass};
 
@@ -111,7 +107,7 @@ pub struct SceneRenderer {
     exposure: AutoExposure,
     tonemap: Tonemap,
     target: Image,
-    scene: Option<LoadedScene>,
+    scene: Option<SceneResidency>,
     bounce_samples: u32,
     denoise_passes: u32,
     timestamps: Timestamps,
@@ -135,22 +131,6 @@ fn target_image(memory: &Memory, extent: vk::Extent2D) -> rtxmw_gpu::Result<Imag
         TARGET_FORMAT,
         vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC,
     )
-}
-
-/// A cell's device-side data.
-///
-/// Every field is a lifetime anchor as much as a value: the descriptor set holds the top-level
-/// structure's handle, the structures reference their geometry by device address, and nothing else
-/// keeps any of it alive — so dropping this is what unloads a cell.
-#[derive(Debug)]
-#[allow(dead_code)]
-struct LoadedScene {
-    geometry: GeometryBuffers,
-    tables: MaterialBuffers,
-    textures: TextureArray,
-    lights: LightBuffer,
-    acceleration: SceneAcceleration,
-    lighting: Lighting,
 }
 
 impl SceneRenderer {
@@ -215,7 +195,7 @@ impl SceneRenderer {
         self.bounce_samples = samples;
     }
 
-    /// Uploads `scene` and builds its acceleration structures, replacing whatever was loaded.
+    /// Makes `scene` the only resident cell, replacing whatever was loaded.
     ///
     /// The caller must have waited for device idle: this frees structures a queued frame could
     /// still be reading.
@@ -224,45 +204,82 @@ impl SceneRenderer {
         device: &Device,
         uploader: &mut Uploader,
         limits: RayTracingLimits,
+        id: CellId,
         scene: &StaticScene,
         textures: &[Option<Texture>],
     ) -> rtxmw_gpu::Result<()> {
-        self.scene = None;
+        self.add_cell(device, uploader, limits, id, scene, textures)?;
+        let residency = self.scene.as_mut().expect("`add_cell` leaves one in place");
+        // Retaining only what was just added, rather than clearing first: an add uploads nothing a
+        // resident cell already named, and clearing would throw that away for no gain.
+        residency.retain_newest();
+        self.commit(device, uploader, limits)
+    }
 
-        let geometry = GeometryBuffers::upload(uploader, &scene.meshes)?;
-        let materials = scene.materials.materials();
-        let tables = MaterialBuffers::upload(uploader, &geometry, materials)?;
-        let acceleration = SceneAcceleration::build(
-            device,
-            uploader,
-            limits,
-            &geometry,
-            materials,
-            &scene.instances,
-        )?;
-        let array = TextureArray::upload(device, uploader, textures)?;
+    /// Makes one more cell resident, sharing everything it has in common with those already here.
+    ///
+    /// Nothing is visible until [`SceneRenderer::commit`], so a caller bringing in several cells
+    /// pays for one top-level build rather than one per cell.
+    ///
+    /// The caller must have waited for device idle.
+    pub fn add_cell(
+        &mut self,
+        device: &Device,
+        uploader: &mut Uploader,
+        limits: RayTracingLimits,
+        id: CellId,
+        scene: &StaticScene,
+        textures: &[Option<Texture>],
+    ) -> rtxmw_gpu::Result<()> {
+        let residency = match self.scene.as_mut() {
+            Some(residency) => residency,
+            None => self
+                .scene
+                .insert(SceneResidency::new(device, uploader, limits)?),
+        };
+        residency.add(device, uploader, limits, id, scene, textures)?;
         assert!(
-            array.len() <= MAX_TEXTURES,
-            "cell needs {} texture slots but the array is built for {MAX_TEXTURES}",
-            array.len()
+            residency.textures().len() <= MAX_TEXTURES,
+            "cells need {} texture slots but the array is built for {MAX_TEXTURES}",
+            residency.textures().len()
         );
-        let lights = LightBuffer::upload(uploader, &scene.lights)?;
+        Ok(())
+    }
 
-        let light_count = lights.count();
-        self.scene = Some(LoadedScene {
-            geometry,
-            tables,
-            textures: array,
-            lights,
-            acceleration,
-            lighting: Lighting {
-                // A cell that declares no ambient gets none rather than a guess: it is meant to be
-                // lit by what is placed in it.
-                ambient: scene.ambient.map_or(Vec3::ZERO, |a| a.colour),
-                light_count,
-                sun: scene.sun,
-            },
-        });
+    /// Drops a cell, if it was resident. Takes effect at the next [`SceneRenderer::commit`].
+    pub fn remove_cell(&mut self, id: &CellId) {
+        if let Some(residency) = self.scene.as_mut() {
+            residency.remove(id);
+        }
+    }
+
+    /// How many distinct meshes are on the device, across every cell that has been resident.
+    ///
+    /// Grow-only, so this counts what has ever been loaded rather than what is placed now — which
+    /// is the number that says whether cells are sharing what they name.
+    pub fn resident_meshes(&self) -> usize {
+        self.scene.as_ref().map_or(0, SceneResidency::mesh_count)
+    }
+
+    /// How many instances the top level holds, which is what resident cells actually place.
+    pub fn resident_instances(&self) -> u32 {
+        self.scene
+            .as_ref()
+            .map_or(0, |scene| scene.acceleration().instance_count())
+    }
+
+    /// Rebuilds what the resident set determines, and points the trace at the result.
+    ///
+    /// The caller must have waited for device idle.
+    pub fn commit(
+        &mut self,
+        device: &Device,
+        uploader: &mut Uploader,
+        limits: RayTracingLimits,
+    ) -> rtxmw_gpu::Result<()> {
+        if let Some(residency) = self.scene.as_mut() {
+            residency.commit(device, uploader, limits)?;
+        }
         self.bind_scene();
         Ok(())
     }
@@ -277,11 +294,11 @@ impl SceneRenderer {
         };
         self.pass.bind(
             SceneBindings {
-                structure: scene.acceleration.tlas(),
-                geometry: &scene.geometry,
-                tables: &scene.tables,
-                lights: &scene.lights,
-                textures: &scene.textures,
+                structure: scene.acceleration().tlas(),
+                geometry: scene.geometry(),
+                tables: scene.tables(),
+                lights: scene.lights(),
+                textures: scene.textures(),
             },
             &self.target,
             &self.gbuffer,
@@ -340,7 +357,7 @@ impl SceneRenderer {
                 light_count: 0,
                 sun: None,
             },
-            |scene| scene.lighting,
+            SceneResidency::lighting,
         );
         FrameConstants::new(
             view,

@@ -55,16 +55,32 @@ fn a_small_scene_builds_one_structure_per_mesh_and_one_instance_per_placement() 
 
     let materials = [Material::default()];
     let mut uploader = gpu.uploader();
-    let geometry = GeometryBuffers::upload(&mut uploader, &meshes).expect("upload failed");
-    let acceleration = SceneAcceleration::build(
-        gpu.device(),
-        &mut uploader,
-        gpu.physical().limits(),
-        &geometry,
-        &materials,
-        &instances,
-    )
-    .expect("build failed");
+    let mut geometry = GeometryBuffers::new(gpu.memory()).expect("arena failed");
+    let slots = geometry
+        .append(&mut uploader, &meshes.iter().collect::<Vec<_>>(), &[0])
+        .expect("upload failed");
+    let mut acceleration =
+        SceneAcceleration::new(gpu.device(), &mut uploader, gpu.physical().limits())
+            .expect("empty scene failed");
+    acceleration
+        .append_meshes(
+            gpu.device(),
+            &mut uploader,
+            gpu.physical().limits(),
+            &geometry,
+            &materials,
+            slots,
+        )
+        .expect("build failed");
+    acceleration
+        .rebuild_top(
+            gpu.device(),
+            &mut uploader,
+            gpu.physical().limits(),
+            &geometry,
+            &instances,
+        )
+        .expect("top level failed");
 
     assert_eq!(acceleration.blas_count(), 2);
     assert_eq!(acceleration.instance_count(), 3);
@@ -92,16 +108,32 @@ fn a_mesh_that_flattened_to_nothing_gets_no_structure() {
 
     let materials = [Material::default()];
     let mut uploader = gpu.uploader();
-    let geometry = GeometryBuffers::upload(&mut uploader, &meshes).expect("upload failed");
-    let acceleration = SceneAcceleration::build(
-        gpu.device(),
-        &mut uploader,
-        gpu.physical().limits(),
-        &geometry,
-        &materials,
-        &instances,
-    )
-    .expect("build failed");
+    let mut geometry = GeometryBuffers::new(gpu.memory()).expect("arena failed");
+    let slots = geometry
+        .append(&mut uploader, &meshes.iter().collect::<Vec<_>>(), &[0])
+        .expect("upload failed");
+    let mut acceleration =
+        SceneAcceleration::new(gpu.device(), &mut uploader, gpu.physical().limits())
+            .expect("empty scene failed");
+    acceleration
+        .append_meshes(
+            gpu.device(),
+            &mut uploader,
+            gpu.physical().limits(),
+            &geometry,
+            &materials,
+            slots,
+        )
+        .expect("build failed");
+    acceleration
+        .rebuild_top(
+            gpu.device(),
+            &mut uploader,
+            gpu.physical().limits(),
+            &geometry,
+            &instances,
+        )
+        .expect("top level failed");
 
     assert_eq!(acceleration.blas_count(), 2, "the empty mesh took a slot");
     assert_eq!(acceleration.instance_count(), 1);
@@ -116,16 +148,11 @@ fn an_empty_cell_still_produces_a_traversable_top_level() {
     let mut uploader = gpu.uploader();
 
     let materials: [Material; 0] = [];
-    let geometry = GeometryBuffers::upload(&mut uploader, &[]).expect("upload failed");
-    let acceleration = SceneAcceleration::build(
-        gpu.device(),
-        &mut uploader,
-        gpu.physical().limits(),
-        &geometry,
-        &materials,
-        &[],
-    )
-    .expect("build failed");
+    let _ = materials;
+    let geometry = GeometryBuffers::new(gpu.memory()).expect("arena failed");
+    let acceleration = SceneAcceleration::new(gpu.device(), &mut uploader, gpu.physical().limits())
+        .expect("empty scene failed");
+    let _ = &geometry;
 
     // A ray query needs a valid structure to initialise against even where nothing is placed, or
     // every caller has to special-case the empty cell.
@@ -148,16 +175,37 @@ fn a_real_interior_builds_and_compacts() {
     let gpu = TestGpu::shared();
     let mut uploader = gpu.uploader();
     let materials = scene.materials.materials();
-    let geometry = GeometryBuffers::upload(&mut uploader, &scene.meshes).expect("upload failed");
-    let acceleration = SceneAcceleration::build(
-        gpu.device(),
-        &mut uploader,
-        gpu.physical().limits(),
-        &geometry,
-        materials,
-        &scene.instances,
-    )
-    .expect("build failed");
+    let mut geometry = GeometryBuffers::new(gpu.memory()).expect("arena failed");
+    let remap: Vec<u32> = (0..materials.len() as u32).collect();
+    let slots = geometry
+        .append(
+            &mut uploader,
+            &scene.meshes.iter().collect::<Vec<_>>(),
+            &remap,
+        )
+        .expect("upload failed");
+    let mut acceleration =
+        SceneAcceleration::new(gpu.device(), &mut uploader, gpu.physical().limits())
+            .expect("empty scene failed");
+    acceleration
+        .append_meshes(
+            gpu.device(),
+            &mut uploader,
+            gpu.physical().limits(),
+            &geometry,
+            materials,
+            slots,
+        )
+        .expect("build failed");
+    acceleration
+        .rebuild_top(
+            gpu.device(),
+            &mut uploader,
+            gpu.physical().limits(),
+            &geometry,
+            &scene.instances,
+        )
+        .expect("top level failed");
 
     // Every mesh in this cell has geometry — `StaticScene` drops placements of empty ones — so the
     // structure count and the instance count must match the scene exactly.

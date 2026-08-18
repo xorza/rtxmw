@@ -9,7 +9,7 @@ use rtxmw_gpu::{
     Validation, image_blit,
 };
 use rtxmw_render::{FrameConstants, OUTPUT_FORMAT, SceneRenderer, TARGET_FORMAT};
-use rtxmw_scene::StaticScene;
+use rtxmw_scene::{CellId, StaticScene};
 use rtxmw_texture::Texture;
 
 /// Rows the trace renders, independent of the window's own height.
@@ -102,9 +102,10 @@ impl Renderer {
         })
     }
 
-    /// Uploads `scene` and builds its acceleration structures, replacing whatever was loaded.
+    /// Uploads `scene` and makes it the only resident cell.
     pub(crate) fn load_scene(
         &mut self,
+        id: CellId,
         scene: &StaticScene,
         textures: &[Option<Texture>],
     ) -> rtxmw_gpu::Result<()> {
@@ -114,9 +115,42 @@ impl Renderer {
             &self.device,
             &mut self.uploader,
             self.physical.limits(),
+            id,
             scene,
             textures,
         )
+    }
+
+    /// Makes one more cell resident, drawn from the next [`Renderer::commit`].
+    pub(crate) fn add_cell(
+        &mut self,
+        id: CellId,
+        scene: &StaticScene,
+        textures: &[Option<Texture>],
+    ) -> rtxmw_gpu::Result<()> {
+        // SAFETY: an upload can move a buffer a queued frame is reading through its descriptor.
+        unsafe { self.device.raw().device_wait_idle()? };
+        self.scene.add_cell(
+            &self.device,
+            &mut self.uploader,
+            self.physical.limits(),
+            id,
+            scene,
+            textures,
+        )
+    }
+
+    /// Drops a resident cell, taking effect at the next [`Renderer::commit`].
+    pub(crate) fn remove_cell(&mut self, id: &CellId) {
+        self.scene.remove_cell(id);
+    }
+
+    /// Rebuilds the top level over whatever is resident now.
+    pub(crate) fn commit(&mut self) -> rtxmw_gpu::Result<()> {
+        // SAFETY: the rebuild frees the structure a queued frame traces against.
+        unsafe { self.device.raw().device_wait_idle()? };
+        self.scene
+            .commit(&self.device, &mut self.uploader, self.physical.limits())
     }
 
     /// The frame constants for a camera, filled in with the loaded cell's lighting.

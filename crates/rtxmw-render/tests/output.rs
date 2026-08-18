@@ -8,7 +8,7 @@ use ash::vk;
 use glam::{Affine3A, Vec2, Vec3};
 use rtxmw_gpu::{TestGpu, readback};
 use rtxmw_render::SceneRenderer;
-use rtxmw_scene::{Instance, Material, Mesh, MeshId, StaticScene, Submesh};
+use rtxmw_scene::{CellId, Instance, Material, Mesh, MeshId, StaticScene, Submesh};
 
 mod common;
 
@@ -101,6 +101,7 @@ fn present(scene: &StaticScene) -> Vec<u8> {
             gpu.device(),
             &mut uploader,
             gpu.physical().limits(),
+            CellId::Interior("fixture".to_owned()),
             scene,
             &[],
         )

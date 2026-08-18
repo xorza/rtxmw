@@ -164,19 +164,6 @@ impl CellId {
             y: (world_y / CELL_SIZE).floor() as i32,
         }
     }
-
-    /// The exterior cell a world position is *well inside*, or `None` within `margin` of an edge.
-    ///
-    /// What keeps a streaming grid from thrashing. Standing on a boundary, the cell a position
-    /// falls in flips with every step and every rounding wobble, and recentring the world on each
-    /// flip would reload it continuously. Withholding an answer near the edge means the grid only
-    /// moves once the camera has committed to somewhere.
-    pub fn settled_in(world_x: f32, world_y: f32, margin: f32) -> Option<Self> {
-        let local = |v: f32| v - (v / CELL_SIZE).floor() * CELL_SIZE;
-        let (x, y) = (local(world_x), local(world_y));
-        let clear = |v: f32| v > margin && v < CELL_SIZE - margin;
-        (clear(x) && clear(y)).then(|| Self::containing(world_x, world_y))
-    }
 }
 
 impl std::fmt::Display for CellId {
@@ -422,39 +409,6 @@ mod tests {
         assert!(refs[3].is_teleport());
         assert_eq!(refs[3].destination_cell, None);
         assert!(!refs[0].is_teleport());
-    }
-
-    #[test]
-    fn a_position_near_a_cell_edge_settles_in_neither() {
-        // Well inside cell (0, 0) and cell (-1, -1).
-        assert_eq!(
-            CellId::settled_in(4000.0, 4000.0, 256.0),
-            Some(CellId::Exterior { x: 0, y: 0 })
-        );
-        assert_eq!(
-            CellId::settled_in(-4000.0, -4000.0, 256.0),
-            Some(CellId::Exterior { x: -1, y: -1 })
-        );
-
-        // Within the margin of an edge, in either axis, the answer is withheld — which is what
-        // stops a camera on a boundary flipping the grid back and forth with every step.
-        assert_eq!(CellId::settled_in(100.0, 4000.0, 256.0), None);
-        assert_eq!(CellId::settled_in(4000.0, 8100.0, 256.0), None);
-        assert_eq!(CellId::settled_in(-10.0, -10.0, 256.0), None);
-
-        // Just past the margin it commits, and to the cell it is actually in.
-        assert_eq!(
-            CellId::settled_in(8192.0 + 300.0, 4000.0, 256.0),
-            Some(CellId::Exterior { x: 1, y: 0 })
-        );
-
-        // A margin of zero is every position except an exact boundary, which is the degenerate
-        // case the hysteresis exists to avoid.
-        assert_eq!(
-            CellId::settled_in(1.0, 1.0, 0.0),
-            Some(CellId::Exterior { x: 0, y: 0 })
-        );
-        assert_eq!(CellId::settled_in(0.0, 0.0, 0.0), None);
     }
 
     #[test]

@@ -20,10 +20,24 @@ pub(crate) fn scene_of(
     ambient: Vec3,
 ) -> StaticScene {
     let mut table = MaterialTable::default();
+    // A fixture names a texture by id and hands the decoded image over separately, with no file
+    // anywhere. The renderer keys textures by where they came from, so each id needs a path to be
+    // known by — and the ids have to line up with the images the caller passes alongside.
+    let named = materials
+        .iter()
+        .filter_map(|material| material.base_colour)
+        .map(|id| id.0 + 1)
+        .max()
+        .unwrap_or(0);
+    for id in 0..named {
+        table.intern_texture(&format!("fixture-texture-{id}"));
+    }
     for material in materials {
         table.intern(*material);
     }
     StaticScene {
+        // Fixtures build meshes by hand, so their identity is only ever their position here.
+        mesh_sources: (0..meshes.len()).map(|i| format!("fixture:{i}")).collect(),
         meshes: meshes.to_vec(),
         instances: instances.to_vec(),
         materials: table,

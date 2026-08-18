@@ -1,6 +1,7 @@
 //! Reader for Morrowind's ESM/ESP content files.
 
 mod cell;
+mod cell_index;
 mod cell_ref;
 mod error;
 mod esm_reader;
@@ -13,6 +14,7 @@ mod position;
 mod record_name;
 
 pub use crate::cell::{Cell, CellAmbient, CellId, CellRefIter};
+pub use crate::cell_index::{CellIndex, CellOffsets};
 pub use crate::cell_ref::CellRef;
 pub use crate::error::{EsmError, Result};
 pub use crate::esm_reader::{EsmReader, Record, RecordIter, Subrecord, SubrecordIter};

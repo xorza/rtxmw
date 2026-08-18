@@ -33,23 +33,15 @@ impl std::fmt::Debug for TextureArray {
 }
 
 impl TextureArray {
-    /// Uploads every texture, substituting the fallback wherever one is absent.
+    /// An array holding only its fallback.
     ///
-    /// Slot `n` is the texture the scene's path list names at `n`, offset by one — slot zero is
-    /// always the fallback, so a material's texture id maps to `id + 1`.
-    pub(crate) fn upload(
-        device: &Device,
-        uploader: &mut Uploader,
-        textures: &[Option<Texture>],
-    ) -> rtxmw_gpu::Result<Self> {
+    /// Textures are added as cells arrive and **never removed**: the shipped library holds 4,311
+    /// distinct textures, which fits both the array's ceiling and the device's memory, so a
+    /// session that visited every cell would still hold a bounded set. Keeping them is what makes
+    /// a neighbouring cell almost free — it names the same files, and they are already here.
+    pub(crate) fn new(device: &Device, uploader: &mut Uploader) -> rtxmw_gpu::Result<Self> {
         let fallback = upload_one(uploader, &fallback_texture())?;
-        let mut slots = Vec::with_capacity(textures.len());
-        for texture in textures {
-            slots.push(match texture {
-                Some(texture) => Some(upload_one(uploader, texture)?),
-                None => None,
-            });
-        }
+        let slots = Vec::new();
 
         // Anisotropy is left off deliberately: it is a rasterizer's answer to a footprint problem
         // that a ray tracer solves with ray differentials instead, and turning it on here would
@@ -72,6 +64,27 @@ impl TextureArray {
             slots,
             sampler,
         })
+    }
+
+    /// Uploads one texture and returns the id a material refers to it by.
+    ///
+    /// An id, not a descriptor index: the fallback occupies descriptor zero and the shader adds one
+    /// when it samples, so ids stay dense from zero and a caller never has to know that.
+    ///
+    /// A texture that failed to decode still takes an id, pointing at the fallback. Dropping it
+    /// instead would shift every later id, which is the sort of off-by-one that shows up as the
+    /// wrong texture on an unrelated wall.
+    pub(crate) fn insert(
+        &mut self,
+        uploader: &mut Uploader,
+        texture: Option<&Texture>,
+    ) -> rtxmw_gpu::Result<u32> {
+        let id = self.slots.len() as u32;
+        self.slots.push(match texture {
+            Some(texture) => Some(upload_one(uploader, texture)?),
+            None => None,
+        });
+        Ok(id)
     }
 
     /// How many slots the array holds, fallback included.

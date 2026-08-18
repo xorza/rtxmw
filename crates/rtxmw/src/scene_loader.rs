@@ -5,28 +5,59 @@ use rtxmw_scene::{CellId, LoadedCell};
 
 use crate::camera::Camera;
 
-/// Cells loaded either side of the one the camera is in.
+/// Cells kept resident either side of the one the camera is in, in cell units.
 ///
-/// Radius 3 is a 7x7 block of 49 cells — about six across, and odd so the camera's own cell is the
-/// middle one rather than a corner between four. Morrowind's own active grid is radius 1, which is
-/// what its draw distance could afford.
-pub(crate) const GRID_RADIUS: i32 = 3;
+/// Radius 3 is a 7x7 window of 49 cells. Morrowind's own active grid is radius 1, which is what its
+/// draw distance could afford; ours is bounded by loading rather than by tracing — measured, the
+/// frame cost of a window this size is 0.1 ms over a 5x5 one, because the cells beyond that are
+/// past anything a ray reaches.
+pub(crate) const LOAD_RADIUS: i32 = 3;
 
-/// How far inside a cell the camera must be before the grid recentres on it, in world units.
+/// How far outside [`LOAD_RADIUS`] a cell is kept before being evicted.
 ///
-/// A twelfth of a cell. Without it the loaded block would follow every step across a boundary and
-/// every step back, reloading the world each time; with it the camera has to commit.
-pub(crate) const GRID_HYSTERESIS: f32 = 683.0;
+/// **This is the hysteresis.** Without it, a camera standing on a boundary would drop a whole
+/// column of cells and load another with every step across and every step back. One cell of slack
+/// means the window has to be genuinely left before anything is unloaded: after a single crossing,
+/// walking back and forth over the same edge costs nothing at all.
+pub(crate) const KEEP_RADIUS: i32 = LOAD_RADIUS + 1;
 
-/// Where the loaded block should recentre, or `None` to leave it where it is.
+/// The cells that should be resident with the camera in `centre`, nearest first.
 ///
-/// Separated from the loading it triggers because the two fail differently: this is a decision
-/// about a position and can be checked exactly, while what follows it is thirty milliseconds of
-/// file reading and an acceleration structure rebuild.
-pub(crate) fn next_centre(position: Vec3, loaded: &CellId) -> Option<CellId> {
-    let settled = CellId::settled_in(position.x, position.y, GRID_HYSTERESIS)?;
-    // A block already centred here has nowhere to move to.
-    (settled != *loaded).then_some(settled)
+/// Nearest first because they arrive one at a time and the near ones are what fills the screen —
+/// a window loaded from the outside in would leave the ground under the camera missing longest.
+pub(crate) fn wanted_cells(centre: &CellId, out: &mut Vec<CellId>) {
+    out.clear();
+    // An interior has no neighbours to stream: a door is the only way out of one.
+    let CellId::Exterior { x, y } = *centre else {
+        return;
+    };
+    let span = -LOAD_RADIUS..=LOAD_RADIUS;
+    out.reserve_exact(span.clone().count() * span.count());
+    for dy in -LOAD_RADIUS..=LOAD_RADIUS {
+        for dx in -LOAD_RADIUS..=LOAD_RADIUS {
+            out.push(CellId::Exterior {
+                x: x + dx,
+                y: y + dy,
+            });
+        }
+    }
+    // Chebyshev, matching the square the window is: it orders by which ring a cell is in, which is
+    // what "outward from the camera" means for a square window.
+    out.sort_by_key(|id| rings_from(centre, id).unwrap_or(i32::MAX));
+}
+
+/// How many cells apart two exteriors are, measured as the window is — or `None` for an interior.
+pub(crate) fn rings_from(centre: &CellId, id: &CellId) -> Option<i32> {
+    match (centre, id) {
+        (
+            CellId::Exterior { x: cx, y: cy },
+            CellId::Exterior {
+                x: other_x,
+                y: other_y,
+            },
+        ) => Some((other_x - cx).abs().max((other_y - cy).abs())),
+        _ => None,
+    }
 }
 
 /// The cell the engine opens in when the command line names none.
@@ -145,37 +176,65 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_block_recentres_only_once_the_camera_has_committed() {
+    fn the_window_is_square_and_ordered_outward_from_the_camera() {
+        let mut wanted = Vec::new();
+        wanted_cells(&CellId::Exterior { x: 0, y: 0 }, &mut wanted);
+
+        // 7 by 7, with LOAD_RADIUS of 3.
+        assert_eq!(wanted.len(), 49);
+        assert_eq!(wanted[0], CellId::Exterior { x: 0, y: 0 });
+        // The last is a corner: three rings out in both axes.
+        assert_eq!(
+            rings_from(&CellId::Exterior { x: 0, y: 0 }, &wanted[48]),
+            Some(3)
+        );
+        // The first ring is entirely ahead of the second, which is what "nearest first" has to
+        // mean when cells arrive one at a time.
+        let ring = |index: usize| rings_from(&CellId::Exterior { x: 0, y: 0 }, &wanted[index]);
+        assert_eq!(ring(1), Some(1));
+        assert_eq!(ring(8), Some(1));
+        assert_eq!(ring(9), Some(2));
+
+        // An interior has nothing around it to stream.
+        wanted_cells(&CellId::Interior("a room".into()), &mut wanted);
+        assert!(wanted.is_empty());
+    }
+
+    #[test]
+    fn stepping_over_a_boundary_and_back_evicts_nothing() {
+        // **The hysteresis, stated as the property it exists for.** The camera crosses from cell
+        // (0, 0) into (1, 0), which pulls in a new column at x = 4 and pushes the one at x = -3
+        // out of the load window. One cell of slack is what keeps it resident anyway, so stepping
+        // back over the same edge finds it still there and loads nothing.
         let here = CellId::Exterior { x: 0, y: 0 };
-        let at = |x: f32, y: f32| next_centre(Vec3::new(x, y, 0.0), &here);
+        let next = CellId::Exterior { x: 1, y: 0 };
+        let west_edge = CellId::Exterior { x: -3, y: 0 };
+        let east_edge = CellId::Exterior { x: 4, y: 0 };
 
-        // Well inside the cell it is already centred on: nothing to do.
-        assert_eq!(at(4000.0, 4000.0), None);
-        // Well inside the next one along: move.
-        assert_eq!(at(12000.0, 4000.0), Some(CellId::Exterior { x: 1, y: 0 }));
-        assert_eq!(at(-4000.0, 4000.0), Some(CellId::Exterior { x: -1, y: 0 }));
-        // Diagonally, too.
-        assert_eq!(
-            at(-4000.0, -4000.0),
-            Some(CellId::Exterior { x: -1, y: -1 })
-        );
+        // Rings are asserted exactly and then compared as numbers: `Option` orders `None` below
+        // every `Some`, so `rings <= Some(KEEP_RADIUS)` would also hold for an interior — which is
+        // the one case this must not quietly accept.
+        let rings = |centre: &CellId, id: &CellId| rings_from(centre, id).expect("both exterior");
 
-        // **Straddling the boundary commits to neither.** Without that the block would reload on
-        // every step across and every step back, which at thirty milliseconds a load is a stall
-        // per footfall.
-        assert_eq!(at(8192.0 + 10.0, 4000.0), None);
-        assert_eq!(at(8192.0 - 10.0, 4000.0), None);
+        // Loaded while standing in (0, 0), and outside the load window from (1, 0)...
+        assert_eq!(rings(&here, &west_edge), LOAD_RADIUS);
+        assert_eq!(rings(&next, &west_edge), 4);
+        // ...but inside what is kept, so crossing does not drop it.
+        assert!(rings(&next, &west_edge) <= KEEP_RADIUS);
 
-        // Stepping out of a building recentres from wherever the camera was: the loaded cell
-        // being an interior is not a reason to stay there. Indoors nothing streams at all, so this
-        // is the function being total rather than a case the engine reaches.
-        assert_eq!(
-            next_centre(
-                Vec3::new(12000.0, 4000.0, 0.0),
-                &CellId::Interior("a room".into())
-            ),
-            Some(CellId::Exterior { x: 1, y: 0 })
-        );
+        // The same in the other direction for the column the crossing brought in.
+        assert_eq!(rings(&next, &east_edge), LOAD_RADIUS);
+        assert_eq!(rings(&here, &east_edge), 4);
+        assert!(rings(&here, &east_edge) <= KEEP_RADIUS);
+
+        // Two cells further and the slack is spent, which is the point: it absorbs a boundary, not
+        // a journey.
+        let away = CellId::Exterior { x: 2, y: 0 };
+        assert_eq!(rings(&away, &west_edge), 5);
+        assert!(rings(&away, &west_edge) > KEEP_RADIUS);
+
+        // An interior is not a distance at all.
+        assert_eq!(rings_from(&here, &CellId::Interior("a room".into())), None);
     }
 
     #[test]

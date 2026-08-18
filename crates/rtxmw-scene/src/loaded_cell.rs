@@ -1,11 +1,12 @@
 //! Everything a cell needs, assembled from the installed game.
 
-use rtxmw_esm::{CellId, EsmReader};
+use rtxmw_esm::{CellId, CellIndex, EsmReader};
 use rtxmw_texture::Texture;
-use rtxmw_vfs::{Vfs, morrowind_data_dir};
+use rtxmw_vfs::Vfs;
 
 use crate::door::Door;
-use crate::error::{Result, SceneError};
+use crate::error::Result;
+use crate::game_files::GameFiles;
 use crate::static_scene::{ModelIndex, StaticScene};
 
 /// A cell's geometry and the textures its materials name.
@@ -28,78 +29,61 @@ pub struct LoadedCell {
     ///
     /// Each one names a place the game itself puts the player, which is what makes any of them a
     /// defensible spawn point — see [`Door`]. Empty for a cell nothing leads to, which a cell
-    /// reached only by script or by coordinates legitimately is.
+    /// reached only by script or by coordinates legitimately is — **and empty for a streamed cell,
+    /// where the search is skipped rather than coming back with nothing**. Only the cell opened
+    /// through [`LoadedCell::load_at`] is asked the question.
     pub entrances: Vec<Door>,
 }
 
 impl LoadedCell {
     /// Loads whichever cell `id` names, or `None` when no game data is configured.
     ///
-    /// The dispatch a caller holding a `CellId` wants: an interior is found by name and an exterior
-    /// by grid position, and nothing above here should have to know which of those it is holding.
+    /// Opens the content file, indexes it, and reads one cell out — so this is the *expensive* way
+    /// in, and the right one exactly once: at startup, for the cell the camera opens in. Anything
+    /// loading a second cell wants [`CellStreamer`], which keeps the file open and the index built
+    /// and pays neither again.
     ///
-    /// `radius` widens an exterior into the block of cells around it and is ignored for an
-    /// interior, which has no neighbours to stream — a door is the only way out of one.
-    pub fn load_at(id: CellId, radius: i32) -> Result<Option<Self>> {
-        match id {
-            CellId::Interior(name) => Self::load_interior(&name),
-            CellId::Exterior { x, y } => Self::load_exterior_grid(x, y, radius),
-        }
-    }
+    /// [`CellStreamer`]: crate::cell_streamer::CellStreamer
+    pub fn load_at(id: CellId) -> Result<Option<Self>> {
+        let Some(files) = GameFiles::open()? else {
+            return Ok(None);
+        };
+        let vfs = &files.vfs;
+        let esm = EsmReader::new(&files.esm)?;
+        let index = CellIndex::build(&esm)?;
+        let models = ModelIndex::build(&esm)?;
 
-    /// Loads the block of exterior cells within `radius` of `(x, y)`, or `None` when no game data
-    /// is configured.
-    ///
-    /// Its entrances are the doors leading into the *centre* cell, since that is where a traveller
-    /// stepping outside arrives; the surrounding cells are there to be seen and walked into. They
-    /// come from the same search an interior's does: a door leading outside names no cell, so the
-    /// grid square its arrival point falls in identifies one — which [`Door::leading_to`] already
-    /// resolves. Standing where the game would put someone stepping out of a building is as good a
-    /// viewpoint outdoors as in.
-    pub fn load_exterior_grid(x: i32, y: i32, radius: i32) -> Result<Option<Self>> {
-        Self::load(CellId::Exterior { x, y }, |esm, models, vfs| {
-            StaticScene::load_exterior_grid(esm, models, vfs, x, y, radius)
-        })
+        let scene = StaticScene::load_cell(&esm, &index, &models, vfs, &id)?;
+        let entrances = Door::leading_to(&esm, &models, &id)?;
+        Ok(Some(Self::assemble(id, scene, vfs, entrances)))
     }
 
     /// Loads the named interior from the installed game, or `None` when none is configured.
-    ///
-    /// Reads the whole of `Morrowind.esm` each call, and so does every other way in here. That was
-    /// fine while one cell was opened at startup; now that a block streams in as the camera moves,
-    /// it is the larger part of the ~30 ms hitch crossing a boundary costs. Hoisting the reader
-    /// above this is what removes it.
     pub fn load_interior(cell_name: &str) -> Result<Option<Self>> {
-        Self::load(
-            CellId::Interior(cell_name.to_owned()),
-            |esm, models, vfs| StaticScene::load_interior(esm, models, vfs, cell_name),
-        )
+        Self::load_at(CellId::Interior(cell_name.to_owned()))
     }
 
-    /// Brings up the game's files, assembles one cell with `build`, and decodes its textures.
+    /// Assembles one cell from files a caller already has open, without searching for its doors.
     ///
-    /// The part every cell shares, whichever way it is addressed: the reader, the model index, the
-    /// door search and the texture decode differ only in which scene comes out of the middle.
-    fn load(
-        destination: CellId,
-        build: impl FnOnce(&EsmReader<'_>, &ModelIndex, &Vfs) -> Result<StaticScene>,
-    ) -> Result<Option<Self>> {
-        let Some(data) = morrowind_data_dir() else {
-            return Ok(None);
-        };
-        let vfs = rtxmw_vfs::morrowind_archives().ok_or_else(|| {
-            SceneError::Io(std::io::Error::other(
-                "the game directory is configured but its archives could not be opened",
-            ))
-        })?;
-        let bytes = std::fs::read(data.join("Morrowind.esm")).map_err(SceneError::Io)?;
-        let esm = EsmReader::new(&bytes)?;
-        let models = ModelIndex::build(&esm)?;
-        let scene = build(&esm, &models, &vfs)?;
-        let entrances = Door::leading_to(&esm, &models, &destination)?;
-        // `destination` is moved into the result below, so the door search borrows it first.
+    /// What streaming loads. The door search is a pass over the whole file costing as much again
+    /// as building the cell, and it answers "where would someone arriving here appear" — which a
+    /// cell the camera is walking into has already answered for itself.
+    pub fn streamed(
+        esm: &EsmReader<'_>,
+        index: &CellIndex,
+        models: &ModelIndex,
+        vfs: &Vfs,
+        id: CellId,
+    ) -> Result<Self> {
+        let scene = StaticScene::load_cell(esm, index, models, vfs, &id)?;
+        Ok(Self::assemble(id, scene, vfs, Vec::new()))
+    }
 
-        // A texture that fails to read or decode becomes `None` rather than aborting the load: one
-        // dangling reference in a cell of hundreds is not a reason to have no cell.
+    /// Decodes the textures a scene's materials name and packages the result.
+    ///
+    /// A texture that fails to read or decode becomes `None` rather than aborting the load: one
+    /// dangling reference in a cell of hundreds is not a reason to have no cell.
+    fn assemble(id: CellId, scene: StaticScene, vfs: &Vfs, entrances: Vec<Door>) -> Self {
         let textures = scene
             .materials
             .textures()
@@ -110,13 +94,12 @@ impl LoadedCell {
                     .and_then(|bytes| Texture::decode(&bytes).ok())
             })
             .collect();
-
-        Ok(Some(Self {
-            id: destination,
+        Self {
+            id,
             scene,
             textures,
             entrances,
-        }))
+        }
     }
 
     /// How many of the cell's texture references resolved to nothing.

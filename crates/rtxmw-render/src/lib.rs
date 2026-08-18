@@ -12,6 +12,7 @@ mod light_buffer;
 mod material_buffers;
 mod scene_acceleration;
 mod scene_renderer;
+mod scene_residency;
 mod texture_array;
 mod tonemap;
 mod visibility_pass;

@@ -17,7 +17,7 @@ use ash::vk;
 use glam::{Affine3A, Vec2, Vec3};
 use rtxmw_gpu::TestGpu;
 use rtxmw_render::SceneRenderer;
-use rtxmw_scene::{Instance, Light, LoadedCell, Material, MeshId, Submesh};
+use rtxmw_scene::{CellId, Instance, Light, LoadedCell, Material, MeshId, Submesh};
 
 mod common;
 
@@ -123,6 +123,7 @@ fn steady_state_rendering_does_not_allocate() {
             gpu.device(),
             &mut uploader,
             gpu.physical().limits(),
+            CellId::Interior("fixture".to_owned()),
             &scene,
             &textures,
         )

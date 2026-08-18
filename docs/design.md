@@ -1053,15 +1053,15 @@ makes one sample a frame viable. Against the ~8 ms §5.3 allowance there is stil
 mid-morning. The colour is a warm white scaled by a constant chosen for its *ratio* to the sky —
 about five to one, as on a clear day — and is provisional in exactly the way `INTENSITY` is.
 
-### M9 — streaming a block of cells
+### M9 — streaming cells one at a time
 
-The camera now flies across a 7×7 block of exterior cells and the block follows it. What that
-measurement turned up is the interesting part.
+The camera flies across a 7×7 window of exterior cells and the window follows it, a cell at a time,
+without a stall. Getting there meant throwing away the first answer.
 
-**The grid is nearly free past 5×5.** Measured at 1920×1080 on the shipped cell, with four bounce
+**The window is nearly free past 5×5.** Measured at 1920×1080 on the shipped cell, with four bounce
 samples, four à-trous passes and sixteen sun rays:
 
-| radius | grid | cells | instances | frame | trace |
+| radius | window | cells | instances | frame | trace |
 |---|---|---|---|---|---|
 | 0 | 1×1 | 1 | 289 | 3.12 ms | 2.52 |
 | 1 | 3×3 | 9 | 1,700 | 6.93 ms | 6.13 |
@@ -1078,26 +1078,85 @@ escape to the sky now hit terrain and spawn shadow and bounce rays of their own.
 So draw distance is not what this budget is spent on. **Ray termination is.** That reframes what to
 tune: sixteen sun samples a pixel, not the size of the world.
 
-Against §5.3's roughly 8 ms allowance the frame is now at 8.16 — over, slightly, and the sun's
-sample count is the obvious place to spend it down once M7's temporal reuse makes fewer samples
-viable.
+#### What the first attempt cost, and why
 
-**One pass over the file for the whole block**, not one per cell: a cell's records are scattered
-through a 79 MB stream and finding them costs a full walk, so a 7×7 grid loaded a cell at a time
-would read the file forty-nine times. Loading 49 cells takes 32 ms against 20 for one. The mesh
-cache spans the block too, which is what turns the same rock repeated across forty-nine cells into
-one mesh with many instances — **378 meshes for 6,406 instances**.
+Streaming began as a *block* reload: cross a boundary, load the 7×7 around the new centre, replace
+everything. It worked and it stalled for a fifth of a second. Broken down, one crossing:
 
-**Recentring waits for the camera to commit.** `CellId::settled_in` withholds an answer within a
-twelfth of a cell of any boundary, so standing on an edge does not reload the world on every step
-across and every step back. The decision is separated from the loading it triggers because the two
-fail differently: one is arithmetic on a position and can be checked exactly, the other is thirty
-milliseconds of file reading and an acceleration structure rebuild.
+| | dev | release |
+|---|---|---|
+| read `Morrowind.esm` | 20.8 ms | 21.6 |
+| build the model index — a pass over the file | 7.9 | 6.6 |
+| build the scene — a second pass | 46.8 | 34.4 |
+| find the doors leading in — a third pass | 45.4 | 25.7 |
+| decode textures | 2.2 | 2.3 |
+| upload and build structures | 71.9 | 43.1 |
+| **total** | **195 ms** | **133 ms** |
 
-**Still hitching.** The reload is synchronous — about 30 ms of file work plus the structure rebuild,
-on the frame that crosses the boundary. M9's done-when says *no hitching*, and that needs the load
-off the main thread with the new block swapped in when it is ready. That is the remaining piece,
-along with distant statics and terrain layer blending.
+The shape is what matters, and it is not "loading is slow". **Three passes over the same 79 MB
+file** to find records whose location never changes, and then a re-upload of a scene that is 90%
+identical to the one already resident — 49 neighbouring cells share 378 meshes between them, so the
+block arriving after a one-cell step is almost entirely the block that was already on the device.
+
+#### Identity, and two lifetimes
+
+The fix is to stop rebuilding what has not changed, which requires knowing what "the same" means.
+Every mesh carries the path it was loaded from (`StaticScene::mesh_sources`; terrain is keyed by its
+cell, being the one mesh no other cell can share), and textures already carried theirs. On that
+identity the renderer keeps two tiers, split by lifetime rather than by kind:
+
+- **Assets are grow-only** — mesh data, bottom-level structures, textures, materials. Keyed by
+  source, uploaded by the first cell to name them, and kept for the life of the renderer. The
+  ceiling is the shipped library: 4,311 distinct textures against the array's 8,192 slots, and some
+  three thousand meshes. A session that visited every cell in the game would hold all of it, in the
+  region of half a gigabyte — so nothing is freed, no slot is renumbered, and a mesh's
+  `first_submesh`, which is what an instance carries as its custom index, is stable forever.
+- **Cells own placements and nothing else** — instances and lights. Evicting one is dropping two
+  lists.
+
+A commit therefore rebuilds only what the resident *set* determines: the geometry and material
+tables (~100 KB together), the lights, the instance buffer and the top level. Everything there is
+proportional to what is placed, not to what is loaded.
+
+This is why the arena is grow-only rather than free-listed. With eviction the arena would fragment
+and mesh slots would have to be reused, which means renumbering, which means rewriting the tables
+that name them. Bounding the problem by the game's own art removes all of it. A mod with 2K textures
+would blow the ceiling; the path-keyed map is where a refcount and a free list would go, and until
+one exists the ceiling is asserted rather than assumed.
+
+#### One walk, then two reads
+
+The file is walked once, on the streamer's thread, into a `CellIndex`: the offset of every cell's
+`CELL` and `LAND` record, plus the `LTEX` palette. After that, loading a cell is
+`esm.record_at(offset)` twice. The palette has to live there for the same reason the offsets do —
+`LTEX` records are scattered with no relation to the cells that use them, so a cell loaded on its
+own would otherwise resolve its ground against however much of the palette happened to precede it.
+
+The door search is simply not run for a streamed cell. It was a third of the cost and it answers
+"where would someone arriving here appear", which a cell the camera is walking into has already
+answered.
+
+#### Hysteresis is two radii
+
+Cells load within Chebyshev radius 3 and are evicted only past 4. Crossing a boundary pulls in a
+column and pushes the far column *out of the load window but not out of the kept one*, so stepping
+back over the same edge finds it still resident and loads nothing. One crossing settles it; no
+timers, no distance-from-edge margin, and one mechanism rather than two.
+
+#### What it costs now
+
+Per cell, with its neighbours already resident: **0.7–3.7 ms to add, 0.6–2.5 ms to commit.** One
+cell per frame, deliberately — a boundary crossing wants a whole column, and taking them together
+would rebuild the same structure seven times inside one frame. Filling the whole 7×7 window from
+cold is 48 cells in **136 ms**, against 195 ms for the single block reload it replaces.
+
+In the windowed engine at 1920×1080: **81 fps while a cell arrives every frame**, 108–112 fps once
+the window is full. The stall is gone — the frame that takes a cell is a slower frame, not a
+dropped one.
+
+M9's remaining pieces are distant statics and terrain layer blending, which is still a hard edge per
+512-unit tile.
+
 
 ### M5 — Direct lighting
 Sun as a directional light with a real angular diameter (so shadows are soft), shadow rays, cell

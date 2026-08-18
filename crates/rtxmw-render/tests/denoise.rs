@@ -9,7 +9,7 @@ use ash::vk;
 use glam::{Affine3A, Vec2, Vec3};
 use rtxmw_gpu::{TestGpu, readback};
 use rtxmw_render::{FrameTimings, SceneRenderer};
-use rtxmw_scene::{Instance, Light, Material, Mesh, MeshId, StaticScene, Submesh};
+use rtxmw_scene::{CellId, Instance, Light, Material, Mesh, MeshId, StaticScene, Submesh};
 
 mod common;
 
@@ -119,6 +119,7 @@ fn trace(scene: &StaticScene, passes: u32) -> Rendered {
             gpu.device(),
             &mut uploader,
             gpu.physical().limits(),
+            CellId::Interior("fixture".to_owned()),
             scene,
             &[],
         )

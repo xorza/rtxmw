@@ -9,7 +9,7 @@ use winit::event_loop::ActiveEventLoop;
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowId};
 
-use rtxmw_scene::{CellId, LoadedCell};
+use rtxmw_scene::{CellId, CellStreamer, LoadedCell};
 
 use crate::WindowOptions;
 use crate::camera::{Camera, Movement};
@@ -54,9 +54,19 @@ pub(crate) struct App {
     /// same rule one level up.
     renderer: Option<Renderer>,
     window: Option<Window>,
-    /// The exterior block currently resident, so the grid only reloads when the camera leaves it.
-    /// `None` indoors, where there is nothing to stream.
-    loaded_centre: Option<CellId>,
+    /// The exterior cell the camera was last known to be in, and the window's centre. Unset until
+    /// the first frame outdoors, which is what makes that frame ask for the window.
+    centre: Option<CellId>,
+    /// Cells on the device, so the window knows what it already has.
+    resident: Vec<CellId>,
+    /// Cells asked for and not yet arrived, so the window does not ask twice while one is in
+    /// flight. Cleared of a cell however it turns out, so a square that is open sea is asked for
+    /// again the next time the window moves over it — which costs an index lookup and no file.
+    requested: Vec<CellId>,
+    /// Scratch for the wanted set, refilled rather than reallocated. Only refilled when the camera
+    /// crosses into another cell, which is what keeps sorting 49 of them off the frame path.
+    wanted: Vec<CellId>,
+    streamer: CellStreamer,
     /// Frames to draw before exiting, for scripting the windowed path.
     exit_after: Option<u32>,
     frames_drawn: u32,
@@ -70,44 +80,99 @@ pub(crate) struct App {
 }
 
 impl App {
-    /// Recentres the loaded block when the camera has settled in a different cell.
+    /// Keeps the cells around the camera resident, loading and evicting one at a time.
     ///
-    /// Synchronous, so the reload is a visible hitch — about 30 ms of file work plus the
-    /// acceleration structure rebuild. Doing it off the main thread is what M9's "no hitching"
-    /// asks for and is the next piece; this is the part that makes the world traversable at all.
-    fn stream_grid(&mut self) {
-        let Some(centre) = &self.loaded_centre else {
+    /// Everything expensive is elsewhere: the reading and decoding happen on the streamer's thread,
+    /// and what lands here is one cell's upload and one rebuild of the top level over what is
+    /// placed. Sharing is what makes that small — a cell arriving next to forty-eight others names
+    /// meshes and textures the device already holds, and uploads almost nothing.
+    ///
+    /// One cell per frame, deliberately. A camera crossing a boundary wants a whole column, and
+    /// taking them all in one frame would rebuild the same structure seven times over while the
+    /// frame it interrupted waited.
+    fn stream_cells(&mut self) {
+        // A door is the only way out of an interior, so nothing streams around one — and a
+        // position inside a building does not meaningfully name a grid square anyway.
+        if !matches!(self.cell, CellId::Exterior { .. }) {
             return;
+        }
+        let mut changed = self.take_one_loaded();
+
+        // The window only moves when the camera crosses into another cell, which is also what
+        // keeps this frame-path free of the work — and the allocation — of sorting 49 cells.
+        let position = self.camera.position();
+        let centre = CellId::containing(position.x, position.y);
+        if self.centre.as_ref() != Some(&centre) {
+            changed |= self.evict_beyond(&centre);
+            self.request_missing(&centre);
+            self.centre = Some(centre);
+        }
+
+        if changed
+            && let Some(renderer) = self.renderer.as_mut()
+            && let Err(e) = renderer.commit()
+        {
+            eprintln!("could not rebuild the scene: {e}");
+        }
+    }
+
+    /// Uploads one cell that finished loading, if any has. Returns whether anything changed.
+    fn take_one_loaded(&mut self) -> bool {
+        let Some(ready) = self.streamer.take_ready() else {
+            return false;
         };
-        let Some(CellId::Exterior { x, y }) =
-            scene_loader::next_centre(self.camera.position(), centre)
-        else {
-            return;
+        self.requested.retain(|id| *id != ready.id);
+        let loaded = match ready.loaded {
+            Ok(loaded) => loaded,
+            // Most often a grid square that is open sea, which has no record at all. Asked for
+            // again the next time the window moves over it, and cheaply: the cell index answers
+            // "no such cell" without touching the file.
+            Err(e) => {
+                eprintln!("could not load {}: {e}", ready.id);
+                return false;
+            }
         };
         let Some(renderer) = self.renderer.as_mut() else {
-            return;
+            return false;
         };
-
-        let started = Instant::now();
-        match LoadedCell::load_exterior_grid(x, y, scene_loader::GRID_RADIUS) {
-            Ok(Some(cell)) => {
-                if let Err(e) = renderer.load_scene(&cell.scene, &cell.textures) {
-                    eprintln!("could not upload {}: {e}", cell.id);
-                    return;
-                }
-                println!(
-                    "streamed to {} in {:.0} ms: {} instances",
-                    cell.id,
-                    started.elapsed().as_secs_f32() * 1000.0,
-                    cell.scene.instances.len()
-                );
-                self.loaded_centre = Some(cell.id);
+        match renderer.add_cell(loaded.id.clone(), &loaded.scene, &loaded.textures) {
+            Ok(()) => {
+                self.resident.push(loaded.id);
+                true
             }
-            // Off the edge of the world, where no cell record exists. The block stays where it is
-            // rather than emptying, so flying out to sea leaves the coast behind rather than
-            // nothing at all.
-            Ok(None) => {}
-            Err(e) => eprintln!("could not stream to ({x}, {y}): {e}"),
+            Err(e) => {
+                eprintln!("could not upload {}: {e}", loaded.id);
+                false
+            }
+        }
+    }
+
+    /// Drops cells further from `centre` than the window keeps. Returns whether anything changed.
+    fn evict_beyond(&mut self, centre: &CellId) -> bool {
+        let Some(renderer) = self.renderer.as_mut() else {
+            return false;
+        };
+        let before = self.resident.len();
+        self.resident.retain(|id| {
+            let keep = scene_loader::rings_from(centre, id)
+                .is_none_or(|rings| rings <= scene_loader::KEEP_RADIUS);
+            if !keep {
+                renderer.remove_cell(id);
+            }
+            keep
+        });
+        before != self.resident.len()
+    }
+
+    /// Asks for whichever cells around `centre` are neither resident nor already on the way.
+    fn request_missing(&mut self, centre: &CellId) {
+        scene_loader::wanted_cells(centre, &mut self.wanted);
+        for id in &self.wanted {
+            if self.resident.contains(id) || self.requested.contains(id) {
+                continue;
+            }
+            self.streamer.request(id.clone());
+            self.requested.push(id.clone());
         }
     }
 
@@ -132,7 +197,11 @@ impl Default for App {
             cell: scene_loader::cell_argument(None),
             renderer: None,
             window: None,
-            loaded_centre: None,
+            centre: None,
+            resident: Vec::new(),
+            requested: Vec::new(),
+            wanted: Vec::new(),
+            streamer: CellStreamer::spawn(),
             exit_after: None,
             frames_drawn: 0,
             // Replaced by the loaded cell's own centre in `resumed`; this only matters if no game
@@ -184,11 +253,12 @@ impl App {
             .map(Renderer::device_name)
             .unwrap_or("no device");
         window.set_title(&format!(
-            "rtxmw — {fps:.0} fps — {:.0}, {:.0}, {:.0} — {:.1} m/s — {device}",
+            "rtxmw — {fps:.0} fps — {:.0}, {:.0}, {:.0} — {:.1} m/s — {} cells — {device}",
             position.x,
             position.y,
             position.z,
             self.camera.speed(),
+            self.resident.len(),
         ));
 
         self.last_title_update = Instant::now();
@@ -228,17 +298,20 @@ impl ApplicationHandler for App {
         // Content after the device, because uploading needs one. A missing install is not fatal:
         // the window still comes up and reports the device, which is what makes it obvious that the
         // path is what is wrong rather than the GPU.
-        match LoadedCell::load_at(self.cell.clone(), scene_loader::GRID_RADIUS) {
+        match LoadedCell::load_at(self.cell.clone()) {
             Ok(Some(cell)) => {
                 let renderer = self.renderer.as_mut().expect("renderer was just created");
-                if let Err(e) = renderer.load_scene(&cell.scene, &cell.textures) {
+                if let Err(e) = renderer.load_scene(cell.id.clone(), &cell.scene, &cell.textures) {
                     eprintln!("could not upload {}: {e}", cell.id);
                     event_loop.exit();
                     return;
                 }
                 println!("{}", scene_loader::describe(&cell));
                 self.camera = scene_loader::Viewpoint::entering(&cell).camera();
-                self.loaded_centre = matches!(cell.id, CellId::Exterior { .. }).then_some(cell.id);
+                // The cell the camera opens in is resident; outdoors, the rest of the window
+                // streams in around it over the following frames. `centre` stays unset so the
+                // first of those frames sees the camera's cell as a change and asks for the rest.
+                self.resident.push(cell.id);
             }
             Ok(None) => eprintln!(
                 "no game data configured — set MORROWIND_DATA_DIR, or put it in .env at the repo root"
@@ -314,7 +387,7 @@ impl ApplicationHandler for App {
                 self.last_frame = Instant::now();
 
                 self.camera.fly(self.keys.movement(), dt);
-                self.stream_grid();
+                self.stream_cells();
 
                 if let (Some(renderer), Some(window)) = (&mut self.renderer, &self.window) {
                     let size = window.inner_size();

@@ -5,13 +5,15 @@
 //! and for checking that the frame path is validation-clean in a script.
 
 use std::path::Path;
+use std::time::Instant;
 
 use ash::vk;
 use rtxmw_gpu::{
-    Device, Instance, Memory, PhysicalDevice, Presentation, Uploader, Validation, readback,
+    Device, Instance, Memory, PhysicalDevice, Presentation, RayTracingLimits, Uploader, Validation,
+    readback,
 };
 use rtxmw_render::SceneRenderer;
-use rtxmw_scene::{CellId, LoadedCell};
+use rtxmw_scene::{CellId, CellStreamer, LoadedCell};
 
 use crate::scene_loader;
 
@@ -35,16 +37,24 @@ pub(crate) fn screenshot(
     let extent = vk::Extent2D { width, height };
     let mut renderer = SceneRenderer::new(&device, &physical, &memory, extent)?;
 
-    let cell = LoadedCell::load_at(cell, scene_loader::GRID_RADIUS)?
+    let cell = LoadedCell::load_at(cell)?
         .ok_or("no game data configured — set MORROWIND_DATA_DIR, or put it in .env")?;
     renderer.load_scene(
         &device,
         &mut uploader,
         physical.limits(),
+        cell.id.clone(),
         &cell.scene,
         &cell.textures,
     )?;
     println!("{}", scene_loader::describe(&cell));
+    fill_window(
+        &device,
+        &mut uploader,
+        physical.limits(),
+        &mut renderer,
+        &cell.id,
+    )?;
 
     let camera = scene_loader::Viewpoint::entering(&cell).camera();
     let constants = renderer.frame_constants(
@@ -78,4 +88,57 @@ pub(crate) fn screenshot(
     // memory, device — which is the order the device's allocations require. Worth knowing rather
     // than worth writing out: reordering the declarations would break it silently.
     Ok(hits as f32 / (width * height) as f32)
+}
+
+/// Streams in the cells around `centre` and waits for them, so a screenshot shows what the engine
+/// shows rather than one cell surrounded by nothing.
+///
+/// Blocking, unlike the windowed path: there is no frame to keep running, and the image is not
+/// worth taking until the world it is of has arrived. An interior has no window and returns at
+/// once.
+fn fill_window(
+    device: &Device,
+    uploader: &mut Uploader,
+    limits: RayTracingLimits,
+    renderer: &mut SceneRenderer,
+    centre: &CellId,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut wanted = Vec::new();
+    scene_loader::wanted_cells(centre, &mut wanted);
+    let streamer = CellStreamer::spawn();
+    let mut outstanding = 0;
+    for id in wanted.iter().filter(|id| *id != centre) {
+        streamer.request(id.clone());
+        outstanding += 1;
+    }
+    if outstanding == 0 {
+        return Ok(());
+    }
+
+    let started = Instant::now();
+    let mut loaded = 0;
+    while outstanding > 0 {
+        let Some(ready) = streamer.wait_ready() else {
+            break;
+        };
+        outstanding -= 1;
+        // A grid square with no cell record is open sea, and the commonest result out here.
+        if let Ok(cell) = ready.loaded {
+            renderer.add_cell(
+                device,
+                uploader,
+                limits,
+                cell.id,
+                &cell.scene,
+                &cell.textures,
+            )?;
+            loaded += 1;
+        }
+    }
+    renderer.commit(device, uploader, limits)?;
+    println!(
+        "  window: {loaded} cells in {:.0} ms",
+        started.elapsed().as_secs_f32() * 1000.0
+    );
+    Ok(())
 }

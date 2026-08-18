@@ -1,5 +1,6 @@
 //! `LAND` records: the height, shading and texturing of one exterior cell.
 
+use crate::cell::CellId;
 use crate::error::Result;
 use crate::esm_reader::Record;
 
@@ -81,6 +82,25 @@ impl LandRecord {
             normals,
             textures,
         }))
+    }
+
+    /// Which cell a `LAND` record belongs to, reading its coordinates and nothing else.
+    ///
+    /// Indexing a file means touching every `LAND` in it, and [`LandRecord::parse`] would undo a
+    /// delta-coded heightmap for each one to answer a question the first eight bytes settle.
+    pub fn grid_of(record: &Record<'_>) -> Result<Option<CellId>> {
+        for sub in record.subrecords() {
+            let sub = sub?;
+            let data = sub.data();
+            if &sub.name().0 == b"INTV" && data.len() >= 8 {
+                let int = |at: usize| i32::from_le_bytes(data[at..at + 4].try_into().unwrap());
+                return Ok(Some(CellId::Exterior {
+                    x: int(0),
+                    y: int(4),
+                }));
+            }
+        }
+        Ok(None)
     }
 
     /// The height at a vertex, indexed from the cell's south-west corner.

@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use rtxmw_esm::{Cell, CellId, EsmReader, ObjectRecord, RecordName};
+use rtxmw_esm::{Cell, CellId, CellIndex, EsmReader, LandRecord, ObjectRecord, RecordName};
 use rtxmw_vfs::{DATA_DIR_VAR, Vfs, morrowind_data_dir};
 
 fn morrowind_esm() -> Option<Vec<u8>> {
@@ -209,4 +209,70 @@ fn cells_partition_into_named_interiors_and_gridded_exteriors() {
     );
     assert!(exteriors > 200, "expected many exteriors, got {exteriors}");
     println!("{interiors} interiors, {exteriors} exteriors, {total_refs} references in total");
+}
+
+#[test]
+fn the_index_finds_every_cell_a_walk_finds_and_points_straight_at_it() {
+    let Some(bytes) = morrowind_esm() else {
+        eprintln!("skipping: Morrowind.esm is not available");
+        return;
+    };
+    let esm = EsmReader::new(&bytes).expect("should parse");
+
+    // What walking the file finds, which is what the index has to agree with. Later records win,
+    // the same way the index resolves them.
+    let mut walked: HashMap<CellId, usize> = HashMap::new();
+    let mut lands: HashMap<CellId, usize> = HashMap::new();
+    for record in esm.records() {
+        let record = record.expect("record should parse");
+        if record.name() == RecordName::new(b"CELL") {
+            let cell = Cell::parse(&record).expect("cell should parse");
+            let id = if cell.is_interior() {
+                CellId::Interior(cell.name)
+            } else {
+                CellId::Exterior {
+                    x: cell.grid_x,
+                    y: cell.grid_y,
+                }
+            };
+            walked.insert(id, record.offset());
+        } else if record.name() == RecordName::new(b"LAND")
+            && let Some(id) = LandRecord::grid_of(&record).expect("coordinates should parse")
+        {
+            lands.insert(id, record.offset());
+        }
+    }
+
+    let index = CellIndex::build(&esm).expect("index should build");
+    assert_eq!(index.len(), walked.len());
+    for (id, offset) in &walked {
+        let found = index.cell(id).expect("indexed cell should be found");
+        assert_eq!(found.cell, *offset, "{id} is filed at the wrong offset");
+        assert_eq!(
+            found.land,
+            lands.get(id).copied(),
+            "{id} has the wrong land"
+        );
+
+        // The offset has to be usable, not merely equal: reading it back must produce the record
+        // it was recorded from.
+        let record = esm.record_at(found.cell).expect("record should re-read");
+        assert_eq!(record.name(), RecordName::new(b"CELL"));
+    }
+
+    // Seyda Neen's shore, where the game opens, has terrain; the palette its tiles index is the
+    // file's own and is shared by every cell in it.
+    let shore = CellId::Exterior { x: -2, y: -9 };
+    assert!(index.cell(&shore).expect("Seyda Neen").land.is_some());
+    assert!(
+        index.land_textures().len() > 100,
+        "only {} land textures",
+        index.land_textures().len()
+    );
+    println!(
+        "{} cells indexed, {} with terrain, {} land textures",
+        index.len(),
+        lands.len(),
+        index.land_textures().len()
+    );
 }

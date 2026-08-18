@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use glam::{Affine3A, Mat3, Quat, Vec2, Vec3};
 use rtxmw_esm::{
-    Cell, CellId, CellRef, EsmReader, LandRecord, LandTexture, LightRecord, ObjectRecord, Record,
+    Cell, CellId, CellIndex, CellRef, EsmReader, LandRecord, LightRecord, ObjectRecord, Record,
     RecordName, TEXTURE_GRID,
 };
 use rtxmw_nif::NifFile;
@@ -125,6 +125,13 @@ impl ModelIndex {
 #[derive(Debug, Default)]
 pub struct StaticScene {
     pub meshes: Vec<Mesh>,
+    /// What each mesh was loaded from, parallel to `meshes`.
+    ///
+    /// A renderer keeping cells resident together dedupes on this: neighbouring cells are mostly
+    /// the same rocks and trees, so the same path in two cells is the same vertex data and the same
+    /// acceleration structure, and only the instances differ. Terrain is keyed by its cell instead
+    /// of by a file, because a heightmap belongs to exactly one.
+    pub mesh_sources: Vec<String>,
     pub instances: Vec<Instance>,
     /// Every distinct material and texture the cell's meshes name, shared across all of them.
     pub materials: MaterialTable,
@@ -139,103 +146,39 @@ pub struct StaticScene {
 }
 
 impl StaticScene {
-    /// Loads the interior cell named `cell_name`.
-    pub fn load_interior(
+    /// Loads the cell `id` names, terrain included.
+    ///
+    /// Both reads are at offsets `index` already found, so this costs what the cell itself costs —
+    /// its models and its textures — and nothing for finding it. That is what makes loading a cell
+    /// at a time, as the camera crosses into it, something other than a pass over the file each
+    /// time.
+    ///
+    /// An exterior with no `LAND`, or one whose record carries no heightmap, is legal — a hundred
+    /// of them ship — and comes back as its objects over no ground at all.
+    pub fn load_cell(
         esm: &EsmReader<'_>,
+        index: &CellIndex,
         models: &ModelIndex,
         vfs: &Vfs,
-        cell_name: &str,
+        id: &CellId,
     ) -> Result<Self> {
-        let cell_tag = RecordName::new(b"CELL");
-        for record in esm.records() {
-            let record = record?;
-            if record.name() != cell_tag {
-                continue;
-            }
-            let cell = Cell::parse(&record)?;
-            if cell.name != cell_name || !cell.is_interior() {
-                continue;
-            }
-            let mut scene = Self::default();
-            let mut by_path = HashMap::new();
-            scene.append_cell(&record, models, vfs, &mut by_path)?;
+        let offsets = index
+            .cell(id)
+            .ok_or_else(|| SceneError::NoSuchCell(id.to_string()))?;
+        let record = esm.record_at(offsets.cell)?;
+        let cell = Cell::parse(&record)?;
+
+        let mut scene = Self::default();
+        let mut by_path = HashMap::new();
+        scene.append_cell(&record, models, vfs, &mut by_path)?;
+
+        if cell.is_interior() {
             scene.ambient = cell.ambient.map(|a| Ambient {
                 colour: srgb::to_linear(a.ambient),
                 sunlight: srgb::to_linear(a.sunlight),
                 fog: srgb::to_linear(a.fog),
             });
             return Ok(scene);
-        }
-        Err(SceneError::NoSuchCell(cell_name.to_owned()))
-    }
-
-    /// Loads every exterior cell within `radius` of `(x, y)` as one scene, terrain included.
-    ///
-    /// **One pass over the file for the whole block**, not one per cell. A cell's records are
-    /// scattered through a 79 MB stream and finding them costs a full walk, so loading a 7×7 grid
-    /// a cell at a time would read the file forty-nine times over.
-    ///
-    /// The block is a square in Chebyshev distance, which is how Morrowind's own active grid is
-    /// shaped: everything within `radius` cells in either axis, so `radius` 1 is the 3×3 the
-    /// original engine kept resident.
-    ///
-    /// A cell with no `LAND`, or one whose record carries no heightmap, is legal — a hundred of
-    /// them ship — and contributes its objects over no ground at all. A grid position with no
-    /// `CELL` record is simply absent, which is what the sea beyond the island's edge is.
-    pub fn load_exterior_grid(
-        esm: &EsmReader<'_>,
-        models: &ModelIndex,
-        vfs: &Vfs,
-        x: i32,
-        y: i32,
-        radius: i32,
-    ) -> Result<Self> {
-        assert!(
-            radius >= 0,
-            "a grid radius counts cells outward from the centre"
-        );
-        let inside =
-            |cell_x: i32, cell_y: i32| (cell_x - x).abs() <= radius && (cell_y - y).abs() <= radius;
-
-        let cell_tag = RecordName::new(b"CELL");
-        let land_tag = RecordName::new(b"LAND");
-        let texture_tag = RecordName::new(b"LTEX");
-        let mut scene = Self::default();
-        let mut by_path: HashMap<String, MeshId> = HashMap::new();
-        let mut palette: Vec<String> = Vec::new();
-        // Terrain is built after the pass rather than during it: the texture palette is spread
-        // through the file and a cell met early would resolve its layers against half of it.
-        let mut lands: Vec<LandRecord> = Vec::new();
-        let mut found = false;
-
-        for record in esm.records() {
-            let record = record?;
-            if record.name() == texture_tag
-                && let Some(entry) = LandTexture::parse(&record)?
-            {
-                let index = entry.index as usize;
-                if palette.len() <= index {
-                    palette.resize(index + 1, String::new());
-                }
-                palette[index] = entry.texture;
-            } else if record.name() == cell_tag {
-                let cell = Cell::parse(&record)?;
-                if !cell.is_interior() && inside(cell.grid_x, cell.grid_y) {
-                    found = true;
-                    scene.append_cell(&record, models, vfs, &mut by_path)?;
-                }
-            } else if record.name() == land_tag
-                && let Some(parsed) = LandRecord::parse(&record)?
-                && inside(parsed.grid_x, parsed.grid_y)
-            {
-                lands.push(parsed);
-            }
-        }
-
-        if !found {
-            return Err(SceneError::NoSuchCell(
-                CellId::Exterior { x, y }.to_string(),
-            ));
         }
 
         // An exterior carries no `AMBI`: out of doors the ambient *is* the sky, which the original
@@ -249,12 +192,19 @@ impl StaticScene {
         // Fixed for now: the orbit is a function of time of day, and nothing tracks that yet.
         scene.sun = Some(Sun::default_daylight());
 
-        for land in &lands {
-            let tile_materials = terrain_materials(land, &palette, &mut scene.materials);
+        if let Some(offset) = offsets.land
+            && let Some(land) = LandRecord::parse(&esm.record_at(offset)?)?
+        {
+            let tile_materials =
+                terrain_materials(&land, index.land_textures(), &mut scene.materials);
             let mesh = MeshId(scene.meshes.len() as u32);
-            scene.meshes.push(Mesh::from_land(land, &tile_materials));
-            // No transform: `Mesh::from_land` places its vertices in the world already, because a
-            // heightmap belongs to exactly one cell and could never be instanced elsewhere.
+            scene.meshes.push(Mesh::from_land(&land, &tile_materials));
+            // Keyed by the cell rather than by a file, because a heightmap belongs to exactly one
+            // and is the one mesh no other cell can share.
+            scene
+                .mesh_sources
+                .push(format!("land:{},{}", land.grid_x, land.grid_y));
+            // No transform: `Mesh::from_land` places its vertices in the world already.
             scene.instances.push(Instance {
                 mesh,
                 transform: Affine3A::IDENTITY,
@@ -265,10 +215,10 @@ impl StaticScene {
 
     /// Adds everything one cell record places to this scene.
     ///
-    /// `by_path` is the caller's, not this function's, and that is the point: a block of exterior
-    /// cells is mostly the *same* rocks and trees repeated, so a cache spanning the whole block
-    /// turns 49 copies of a mesh into one mesh with 49 instances — which is the split an
-    /// acceleration structure wants anyway.
+    /// `by_path` deduplicates within the cell: one that places the same crate forty times holds one
+    /// mesh and forty instances. Sharing *between* cells is the renderer's job rather than this
+    /// one's — it keeps what it has uploaded and recognises a mesh a neighbouring cell names
+    /// again, which a scene assembled here cannot know about.
     fn append_cell(
         &mut self,
         record: &Record<'_>,
@@ -301,6 +251,7 @@ impl StaticScene {
                     let id = MeshId(self.meshes.len() as u32);
                     let mesh = Mesh::from_nif(&nif, &mut self.materials);
                     self.meshes.push(mesh);
+                    self.mesh_sources.push(path.to_owned());
                     by_path.insert(path.to_owned(), id);
                     id
                 }

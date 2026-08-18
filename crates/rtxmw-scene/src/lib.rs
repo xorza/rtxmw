@@ -3,8 +3,10 @@
 //! This is the seam between the format crates and the renderer: nothing below it knows about
 //! Vulkan, and nothing above it knows about ESM records or NIF blocks.
 
+mod cell_streamer;
 mod door;
 mod error;
+mod game_files;
 mod light;
 mod loaded_cell;
 mod material;
@@ -19,6 +21,7 @@ mod sun;
 // about `rtxmw-esm`. This is the published surface saying so.
 pub use rtxmw_esm::CellId;
 
+pub use crate::cell_streamer::{CellStreamer, StreamedCell};
 pub use crate::door::Door;
 pub use crate::error::{Result, SceneError};
 pub use crate::light::{Ambient, Light};

@@ -4,7 +4,7 @@
 //! but not correct: a transposed grid or a mis-signed delta agrees with its own inverse perfectly.
 //! What catches those is the shape of Vvardenfell.
 
-use rtxmw_esm::{DEFAULT_HEIGHT, EsmReader, GRID, LandRecord, RecordName, VERTICES};
+use rtxmw_esm::{CellId, DEFAULT_HEIGHT, EsmReader, GRID, LandRecord, RecordName, VERTICES};
 use rtxmw_vfs::{DATA_DIR_VAR, morrowind_data_dir};
 
 #[test]
@@ -30,10 +30,21 @@ fn every_shipped_cell_decodes_into_plausible_terrain() {
         if record.name() != land_tag {
             continue;
         }
+        // The cheap read the cell index uses must agree with the full parse on every record in
+        // the game — it is the same eight bytes, and a cell filed under the wrong coordinates
+        // would hand out the wrong terrain to whoever asked.
+        let cheap = LandRecord::grid_of(&record).expect("coordinates should parse");
         let Some(land) = LandRecord::parse(&record).expect("land should parse") else {
             bare += 1;
             continue;
         };
+        assert_eq!(
+            cheap,
+            Some(CellId::Exterior {
+                x: land.grid_x,
+                y: land.grid_y
+            })
+        );
         cells += 1;
         assert_eq!(land.heights.len(), VERTICES);
         if !land.textures.is_empty() {

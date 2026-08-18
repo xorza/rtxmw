@@ -225,6 +225,21 @@ impl<'a> EsmReader<'a> {
         &self.header
     }
 
+    /// The record starting at `offset`, which an earlier pass reported as [`Record::offset`].
+    ///
+    /// Records are found by walking and a content file is tens of megabytes, so an index of
+    /// offsets is what turns "load this cell" from a pass over the whole file into two reads. An
+    /// offset that did not come from a record parses whatever bytes are there as a header, which
+    /// is why this takes one rather than searching for the nearest.
+    pub fn record_at(&self, offset: usize) -> Result<Record<'a>> {
+        RecordIter {
+            data: self.data,
+            position: offset,
+        }
+        .next()
+        .ok_or(EsmError::UnexpectedEnd { offset })?
+    }
+
     /// Walks every record after the header.
     pub fn records(&self) -> RecordIter<'a> {
         RecordIter {

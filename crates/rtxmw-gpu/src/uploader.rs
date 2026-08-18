@@ -46,13 +46,26 @@ impl Uploader {
 
     /// Copies `bytes` to the start of `destination` and waits for the copy to complete.
     pub fn upload(&mut self, destination: &Buffer, bytes: &[u8]) -> Result<()> {
+        self.upload_at(destination, 0, bytes)
+    }
+
+    /// Copies `bytes` into `destination` starting at `offset`, and waits for the copy.
+    ///
+    /// What appending to a buffer needs: a growing arena writes each new run past what is already
+    /// there rather than restaging everything it holds.
+    pub fn upload_at(
+        &mut self,
+        destination: &Buffer,
+        offset: vk::DeviceSize,
+        bytes: &[u8],
+    ) -> Result<()> {
         if bytes.is_empty() {
             return Ok(());
         }
         let size = bytes.len() as vk::DeviceSize;
         assert!(
-            size <= destination.size(),
-            "upload of {size} bytes into a {} byte buffer",
+            offset + size <= destination.size(),
+            "upload of {size} bytes at {offset} into a {} byte buffer",
             destination.size()
         );
 
@@ -67,6 +80,37 @@ impl Uploader {
             .copy_from_slice(bytes);
 
         let from = staging.raw();
+        let to = destination.raw();
+        self.commands.submit_and_wait(|device, cmd| {
+            let region = vk::BufferCopy::default().dst_offset(offset).size(size);
+            // SAFETY: the command buffer is recording and both buffers belong to this device.
+            unsafe {
+                device.cmd_copy_buffer(cmd, from, to, &[region]);
+                memory_barrier::full(device, cmd);
+            }
+        })
+    }
+
+    /// Copies the first `size` bytes of `source` into `destination`, and waits.
+    ///
+    /// Device to device, staging nothing: what an arena outgrowing its buffer does with what it
+    /// already holds, where a round trip through host memory would cost twice the bandwidth.
+    pub fn copy_buffer(
+        &mut self,
+        source: &Buffer,
+        destination: &Buffer,
+        size: vk::DeviceSize,
+    ) -> Result<()> {
+        if size == 0 {
+            return Ok(());
+        }
+        assert!(
+            size <= source.size() && size <= destination.size(),
+            "copy of {size} bytes between a {} byte and a {} byte buffer",
+            source.size(),
+            destination.size()
+        );
+        let from = source.raw();
         let to = destination.raw();
         self.commands.submit_and_wait(|device, cmd| {
             let region = vk::BufferCopy::default().size(size);

@@ -2,8 +2,8 @@
 //!
 //! Skips when the game is not installed.
 
-use rtxmw_esm::{CellId, EsmReader};
-use rtxmw_scene::{Door, MaterialTable, Mesh, ModelIndex, StaticScene};
+use rtxmw_esm::{CellId, CellIndex, EsmReader};
+use rtxmw_scene::{CellStreamer, Door, LoadedCell, MaterialTable, Mesh, ModelIndex, StaticScene};
 use rtxmw_vfs::{DATA_DIR_VAR, morrowind_archives, morrowind_data_dir};
 
 const CELL: &str = "Seyda Neen, Census and Excise Office";
@@ -21,7 +21,9 @@ fn a_known_interior_assembles_into_meshes_and_instances() {
     let models = ModelIndex::build(&esm).expect("model index should build");
     assert!(models.len() > 2_000, "only {} models indexed", models.len());
 
-    let scene = StaticScene::load_interior(&esm, &models, &vfs, CELL).expect("cell should load");
+    let index = CellIndex::build(&esm).expect("cell index should build");
+    let scene = StaticScene::load_cell(&esm, &index, &models, &vfs, &CellId::Interior(CELL.into()))
+        .expect("cell should load");
 
     assert!(
         !scene.instances.is_empty(),
@@ -285,7 +287,9 @@ fn the_doors_leading_into_a_cell_land_a_traveller_inside_it() {
 
     let destination = CellId::Interior(CELL.into());
     let doors = Door::leading_to(&esm, &models, &destination).expect("scan should succeed");
-    let scene = StaticScene::load_interior(&esm, &models, &vfs, CELL).expect("cell should load");
+    let index = CellIndex::build(&esm).expect("cell index should build");
+    let scene = StaticScene::load_cell(&esm, &index, &models, &vfs, &CellId::Interior(CELL.into()))
+        .expect("cell should load");
     let bounds = scene.bounds().expect("a furnished cell has geometry");
     println!("{} doors lead into {CELL}, bounds {bounds:?}", doors.len());
     for door in &doors {
@@ -380,8 +384,9 @@ fn an_exterior_cell_carries_its_terrain_as_well_as_its_objects() {
 
     // Seyda Neen, where the game opens.
     let (x, y) = (-2, -9);
-    let scene =
-        StaticScene::load_exterior_grid(&esm, &models, &vfs, x, y, 0).expect("cell should load");
+    let index = CellIndex::build(&esm).expect("cell index should build");
+    let scene = StaticScene::load_cell(&esm, &index, &models, &vfs, &CellId::Exterior { x, y })
+        .expect("cell should load");
 
     // The terrain is the one mesh with a vertex per point of the 65×65 grid.
     let terrain = scene
@@ -479,4 +484,54 @@ fn an_exterior_cell_carries_its_terrain_as_well_as_its_objects() {
         .collect();
     assert_eq!(placements.len(), 1);
     assert_eq!(placements[0].transform, glam::Affine3A::IDENTITY);
+}
+
+#[test]
+fn a_streamed_cell_is_the_same_cell_the_direct_path_loads() {
+    if morrowind_data_dir().is_none() {
+        eprintln!("skipping: {DATA_DIR_VAR} is not configured (set it, or add it to .env)");
+        return;
+    }
+    // Seyda Neen's shore, then a grid square far out in the ocean that has no cell record.
+    let shore = CellId::Exterior { x: -2, y: -9 };
+    let sea = CellId::Exterior { x: 9_999, y: 9_999 };
+
+    let streamer = CellStreamer::spawn();
+    streamer.request(shore.clone());
+    streamer.request(sea.clone());
+
+    // Answered in the order asked, which is what lets a caller send a whole window at once and
+    // still get the nearest cell first.
+    let first = streamer.wait_ready().expect("the worker should answer");
+    assert_eq!(first.id, shore);
+    let streamed = first.loaded.expect("the shore should load");
+
+    let direct = LoadedCell::load_at(shore)
+        .expect("direct load should succeed")
+        .expect("the game is available");
+
+    // The same cell, by every measure the renderer is given.
+    assert_eq!(streamed.scene.meshes.len(), direct.scene.meshes.len());
+    assert_eq!(streamed.scene.instances.len(), direct.scene.instances.len());
+    assert_eq!(streamed.scene.mesh_sources, direct.scene.mesh_sources);
+    assert_eq!(
+        streamed.scene.materials.textures(),
+        direct.scene.materials.textures()
+    );
+    assert_eq!(
+        streamed.textures.len(),
+        streamed.scene.materials.textures().len()
+    );
+
+    // Except its entrances, which streaming deliberately does not go looking for — that search is
+    // a pass over the whole file, and a cell walked into needs no arrival point.
+    assert!(streamed.entrances.is_empty());
+
+    // A square with no cell record fails as itself rather than silently, so the caller knows which
+    // request will never arrive.
+    let second = streamer
+        .wait_ready()
+        .expect("the worker should answer again");
+    assert_eq!(second.id, sea);
+    assert!(second.loaded.is_err(), "open sea should not load");
 }

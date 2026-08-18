@@ -10,7 +10,8 @@ use glam::{Affine3A, Vec2, Vec3};
 use rtxmw_gpu::{TestGpu, readback};
 use rtxmw_render::SceneRenderer;
 use rtxmw_scene::{
-    AlphaMode, Instance, Light, LoadedCell, Material, Mesh, MeshId, StaticScene, Submesh, TextureId,
+    AlphaMode, CellId, Instance, Light, LoadedCell, Material, Mesh, MeshId, StaticScene, Submesh,
+    TextureId,
 };
 use rtxmw_texture::{Texture, TextureFormat};
 use rtxmw_vfs::DATA_DIR_VAR;
@@ -125,6 +126,7 @@ fn trace_scene(
             gpu.device(),
             &mut uploader,
             gpu.physical().limits(),
+            CellId::Interior("fixture".to_owned()),
             scene,
             textures,
         )

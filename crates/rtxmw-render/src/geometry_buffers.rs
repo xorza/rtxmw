@@ -2,7 +2,7 @@
 
 use ash::vk;
 use bytemuck::{Pod, Zeroable};
-use rtxmw_gpu::{Buffer, BufferMemory, Uploader};
+use rtxmw_gpu::{Buffer, BufferMemory, Memory, Uploader};
 use rtxmw_scene::Mesh;
 
 /// Per-vertex shading data, parallel to the position stream.
@@ -77,56 +77,122 @@ pub struct GeometryBuffers {
     indices: Buffer,
     ranges: Vec<MeshRange>,
     submeshes: Vec<SubmeshRange>,
+    /// Vertices and indices written so far, which is where the next append starts.
+    vertices: u32,
+    index_total: u32,
 }
 
 impl GeometryBuffers {
     /// Stride of the position stream, which an acceleration structure build is told explicitly.
     pub const POSITION_STRIDE: vk::DeviceSize = size_of::<[f32; 3]>() as vk::DeviceSize;
 
-    /// Packs `meshes` and uploads them, one [`MeshRange`] per mesh in the order given.
+    /// An arena holding nothing.
     ///
-    /// A mesh with no visible geometry keeps its slot as a zero-length range, so a `MeshId` from
-    /// the scene stays a direct index into [`GeometryBuffers::ranges`].
-    pub fn upload(uploader: &mut Uploader, meshes: &[Mesh]) -> rtxmw_gpu::Result<Self> {
-        let packed = pack(meshes);
+    /// Meshes are appended as cells arrive and **never removed**: the whole shipped library is
+    /// about three thousand meshes, so a session that walked every cell would hold a bounded set
+    /// small enough to keep. That is what makes a mesh's slot, and with it the `first_submesh` an
+    /// instance carries, stable for as long as the renderer lives — nothing renumbers, so nothing
+    /// has to be rewritten when a cell goes away.
+    pub fn new(memory: &Memory) -> rtxmw_gpu::Result<Self> {
+        Ok(Self {
+            positions: Buffer::new(
+                memory,
+                "scene positions",
+                Buffer::MIN_SIZE,
+                build_input_usage(),
+                BufferMemory::Device,
+            )?,
+            attributes: Buffer::new(
+                memory,
+                "scene vertex attributes",
+                Buffer::MIN_SIZE,
+                // Never read by a build, only at a hit, so no build-input usage.
+                geometry_usage(),
+                BufferMemory::Device,
+            )?,
+            indices: Buffer::new(
+                memory,
+                "scene indices",
+                Buffer::MIN_SIZE,
+                build_input_usage(),
+                BufferMemory::Device,
+            )?,
+            ranges: Vec::new(),
+            submeshes: Vec::new(),
+            vertices: 0,
+            index_total: 0,
+        })
+    }
+
+    /// Appends `meshes` and uploads them, returning the slots they landed in.
+    ///
+    /// `material_remap` turns the cell-local material each submesh names into the index it has in
+    /// the renderer's own table, because a mesh shared by two cells is described once here and must
+    /// not carry either cell's numbering.
+    ///
+    /// A mesh with no visible geometry keeps its slot as a zero-length range, so the caller's mesh
+    /// order stays a direct index into [`GeometryBuffers::ranges`].
+    pub fn append(
+        &mut self,
+        uploader: &mut Uploader,
+        meshes: &[&Mesh],
+        material_remap: &[u32],
+    ) -> rtxmw_gpu::Result<std::ops::Range<u32>> {
+        let first_slot = self.ranges.len() as u32;
+        let packed = pack(
+            meshes,
+            self.vertices,
+            self.index_total,
+            self.submeshes.len() as u32,
+        );
+
         let position_bytes: &[u8] = bytemuck::cast_slice(&packed.positions);
         let attribute_bytes: &[u8] = bytemuck::cast_slice(&packed.attributes);
         let index_bytes: &[u8] = bytemuck::cast_slice(&packed.indices);
+        let position_offset = self.vertices as vk::DeviceSize * Self::POSITION_STRIDE;
+        let attribute_offset =
+            self.vertices as vk::DeviceSize * size_of::<VertexAttributes>() as vk::DeviceSize;
+        let index_offset = self.index_total as vk::DeviceSize * size_of::<u32>() as vk::DeviceSize;
 
-        let positions = Buffer::new(
-            uploader.memory(),
+        grow(
+            uploader,
+            &mut self.positions,
+            position_offset,
+            position_offset + position_bytes.len() as vk::DeviceSize,
             "scene positions",
-            (position_bytes.len() as vk::DeviceSize).max(Buffer::MIN_SIZE),
             build_input_usage(),
-            BufferMemory::Device,
         )?;
-        let attributes = Buffer::new(
-            uploader.memory(),
+        grow(
+            uploader,
+            &mut self.attributes,
+            attribute_offset,
+            attribute_offset + attribute_bytes.len() as vk::DeviceSize,
             "scene vertex attributes",
-            (attribute_bytes.len() as vk::DeviceSize).max(Buffer::MIN_SIZE),
-            // Never read by a build, only at a hit, so no build-input usage.
             geometry_usage(),
-            BufferMemory::Device,
         )?;
-        let indices = Buffer::new(
-            uploader.memory(),
+        grow(
+            uploader,
+            &mut self.indices,
+            index_offset,
+            index_offset + index_bytes.len() as vk::DeviceSize,
             "scene indices",
-            (index_bytes.len() as vk::DeviceSize).max(Buffer::MIN_SIZE),
             build_input_usage(),
-            BufferMemory::Device,
         )?;
 
-        uploader.upload(&positions, position_bytes)?;
-        uploader.upload(&attributes, attribute_bytes)?;
-        uploader.upload(&indices, index_bytes)?;
+        uploader.upload_at(&self.positions, position_offset, position_bytes)?;
+        uploader.upload_at(&self.attributes, attribute_offset, attribute_bytes)?;
+        uploader.upload_at(&self.indices, index_offset, index_bytes)?;
 
-        Ok(Self {
-            positions,
-            attributes,
-            indices,
-            ranges: packed.ranges,
-            submeshes: packed.submeshes,
-        })
+        self.vertices += packed.positions.len() as u32;
+        self.index_total += packed.indices.len() as u32;
+        self.ranges.extend_from_slice(&packed.ranges);
+        self.submeshes
+            .extend(packed.submeshes.into_iter().map(|submesh| SubmeshRange {
+                material: material_remap[submesh.material as usize],
+                ..submesh
+            }));
+
+        Ok(first_slot..self.ranges.len() as u32)
     }
 
     /// Tightly packed `float3` positions, the vertex stream a build reads.
@@ -209,8 +275,36 @@ struct Packed {
     submeshes: Vec<SubmeshRange>,
 }
 
+/// Moves a buffer's contents into a larger one when what is needed no longer fits.
+///
+/// Doubling rather than fitting exactly: an arena grown one cell at a time would otherwise copy
+/// everything it holds on every append, which is quadratic in the number of cells streamed.
+fn grow(
+    uploader: &mut Uploader,
+    buffer: &mut Buffer,
+    used: vk::DeviceSize,
+    needed: vk::DeviceSize,
+    name: &str,
+    usage: vk::BufferUsageFlags,
+) -> rtxmw_gpu::Result<()> {
+    if needed <= buffer.size() {
+        return Ok(());
+    }
+    let memory = uploader.memory().clone();
+    let bigger = Buffer::new(
+        &memory,
+        name,
+        needed.max(buffer.size() * 2),
+        usage,
+        BufferMemory::Device,
+    )?;
+    uploader.copy_buffer(buffer, &bigger, used)?;
+    *buffer = bigger;
+    Ok(())
+}
+
 /// Concatenates every mesh into the three parallel streams, recording where each landed.
-fn pack(meshes: &[Mesh]) -> Packed {
+fn pack(meshes: &[&Mesh], first_vertex: u32, first_index: u32, first_submesh: u32) -> Packed {
     let vertices: usize = meshes.iter().map(|m| m.positions.len()).sum();
     let index_total: usize = meshes.iter().map(|m| m.indices.len()).sum();
 
@@ -232,19 +326,19 @@ fn pack(meshes: &[Mesh]) -> Packed {
             "flattening should leave UVs parallel to positions"
         );
 
-        let first_index = indices.len() as u32;
+        let base_index = first_index + indices.len() as u32;
         ranges.push(MeshRange {
-            first_vertex: positions.len() as u32,
+            first_vertex: first_vertex + positions.len() as u32,
             vertex_count: mesh.positions.len() as u32,
-            first_index,
+            first_index: base_index,
             index_count: mesh.indices.len() as u32,
-            first_submesh: submeshes.len() as u32,
+            first_submesh: first_submesh + submeshes.len() as u32,
             submesh_count: mesh.submeshes.len() as u32,
         });
         // Rebased onto the shared buffer. The scene counts a submesh from the start of its own
         // mesh, which is the right thing there and the wrong thing for a build range.
         submeshes.extend(mesh.submeshes.iter().map(|sub| SubmeshRange {
-            first_index: first_index + sub.first_index,
+            first_index: base_index + sub.first_index,
             index_count: sub.index_count,
             material: sub.material,
         }));
@@ -273,6 +367,11 @@ mod tests {
     use super::*;
     use glam::{Vec2, Vec3};
     use rtxmw_scene::Submesh;
+
+    /// Packs into an empty arena, which is what most of these check.
+    fn packed(meshes: &[Mesh]) -> Packed {
+        pack(&meshes.iter().collect::<Vec<_>>(), 0, 0, 0)
+    }
 
     /// A mesh whose vertices and normals are distinguishable by index.
     fn mesh(vertices: u32, indices: &[u32]) -> Mesh {
@@ -305,7 +404,7 @@ mod tests {
             indices,
             ranges,
             submeshes,
-        } = pack(&meshes);
+        } = packed(&meshes);
 
         assert_eq!(
             ranges,
@@ -359,10 +458,35 @@ mod tests {
     }
 
     #[test]
+    fn an_append_lands_past_what_the_arena_already_holds() {
+        // An arena holding 10 vertices, 30 indices and 2 submeshes takes a 3-vertex, 1-triangle
+        // mesh: it starts at vertex 10 and index 30, and its submesh is the third.
+        let meshes = [mesh(3, &[0, 1, 2])];
+        let out = pack(&meshes.iter().collect::<Vec<_>>(), 10, 30, 2);
+
+        assert_eq!(
+            out.ranges[0],
+            MeshRange {
+                first_vertex: 10,
+                vertex_count: 3,
+                first_index: 30,
+                index_count: 3,
+                first_submesh: 2,
+                submesh_count: 1,
+            }
+        );
+        // The submesh counts from the start of the whole buffer, not of its mesh.
+        assert_eq!(out.submeshes[0].first_index, 30);
+        // Index *values* stay mesh-local, which is what lets a mesh be appended anywhere without
+        // rewriting its indices — the build adds `first_vertex` instead.
+        assert_eq!(out.indices, vec![0, 1, 2]);
+    }
+
+    #[test]
     fn attributes_stay_aligned_with_the_positions_they_belong_to() {
         let meshes = [mesh(2, &[0, 1, 1]), mesh(2, &[0, 1, 1])];
-        let packed = pack(&meshes);
-        let (positions, attributes) = (packed.positions, packed.attributes);
+        let out = packed(&meshes);
+        let (positions, attributes) = (out.positions, out.attributes);
 
         // Vertex 1 of the second mesh is the fourth entry overall, and carries that mesh's own
         // second normal and UV, not a continuation of the first mesh's numbering.
@@ -381,7 +505,7 @@ mod tests {
         // The scene indexes meshes by position, so a mesh that flattened to nothing must not shift
         // the ones after it.
         let meshes = [mesh(3, &[0, 1, 2]), mesh(0, &[]), mesh(3, &[0, 1, 2])];
-        let ranges = pack(&meshes).ranges;
+        let ranges = packed(&meshes).ranges;
 
         assert_eq!(ranges.len(), 3);
         assert_eq!(

@@ -1,4 +1,4 @@
-//! Building a cell's acceleration structures: one BLAS per mesh, one TLAS over the placements.
+//! The structures a ray traverses: one BLAS per mesh, one TLAS over every resident placement.
 
 use ash::vk;
 use rtxmw_gpu::{Buffer, BufferMemory, Device, RayTracingLimits, Uploader, memory_barrier};
@@ -7,15 +7,22 @@ use rtxmw_scene::{AlphaMode, Instance, Material};
 use crate::acceleration_structure::AccelerationStructure;
 use crate::geometry_buffers::GeometryBuffers;
 
-/// Everything the ray tracer traverses for one cell.
+/// Everything the ray tracer traverses, across every cell that is resident.
 ///
-/// One BLAS per distinct mesh and one instance per placement is the whole point of the mesh/instance
-/// split: Seyda Neen's Census and Excise Office places 261 objects drawn from 104 meshes, so a
-/// per-placement structure would build and store the same geometry two and a half times over.
+/// One BLAS per distinct mesh and one instance per placement is the whole point of the
+/// mesh/instance split: Seyda Neen's Census and Excise Office places 261 objects drawn from 104
+/// meshes, so a per-placement structure would build and store the same geometry two and a half
+/// times over. The saving compounds across cells, where a rock is shared by the whole window.
+///
+/// The two levels have different lifetimes and that is the streaming story in one line: bottom
+/// levels are built once per mesh and kept, the top level is rebuilt whenever a cell arrives or
+/// leaves.
 #[derive(Debug)]
 pub struct SceneAcceleration {
     /// One per mesh that had triangles, in mesh order but skipping the empty ones.
     blas: Vec<AccelerationStructure>,
+    /// Which entry of `blas` each mesh slot built into, or [`NO_BLAS`] for one with no triangles.
+    by_mesh: Vec<u32>,
     tlas: AccelerationStructure,
     /// Owned so it outlives the top-level build, and because a refit will rewrite it in place.
     instances: Buffer,
@@ -25,51 +32,90 @@ pub struct SceneAcceleration {
 }
 
 impl SceneAcceleration {
-    /// Builds every structure and compacts the bottom level.
+    /// An empty scene: no bottom levels, and a top level over no instances.
     ///
-    /// Costs four queue submissions — build and measure, compact, upload instances, build top level
-    /// — each waiting on a fence. That is load-time work; overlapping it belongs with cell streaming
-    /// at M9, where the latency is actually visible.
-    pub fn build(
+    /// A structure rather than `None`, so the descriptor a pass binds is valid from the moment the
+    /// renderer exists — a ray query against an empty top level misses, which is the right answer
+    /// before any cell is resident.
+    pub fn new(
+        device: &Device,
+        uploader: &mut Uploader,
+        limits: RayTracingLimits,
+    ) -> rtxmw_gpu::Result<Self> {
+        let instances = instance_buffer(uploader, 0)?;
+        let tlas = build_top_level(device, uploader, limits, &instances, 0)?;
+        Ok(Self {
+            blas: Vec::new(),
+            by_mesh: Vec::new(),
+            tlas,
+            instances,
+            instance_count: 0,
+            uncompacted_blas_bytes: 0,
+        })
+    }
+
+    /// Builds and compacts bottom levels for the meshes occupying `slots`.
+    ///
+    /// Called once per mesh, when the first cell to name it arrives — a bottom level costs more to
+    /// build than everything else about a cell put together, and the cell next door places the
+    /// same rocks. Costs two queue submissions for the whole batch, not per mesh.
+    pub fn append_meshes(
+        &mut self,
         device: &Device,
         uploader: &mut Uploader,
         limits: RayTracingLimits,
         geometry: &GeometryBuffers,
         materials: &[Material],
-        instances: &[Instance],
-    ) -> rtxmw_gpu::Result<Self> {
+        slots: std::ops::Range<u32>,
+    ) -> rtxmw_gpu::Result<()> {
         let BuiltBottomLevel {
             structures,
             by_mesh,
             uncompacted_bytes,
             compacted_sizes,
-        } = build_bottom_level(device, uploader, limits, geometry, materials)?;
-        let blas = compact(device, uploader, structures, &compacted_sizes)?;
+        } = build_bottom_level(device, uploader, limits, geometry, materials, slots)?;
+        let base = self.blas.len() as u32;
+        self.blas
+            .extend(compact(device, uploader, structures, &compacted_sizes)?);
+        self.by_mesh.extend(by_mesh.into_iter().map(|slot| {
+            if slot == NO_BLAS {
+                NO_BLAS
+            } else {
+                slot + base
+            }
+        }));
+        self.uncompacted_blas_bytes += uncompacted_bytes;
+        Ok(())
+    }
 
+    /// Rebuilds the top level over `instances`, replacing whatever it held.
+    ///
+    /// The whole cost of a cell arriving or leaving, once its meshes are resident: the bottom
+    /// levels are untouched and this is one build over what is placed.
+    pub fn rebuild_top(
+        &mut self,
+        device: &Device,
+        uploader: &mut Uploader,
+        limits: RayTracingLimits,
+        geometry: &GeometryBuffers,
+        instances: &[Instance],
+    ) -> rtxmw_gpu::Result<()> {
         let first_submesh: Vec<u32> = geometry.ranges().iter().map(|r| r.first_submesh).collect();
-        let instance_data = describe_instances(&by_mesh, &blas, &first_submesh, instances);
-        let instance_buffer = Buffer::with_alignment(
-            uploader.memory(),
-            "tlas instances",
-            instance_buffer_size(instance_data.len()),
-            vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR
-                | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
-                | vk::BufferUsageFlags::TRANSFER_DST,
-            BufferMemory::Device,
-            INSTANCE_ADDRESS_ALIGNMENT,
+        let records = describe_instances(&self.by_mesh, &self.blas, &first_submesh, instances);
+        if records.len() as vk::DeviceSize * INSTANCE_SIZE > self.instances.size() {
+            self.instances = instance_buffer(uploader, records.len())?;
+        }
+        uploader.upload(&self.instances, instance_bytes_of(&records))?;
+
+        self.instance_count = records.len() as u32;
+        self.tlas = build_top_level(
+            device,
+            uploader,
+            limits,
+            &self.instances,
+            self.instance_count,
         )?;
-        uploader.upload(&instance_buffer, instance_bytes_of(&instance_data))?;
-
-        let instance_count = instance_data.len() as u32;
-        let tlas = build_top_level(device, uploader, limits, &instance_buffer, instance_count)?;
-
-        Ok(Self {
-            blas,
-            tlas,
-            instances: instance_buffer,
-            instance_count,
-            uncompacted_blas_bytes: uncompacted_bytes,
-        })
+        Ok(())
     }
 
     /// The structure a ray query is initialised against.
@@ -96,11 +142,6 @@ impl SceneAcceleration {
     pub fn uncompacted_blas_bytes(&self) -> vk::DeviceSize {
         self.uncompacted_blas_bytes
     }
-
-    /// Every byte the scene's traversal data occupies, instance buffer included.
-    pub fn byte_size(&self) -> vk::DeviceSize {
-        self.blas_bytes() + self.tlas.size() + self.instances.size()
-    }
 }
 
 /// Alignment a top-level build requires of its instance buffer's address.
@@ -126,6 +167,7 @@ fn build_bottom_level(
     limits: RayTracingLimits,
     geometry: &GeometryBuffers,
     materials: &[Material],
+    slots: std::ops::Range<u32>,
 ) -> rtxmw_gpu::Result<BuiltBottomLevel> {
     if let Some(worst) = geometry.submeshes().iter().map(|s| s.material).max() {
         assert!(
@@ -144,11 +186,12 @@ fn build_bottom_level(
     let mut geometries = Vec::with_capacity(geometry.submeshes().len());
     let mut ranges = Vec::with_capacity(geometry.submeshes().len());
     let mut primitive_counts = Vec::with_capacity(geometry.submeshes().len());
-    let mut by_mesh = Vec::with_capacity(geometry.ranges().len());
+    let building = &geometry.ranges()[slots.start as usize..slots.end as usize];
+    let mut by_mesh = Vec::with_capacity(building.len());
     // Which slice of `geometries` each structure is built from.
     let mut geometry_spans: Vec<std::ops::Range<u32>> = Vec::new();
 
-    for range in geometry.ranges() {
+    for range in building {
         if range.submesh_count == 0 {
             by_mesh.push(NO_BLAS);
             continue;
@@ -539,6 +582,25 @@ fn build_top_level(
 
     Ok(tlas)
 }
+
+/// A buffer sized for `count` instance records, aligned to what a top-level build requires.
+fn instance_buffer(uploader: &mut Uploader, count: usize) -> rtxmw_gpu::Result<Buffer> {
+    let memory = uploader.memory().clone();
+    Buffer::with_alignment(
+        &memory,
+        "tlas instances",
+        instance_buffer_size(count),
+        vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR
+            | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
+            | vk::BufferUsageFlags::TRANSFER_DST,
+        BufferMemory::Device,
+        INSTANCE_ADDRESS_ALIGNMENT,
+    )
+}
+
+/// What one instance record occupies.
+const INSTANCE_SIZE: vk::DeviceSize =
+    size_of::<vk::AccelerationStructureInstanceKHR>() as vk::DeviceSize;
 
 /// Size of an instance buffer holding `count` records, never zero.
 fn instance_buffer_size(count: usize) -> vk::DeviceSize {
