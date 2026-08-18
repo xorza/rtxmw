@@ -10,9 +10,11 @@ use glam::{Affine3A, Vec2, Vec3};
 use rtxmw_esm::EsmReader;
 use rtxmw_gpu::{TestGpu, image_barrier, memory_barrier};
 use rtxmw_render::{
-    FrameConstants, GeometryBuffers, MaterialBuffers, SceneAcceleration, VisibilityPass,
+    FrameConstants, GeometryBuffers, MaterialBuffers, SceneAcceleration, TextureArray,
+    VisibilityPass,
 };
 use rtxmw_scene::{Instance, Material, Mesh, MeshId, ModelIndex, StaticScene, Submesh};
+use rtxmw_texture::Texture;
 use rtxmw_vfs::{DATA_DIR_VAR, morrowind_archives, morrowind_data_dir};
 
 const CELL: &str = "Seyda Neen, Census and Excise Office";
@@ -66,11 +68,22 @@ fn trace_with(
     eye: Vec3,
     forward: Vec3,
 ) -> Vec<u8> {
+    trace_textured(meshes, materials, &[], instances, eye, forward)
+}
+
+/// As [`trace_with`], with textures for the scene's path list to sample.
+fn trace_textured(
+    meshes: &[Mesh],
+    materials: &[Material],
+    textures: &[Option<Texture>],
+    instances: &[Instance],
+    eye: Vec3,
+    forward: Vec3,
+) -> Vec<u8> {
     let gpu = TestGpu::shared();
     let mut uploader = gpu.uploader();
 
-    let geometry =
-        GeometryBuffers::upload(gpu.memory(), &mut uploader, meshes).expect("upload failed");
+    let geometry = GeometryBuffers::upload(&mut uploader, meshes).expect("upload failed");
     let acceleration = SceneAcceleration::build(
         gpu.device(),
         &mut uploader,
@@ -81,14 +94,23 @@ fn trace_with(
     )
     .expect("build failed");
 
-    let tables = MaterialBuffers::upload(gpu.memory(), &mut uploader, &geometry, materials)
+    let tables = MaterialBuffers::upload(&mut uploader, &geometry, materials)
         .expect("material upload failed");
+
+    let array =
+        TextureArray::upload(gpu.device(), &mut uploader, textures).expect("texture upload failed");
 
     let target = gpu
         .create_target(WIDTH, HEIGHT, vk::Format::R16G16B16A16_SFLOAT)
         .expect("could not create target");
-    let mut pass = VisibilityPass::new(gpu.device()).expect("pipeline failed");
-    pass.bind(acceleration.tlas(), target.image(), &tables);
+    let mut pass = VisibilityPass::new(gpu.device(), array.len()).expect("pipeline failed");
+    pass.bind(
+        acceleration.tlas(),
+        target.image(),
+        &geometry,
+        &tables,
+        &array,
+    );
 
     let view = glam::camera::rh::view::look_to_mat4(eye, forward, Vec3::Z);
     let projection = glam::camera::rh::proj::vulkan::perspective_infinite_reverse(
@@ -231,8 +253,19 @@ fn two_materials_in_one_mesh_shade_differently() {
         material: 1,
     });
 
-    // Two materials that differ only in identity, so any colour difference is the lookup working.
-    let materials = [Material::default(), Material::default()];
+    // Two materials distinguishable by their own colour. Identity alone is no longer enough now
+    // that shading reads the material rather than hashing its index — which is the point: a colour
+    // difference here means the right *entry* was fetched, not merely a different one.
+    let materials = [
+        Material {
+            diffuse: Vec3::new(1.0, 0.0, 0.0),
+            ..Material::default()
+        },
+        Material {
+            diffuse: Vec3::new(0.0, 1.0, 0.0),
+            ..Material::default()
+        },
+    ];
     let instances = [Instance {
         mesh: MeshId(0),
         transform: Affine3A::IDENTITY,
@@ -401,9 +434,25 @@ fn a_real_interior_traces_to_a_recognisable_image() {
         .expect("a furnished cell has geometry")
         .centre();
 
-    let pixels = trace_with(
+    // Decode every texture the cell names. The 45 dangling references across the whole library are
+    // why this is `Option`: a miss becomes the fallback slot rather than a failure.
+    let mut textures = Vec::with_capacity(scene.materials.textures().len());
+    let mut missing = 0usize;
+    for path in scene.materials.textures() {
+        let decoded = vfs
+            .read(path)
+            .ok()
+            .and_then(|bytes| Texture::decode(&bytes).ok());
+        if decoded.is_none() {
+            missing += 1;
+        }
+        textures.push(decoded);
+    }
+
+    let pixels = trace_textured(
         &scene.meshes,
         scene.materials.materials(),
+        &textures,
         &scene.instances,
         eye,
         Vec3::X,
@@ -419,13 +468,22 @@ fn a_real_interior_traces_to_a_recognisable_image() {
         shades.insert(shade(pixel));
     }
 
+    // Alpha carries the hit flag, so a miss is alpha zero — which a PNG viewer composites as
+    // transparent and shows as whatever is behind it. For a picture to look at, the flag has to be
+    // dropped, or half the image reads as blown-out white when it is really background.
+    let mut opaque = pixels.clone();
+    for pixel in opaque.chunks_exact_mut(4) {
+        pixel[3] = 0xFF;
+    }
     let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("seyda_neen.png");
-    rtxmw_gpu::golden::write_png(&path, &pixels, WIDTH, HEIGHT);
+    rtxmw_gpu::golden::write_png(&path, &opaque, WIDTH, HEIGHT);
 
     println!(
-        "{CELL}: {hits} of {total} pixels hit ({:.0}%), {} distinct shades, from {eye:?}\n  wrote {}",
+        "{CELL}: {hits} of {total} pixels hit ({:.0}%), {} distinct shades from {} textures \
+         ({missing} missing), from {eye:?}\n  wrote {}",
         hits as f64 / total as f64 * 100.0,
         shades.len(),
+        textures.len(),
         path.display()
     );
 
@@ -435,15 +493,12 @@ fn a_real_interior_traces_to_a_recognisable_image() {
         hits > total * 2 / 5,
         "only {hits} of {total} pixels hit from inside the room"
     );
+    // Textured surfaces vary per texel, so this is now counting sampled colour rather than material
+    // identity: hundreds of shades means UVs are being interpolated and the array is being read. A
+    // handful would mean flat material colour with the texture lookup doing nothing.
     assert!(
-        shades.len() > 2,
-        "only {} distinct material colours in view — the hit is not resolving its geometry",
+        shades.len() > 500,
+        "only {} distinct shades — the textures are not being sampled",
         shades.len()
-    );
-    assert!(
-        shades.len() <= scene.materials.materials().len(),
-        "{} colours from {} materials",
-        shades.len(),
-        scene.materials.materials().len()
     );
 }

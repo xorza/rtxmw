@@ -85,6 +85,20 @@ impl Texture {
         }
     }
 
+    /// Builds a single-level texture from pixels held in memory.
+    ///
+    /// For images the renderer synthesises rather than loads — a fallback for a missing file being
+    /// the one that matters.
+    pub fn from_pixels(format: TextureFormat, width: u32, height: u32, data: Vec<u8>) -> Self {
+        let levels = vec![MipLevel {
+            offset: 0,
+            size: format.level_size(width, height),
+            width,
+            height,
+        }];
+        Self::new(format, data, levels).expect("synthesised pixels match their own level table")
+    }
+
     /// Builds a texture from already-decoded bytes and its level table.
     ///
     /// A short buffer is a malformed file and comes back as an error; an empty level table is a

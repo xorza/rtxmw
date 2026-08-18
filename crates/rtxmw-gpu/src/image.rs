@@ -10,9 +10,9 @@ use crate::memory::Memory;
 
 /// A device-local colour image, its allocation and its view, freed together.
 ///
-/// One mip, one layer: the renderer's targets are full-resolution buffers written by compute and
-/// read by a blit, not textures. Mipped, arrayed images arrive with materials at M4 and are a
-/// different enough shape to be a different type.
+/// One array layer. Render targets take one mip level; textures take the chain their file carries,
+/// which matters more in a ray tracer than a rasterizer — there is no screen-space derivative to
+/// pick a level from, so an unmipped texture aliases into noise at distance.
 #[derive(Debug)]
 pub struct Image {
     memory: Memory,
@@ -22,10 +22,11 @@ pub struct Image {
     allocation: Option<Allocation>,
     extent: vk::Extent2D,
     format: vk::Format,
+    mip_levels: u32,
 }
 
 impl Image {
-    /// Creates an image of `extent` in `format` and binds memory to it.
+    /// Creates a single-level image of `extent` in `format` and binds memory to it.
     pub fn new(
         memory: &Memory,
         name: &str,
@@ -33,6 +34,22 @@ impl Image {
         format: vk::Format,
         usage: vk::ImageUsageFlags,
     ) -> Result<Self> {
+        Self::mipped(memory, name, extent, format, usage, 1)
+    }
+
+    /// Creates an image with `mip_levels` levels, largest first.
+    pub fn mipped(
+        memory: &Memory,
+        name: &str,
+        extent: vk::Extent2D,
+        format: vk::Format,
+        usage: vk::ImageUsageFlags,
+        mip_levels: u32,
+    ) -> Result<Self> {
+        assert!(
+            mip_levels > 0,
+            "`{name}`: an image needs at least one level"
+        );
         assert!(
             extent.width > 0 && extent.height > 0,
             "`{name}`: Vulkan rejects an image with a zero dimension, got {}x{}",
@@ -48,7 +65,7 @@ impl Image {
                 height: extent.height,
                 depth: 1,
             })
-            .mip_levels(1)
+            .mip_levels(mip_levels)
             .array_layers(1)
             .samples(vk::SampleCountFlags::TYPE_1)
             .tiling(vk::ImageTiling::OPTIMAL)
@@ -91,6 +108,7 @@ impl Image {
             allocation: Some(allocation),
             extent,
             format,
+            mip_levels,
         };
 
         // SAFETY: the allocation was made against this image's own requirements.
@@ -104,7 +122,10 @@ impl Image {
             .image(raw)
             .view_type(vk::ImageViewType::TYPE_2D)
             .format(format)
-            .subresource_range(COLOR_RANGE);
+            .subresource_range(vk::ImageSubresourceRange {
+                level_count: mip_levels,
+                ..COLOR_RANGE
+            });
         // SAFETY: `raw` is bound and alive.
         image.view = unsafe { memory.device().create_image_view(&view_info, None)? };
 
@@ -129,6 +150,19 @@ impl Image {
     /// The format the image was created with.
     pub fn format(&self) -> vk::Format {
         self.format
+    }
+
+    /// How many mip levels the image holds.
+    pub fn mip_levels(&self) -> u32 {
+        self.mip_levels
+    }
+
+    /// The whole image, for a barrier that has to cover every level.
+    pub fn full_range(&self) -> vk::ImageSubresourceRange {
+        vk::ImageSubresourceRange {
+            level_count: self.mip_levels,
+            ..COLOR_RANGE
+        }
     }
 }
 

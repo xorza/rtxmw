@@ -6,6 +6,8 @@ use crate::buffer::{Buffer, BufferMemory};
 use crate::commands::Commands;
 use crate::device::Device;
 use crate::error::Result;
+use crate::image::Image;
+use crate::image_barrier;
 use crate::memory::Memory;
 use crate::memory_barrier;
 
@@ -67,6 +69,64 @@ impl Uploader {
             unsafe {
                 device.cmd_copy_buffer(cmd, from, to, &[region]);
                 memory_barrier::full(device, cmd);
+            }
+        })
+    }
+
+    /// Stages `bytes` into `image` and leaves it ready to sample.
+    ///
+    /// `regions` say which part of the staging buffer becomes which mip level; the caller builds
+    /// them because only it knows the format's block layout. The image is transitioned from
+    /// `UNDEFINED`, so whatever it held is discarded — an upload writes every level it names.
+    pub fn upload_image(
+        &mut self,
+        image: &Image,
+        bytes: &[u8],
+        regions: &[vk::BufferImageCopy],
+    ) -> Result<()> {
+        assert!(!bytes.is_empty(), "an image upload needs pixels");
+        let size = bytes.len() as vk::DeviceSize;
+
+        self.grow_staging(size)?;
+        let staging = self
+            .staging
+            .as_mut()
+            .expect("`grow_staging` leaves a staging buffer in place");
+        staging
+            .mapped_mut()
+            .expect("staging memory is host-visible by construction")[..bytes.len()]
+            .copy_from_slice(bytes);
+
+        let from = staging.raw();
+        let to = image.raw();
+        let range = image.full_range();
+        self.commands.submit_and_wait(|device, cmd| {
+            // SAFETY: the command buffer is recording, the image belongs to this device, and the
+            // regions were built against the same level table the image was created with.
+            unsafe {
+                image_barrier::transition_range(
+                    device,
+                    cmd,
+                    to,
+                    vk::ImageLayout::UNDEFINED,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    range,
+                );
+                device.cmd_copy_buffer_to_image(
+                    cmd,
+                    from,
+                    to,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    regions,
+                );
+                image_barrier::transition_range(
+                    device,
+                    cmd,
+                    to,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    range,
+                );
             }
         })
     }

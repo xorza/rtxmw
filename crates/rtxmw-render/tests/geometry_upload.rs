@@ -43,8 +43,7 @@ fn every_uploaded_stream_reads_back_byte_for_byte() {
     ];
 
     let mut uploader = gpu.uploader();
-    let buffers =
-        GeometryBuffers::upload(gpu.memory(), &mut uploader, &meshes).expect("upload failed");
+    let buffers = GeometryBuffers::upload(&mut uploader, &meshes).expect("upload failed");
 
     assert_eq!(buffers.vertex_count(), 7);
     assert_eq!(buffers.triangle_count(), 3);
@@ -120,7 +119,7 @@ fn a_scene_with_no_geometry_still_produces_valid_buffers() {
 
     // Vulkan rejects a zero-sized buffer, so an empty cell has to come out with real handles rather
     // than an error the caller has to special-case.
-    let buffers = GeometryBuffers::upload(gpu.memory(), &mut uploader, &[]).expect("upload failed");
+    let buffers = GeometryBuffers::upload(&mut uploader, &[]).expect("upload failed");
     assert_eq!(buffers.vertex_count(), 0);
     assert_eq!(buffers.triangle_count(), 0);
     assert!(buffers.ranges().is_empty());
@@ -144,8 +143,7 @@ fn a_real_interior_uploads_with_every_triangle_accounted_for() {
 
     let gpu = TestGpu::shared();
     let mut uploader = gpu.uploader();
-    let buffers =
-        GeometryBuffers::upload(gpu.memory(), &mut uploader, &scene.meshes).expect("upload failed");
+    let buffers = GeometryBuffers::upload(&mut uploader, &scene.meshes).expect("upload failed");
 
     // Nothing may be dropped or duplicated on the way to the device: the buffers hold exactly the
     // distinct meshes, which is what the acceleration structures will be built from.

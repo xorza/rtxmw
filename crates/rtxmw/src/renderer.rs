@@ -8,9 +8,11 @@ use rtxmw_gpu::{
     Uploader, Validation, image_blit, memory_barrier,
 };
 use rtxmw_render::{
-    FrameConstants, GeometryBuffers, MaterialBuffers, SceneAcceleration, VisibilityPass,
+    FrameConstants, GeometryBuffers, MaterialBuffers, SceneAcceleration, TextureArray,
+    VisibilityPass,
 };
 use rtxmw_scene::StaticScene;
+use rtxmw_texture::Texture;
 
 /// Rendering resolution, independent of the window. The design budgets for 1920x1080 internal
 /// upscaled to 3840x2160; the blit to the swapchain is what bridges the two.
@@ -23,19 +25,27 @@ const RENDER_SIZE: vk::Extent2D = vk::Extent2D {
 /// and an 8-bit intermediate would clip highlights before anything got the chance to.
 const RENDER_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 
+/// Ceiling on the bindless array, sized once at startup because the descriptor set layout is.
+///
+/// A cell uses far fewer — Seyda Neen's office needs 118 — and the whole shipped library holds
+/// 4,311 distinct textures, so this leaves room for a cell far larger than any interior while
+/// staying well inside what the hardware allows for a sampled-image array.
+const MAX_TEXTURES: u32 = 8192;
+
 /// The whole GPU side of the engine.
 ///
 /// Field order is load-bearing: fields drop in declaration order, and every device-owned object
 /// must be destroyed before the device itself. `Memory` hands out clones to every buffer and image,
-/// so it and everything holding one must precede `device`.
+/// so everything holding one — the uploader included — must precede `device`.
 #[derive(Debug)]
 pub(crate) struct Renderer {
     /// The loaded cell, or `None` before one is given.
     scene: Option<LoadedScene>,
     pass: VisibilityPass,
     target: Image,
+    /// Holds the only `Memory` clone the renderer needs: every buffer and image keeps its own, and
+    /// everything that creates one goes through the uploader to reach it.
     uploader: Uploader,
-    memory: Memory,
     frames: Frames,
     swapchain: Swapchain,
     surface: Surface,
@@ -59,6 +69,7 @@ pub(crate) struct Renderer {
 struct LoadedScene {
     geometry: GeometryBuffers,
     tables: MaterialBuffers,
+    textures: TextureArray,
     acceleration: SceneAcceleration,
 }
 
@@ -96,14 +107,13 @@ impl Renderer {
             RENDER_FORMAT,
             vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC,
         )?;
-        let pass = VisibilityPass::new(&device)?;
+        let pass = VisibilityPass::new(&device, MAX_TEXTURES)?;
 
         Ok(Self {
             scene: None,
             pass,
             target,
             uploader,
-            memory,
             frames,
             swapchain,
             surface,
@@ -115,15 +125,18 @@ impl Renderer {
     }
 
     /// Uploads `scene` and builds its acceleration structures, replacing whatever was loaded.
-    pub(crate) fn load_scene(&mut self, scene: &StaticScene) -> rtxmw_gpu::Result<()> {
+    pub(crate) fn load_scene(
+        &mut self,
+        scene: &StaticScene,
+        textures: &[Option<Texture>],
+    ) -> rtxmw_gpu::Result<()> {
         // SAFETY: replacing the scene frees structures a queued frame could still be reading.
         unsafe { self.device.raw().device_wait_idle()? };
         self.scene = None;
 
-        let geometry = GeometryBuffers::upload(&self.memory, &mut self.uploader, &scene.meshes)?;
+        let geometry = GeometryBuffers::upload(&mut self.uploader, &scene.meshes)?;
         let materials = scene.materials.materials();
-        let tables =
-            MaterialBuffers::upload(&self.memory, &mut self.uploader, &geometry, materials)?;
+        let tables = MaterialBuffers::upload(&mut self.uploader, &geometry, materials)?;
         let acceleration = SceneAcceleration::build(
             &self.device,
             &mut self.uploader,
@@ -132,10 +145,24 @@ impl Renderer {
             materials,
             &scene.instances,
         )?;
-        self.pass.bind(acceleration.tlas(), &self.target, &tables);
+        let textures = TextureArray::upload(&self.device, &mut self.uploader, textures)?;
+        assert!(
+            textures.len() <= MAX_TEXTURES,
+            "cell needs {} texture slots but the array is built for {MAX_TEXTURES}",
+            textures.len()
+        );
+
+        self.pass.bind(
+            acceleration.tlas(),
+            &self.target,
+            &geometry,
+            &tables,
+            &textures,
+        );
         self.scene = Some(LoadedScene {
             geometry,
             tables,
+            textures,
             acceleration,
         });
         Ok(())

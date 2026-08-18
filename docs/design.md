@@ -501,6 +501,33 @@ The test that matters is `two_materials_in_one_mesh_shade_differently`: both hal
 *same* mesh, so they share an instance and a custom index and only `geometry_index` separates them.
 Dropping that term from the shader still fills exactly the same pixels — and fails only this test.
 
+**M4 — done.** `TextureArray` in `rtxmw-render`, UV interpolation at the hit, and the cell renders
+with its own albedo. Seyda Neen's office samples **118 textures across 3,133 distinct shades**, with
+none of its references missing.
+
+- **The bindless array is the set's last binding.** Vulkan permits a variable descriptor count only
+  on the final element, which validation caught the moment the array sat at binding 4 with two
+  buffers after it. Adding any binding after it moves it.
+- **Slot zero is a magenta fallback**, and a material's texture id addresses `id + 1`. Missing
+  textures are a normal case — 45 of the library's 4,311 references name files that were removed —
+  so the array absorbs them rather than the caller special-casing a hole.
+- **Every format maps to an sRGB view.** These are all albedo; sampling them as UNORM feeds
+  gamma-encoded values to a linear renderer, which darkens midtones by about half and cannot be
+  tuned out afterwards. Pinned by a test, because it looks merely "a bit dark" rather than wrong.
+- **`textureLod`, never `texture`.** Implicit LOD needs screen-space derivatives, which a compute
+  shader does not have. Level zero aliases at distance; the real fix is ray differentials, which
+  need the pixel footprint carried along the ray.
+- **`spirv-val` needs `--scalar-block-layout`.** The shaders declare scalar layout and the device
+  enables the feature, but the validator defaults to std430 and rejects a `vec3`-carrying struct
+  array for a stride that is correct under the rules actually in force.
+- **Anisotropy is deliberately off.** It is a rasterizer's answer to a footprint problem a ray
+  tracer should solve with differentials, and enabling it would paper over their absence.
+
+One diagnostic lesson worth keeping: alpha carries the hit flag, and the debug PNG preserved it — so
+every missed ray wrote a transparent pixel that a viewer composited as white. Half the frame looked
+blown out and I went looking for a sampling bug that did not exist. The pixel values were
+`[13, 18, 25, 0]`, the background, all along. The dump now forces alpha opaque.
+
 ### M5 — Direct lighting
 Sun as a directional light with a real angular diameter (so shadows are soft), shadow rays, cell
 ambient, `LIGH` point lights with shadow rays and a defensible attenuation model, emissive surfaces.

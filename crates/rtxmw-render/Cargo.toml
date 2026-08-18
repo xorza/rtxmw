@@ -15,6 +15,7 @@ bytemuck.workspace = true
 glam.workspace = true
 rtxmw-gpu.workspace = true
 rtxmw-scene.workspace = true
+rtxmw-texture.workspace = true
 
 [dev-dependencies]
 rtxmw-esm.workspace = true

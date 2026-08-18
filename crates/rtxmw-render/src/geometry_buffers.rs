@@ -2,7 +2,7 @@
 
 use ash::vk;
 use bytemuck::{Pod, Zeroable};
-use rtxmw_gpu::{Buffer, BufferMemory, Memory, Uploader};
+use rtxmw_gpu::{Buffer, BufferMemory, Uploader};
 use rtxmw_scene::Mesh;
 
 /// Per-vertex shading data, parallel to the position stream.
@@ -87,25 +87,21 @@ impl GeometryBuffers {
     ///
     /// A mesh with no visible geometry keeps its slot as a zero-length range, so a `MeshId` from
     /// the scene stays a direct index into [`GeometryBuffers::ranges`].
-    pub fn upload(
-        memory: &Memory,
-        uploader: &mut Uploader,
-        meshes: &[Mesh],
-    ) -> rtxmw_gpu::Result<Self> {
+    pub fn upload(uploader: &mut Uploader, meshes: &[Mesh]) -> rtxmw_gpu::Result<Self> {
         let packed = pack(meshes);
         let position_bytes: &[u8] = bytemuck::cast_slice(&packed.positions);
         let attribute_bytes: &[u8] = bytemuck::cast_slice(&packed.attributes);
         let index_bytes: &[u8] = bytemuck::cast_slice(&packed.indices);
 
         let positions = Buffer::new(
-            memory,
+            uploader.memory(),
             "scene positions",
             (position_bytes.len() as vk::DeviceSize).max(Buffer::MIN_SIZE),
             build_input_usage(),
             BufferMemory::Device,
         )?;
         let attributes = Buffer::new(
-            memory,
+            uploader.memory(),
             "scene vertex attributes",
             (attribute_bytes.len() as vk::DeviceSize).max(Buffer::MIN_SIZE),
             // Never read by a build, only at a hit, so no build-input usage.
@@ -113,7 +109,7 @@ impl GeometryBuffers {
             BufferMemory::Device,
         )?;
         let indices = Buffer::new(
-            memory,
+            uploader.memory(),
             "scene indices",
             (index_bytes.len() as vk::DeviceSize).max(Buffer::MIN_SIZE),
             build_input_usage(),

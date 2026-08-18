@@ -2,7 +2,7 @@
 
 use ash::vk;
 use bytemuck::{Pod, Zeroable};
-use rtxmw_gpu::{Buffer, BufferMemory, Memory, Uploader};
+use rtxmw_gpu::{Buffer, BufferMemory, Uploader};
 use rtxmw_scene::{AlphaMode, Material};
 
 use crate::geometry_buffers::GeometryBuffers;
@@ -11,6 +11,9 @@ use crate::geometry_buffers::GeometryBuffers;
 ///
 /// A sentinel rather than a separate flag bit: the shader has to branch on it either way, and a
 /// value that indexes nothing is harder to mistake for a valid slot than a zero would be.
+///
+/// Declared again as `NO_TEXTURE` in `primary_visibility.comp`, because a GLSL shader cannot see a
+/// Rust constant. The test below pins the literal so the two cannot drift apart silently.
 pub const NO_TEXTURE: u32 = u32::MAX;
 
 /// One acceleration structure geometry, indexed by `instance_custom_index + geometry_index`.
@@ -71,7 +74,6 @@ pub struct MaterialBuffers {
 impl MaterialBuffers {
     /// Builds and uploads both tables for an already-packed scene.
     pub fn upload(
-        memory: &Memory,
         uploader: &mut Uploader,
         geometry: &GeometryBuffers,
         materials: &[Material],
@@ -97,14 +99,14 @@ impl MaterialBuffers {
         let material_bytes: &[u8] = bytemuck::cast_slice(&material_table);
 
         let geometries = Buffer::new(
-            memory,
+            uploader.memory(),
             "scene geometry table",
             (geometry_bytes.len() as vk::DeviceSize).max(Buffer::MIN_SIZE),
             usage(),
             BufferMemory::Device,
         )?;
         let materials_buffer = Buffer::new(
-            memory,
+            uploader.memory(),
             "scene material table",
             (material_bytes.len() as vk::DeviceSize).max(Buffer::MIN_SIZE),
             usage(),
@@ -150,6 +152,9 @@ mod tests {
         // shift every entry after the first.
         assert_eq!(size_of::<GpuGeometry>(), 16);
         assert_eq!(size_of::<GpuMaterial>(), 48);
+        // The shader spells this out as `0xFFFFFFFFu`; changing it here alone would leave every
+        // untextured surface sampling slot zero of the array instead of taking the fallback branch.
+        assert_eq!(NO_TEXTURE, 0xFFFF_FFFF);
     }
 
     #[test]

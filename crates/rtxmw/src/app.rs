@@ -157,7 +157,7 @@ impl ApplicationHandler for App {
         match scene_loader::load_default_cell() {
             Ok(Some(loaded)) => {
                 let renderer = self.renderer.as_mut().expect("renderer was just created");
-                if let Err(e) = renderer.load_scene(&loaded.scene) {
+                if let Err(e) = renderer.load_scene(&loaded.scene, &loaded.textures) {
                     eprintln!("could not upload {}: {e}", loaded.name);
                     event_loop.exit();
                     return;

@@ -1275,6 +1275,7 @@ dependencies = [
  "rtxmw-gpu",
  "rtxmw-render",
  "rtxmw-scene",
+ "rtxmw-texture",
  "rtxmw-vfs",
  "winit",
 ]
@@ -1316,6 +1317,7 @@ dependencies = [
  "rtxmw-esm",
  "rtxmw-gpu",
  "rtxmw-scene",
+ "rtxmw-texture",
  "rtxmw-vfs",
 ]
 

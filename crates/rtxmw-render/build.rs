@@ -77,6 +77,10 @@ fn validate(module: &Path) {
     let result = Command::new("spirv-val")
         .arg("--target-env")
         .arg(TARGET_ENV)
+        // The shaders declare `scalar` block layout and the device enables the matching feature, so
+        // the validator has to be told the same. Without it a `vec3`-carrying struct array is
+        // rejected for a stride that is correct under the rules actually in force.
+        .arg("--scalar-block-layout")
         .arg(module)
         .output();
 

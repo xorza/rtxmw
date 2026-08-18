@@ -56,8 +56,7 @@ fn a_small_scene_builds_one_structure_per_mesh_and_one_instance_per_placement() 
 
     let materials = [Material::default()];
     let mut uploader = gpu.uploader();
-    let geometry =
-        GeometryBuffers::upload(gpu.memory(), &mut uploader, &meshes).expect("upload failed");
+    let geometry = GeometryBuffers::upload(&mut uploader, &meshes).expect("upload failed");
     let acceleration = SceneAcceleration::build(
         gpu.device(),
         &mut uploader,
@@ -94,8 +93,7 @@ fn a_mesh_that_flattened_to_nothing_gets_no_structure() {
 
     let materials = [Material::default()];
     let mut uploader = gpu.uploader();
-    let geometry =
-        GeometryBuffers::upload(gpu.memory(), &mut uploader, &meshes).expect("upload failed");
+    let geometry = GeometryBuffers::upload(&mut uploader, &meshes).expect("upload failed");
     let acceleration = SceneAcceleration::build(
         gpu.device(),
         &mut uploader,
@@ -119,8 +117,7 @@ fn an_empty_cell_still_produces_a_traversable_top_level() {
     let mut uploader = gpu.uploader();
 
     let materials: [Material; 0] = [];
-    let geometry =
-        GeometryBuffers::upload(gpu.memory(), &mut uploader, &[]).expect("upload failed");
+    let geometry = GeometryBuffers::upload(&mut uploader, &[]).expect("upload failed");
     let acceleration = SceneAcceleration::build(
         gpu.device(),
         &mut uploader,
@@ -156,8 +153,7 @@ fn a_real_interior_builds_and_compacts() {
     let gpu = TestGpu::shared();
     let mut uploader = gpu.uploader();
     let materials = scene.materials.materials();
-    let geometry =
-        GeometryBuffers::upload(gpu.memory(), &mut uploader, &scene.meshes).expect("upload failed");
+    let geometry = GeometryBuffers::upload(&mut uploader, &scene.meshes).expect("upload failed");
     let acceleration = SceneAcceleration::build(
         gpu.device(),
         &mut uploader,

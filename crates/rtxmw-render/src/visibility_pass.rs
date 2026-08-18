@@ -6,8 +6,10 @@ use glam::{Mat4, Vec3};
 use rtxmw_gpu::{Device, Image};
 
 use crate::acceleration_structure::AccelerationStructure;
+use crate::geometry_buffers::GeometryBuffers;
 use crate::material_buffers::MaterialBuffers;
 use crate::shaders;
+use crate::texture_array::TextureArray;
 
 /// What the shader needs to turn a pixel into a ray, as its push constant block.
 ///
@@ -70,7 +72,14 @@ const WORKGROUP: u32 = 8;
 
 impl VisibilityPass {
     /// Creates the layout, pool, descriptor set and pipeline.
-    pub fn new(device: &Device) -> rtxmw_gpu::Result<Self> {
+    ///
+    /// `max_textures` sizes the bindless array's binding. It is a ceiling rather than a count: the
+    /// set is allocated with room for it and each scene writes as many slots as it actually has.
+    pub fn new(device: &Device, max_textures: u32) -> rtxmw_gpu::Result<Self> {
+        assert!(
+            max_textures > 0,
+            "the texture array needs at least a fallback slot"
+        );
         let raw = device.raw();
 
         let bindings = [
@@ -94,8 +103,42 @@ impl VisibilityPass {
                 .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::COMPUTE),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(4)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(5)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+            // Last, because Vulkan allows a variable descriptor count only on a set's final
+            // binding. Adding anything after this one moves it.
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(6)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(max_textures)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
         ];
-        let layout_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
+        // Only the texture array is variable and partially bound: a cell that uses 118 textures
+        // writes 118 descriptors into a binding declared for far more, and the rest are never read.
+        // Declaring them all bound would mean uploading placeholder views for slots no ray reaches.
+        let flags = [
+            vk::DescriptorBindingFlags::empty(),
+            vk::DescriptorBindingFlags::empty(),
+            vk::DescriptorBindingFlags::empty(),
+            vk::DescriptorBindingFlags::empty(),
+            vk::DescriptorBindingFlags::empty(),
+            vk::DescriptorBindingFlags::empty(),
+            vk::DescriptorBindingFlags::PARTIALLY_BOUND
+                | vk::DescriptorBindingFlags::VARIABLE_DESCRIPTOR_COUNT,
+        ];
+        let mut binding_flags =
+            vk::DescriptorSetLayoutBindingFlagsCreateInfo::default().binding_flags(&flags);
+        let layout_info = vk::DescriptorSetLayoutCreateInfo::default()
+            .bindings(&bindings)
+            .push_next(&mut binding_flags);
         // SAFETY: `layout_info` is fully initialised and the device is alive.
         let descriptor_layout = unsafe { raw.create_descriptor_set_layout(&layout_info, None)? };
 
@@ -108,7 +151,10 @@ impl VisibilityPass {
                 .descriptor_count(1),
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(2),
+                .descriptor_count(4),
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(max_textures),
         ];
         let pool_info = vk::DescriptorPoolCreateInfo::default()
             .pool_sizes(&sizes)
@@ -117,9 +163,13 @@ impl VisibilityPass {
         let pool = unsafe { raw.create_descriptor_pool(&pool_info, None)? };
 
         let layouts = [descriptor_layout];
+        let counts = [max_textures];
+        let mut variable_count = vk::DescriptorSetVariableDescriptorCountAllocateInfo::default()
+            .descriptor_counts(&counts);
         let allocate = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(pool)
-            .set_layouts(&layouts);
+            .set_layouts(&layouts)
+            .push_next(&mut variable_count);
         // SAFETY: the pool was just created with room for exactly this set.
         let set = unsafe { raw.allocate_descriptor_sets(&allocate)? }[0];
 
@@ -176,7 +226,9 @@ impl VisibilityPass {
         &mut self,
         scene: &AccelerationStructure,
         target: &Image,
+        geometry: &GeometryBuffers,
         tables: &MaterialBuffers,
+        textures: &TextureArray,
     ) {
         let structures = [scene.raw()];
         let mut acceleration = vk::WriteDescriptorSetAccelerationStructureKHR::default()
@@ -218,10 +270,43 @@ impl VisibilityPass {
             .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
             .buffer_info(&material_info);
 
+        let texture_infos = textures.descriptors();
+        let texture_write = vk::WriteDescriptorSet::default()
+            .dst_set(self.set)
+            .dst_binding(6)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .image_info(&texture_infos);
+
+        let index_info = [vk::DescriptorBufferInfo::default()
+            .buffer(geometry.indices().raw())
+            .range(vk::WHOLE_SIZE)];
+        let index_write = vk::WriteDescriptorSet::default()
+            .dst_set(self.set)
+            .dst_binding(4)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(&index_info);
+
+        let attribute_info = [vk::DescriptorBufferInfo::default()
+            .buffer(geometry.attributes().raw())
+            .range(vk::WHOLE_SIZE)];
+        let attribute_write = vk::WriteDescriptorSet::default()
+            .dst_set(self.set)
+            .dst_binding(5)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(&attribute_info);
+
         // SAFETY: every write names this pass's own set, and no dispatch using it is in flight.
         unsafe {
             self.device.update_descriptor_sets(
-                &[scene_write, image_write, geometry_write, material_write],
+                &[
+                    scene_write,
+                    image_write,
+                    geometry_write,
+                    material_write,
+                    texture_write,
+                    index_write,
+                    attribute_write,
+                ],
                 &[],
             )
         };

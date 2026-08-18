@@ -26,6 +26,22 @@ pub unsafe fn transition(
     from: vk::ImageLayout,
     to: vk::ImageLayout,
 ) {
+    // SAFETY: forwarded unchanged.
+    unsafe { transition_range(device, command_buffer, image, from, to, COLOR_RANGE) }
+}
+
+/// As [`transition`], for an image whose subresource range is not a single mip level.
+///
+/// # Safety
+/// `command_buffer` must be in the recording state, and `image` must belong to `device`.
+pub unsafe fn transition_range(
+    device: &ash::Device,
+    command_buffer: vk::CommandBuffer,
+    image: vk::Image,
+    from: vk::ImageLayout,
+    to: vk::ImageLayout,
+    range: vk::ImageSubresourceRange,
+) {
     let barrier = vk::ImageMemoryBarrier2::default()
         .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
         .src_access_mask(vk::AccessFlags2::MEMORY_WRITE)
@@ -34,7 +50,7 @@ pub unsafe fn transition(
         .old_layout(from)
         .new_layout(to)
         .image(image)
-        .subresource_range(COLOR_RANGE);
+        .subresource_range(range);
     let barriers = [barrier];
     let dependency = vk::DependencyInfo::default().image_memory_barriers(&barriers);
     // SAFETY: the caller guarantees the command buffer is recording.

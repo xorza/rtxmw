@@ -1,6 +1,7 @@
 #version 460
 #extension GL_EXT_ray_query : require
 #extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_nonuniform_qualifier : require
 
 // Primary visibility by inline ray query.
 //
@@ -41,6 +42,27 @@ layout(set = 0, binding = 2, scalar) readonly buffer Geometries {
 layout(set = 0, binding = 3, scalar) readonly buffer Materials {
     Material materials[];
 };
+
+layout(set = 0, binding = 4, scalar) readonly buffer Indices {
+    uint indices[];
+};
+
+struct Attributes {
+    vec3 normal;
+    vec2 uv;
+};
+
+layout(set = 0, binding = 5, scalar) readonly buffer VertexAttributes {
+    Attributes attributes[];
+};
+
+// Last binding, and the only runtime-sized one: Vulkan allows a variable descriptor count only on
+// the final element of a set. Slot zero is the fallback, so a material's texture id addresses
+// `id + 1`.
+layout(set = 0, binding = 6) uniform sampler2D textures[];
+
+/// Stands in for a material with no base colour texture.
+const uint NO_TEXTURE = 0xFFFFFFFFu;
 
 // 80 bytes. Vulkan only guarantees 128 bytes of push constants, so sending separate inverse view
 // and projection matrices (144 with the camera) would work on this GPU and fail the guarantee.
@@ -93,17 +115,34 @@ void main() {
         // geometry index is which of its runs was hit. Their sum is the entry, with no indirection.
         uint slot = rayQueryGetIntersectionInstanceCustomIndexEXT(query, true)
                   + rayQueryGetIntersectionGeometryIndexEXT(query, true);
-        uint id = geometries[slot].material;
-        Material material = materials[id];
+        Geometry geometry = geometries[slot];
+        Material material = materials[geometry.material];
 
-        // False colour by material until textures exist. Hashing the index rather than showing the
-        // diffuse colour is deliberate: vanilla materials are almost all white, so a diffuse view
-        // would be a blank image whether or not the lookup worked.
-        vec3 tint = vec3(float((id * 37u) % 255u), float((id * 91u) % 255u),
-                         float((id * 151u) % 255u)) / 255.0;
-        // Modulated by the material's own diffuse so both tables are genuinely read: a misaligned
-        // material buffer shows up as wrong colour rather than being optimised away unnoticed.
-        colour = max(tint, vec3(0.08)) * material.diffuse;
+        // The three corners of the triangle that was hit. `first_index` locates the run inside the
+        // shared index buffer and `first_vertex` rebases the mesh-local index values onto the
+        // shared attribute stream — the same two offsets the acceleration structure was built with.
+        uint triangle = geometry.first_index + 3u * rayQueryGetIntersectionPrimitiveIndexEXT(query, true);
+        uint i0 = geometry.first_vertex + indices[triangle];
+        uint i1 = geometry.first_vertex + indices[triangle + 1u];
+        uint i2 = geometry.first_vertex + indices[triangle + 2u];
+
+        // Barycentrics come back as the second and third weights; the first is what is left.
+        vec2 bary = rayQueryGetIntersectionBarycentricsEXT(query, true);
+        vec3 weights = vec3(1.0 - bary.x - bary.y, bary.x, bary.y);
+        vec2 uv = attributes[i0].uv * weights.x
+                + attributes[i1].uv * weights.y
+                + attributes[i2].uv * weights.z;
+
+        colour = material.diffuse;
+        if (material.base_colour != NO_TEXTURE) {
+            // `nonuniformEXT` because neighbouring rays in a warp land on different materials, and
+            // an index that varies across the warp is undefined without it.
+            uint slot_index = material.base_colour + 1u;
+            // Explicit level, not `texture()`: implicit LOD needs screen-space derivatives, which a
+            // compute shader does not have. Level zero aliases at distance — the real fix is ray
+            // differentials, which need the pixel footprint carried along the ray.
+            colour *= textureLod(textures[nonuniformEXT(slot_index)], uv, 0.0).rgb;
+        }
     }
     imageStore(target, pixel, vec4(colour, hit));
 }
