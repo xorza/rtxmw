@@ -7,6 +7,7 @@ use rtxmw_gpu::{Device, Image};
 
 use crate::acceleration_structure::AccelerationStructure;
 use crate::geometry_buffers::GeometryBuffers;
+use crate::light_buffer::LightBuffer;
 use crate::material_buffers::MaterialBuffers;
 use crate::shaders;
 use crate::texture_array::TextureArray;
@@ -21,6 +22,10 @@ use crate::texture_array::TextureArray;
 pub struct FrameConstants {
     inverse_view_projection: [f32; 16],
     camera_position: [f32; 3],
+    light_count: u32,
+    /// The cell's fixed lighting, standing in for every bounce the original engine could not
+    /// compute. Interiors are mostly this.
+    ambient: [f32; 3],
     /// The block is a multiple of 16 bytes with this; the shader ignores it.
     padding: u32,
 }
@@ -30,10 +35,18 @@ impl FrameConstants {
     ///
     /// `projection` must be the reverse-Z Vulkan projection the shader assumes — it unprojects the
     /// near plane at depth 1, which is the only plane an infinite projection leaves invertible.
-    pub fn new(view: Mat4, projection: Mat4, camera_position: Vec3) -> Self {
+    pub fn new(
+        view: Mat4,
+        projection: Mat4,
+        camera_position: Vec3,
+        ambient: Vec3,
+        light_count: u32,
+    ) -> Self {
         Self {
             inverse_view_projection: (projection * view).inverse().to_cols_array(),
             camera_position: camera_position.to_array(),
+            light_count,
+            ambient: ambient.to_array(),
             padding: 0,
         }
     }
@@ -113,10 +126,15 @@ impl VisibilityPass {
                 .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::COMPUTE),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(6)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
             // Last, because Vulkan allows a variable descriptor count only on a set's final
             // binding. Adding anything after this one moves it.
             vk::DescriptorSetLayoutBinding::default()
-                .binding(6)
+                .binding(7)
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                 .descriptor_count(max_textures)
                 .stage_flags(vk::ShaderStageFlags::COMPUTE),
@@ -124,16 +142,9 @@ impl VisibilityPass {
         // Only the texture array is variable and partially bound: a cell that uses 118 textures
         // writes 118 descriptors into a binding declared for far more, and the rest are never read.
         // Declaring them all bound would mean uploading placeholder views for slots no ray reaches.
-        let flags = [
-            vk::DescriptorBindingFlags::empty(),
-            vk::DescriptorBindingFlags::empty(),
-            vk::DescriptorBindingFlags::empty(),
-            vk::DescriptorBindingFlags::empty(),
-            vk::DescriptorBindingFlags::empty(),
-            vk::DescriptorBindingFlags::empty(),
-            vk::DescriptorBindingFlags::PARTIALLY_BOUND
-                | vk::DescriptorBindingFlags::VARIABLE_DESCRIPTOR_COUNT,
-        ];
+        let mut flags = [vk::DescriptorBindingFlags::empty(); 8];
+        flags[7] = vk::DescriptorBindingFlags::PARTIALLY_BOUND
+            | vk::DescriptorBindingFlags::VARIABLE_DESCRIPTOR_COUNT;
         let mut binding_flags =
             vk::DescriptorSetLayoutBindingFlagsCreateInfo::default().binding_flags(&flags);
         let layout_info = vk::DescriptorSetLayoutCreateInfo::default()
@@ -151,7 +162,7 @@ impl VisibilityPass {
                 .descriptor_count(1),
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(4),
+                .descriptor_count(5),
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                 .descriptor_count(max_textures),
@@ -228,6 +239,7 @@ impl VisibilityPass {
         target: &Image,
         geometry: &GeometryBuffers,
         tables: &MaterialBuffers,
+        lights: &LightBuffer,
         textures: &TextureArray,
     ) {
         let structures = [scene.raw()];
@@ -273,9 +285,18 @@ impl VisibilityPass {
         let texture_infos = textures.descriptors();
         let texture_write = vk::WriteDescriptorSet::default()
             .dst_set(self.set)
-            .dst_binding(6)
+            .dst_binding(7)
             .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
             .image_info(&texture_infos);
+
+        let light_info = [vk::DescriptorBufferInfo::default()
+            .buffer(lights.buffer().raw())
+            .range(vk::WHOLE_SIZE)];
+        let light_write = vk::WriteDescriptorSet::default()
+            .dst_set(self.set)
+            .dst_binding(6)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(&light_info);
 
         let index_info = [vk::DescriptorBufferInfo::default()
             .buffer(geometry.indices().raw())
@@ -306,6 +327,7 @@ impl VisibilityPass {
                     texture_write,
                     index_write,
                     attribute_write,
+                    light_write,
                 ],
                 &[],
             )
@@ -382,7 +404,7 @@ mod tests {
     fn the_push_block_fits_the_guaranteed_range() {
         // Vulkan promises 128 bytes and no more; exceeding it works on this GPU and fails elsewhere.
         assert!(size_of::<FrameConstants>() <= 128);
-        assert_eq!(size_of::<FrameConstants>(), 80);
+        assert_eq!(size_of::<FrameConstants>(), 96);
     }
 
     #[test]
@@ -396,7 +418,7 @@ mod tests {
             16.0 / 9.0,
             0.05,
         );
-        let constants = FrameConstants::new(view, projection, eye);
+        let constants = FrameConstants::new(view, projection, eye, Vec3::ZERO, 0);
 
         // Round-trip a world point through the forward transform and back through the stored
         // inverse. Anything that transposed or reordered the matrix survives multiplication but

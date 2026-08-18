@@ -4,13 +4,17 @@
 //! Vulkan, and nothing above it knows about ESM records or NIF blocks.
 
 mod error;
+mod light;
 mod material;
 mod material_table;
 mod mesh;
+mod srgb;
 mod static_scene;
 
 pub use crate::error::{Result, SceneError};
+pub use crate::light::{Ambient, Light};
 pub use crate::material::{AlphaMode, Material, TextureId};
 pub use crate::material_table::MaterialTable;
 pub use crate::mesh::{Bounds, Mesh, Submesh};
+pub use crate::srgb::to_linear;
 pub use crate::static_scene::{Instance, MeshId, ModelIndex, StaticScene};

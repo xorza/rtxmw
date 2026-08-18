@@ -10,11 +10,11 @@ use glam::{Affine3A, Vec2, Vec3};
 use rtxmw_esm::EsmReader;
 use rtxmw_gpu::{TestGpu, image_barrier, memory_barrier};
 use rtxmw_render::{
-    FrameConstants, GeometryBuffers, MaterialBuffers, SceneAcceleration, TextureArray,
+    FrameConstants, GeometryBuffers, LightBuffer, MaterialBuffers, SceneAcceleration, TextureArray,
     VisibilityPass,
 };
 use rtxmw_scene::{
-    AlphaMode, Instance, Material, Mesh, MeshId, ModelIndex, StaticScene, Submesh, TextureId,
+    AlphaMode, Instance, Light, Material, Mesh, MeshId, ModelIndex, StaticScene, Submesh, TextureId,
 };
 use rtxmw_texture::{Texture, TextureFormat};
 use rtxmw_vfs::{DATA_DIR_VAR, morrowind_archives, morrowind_data_dir};
@@ -82,6 +82,32 @@ fn trace_textured(
     eye: Vec3,
     forward: Vec3,
 ) -> Vec<u8> {
+    // Full ambient and no lights, so an unlit trace shows albedo unchanged — which is what every
+    // test written before lighting existed is asserting about.
+    trace_lit(
+        meshes,
+        materials,
+        textures,
+        &[],
+        Vec3::ONE,
+        instances,
+        eye,
+        forward,
+    )
+}
+
+/// As [`trace_textured`], with lights and an ambient term.
+#[allow(clippy::too_many_arguments)]
+fn trace_lit(
+    meshes: &[Mesh],
+    materials: &[Material],
+    textures: &[Option<Texture>],
+    lights: &[Light],
+    ambient: Vec3,
+    instances: &[Instance],
+    eye: Vec3,
+    forward: Vec3,
+) -> Vec<u8> {
     let gpu = TestGpu::shared();
     let mut uploader = gpu.uploader();
 
@@ -101,6 +127,7 @@ fn trace_textured(
 
     let array =
         TextureArray::upload(gpu.device(), &mut uploader, textures).expect("texture upload failed");
+    let light_buffer = LightBuffer::upload(&mut uploader, lights).expect("light upload failed");
 
     let target = gpu
         .create_target(WIDTH, HEIGHT, vk::Format::R16G16B16A16_SFLOAT)
@@ -111,6 +138,7 @@ fn trace_textured(
         target.image(),
         &geometry,
         &tables,
+        &light_buffer,
         &array,
     );
 
@@ -120,7 +148,7 @@ fn trace_textured(
         WIDTH as f32 / HEIGHT as f32,
         0.05,
     );
-    let constants = FrameConstants::new(view, projection, eye);
+    let constants = FrameConstants::new(view, projection, eye, ambient, light_buffer.count());
 
     let image = target.image().raw();
     let extent = target.extent();
@@ -523,6 +551,124 @@ fn an_opaque_material_ignores_its_texture_alpha() {
     );
 }
 
+/// Mean brightness of the hit pixels.
+fn mean_brightness(pixels: &[u8]) -> f32 {
+    let mut total = 0.0;
+    let mut count = 0.0;
+    for pixel in pixels.chunks_exact(4).filter(|p| is_hit(p)) {
+        total += (pixel[0] as f32 + pixel[1] as f32 + pixel[2] as f32) / 3.0;
+        count += 1.0;
+    }
+    if count == 0.0 { 0.0 } else { total / count }
+}
+
+#[test]
+fn a_light_brightens_what_it_reaches() {
+    let meshes = [wall(200.0, -150.0..150.0, -150.0..150.0)];
+    let materials = [Material::default()];
+    let instances = [Instance {
+        mesh: MeshId(0),
+        transform: Affine3A::IDENTITY,
+    }];
+    let ambient = Vec3::splat(0.05);
+    let light = Light {
+        position: Vec3::new(100.0, 0.0, 0.0),
+        colour: Vec3::ONE,
+        radius: 300.0,
+    };
+
+    let unlit = trace_lit(
+        &meshes,
+        &materials,
+        &[],
+        &[],
+        ambient,
+        &instances,
+        Vec3::ZERO,
+        Vec3::X,
+    );
+    let lit = trace_lit(
+        &meshes,
+        &materials,
+        &[],
+        std::slice::from_ref(&light),
+        ambient,
+        &instances,
+        Vec3::ZERO,
+        Vec3::X,
+    );
+
+    assert!(
+        mean_brightness(&unlit) > 0.0,
+        "the wall was not drawn at all"
+    );
+    assert!(
+        mean_brightness(&lit) > mean_brightness(&unlit) * 2.0,
+        "adding a light moved mean brightness only from {} to {}",
+        mean_brightness(&unlit),
+        mean_brightness(&lit)
+    );
+}
+
+#[test]
+fn an_occluder_between_light_and_surface_casts_a_shadow() {
+    // Worked out by hand. The light sits at (100, 0, 100) and the lit wall at x = 200, so a ray
+    // from the light to the wall's centre (200, 0, 0) crosses x = 150 at z = 50. An occluder there
+    // spanning z in [20, 80] therefore blocks it. The centre pixel's own view ray travels along
+    // z = 0 and passes *under* that occluder, so it still sees wall in both traces — which is what
+    // makes the two comparable.
+    let lit_wall = wall(200.0, -150.0..150.0, -150.0..150.0);
+    let occluder = wall(150.0, -30.0..30.0, 20.0..80.0);
+    let materials = [Material::default()];
+    let light = Light {
+        position: Vec3::new(100.0, 0.0, 100.0),
+        colour: Vec3::ONE,
+        radius: 400.0,
+    };
+    let ambient = Vec3::splat(0.05);
+    let place = |mesh: u32| Instance {
+        mesh: MeshId(mesh),
+        transform: Affine3A::IDENTITY,
+    };
+
+    let clear = trace_lit(
+        std::slice::from_ref(&lit_wall),
+        &materials,
+        &[],
+        std::slice::from_ref(&light),
+        ambient,
+        &[place(0)],
+        Vec3::ZERO,
+        Vec3::X,
+    );
+    let blocked = trace_lit(
+        &[lit_wall, occluder],
+        &materials,
+        &[],
+        std::slice::from_ref(&light),
+        ambient,
+        &[place(0), place(1)],
+        Vec3::ZERO,
+        Vec3::X,
+    );
+
+    let centre = WIDTH / 2;
+    let sum = |p: &[u8]| p[0] as u32 + p[1] as u32 + p[2] as u32;
+    let open = at(&clear, centre, centre);
+    let shadow = at(&blocked, centre, centre);
+
+    assert!(
+        is_hit(open) && is_hit(shadow),
+        "the wall centre was not hit"
+    );
+    assert!(
+        sum(open) > sum(shadow) * 2,
+        "the occluder cast no shadow: {open:?} lit against {shadow:?} blocked"
+    );
+    // Ambient still reaches it — a shadow is unlit, not black.
+    assert!(sum(shadow) > 0, "the shadowed point lost its ambient too");
+}
+
 #[test]
 fn a_real_interior_traces_to_a_recognisable_image() {
     let Some(data) = morrowind_data_dir() else {
@@ -558,10 +704,12 @@ fn a_real_interior_traces_to_a_recognisable_image() {
         textures.push(decoded);
     }
 
-    let pixels = trace_textured(
+    let pixels = trace_lit(
         &scene.meshes,
         scene.materials.materials(),
         &textures,
+        &scene.lights,
+        scene.ambient.map_or(Vec3::ZERO, |a| a.colour),
         &scene.instances,
         eye,
         Vec3::X,
@@ -594,8 +742,10 @@ fn a_real_interior_traces_to_a_recognisable_image() {
         .filter(|m| !matches!(m.alpha, AlphaMode::Opaque))
         .count();
     println!(
-        "  {cutouts} of {} materials run the alpha cutout",
-        scene.materials.materials().len()
+        "  {cutouts} of {} materials run the alpha cutout, {} lights, ambient {:?}",
+        scene.materials.materials().len(),
+        scene.lights.len(),
+        scene.ambient.map(|a| a.colour)
     );
     println!(
         "{CELL}: {hits} of {total} pixels hit ({:.0}%), {} distinct shades from {} textures \

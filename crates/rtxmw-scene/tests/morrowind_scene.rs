@@ -115,6 +115,18 @@ fn a_known_interior_assembles_into_meshes_and_instances() {
         );
     }
 
+    println!(
+        "  {} lights, ambient {:?}",
+        scene.lights.len(),
+        scene.ambient.map(|a| a.colour)
+    );
+    for light in scene.lights.iter().take(4) {
+        println!(
+            "    light at {:?} radius {} colour {:?}",
+            light.position, light.radius, light.colour
+        );
+    }
+
     let textured = scene
         .materials
         .materials()

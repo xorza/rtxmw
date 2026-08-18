@@ -553,6 +553,35 @@ fast path, which is the right shape; marking only the 72 would have looked corre
 Seyda Neen's office runs the cutout on 14 of its 119 materials. The mask thresholds the data
 actually uses are 100 and 192 out of 255, plus two materials at zero.
 
+### M5 — interior direct lighting — **done**
+`LightRecord` in `rtxmw-esm`, `Light`/`Ambient` in `rtxmw-scene`, `LightBuffer` in `rtxmw-render`,
+and shadow rays in the visibility shader. Seyda Neen's office places **13 lights** — warm torch
+orange, radii 64 to 128 units — under an ambient of `(0.038, 0.026, 0.026)`.
+
+- **Both the light colours and the cell ambient are sRGB-encoded** in the file, like everything
+  authored for a fixed-function renderer. Using them unconverted makes every light too bright and
+  too washed out, in exactly the way an unconverted albedo texture does. Decoded on the way in and
+  pinned by tests at mid grey, where the two spaces diverge most.
+- **Morrowind stores no intensity.** A `LIGH` record carries a colour and a radius and nothing else,
+  because the original renderer's fixed attenuation curve supplied brightness. Radiant intensity is
+  therefore derived as `radius² × INTENSITY`, which makes reach the only control the data needs to
+  give and keeps a lamp and a candle differing by their size rather than by an invented number.
+- **Attenuation is inverse square, windowed to reach exactly zero at the radius.** Morrowind's
+  radius is a hard cutoff, and a clipped inverse square leaves a visible edge where the falloff
+  jumps to nothing.
+- **Carried, negative and off-by-default lights are not placed.** A carried light belongs to whoever
+  holds it; a negative one *subtracts* illumination, which is a trick for a renderer accumulating
+  into a framebuffer and meaningless for one tracing paths.
+- **Shadow rays run the alpha cutout too**, so a grate throws bars rather than a rectangle, and they
+  use `TerminateOnFirstHit` — a shadow ray asks only whether something is in the way.
+
+**The interior comes out dark, and that is the honest result rather than a bug.** The ambient is
+0.038 and the lights reach 64–128 units inside a room spanning 1,757 × 2,559. Away from a torch,
+almost nothing is lit. This is §5.1 arriving from the other direction: the original engine leaned on
+pre-lit albedo *and* a flat ambient to carry a room's illumination, so lighting that albedo correctly
+leaves it looking underlit rather than double-lit. `INTENSITY` is tuned by eye and provisional —
+the de-lighting spike is what would make any value here mean something.
+
 ### M5 — Direct lighting
 Sun as a directional light with a real angular diameter (so shadows are soft), shadow rays, cell
 ambient, `LIGH` point lights with shadow rays and a defensible attenuation model, emissive surfaces.

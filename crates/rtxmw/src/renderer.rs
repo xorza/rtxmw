@@ -1,6 +1,7 @@
 //! Owns every GPU object and draws one frame.
 
 use ash::vk;
+use glam::Vec3;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use rtxmw_gpu::image_barrier::{self, COLOR_RANGE};
 use rtxmw_gpu::{
@@ -8,7 +9,7 @@ use rtxmw_gpu::{
     Uploader, Validation, image_blit, memory_barrier,
 };
 use rtxmw_render::{
-    FrameConstants, GeometryBuffers, MaterialBuffers, SceneAcceleration, TextureArray,
+    FrameConstants, GeometryBuffers, LightBuffer, MaterialBuffers, SceneAcceleration, TextureArray,
     VisibilityPass,
 };
 use rtxmw_scene::StaticScene;
@@ -70,7 +71,10 @@ struct LoadedScene {
     geometry: GeometryBuffers,
     tables: MaterialBuffers,
     textures: TextureArray,
+    lights: LightBuffer,
     acceleration: SceneAcceleration,
+    /// Read every frame into the push constants, so it lives with the scene rather than the camera.
+    ambient: Vec3,
 }
 
 impl Renderer {
@@ -152,18 +156,25 @@ impl Renderer {
             textures.len()
         );
 
+        let lights = LightBuffer::upload(&mut self.uploader, &scene.lights)?;
+
         self.pass.bind(
             acceleration.tlas(),
             &self.target,
             &geometry,
             &tables,
+            &lights,
             &textures,
         );
         self.scene = Some(LoadedScene {
             geometry,
             tables,
             textures,
+            lights,
             acceleration,
+            // A cell with no ambient of its own gets none, rather than a guess: an interior that
+            // declares nothing is meant to be lit by what is placed in it.
+            ambient: scene.ambient.map_or(Vec3::ZERO, |a| a.colour),
         });
         Ok(())
     }
@@ -205,6 +216,18 @@ impl Renderer {
             limits.max_geometry_count,
             limits.max_instance_count,
         )
+    }
+
+    /// The loaded cell's ambient colour, or black when nothing is loaded.
+    pub(crate) fn ambient(&self) -> Vec3 {
+        self.scene
+            .as_ref()
+            .map_or(Vec3::ZERO, |scene| scene.ambient)
+    }
+
+    /// How many lights the loaded cell placed.
+    pub(crate) fn light_count(&self) -> u32 {
+        self.scene.as_ref().map_or(0, |scene| scene.lights.count())
     }
 
     /// Aspect ratio of the offscreen target, which is what the projection must match.

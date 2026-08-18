@@ -56,10 +56,21 @@ layout(set = 0, binding = 5, scalar) readonly buffer VertexAttributes {
     Attributes attributes[];
 };
 
+struct Light {
+    vec3 position;
+    float radius;
+    vec3 colour;
+    float padding;
+};
+
+layout(set = 0, binding = 6, scalar) readonly buffer Lights {
+    Light lights[];
+};
+
 // Last binding, and the only runtime-sized one: Vulkan allows a variable descriptor count only on
 // the final element of a set. Slot zero is the fallback, so a material's texture id addresses
 // `id + 1`.
-layout(set = 0, binding = 6) uniform sampler2D textures[];
+layout(set = 0, binding = 7) uniform sampler2D textures[];
 
 // Stands in for a material with no base colour texture. Declared as `NO_TEXTURE` in
 // `material_buffers.rs` too, and pinned there by a test, because a shader cannot see a Rust
@@ -72,6 +83,8 @@ const uint NO_TEXTURE = 0xFFFFFFFFu;
 layout(push_constant) uniform Frame {
     mat4 inverse_view_projection;
     vec3 camera_position;
+    uint light_count;
+    vec3 ambient;
     uint _pad;
 } frame;
 
@@ -81,12 +94,16 @@ layout(push_constant) uniform Frame {
 const float RAY_MIN = 0.01;
 // Far enough to cross an exterior cell, which is 8192 world units.
 const float RAY_MAX = 1.0e6;
+// How far along the normal a shadow ray starts. Morrowind's unit is about 1.4 cm, so this is a
+// couple of centimetres — enough to clear the interpolation error on a large triangle without
+// letting light leak under a wall.
+const float SHADOW_BIAS = 1.5;
 
-// Texture coordinate at a hit, interpolated from the triangle's three corners.
+// Texture coordinate and object-space normal at a hit, interpolated from the triangle's corners.
 //
 // Takes the pieces rather than the ray query itself so the candidate loop and the committed hit can
 // share it — they read the same values through different accessors.
-vec2 surface_uv(Geometry geom, uint primitive, vec2 bary) {
+void surface_at(Geometry geom, uint primitive, vec2 bary, out vec2 uv, out vec3 normal) {
     // `first_index` locates the run inside the shared index buffer and `first_vertex` rebases the
     // mesh-local index values onto the shared attribute stream — the same two offsets the
     // acceleration structure was built with.
@@ -97,9 +114,20 @@ vec2 surface_uv(Geometry geom, uint primitive, vec2 bary) {
 
     // Barycentrics come back as the second and third weights; the first is what is left.
     vec3 weights = vec3(1.0 - bary.x - bary.y, bary.x, bary.y);
-    return attributes[i0].uv * weights.x
-         + attributes[i1].uv * weights.y
-         + attributes[i2].uv * weights.z;
+    uv = attributes[i0].uv * weights.x
+       + attributes[i1].uv * weights.y
+       + attributes[i2].uv * weights.z;
+    normal = attributes[i0].normal * weights.x
+           + attributes[i1].normal * weights.y
+           + attributes[i2].normal * weights.z;
+}
+
+// Just the texture coordinate, for the alpha cutout — which has no use for a normal.
+vec2 surface_uv(Geometry geom, uint primitive, vec2 bary) {
+    vec2 uv;
+    vec3 normal;
+    surface_at(geom, primitive, bary, uv, normal);
+    return uv;
 }
 
 // The material's base colour texel at `uv`.
@@ -125,6 +153,44 @@ bool alpha_passes(uint slot, uint primitive, vec2 bary) {
     }
     float alpha = base_colour(material, surface_uv(geom, primitive, bary)).a;
     return alpha >= material.alpha_cutoff;
+}
+
+// Whether anything blocks the segment from `origin` along `dir` for `distance` units.
+//
+// `TerminateOnFirstHit` because a shadow ray only asks whether *something* is in the way — the
+// nearest blocker is no more useful than any other, and stopping at the first is most of why a
+// shadow ray is cheaper than a visibility ray.
+bool occluded(vec3 origin, vec3 dir, float distance) {
+    rayQueryEXT query;
+    rayQueryInitializeEXT(query, scene, gl_RayFlagsTerminateOnFirstHitEXT, 0xFF,
+                          origin, RAY_MIN, dir, distance);
+    while (rayQueryProceedEXT(query)) {
+        if (rayQueryGetIntersectionTypeEXT(query, false)
+            == gl_RayQueryCandidateIntersectionTriangleEXT) {
+            uint slot = rayQueryGetIntersectionInstanceCustomIndexEXT(query, false)
+                      + rayQueryGetIntersectionGeometryIndexEXT(query, false);
+            // A cutout casts the shadow of what survives it, not of its bounding quad — a grate
+            // has to throw bars rather than a rectangle.
+            if (alpha_passes(slot,
+                             rayQueryGetIntersectionPrimitiveIndexEXT(query, false),
+                             rayQueryGetIntersectionBarycentricsEXT(query, false))) {
+                rayQueryConfirmIntersectionEXT(query);
+            }
+        }
+    }
+    return rayQueryGetIntersectionTypeEXT(query, true) != gl_RayQueryCommittedIntersectionNoneEXT;
+}
+
+// How much of a light reaches a point `distance` away.
+//
+// Inverse square, windowed so the contribution reaches exactly zero at the light's radius rather
+// than being clipped there. Morrowind's radius is a hard cutoff in the original engine, and a
+// clipped inverse square leaves a visible edge where the falloff jumps to nothing.
+float attenuation(float distance, float radius) {
+    float ratio = distance / radius;
+    float window = clamp(1.0 - ratio * ratio * ratio * ratio, 0.0, 1.0);
+    // The `+ 1` keeps the singularity at zero distance finite; a light is not a point in practice.
+    return window * window / (distance * distance + 1.0);
 }
 
 void main() {
@@ -174,14 +240,47 @@ void main() {
                   + rayQueryGetIntersectionGeometryIndexEXT(query, true);
         Geometry geom = geometries[slot];
         Material material = materials[geom.material];
-        vec2 uv = surface_uv(geom,
-                             rayQueryGetIntersectionPrimitiveIndexEXT(query, true),
-                             rayQueryGetIntersectionBarycentricsEXT(query, true));
+        vec2 uv;
+        vec3 object_normal;
+        surface_at(geom,
+                   rayQueryGetIntersectionPrimitiveIndexEXT(query, true),
+                   rayQueryGetIntersectionBarycentricsEXT(query, true),
+                   uv, object_normal);
 
-        colour = material.diffuse;
+        vec3 albedo = material.diffuse;
         if (material.base_colour != NO_TEXTURE) {
-            colour *= base_colour(material, uv).rgb;
+            albedo *= base_colour(material, uv).rgb;
         }
+
+        // The normal is interpolated in object space, so it needs the instance's own transform.
+        // Morrowind scales uniformly, which is why the plain matrix works here — a non-uniform
+        // scale would need the inverse transpose instead.
+        mat4x3 to_world = rayQueryGetIntersectionObjectToWorldEXT(query, true);
+        vec3 world_normal = normalize(mat3(to_world) * object_normal);
+        vec3 position = frame.camera_position
+                      + direction * rayQueryGetIntersectionTEXT(query, true);
+
+        // Ambient stands in for every bounce there is no path tracer for yet.
+        colour = albedo * frame.ambient;
+        for (uint i = 0u; i < frame.light_count; ++i) {
+            Light light = lights[i];
+            vec3 to_light = light.position - position;
+            float distance = length(to_light);
+            if (distance >= light.radius) {
+                continue;
+            }
+            vec3 L = to_light / distance;
+            float facing = dot(world_normal, L);
+            if (facing <= 0.0) {
+                continue;
+            }
+            // Offset along the normal so the surface does not shadow itself on its own triangle.
+            if (occluded(position + world_normal * SHADOW_BIAS, L, distance - SHADOW_BIAS)) {
+                continue;
+            }
+            colour += albedo * light.colour * facing * attenuation(distance, light.radius);
+        }
+        colour += material.emissive;
     }
     imageStore(target, pixel, vec4(colour, hit));
 }

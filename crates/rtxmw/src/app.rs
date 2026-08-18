@@ -163,10 +163,11 @@ impl ApplicationHandler for App {
                     return;
                 }
                 println!(
-                    "{}: {} meshes, {} instances",
+                    "{}: {} meshes, {} instances, {} lights",
                     loaded.name,
                     loaded.scene.meshes.len(),
-                    loaded.scene.instances.len()
+                    loaded.scene.instances.len(),
+                    loaded.scene.lights.len()
                 );
                 self.camera = Camera::new(loaded.viewpoint);
             }
@@ -251,6 +252,8 @@ impl ApplicationHandler for App {
                         self.camera.view(),
                         self.camera.projection(renderer.aspect_ratio()),
                         self.camera.position(),
+                        renderer.ambient(),
+                        renderer.light_count(),
                     );
                     if let Err(e) = renderer.draw(size.width, size.height, &constants) {
                         eprintln!("draw failed: {e}");

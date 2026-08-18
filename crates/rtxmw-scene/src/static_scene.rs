@@ -3,13 +3,15 @@
 use std::collections::HashMap;
 
 use glam::{Affine3A, Mat3, Quat, Vec3};
-use rtxmw_esm::{Cell, CellRef, EsmReader, ObjectRecord, Record, RecordName};
+use rtxmw_esm::{Cell, CellRef, EsmReader, LightRecord, ObjectRecord, Record, RecordName};
 use rtxmw_nif::NifFile;
 use rtxmw_vfs::Vfs;
 
 use crate::error::{Result, SceneError};
+use crate::light::{Ambient, Light};
 use crate::material_table::MaterialTable;
 use crate::mesh::{Bounds, Mesh};
+use crate::srgb;
 
 /// Index of a mesh within [`StaticScene::meshes`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -31,23 +33,40 @@ pub struct Instance {
 pub struct ModelIndex {
     /// Lower-cased object id to virtual file system path.
     models: HashMap<String, String>,
+    /// Lower-cased object id to light data, for the `LIGH` records among them.
+    lights: HashMap<String, LightRecord>,
 }
 
 impl ModelIndex {
     /// Scans every placeable record in `esm`.
     pub fn build(esm: &EsmReader<'_>) -> Result<Self> {
+        let light_tag = RecordName::new(b"LIGH");
         let mut models = HashMap::new();
+        let mut lights = HashMap::new();
         for record in esm.records() {
             let record = record?;
             if record.is_deleted() || record.is_ignored() || !ObjectRecord::is_placeable(&record) {
                 continue;
             }
             let object = ObjectRecord::parse(&record)?;
+            let id = object.id.to_lowercase();
             if let Some(path) = object.model_path() {
-                models.insert(object.id.to_lowercase(), path);
+                models.insert(id.clone(), path);
+            }
+            // A light is a placeable object *and* a light: the same record carries the lamp you see
+            // and the illumination it casts, and a cell reference to it places both.
+            if record.name() == light_tag
+                && let Some(light) = LightRecord::parse(&record)?
+            {
+                lights.insert(id, light);
             }
         }
-        Ok(Self { models })
+        Ok(Self { models, lights })
+    }
+
+    /// The light data for `object_id`, if the record is a `LIGH`.
+    pub fn light_of(&self, object_id: &str) -> Option<LightRecord> {
+        self.lights.get(&object_id.to_lowercase()).copied()
     }
 
     /// The mesh path for `object_id`, if it has one.
@@ -78,6 +97,10 @@ pub struct StaticScene {
     pub instances: Vec<Instance>,
     /// Every distinct material and texture the cell's meshes name, shared across all of them.
     pub materials: MaterialTable,
+    /// Point lights placed in the cell, in world space.
+    pub lights: Vec<Light>,
+    /// The cell's fixed lighting. Absent for a cell that declares none.
+    pub ambient: Option<Ambient>,
     /// References skipped because their record had no model, for reporting.
     pub without_model: Vec<String>,
 }
@@ -100,7 +123,13 @@ impl StaticScene {
             if cell.name != cell_name || !cell.is_interior() {
                 continue;
             }
-            return Self::from_cell(&record, models, vfs);
+            let mut scene = Self::from_cell(&record, models, vfs)?;
+            scene.ambient = cell.ambient.map(|a| Ambient {
+                colour: srgb::to_linear(a.ambient),
+                sunlight: srgb::to_linear(a.sunlight),
+                fog: srgb::to_linear(a.fog),
+            });
+            return Ok(scene);
         }
         Err(SceneError::NoSuchCell(cell_name.to_owned()))
     }
@@ -136,6 +165,18 @@ impl StaticScene {
                     id
                 }
             };
+
+            // A `LIGH` reference places both a mesh and the light it casts, and the two are
+            // independent: a lamp whose mesh failed to load should still light the room.
+            if let Some(light) = models.light_of(&cell_ref.object_id)
+                && light.is_placeable()
+            {
+                scene.lights.push(Light {
+                    position: Vec3::from_array(cell_ref.position.translation),
+                    colour: srgb::to_linear(light.colour),
+                    radius: light.radius as f32,
+                });
+            }
 
             // A mesh with nothing visible — a pure collision proxy, say — places no instance.
             if scene.meshes[mesh.0 as usize].is_empty() {
