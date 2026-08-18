@@ -1193,11 +1193,12 @@ the 3×3 active cell grid, distant statics.
 **Note:** this is where TLAS instance counts get large — the point at which wgpu's CPU marshalling
 would have become the bottleneck.
 
-### M10 — Water
-Per-cell water plane, RT reflection and refraction, absorption and scattering.
+### M10 — Water — **done**
+Per-cell water plane, RT reflection and refraction, absorption and scattering, analytic caustics.
 **Done when:** standing on Seyda Neen's shore, the seabed is visible through moving water, the
 surface reflects the sky and the coast, and the frame still fits §5.3.
-**Proposal and plan:** §7.
+**Proposal, plan and what was measured:** §7.
+**Not done:** foam at the shoreline, and sun shafts underwater.
 
 ---
 
@@ -1554,8 +1555,27 @@ caustic, a lens with no throw, and unabsorbed sunlight each fail exactly the tes
 
 **Free, as far as the frame can tell**: 131–133 fps against 131–134 with the water flat.
 
-**Stage 4 — shore and underwater.** Depth fade where water meets land, underwater fog, total
-internal reflection, optionally foam. Last because it is refinement, first in visibility.
+**Stage 4 — shore and underwater — done.** The waterline fades over the last thirty-five units of
+depth, and a camera below the surface fogs every primary ray rather than only what it sees past a
+refraction. Total internal reflection came free at stage 1, out of `refract` returning zero past the
+critical angle.
+
+**The seam is a grazing-angle artefact**, which is what makes it worth fixing and what nearly made
+the test worthless. Looked at from above, three units of water is almost invisible whatever the
+shader does — the first version of the test compared views straight down, passed, and went on
+passing with the fade deleted entirely. Edge-on, Fresnel turns that same water into a mirror, so
+the pixel where the ground all but touches the surface reflects sky while the shore beside it shows
+sand. That step is the line a water plane draws across two cells in five, and the test now measures
+it from the angle where it exists.
+
+Underwater, the *albedo* is dimmed rather than the lighting: the filter divides the lighting by the
+albedo and dimming both would put the water straight back, and what the depth took is a property of
+the path rather than of the light that travelled it.
+
+**M10 is done.** Standing on Seyda Neen's shore: the seabed is visible through moving water, the
+surface reflects the sky and the coast, caustics play on the bottom, and the frame is inside §5.3.
+A precise cost is not worth quoting from this machine — measurements across the session ranged 116
+to 150 fps at 1920x1080 depending on what else held the GPU, against a budget of 125.
 
 ### 7.8 Costs and risks
 

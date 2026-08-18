@@ -257,6 +257,15 @@ const float CAUSTIC_MAX = 3.0;
 // says the true thing anyway: caustics are sharp in a shallow pool and washed out in deep water.
 const float CAUSTIC_MAX_DEPTH = 140.0;
 
+// How little water there has to be before the surface stops being drawn at all, in world units.
+//
+// **The waterline.** Where the ground rises to meet the surface, the depth between them goes to
+// zero, and a pixel of water with no water under it has to come out as exactly the shore beside it
+// — otherwise the plane cuts the terrain along a hard line, which is the classic tell of a water
+// plane and is on screen in 533 of the game's 1,292 land cells. Half a metre of fade is enough to
+// hide the intersection without making the shallows look thin.
+const float SHORE_FADE = 35.0;
+
 // What a refraction ray that hits nothing has travelled through. Longer than the deepest water in
 // the game — the lowest terrain vertex is 2,152 units down — so nothing is ever *less* absorbed for
 // having missed the seabed.
@@ -800,6 +809,15 @@ vec3 water_normal(vec2 p, float time, float footprint) {
     return normalize(vec3(-slope, 1.0));
 }
 
+// What is left of `radiance` after `path` units of water, plus what the water glows back.
+//
+// Beer-Lambert one way and single scattering the other: what the water takes out of a beam it
+// partly returns as its own colour, which is why a deep channel is not simply darker but bluer.
+vec3 absorbed_by_water(vec3 radiance, float path) {
+    vec3 transmittance = exp(-WATER_EXTINCTION * path);
+    return radiance * transmittance + WATER_SCATTER * (1.0 - transmittance) * frame.ambient;
+}
+
 // Radiance leaving a water surface toward whatever traced it.
 //
 // Two rays and no sampling, which is the point: a mirror reflection and a refraction are
@@ -842,9 +860,16 @@ vec3 water_shade(Surface surface, vec3 incident, uvec2 pixel) {
     // surface, so the reflection's distance is discarded.
     // Offset along the *plane*, not the facet: what a ray has to clear to avoid finding this
     // surface again is the quad, and only the plane's normal is guaranteed to take it off that.
-    float discarded;
+    // **Absorption follows whichever ray went into the water, and that flips with the side.** Seen
+    // from above, the refraction dives into it and the reflection leaves into air; from below, the
+    // reflection stays under and the refraction is the sky through Snell's window, which has
+    // travelled no water at all. Attenuating the wrong one turns that window green.
+    float mirrored;
     vec3 reflected = water_ray(surface.position + flat_normal * SHADOW_BIAS, reflect(incident, n),
-                               surface.footprint, pixel, STREAM_WATER_REFLECT, discarded);
+                               surface.footprint, pixel, STREAM_WATER_REFLECT, mirrored);
+    if (from_below) {
+        reflected = absorbed_by_water(reflected, mirrored);
+    }
 
     vec3 through = refract(incident, n, eta);
     if (dot(through, through) < 1e-6) {
@@ -856,13 +881,12 @@ vec3 water_shade(Surface surface, vec3 incident, uvec2 pixel) {
     float depth;
     vec3 behind = water_ray(surface.position - flat_normal * SHADOW_BIAS, through,
                             surface.footprint, pixel, STREAM_WATER_REFRACT, depth);
-    // Beer-Lambert along the path the refracted ray actually travelled, so shallow water is nearly
-    // clear and the same water is opaque where the ground falls away.
-    vec3 transmittance = exp(-WATER_EXTINCTION * depth);
-    vec3 scattered = WATER_SCATTER * (1.0 - transmittance) * frame.ambient;
-    vec3 refracted = behind * transmittance + scattered;
+    vec3 refracted = from_below ? behind : absorbed_by_water(behind, depth);
 
-    return mix(refracted, reflected, fresnel);
+    // With no water left between the surface and the ground, this is the ground. Only from above:
+    // seen from under it, `depth` is a distance through air and says nothing about a shore.
+    float shore = from_below ? 1.0 : smoothstep(0.0, SHORE_FADE, depth);
+    return mix(behind, mix(refracted, reflected, fresnel), shore);
 }
 
 // The cosine-weighted mean radiance arriving at a surface over its hemisphere, one bounce deep.
@@ -937,7 +961,18 @@ void main() {
         lighting = gather_indirect(surface, pixel)
                  + direct_light(surface, pixel, STREAM_DIRECT, SHADOW_SAMPLES);
     }
-    imageStore(albedo_target, ivec2(pixel), vec4(surface.albedo, 1.0));
+    // Under the surface, everything the ray crossed to get here was water. The albedo is dimmed
+    // rather than the lighting, because the filter divides the lighting by it and multiplying both
+    // would put the water back — and what the depth took is a property of the path, not of the
+    // light that travelled it.
+    vec3 albedo = surface.albedo;
+    if (frame.water_level - frame.camera_position.z > 0.0) {
+        float path = surface.hit ? surface.t : WATER_MAX_PATH;
+        emitted = absorbed_by_water(emitted, path);
+        albedo *= exp(-WATER_EXTINCTION * path);
+    }
+
+    imageStore(albedo_target, ivec2(pixel), vec4(albedo, 1.0));
     imageStore(normal_depth_target, ivec2(pixel), vec4(surface.normal, surface.t));
     imageStore(illumination_target, ivec2(pixel), vec4(lighting, 1.0));
     // Alpha carries whether anything was hit at all. Inferring it from the colour worked while the

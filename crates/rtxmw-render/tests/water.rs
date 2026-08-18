@@ -390,3 +390,93 @@ fn the_caustic_pattern_sharpens_with_depth() {
         "caustics should be far stronger at depth: {deep} against {shallow}"
     );
 }
+
+#[test]
+fn the_waterline_leaves_no_seam_where_the_ground_meets_the_surface() {
+    // **Edge-on, which is where the seam actually shows.** Looked at from above, three units of
+    // water is nearly invisible whatever the shader does; at a glancing angle Fresnel turns the
+    // same water into a mirror, so the pixel where the ground all but touches the surface reflects
+    // the sky while the shore beside it shows sand. That step is the line the plane draws across
+    // two cells in five, and closing it is what this checks.
+    let eye = Vec3::new(0.0, -2000.0, 30.0);
+    let forward = Vec3::new(0.0, 1.0, -0.014).normalize();
+    let sand = Material {
+        diffuse: Vec3::splat(0.5),
+        ..Material::default()
+    };
+    // Three units of water, not zero: a floor exactly coplanar with the surface is a degenerate
+    // scene, and the question here is what happens as the depth vanishes rather than at nothing.
+    let mut touching = flooded(3.0, sand);
+    touching.sun = Some(Sun {
+        direction: Vec3::NEG_Z,
+        colour: Vec3::splat(2.0),
+        angular_radius: 0.0,
+    });
+    let dry = seabed(3.0, false);
+
+    let with_water = mean_green(&frame_at(&touching, eye, forward, 0.0));
+    let without = mean_green(&frame_at(&dry, eye, forward, 0.0));
+    let difference = (with_water - without).abs() / without;
+    assert!(
+        difference < 0.05,
+        "water over no water must look like no water: {with_water} against {without}"
+    );
+}
+
+#[test]
+fn looking_through_water_from_under_it_fades_with_distance() {
+    // The camera below the surface, so the whole primary ray is under water rather than only the
+    // part past a refraction. What it sees has to dim with how far away it is.
+    let scene = seabed(600.0, true);
+    let near = mean_green(&frame_at(
+        &scene,
+        Vec3::new(0.0, 0.0, -400.0),
+        Vec3::NEG_Z,
+        0.0,
+    ));
+    let far = mean_green(&frame_at(
+        &scene,
+        Vec3::new(0.0, 0.0, -100.0),
+        Vec3::NEG_Z,
+        0.0,
+    ));
+
+    // The floor is 200 units below the near camera and 500 below the far one. Green survives
+    // `exp(-0.001429 * 200)` = 0.752 of the first and `exp(-0.001429 * 500)` = 0.489 of the
+    // second, so the further view keeps about 65% of what the nearer one does.
+    let ratio = far / near;
+    let expected = (-0.001429f32 * 300.0).exp();
+    assert!(
+        (ratio - expected).abs() < 0.12,
+        "the far view should keep about {expected} of the near one, got {ratio} \
+         ({far} against {near})"
+    );
+}
+
+#[test]
+fn the_sky_through_snells_window_has_travelled_no_water() {
+    // Looking up from under the surface, the refracted ray is in *air* — it is the sky, seen
+    // through the window the critical angle leaves. Attenuating it as though it had crossed the
+    // water is the easy mistake, and it turns the one bright thing down there green.
+    //
+    // The sky is made bright and the seabed dark so the two cannot be confused for one another.
+    let mut scene = flooded(
+        800.0,
+        Material {
+            diffuse: Vec3::ZERO,
+            ..Material::default()
+        },
+    );
+    scene.ambient = Some(rtxmw_scene::Ambient {
+        colour: Vec3::splat(0.8),
+        ..rtxmw_scene::Ambient::default()
+    });
+
+    // Just under the surface looking straight up, where the window is widest and the water between
+    // the camera and it is a few units rather than a few hundred.
+    let up = mean_green(&frame_at(&scene, Vec3::new(0.0, 0.0, -12.0), Vec3::Z, 0.0));
+    assert!(
+        up > 0.4,
+        "the sky through the surface should be close to the sky itself, got {up}"
+    );
+}
