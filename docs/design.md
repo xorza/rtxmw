@@ -1572,6 +1572,19 @@ Underwater, the *albedo* is dimmed rather than the lighting: the filter divides 
 albedo and dimming both would put the water straight back, and what the depth took is a property of
 the path rather than of the light that travelled it.
 
+**A ribbon of flat colour along every waterline**, found by looking at a screenshot rather than at
+a test. The refraction ray was offset to the *far* side of the plane, so wherever the bed sat nearer
+the surface than the 1.5-unit offset itself, the ray began under the ground, travelled down through
+open air and reported water of unbounded depth — which shades as pure scattering colour. On a gentle
+shore that band is metres wide. Both water rays now leave from the viewer's side and are traced
+against solid geometry only, which is what makes that legal: culling water from its own reflection
+and refraction removes the self-intersection the offset existed to avoid, and removes the
+"water behind water" case with it.
+
+The lesson is where the bug was found. Every test passed throughout: the waterline test used three
+units of water, twice the offset, and the artefact lives below it. It now checks both sides of that
+number.
+
 **M10 is done.** Standing on Seyda Neen's shore: the seabed is visible through moving water, the
 surface reflects the sky and the coast, caustics play on the bottom, and the frame is inside §5.3.
 A precise cost is not worth quoting from this machine — measurements across the session ranged 116

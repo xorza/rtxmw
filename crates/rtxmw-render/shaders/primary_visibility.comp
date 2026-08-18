@@ -42,8 +42,9 @@ struct Material {
 const uint KIND_DIFFUSE = 0u;
 const uint KIND_WATER = 1u;
 
-// Instance mask bits. A ray asking for `MASK_SOLID` alone cannot see water.
+// Instance mask bits. A ray asking for `MASK_SOLID` alone cannot see water; `MASK_ANY` sees all.
 const uint MASK_SOLID = 0x01u;
+const uint MASK_ANY = 0xFFu;
 
 // Scalar layout so these match the host structs field for field. Under the default std430 rules a
 // `vec3` would be padded to sixteen bytes and every entry after the first would be misread.
@@ -691,7 +692,7 @@ vec3 sky(vec3 direction) {
 //
 // `cone_width` is the footprint the ray already carries at its origin and `cone_spread` how fast it
 // widens per unit travelled; together they pick the mip a hit samples.
-Surface trace(vec3 origin, vec3 direction, float cone_width, float cone_spread) {
+Surface trace(vec3 origin, vec3 direction, float cone_width, float cone_spread, uint mask) {
     // Every field has to hold something before the miss returns below, and on a miss none of them
     // is read — `hit` is what a caller branches on. So these are zeroes rather than plausible
     // stand-ins, which would invite someone to use one.
@@ -708,7 +709,7 @@ Surface trace(vec3 origin, vec3 direction, float cone_width, float cone_spread) 
     // No blanket opacity flag: the per-geometry `OPAQUE` bits the build set from each material are
     // what decide this. Forcing it here would override them and put the cutout back.
     rayQueryEXT query;
-    rayQueryInitializeEXT(query, scene, gl_RayFlagsNoneEXT, 0xFF,
+    rayQueryInitializeEXT(query, scene, gl_RayFlagsNoneEXT, mask,
                           origin, RAY_MIN, direction, RAY_MAX);
     // Duplicated in `occluded`, which the language forces — see the note there.
     while (rayQueryProceedEXT(query)) {
@@ -772,8 +773,12 @@ Surface trace(vec3 origin, vec3 direction, float cone_width, float cone_spread) 
 // Shaded but not bounced, terminated with the flat ambient a diffuse bounce ends with — the light
 // reaching the seabed through two more surfaces is not what anyone is looking at.
 //
-// Water hit again comes back as sky. GLSL has no recursion, and one sea at one level is what the
-// game has: a second water surface behind the first is a case that does not arise.
+// **Solid geometry only.** GLSL has no recursion, so water behind water could not be shaded anyway
+// — and culling it is what lets both rays start on the *viewer's* side of the plane. That matters
+// more than it sounds: pushed to the far side instead, a refraction ray at a shore begins below
+// ground wherever the bed is nearer the surface than the offset itself, then travels down through
+// open air and reports water of infinite depth. On a gentle slope that band is metres wide, and it
+// drew a flat ribbon of scattering colour along the whole waterline.
 vec3 water_ray(vec3 origin, vec3 direction, float footprint, uvec2 pixel, uint salt,
                out float travelled) {
     // The pixel's own cone, not a bounce's. **A reflection and a refraction are specular**: they
@@ -781,9 +786,9 @@ vec3 water_ray(vec3 origin, vec3 direction, float footprint, uvec2 pixel, uint s
     // wants the coarse mip that goes with it. Tracing these at the bounce rate put a seabed a
     // hundred units down under a hundred-unit footprint — every texture at its top mip, and every
     // wave averaged out of the caustics that the same footprint governs.
-    Surface hit = trace(origin, direction, footprint, frame.cone_spread);
+    Surface hit = trace(origin, direction, footprint, frame.cone_spread, MASK_SOLID);
     travelled = hit.hit ? hit.t : WATER_MAX_PATH;
-    if (!hit.hit || hit.water) {
+    if (!hit.hit) {
         return sky(direction);
     }
     return shade(hit, frame.ambient, pixel, salt, BOUNCE_SHADOW_SAMPLES);
@@ -879,7 +884,7 @@ vec3 water_shade(Surface surface, vec3 incident, uvec2 pixel) {
     }
 
     float depth;
-    vec3 behind = water_ray(surface.position - flat_normal * SHADOW_BIAS, through,
+    vec3 behind = water_ray(surface.position + flat_normal * SHADOW_BIAS, through,
                             surface.footprint, pixel, STREAM_WATER_REFRACT, depth);
     vec3 refracted = from_below ? behind : absorbed_by_water(behind, depth);
 
@@ -909,7 +914,7 @@ vec3 gather_indirect(Surface surface, uvec2 pixel) {
     for (uint b = 0u; b < frame.bounce_samples; ++b) {
         vec2 u = unit_pair(hash(uvec4(pixel, STREAM_BOUNCE, b)));
         Surface bounce = trace(origin, cosine_direction(surface.normal, u), surface.footprint,
-                               BOUNCE_SPREAD);
+                               BOUNCE_SPREAD, MASK_ANY);
         // Water counts as an escape rather than a surface: it has no albedo of its own, so
         // shading it here would return black, and what a bounce ray actually finds there is the
         // sky reflected off it or the ground through it — both far closer to the ambient this
@@ -944,7 +949,7 @@ void main() {
     vec4 target_point = frame.inverse_view_projection * vec4(screen_uv * 2.0 - 1.0, 1.0, 1.0);
     vec3 direction = normalize(target_point.xyz / target_point.w - frame.camera_position);
 
-    Surface surface = trace(frame.camera_position, direction, 0.0, frame.cone_spread);
+    Surface surface = trace(frame.camera_position, direction, 0.0, frame.cone_spread, MASK_ANY);
 
     // A miss contributes only the sky, and writes zeroes across the G-buffer rather than leaving
     // it alone. That is not tidiness: the filter reads a neighbourhood, and an untouched pixel

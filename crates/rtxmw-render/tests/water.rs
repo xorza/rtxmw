@@ -400,27 +400,22 @@ fn the_waterline_leaves_no_seam_where_the_ground_meets_the_surface() {
     // two cells in five, and closing it is what this checks.
     let eye = Vec3::new(0.0, -2000.0, 30.0);
     let forward = Vec3::new(0.0, 1.0, -0.014).normalize();
-    let sand = Material {
-        diffuse: Vec3::splat(0.5),
-        ..Material::default()
-    };
-    // Three units of water, not zero: a floor exactly coplanar with the surface is a degenerate
-    // scene, and the question here is what happens as the depth vanishes rather than at nothing.
-    let mut touching = flooded(3.0, sand);
-    touching.sun = Some(Sun {
-        direction: Vec3::NEG_Z,
-        colour: Vec3::splat(2.0),
-        angular_radius: 0.0,
-    });
-    let dry = seabed(3.0, false);
+    // Two depths, either side of the offset a ray is pushed off a surface by — 1.5 units. Below
+    // it, a refraction ray started on the far side of the plane would begin *under the ground*,
+    // travel down through open air and report water of unbounded depth; on a gentle shore that
+    // band is metres wide and drew a flat ribbon of scattering colour along the whole waterline.
+    for depth in [0.6f32, 3.0] {
+        let covered = seabed(depth, true);
+        let dry = seabed(depth, false);
 
-    let with_water = mean_green(&frame_at(&touching, eye, forward, 0.0));
-    let without = mean_green(&frame_at(&dry, eye, forward, 0.0));
-    let difference = (with_water - without).abs() / without;
-    assert!(
-        difference < 0.05,
-        "water over no water must look like no water: {with_water} against {without}"
-    );
+        let with_water = mean_green(&frame_at(&covered, eye, forward, 0.0));
+        let without = mean_green(&frame_at(&dry, eye, forward, 0.0));
+        let difference = (with_water - without).abs() / without;
+        assert!(
+            difference < 0.05,
+            "{depth} units of water must look like no water: {with_water} against {without}"
+        );
+    }
 }
 
 #[test]
