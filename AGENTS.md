@@ -74,7 +74,7 @@ The performance target is **1920×1080 internal → 3840×2160 output at 60 fps*
 ### Per-frame heap allocations are a tracked metric
 
 **Steady-state frames must allocate zero times on the heap.** This is enforced, not aspirational:
-`crates/rtxmw-gpu/tests/frame_allocations.rs` runs the frame path under the `dhat` heap profiler and
+`crates/rtxmw-render/tests/frame_allocations.rs` runs the frame path under the `dhat` heap profiler and
 fails if the measured window allocates at all. It is a `#[test]`, not a benchmark — the property is
 pass/fail rather than a wall-clock measurement, and keeping it out of criterion keeps compile times
 down.
@@ -93,8 +93,12 @@ started failing" is not.
 
 When it fails, the test writes `dhat-heap.json`; open it with
 <https://nnethercote.github.io/dh_view/dh_view.html> and sort by "Total (blocks)" to find the call
-site. Note the test currently covers record-and-submit only; swapchain acquire and present need a
-window, so fold them in once there is a headless path through the real frame loop.
+site.
+
+It measures **a whole frame of the real renderer with a stationary camera** — building the frame
+constants, recording the trace, submitting it, waiting for it — against the shipped cell where the
+game is installed and a small lit scene where it is not. Only swapchain acquire and present are
+outside it, because they need a surface.
 
 ### Game data
 

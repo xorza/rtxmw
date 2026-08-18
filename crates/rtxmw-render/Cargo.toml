@@ -18,6 +18,11 @@ rtxmw-scene.workspace = true
 rtxmw-texture.workspace = true
 
 [dev-dependencies]
+dhat.workspace = true
 rtxmw-esm.workspace = true
 rtxmw-gpu = { workspace = true, features = ["internals"] }
 rtxmw-vfs = { workspace = true, features = ["internals"] }
+
+# Installs a global allocator, so it needs its own binary.
+[[test]]
+name = "frame_allocations"

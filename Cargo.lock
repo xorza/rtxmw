@@ -1293,7 +1293,6 @@ version = "0.1.0"
 dependencies = [
  "ash",
  "ash-window",
- "dhat",
  "gpu-allocator",
  "half",
  "png",
@@ -1313,6 +1312,7 @@ version = "0.1.0"
 dependencies = [
  "ash",
  "bytemuck",
+ "dhat",
  "glam",
  "rtxmw-esm",
  "rtxmw-gpu",

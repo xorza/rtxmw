@@ -7,15 +7,15 @@
 
 use ash::vk;
 use glam::{Affine3A, Vec2, Vec3};
-use rtxmw_esm::EsmReader;
 use rtxmw_gpu::{TestGpu, readback};
 use rtxmw_render::SceneRenderer;
 use rtxmw_scene::{
-    AlphaMode, Ambient, Instance, Light, Material, MaterialTable, Mesh, MeshId, ModelIndex,
-    StaticScene, Submesh, TextureId,
+    AlphaMode, Ambient, Instance, Light, Material, Mesh, MeshId, StaticScene, Submesh, TextureId,
 };
 use rtxmw_texture::{Texture, TextureFormat};
-use rtxmw_vfs::{DATA_DIR_VAR, morrowind_archives, morrowind_data_dir};
+use rtxmw_vfs::DATA_DIR_VAR;
+
+mod common;
 
 const CELL: &str = "Seyda Neen, Census and Excise Office";
 const WIDTH: u32 = 256;
@@ -55,25 +55,9 @@ fn wall(x: f32, y: std::ops::Range<f32>, z: std::ops::Range<f32>) -> Mesh {
     }
 }
 
-/// Assembles a `StaticScene` from loose parts, so a test can describe one without a content file.
-fn scene_of(meshes: &[Mesh], materials: &[Material], instances: &[Instance]) -> StaticScene {
-    let mut table = MaterialTable::default();
-    for material in materials {
-        table.intern(*material);
-    }
-    StaticScene {
-        meshes: meshes.to_vec(),
-        instances: instances.to_vec(),
-        materials: table,
-        lights: Vec::new(),
-        ambient: None,
-        without_model: Vec::new(),
-    }
-}
-
 /// Traces `instances` from `eye` looking along `forward` and returns the image as 8-bit RGBA.
 fn trace(meshes: &[Mesh], instances: &[Instance], eye: Vec3, forward: Vec3) -> Vec<u8> {
-    let mut scene = scene_of(meshes, &[Material::default()], instances);
+    let mut scene = common::scene_of(meshes, &[Material::default()], instances);
     // Full ambient and no lights, so an unlit trace shows albedo unchanged — which is what every
     // test written before lighting existed is asserting about.
     scene.ambient = Some(Ambient {
@@ -92,7 +76,7 @@ fn trace_textured(
     eye: Vec3,
     forward: Vec3,
 ) -> Vec<u8> {
-    let mut scene = scene_of(meshes, materials, instances);
+    let mut scene = common::scene_of(meshes, materials, instances);
     scene.ambient = Some(Ambient {
         colour: Vec3::ONE,
         ..Ambient::default()
@@ -112,7 +96,7 @@ fn trace_lit(
     eye: Vec3,
     forward: Vec3,
 ) -> Vec<u8> {
-    let mut scene = scene_of(meshes, materials, instances);
+    let mut scene = common::scene_of(meshes, materials, instances);
     scene.lights = lights.to_vec();
     scene.ambient = Some(Ambient {
         colour: ambient,
@@ -740,15 +724,11 @@ fn a_shadow_edge_is_soft_rather_than_binary() {
 
 #[test]
 fn a_real_interior_traces_to_a_recognisable_image() {
-    let Some(data) = morrowind_data_dir() else {
+    let Some(cell) = common::load_cell(CELL) else {
         eprintln!("skipping: {DATA_DIR_VAR} is not configured (set it, or add it to .env)");
         return;
     };
-    let vfs = morrowind_archives().expect("the game is available");
-    let bytes = std::fs::read(data.join("Morrowind.esm")).expect("Morrowind.esm should read");
-    let esm = EsmReader::new(&bytes).expect("should parse");
-    let models = ModelIndex::build(&esm).expect("model index should build");
-    let scene = StaticScene::load_interior(&esm, &models, &vfs, CELL).expect("cell should load");
+    let scene = cell.scene;
 
     // The centre of the cell's own geometry, which for this office lands inside the larger room.
     // There is no general "stand here" rule without tracing probe rays, so this is a fixture choice
@@ -758,20 +738,8 @@ fn a_real_interior_traces_to_a_recognisable_image() {
         .expect("a furnished cell has geometry")
         .centre();
 
-    // Decode every texture the cell names. The 45 dangling references across the whole library are
-    // why this is `Option`: a miss becomes the fallback slot rather than a failure.
-    let mut textures = Vec::with_capacity(scene.materials.textures().len());
-    let mut missing = 0usize;
-    for path in scene.materials.textures() {
-        let decoded = vfs
-            .read(path)
-            .ok()
-            .and_then(|bytes| Texture::decode(&bytes).ok());
-        if decoded.is_none() {
-            missing += 1;
-        }
-        textures.push(decoded);
-    }
+    let textures = cell.textures;
+    let missing = textures.iter().filter(|t| t.is_none()).count();
 
     let pixels = trace_lit(
         &scene.meshes,

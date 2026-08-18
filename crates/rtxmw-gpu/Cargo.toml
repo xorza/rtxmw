@@ -20,11 +20,3 @@ gpu-allocator.workspace = true
 half.workspace = true
 png.workspace = true
 raw-window-handle.workspace = true
-
-[dev-dependencies]
-dhat.workspace = true
-
-# Needs the offscreen harness, and installs a global allocator — hence its own binary.
-[[test]]
-name = "frame_allocations"
-required-features = ["internals"]
