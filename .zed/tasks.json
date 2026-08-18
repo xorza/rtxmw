@@ -1,6 +1,6 @@
 [
   {
-    "label": "run rtxmw (debug)",
+    "label": "run rtxmw customs",
     "command": "cargo",
     "args": [
       "run",
@@ -16,14 +16,12 @@
     "reveal": "always"
   },
   {
-    "label": "run rtxmw (release-max)",
+    "label": "run rtxmw seyda need",
     "command": "cargo",
     "args": [
       "run",
       "-p",
       "rtxmw",
-      "--profile",
-      "release-max",
       "--",
       "-2,-9"
     ],
