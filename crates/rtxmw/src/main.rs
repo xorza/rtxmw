@@ -8,10 +8,12 @@ mod scene_loader;
 
 use std::path::PathBuf;
 
+use glam::Vec3;
 use rtxmw_scene::CellId;
 use winit::event_loop::{ControlFlow, EventLoop};
 
 use crate::app::App;
+use crate::scene_loader::ViewpointOverride;
 
 /// Resolution of a `--screenshot` render when none is given, independent of any window.
 ///
@@ -25,7 +27,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // is an interior's name.
     //
     //     rtxmw [CELL] [--frames N]
-    //     rtxmw --screenshot <path> [WIDTHxHEIGHT] [CELL]
+    //     rtxmw --screenshot <path> [WIDTHxHEIGHT] [CELL] [--at X,Y,Z] [--look X,Y,Z]
     //
     // `--screenshot` renders one frame offscreen and exits, opening no window. The device it brings
     // up has no surface at all, so it works over ssh and in a script.
@@ -95,6 +97,12 @@ pub(crate) struct ScreenshotOptions {
     pub(crate) width: u32,
     pub(crate) height: u32,
     pub(crate) cell: CellId,
+    /// Where to stand and which way to face, in as much as the caller said.
+    ///
+    /// A screenshot's whole value is being able to look at what someone reported, and what they
+    /// report is rarely visible from the doorway — a canopy artefact needs the camera inside the
+    /// tree. Without this the only way there is the windowed binary, by hand, unrepeatably.
+    pub(crate) viewpoint: ViewpointOverride,
 }
 
 impl ScreenshotOptions {
@@ -103,13 +111,42 @@ impl ScreenshotOptions {
     /// Positional throughout, unlike the windowed mode's: a path, then a size, then a cell. The
     /// size has to precede the cell because an interior's name can be anything at all, so there is
     /// nothing to tell one from the other by.
+    ///
+    /// `--at X,Y,Z` and `--look X,Y,Z` may follow, and are the one exception — an interior's name
+    /// could be anything, so a viewpoint has to be flagged rather than counted.
     fn parse(arguments: &[String]) -> Result<Self, String> {
         let mut rest = arguments.iter();
         let path = PathBuf::from(
             rest.next()
                 .ok_or("--screenshot needs a path to write the image to")?,
         );
-        let (width, height) = match rest.next() {
+        let mut positional: Vec<&String> = Vec::new();
+        let mut at = None;
+        let mut look = None;
+        while let Some(argument) = rest.next() {
+            let mut vector = |what: &str| -> Result<Vec3, String> {
+                let value = rest
+                    .next()
+                    .ok_or_else(|| format!("{what} needs an X,Y,Z"))?;
+                let parts: Vec<&str> = value.split(',').collect();
+                let malformed = || format!("expected {what} X,Y,Z, got {value:?}");
+                let [x, y, z] = parts[..] else {
+                    return Err(malformed());
+                };
+                Ok(Vec3::new(
+                    x.parse().map_err(|_| malformed())?,
+                    y.parse().map_err(|_| malformed())?,
+                    z.parse().map_err(|_| malformed())?,
+                ))
+            };
+            match argument.as_str() {
+                "--at" => at = Some(vector("--at")?),
+                "--look" => look = Some(vector("--look")?),
+                _ => positional.push(argument),
+            }
+        }
+        let mut positional = positional.into_iter();
+        let (width, height) = match positional.next() {
             None => SCREENSHOT_SIZE,
             Some(size) => {
                 let malformed = || format!("expected a size like 1920x1080, got {size:?}");
@@ -126,7 +163,11 @@ impl ScreenshotOptions {
             path,
             width,
             height,
-            cell: scene_loader::cell_argument(rest.next().map(String::as_str)),
+            cell: scene_loader::cell_argument(positional.next().map(String::as_str)),
+            viewpoint: ViewpointOverride {
+                position: at,
+                forward: look,
+            },
         })
     }
 }
@@ -134,8 +175,13 @@ impl ScreenshotOptions {
 /// Renders one frame offscreen from the arguments after `--screenshot`.
 fn screenshot(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let options = ScreenshotOptions::parse(arguments)?;
-    let hit_fraction =
-        headless::screenshot(&options.path, options.width, options.height, options.cell)?;
+    let hit_fraction = headless::screenshot(
+        &options.path,
+        options.width,
+        options.height,
+        options.cell,
+        options.viewpoint,
+    )?;
     println!(
         "wrote {} ({:.0}% of rays hit geometry)",
         options.path.display(),
@@ -191,6 +237,47 @@ mod tests {
     }
 
     #[test]
+    fn a_screenshot_can_be_told_where_to_stand_and_which_way_to_look() {
+        // Flagged rather than positional, and so allowed anywhere among the positional arguments:
+        // an interior's name can be any string, so a fourth positional could not be told from it.
+        assert_eq!(
+            screenshot_options(&["out.png", "--at", "10,20,30", "640x480", "--look", "0,-1,0"]),
+            Ok(ScreenshotOptions {
+                path: PathBuf::from("out.png"),
+                width: 640,
+                height: 480,
+                cell: interior(scene_loader::DEFAULT_CELL),
+                viewpoint: ViewpointOverride {
+                    position: Some(Vec3::new(10.0, 20.0, 30.0)),
+                    forward: Some(Vec3::NEG_Y),
+                },
+            })
+        );
+        // Either half on its own: what is not said is left to the cell rather than made up here,
+        // so asking only to turn on the spot is a thing that can be asked.
+        assert_eq!(
+            screenshot_options(&["out.png", "--at", "1,2,3"])
+                .expect("should parse")
+                .viewpoint,
+            ViewpointOverride {
+                position: Some(Vec3::new(1.0, 2.0, 3.0)),
+                forward: None,
+            }
+        );
+        assert_eq!(
+            screenshot_options(&["out.png", "--look", "0,0,-1"])
+                .expect("should parse")
+                .viewpoint,
+            ViewpointOverride {
+                position: None,
+                forward: Some(Vec3::NEG_Z),
+            }
+        );
+        assert!(screenshot_options(&["out.png", "--at", "1,2"]).is_err());
+        assert!(screenshot_options(&["out.png", "--at"]).is_err());
+    }
+
+    #[test]
     fn a_screenshot_takes_a_path_then_a_size_then_a_cell() {
         assert_eq!(
             screenshot_options(&["out.png"]),
@@ -199,6 +286,7 @@ mod tests {
                 width: SCREENSHOT_SIZE.0,
                 height: SCREENSHOT_SIZE.1,
                 cell: interior(scene_loader::DEFAULT_CELL),
+                viewpoint: ViewpointOverride::default(),
             })
         );
         assert_eq!(
@@ -208,6 +296,7 @@ mod tests {
                 width: 1920,
                 height: 1080,
                 cell: CellId::Exterior { x: -2, y: -9 },
+                viewpoint: ViewpointOverride::default(),
             })
         );
 

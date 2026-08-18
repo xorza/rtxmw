@@ -16,16 +16,21 @@ use rtxmw_render::SceneRenderer;
 use rtxmw_scene::{CellId, CellStreamer, LoadedCell};
 
 use crate::scene_loader;
+use crate::scene_loader::{Viewpoint, ViewpointOverride};
 
 /// Renders the default cell once and writes it to `path` as a PNG.
 ///
 /// Returns the fraction of pixels that hit geometry, which is enough to tell "the cell rendered"
 /// from "the camera was pointed at nothing" without opening the file.
+///
+/// `viewpoint` says where the camera stands and which way it faces; whatever it leaves out is where
+/// a traveller entering the cell would stand and what they would be looking at.
 pub(crate) fn screenshot(
     path: &Path,
     width: u32,
     height: u32,
     cell: CellId,
+    viewpoint: ViewpointOverride,
 ) -> Result<f32, Box<dyn std::error::Error>> {
     // No surface extensions and no swapchain: this device could not present if asked.
     let instance = Instance::new(c"rtxmw", &[], Validation::for_build())?;
@@ -56,7 +61,7 @@ pub(crate) fn screenshot(
         &cell.id,
     )?;
 
-    let camera = scene_loader::Viewpoint::entering(&cell).camera();
+    let camera = viewpoint.over(Viewpoint::entering(&cell)).camera();
     let constants = renderer.frame_constants(
         camera.view(),
         camera.projection(width as f32 / height as f32),

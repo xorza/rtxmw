@@ -1696,6 +1696,75 @@ Edges are keyed by quantised *position*, not by vertex index. Morrowind splits v
 texture seam, so two triangles sharing an edge routinely name four different vertices for it —
 counted by index, every seam reads as a border and every solid as cloth.
 
+### 7.11 The shading normal faces the ray
+
+The dark dust over every tree, the speckle on the interior tapestries and the sparkle along a rug's
+edge were one defect, and it was neither the denoiser nor the alpha cutout that the shape of it kept
+suggesting. **The shading normal was whichever way the vertices were authored, so a surface hit from
+its far side reported the light landing on its near one** — lit through its own body. Morrowind's
+foliage is thousands of single cards packed below a pixel apiece, wound every which way; neighbouring
+pixels landing on cards facing opposite ways came back at opposite brightnesses, and that is the
+dust.
+
+The normal now faces the ray, which is what `gl_FrontFacing` does for every rasteriser. It could not
+be done before §7.9: while ray offsets were taken along the shading normal, turning it toward the
+viewer sent shadow rays out from under the surface and blacked out `Seyda Neen, Census and Excise
+Office` — nine distinct shades where there were hundreds. With offsets on the triangle's own plane
+and chosen per ray direction, the two are independent and the interior keeps its forty thousand.
+
+**Which side the ray met is decided by the triangle's plane, not by the normal being turned.** Doing
+it the other way is the obvious reading and it is wrong: an interpolated normal near a silhouette can
+point away from a face the camera is looking straight at, so the test flips part of a surface and not
+the rest, along a seam that slides across the floor as the camera moves. A rug seen from across a
+room grew a hard dark band down the middle of it. A plane cannot disagree with itself that way —
+either the ray met the front of the triangle or it met the back.
+
+That rests on the winding agreeing with the authored normals, which nothing in the format enforces,
+so it is measured rather than assumed: **77 of 60,215 triangles** across a furnished interior and a
+stretch of shore are wound against their own normals, a fifth of a percent. Three of this repo's own
+*fixtures* were, though — quads written normals-first with the indices copied from a neighbour — and
+they had never been wrong before, because nothing consulted a winding until now.
+
+Getting there cost five wrong answers, each cheap to test and each ruled out by one render:
+
+| suspected | measured |
+|---|---|
+| alpha cutout coin-flipping per pixel | cutoff swept 0.15/0.5/0.85: 17.8 / 19.0 / 17.1 — real but a tenth of it |
+| the mip level the cutout is tested at | +3 levels of bias: 19.0 → 17.3, and visually unchanged |
+| alpha coverage drifting across mip levels | corrected to hold at 44%: 19.0 → 19.8, *worse* |
+| the indirect gather being under-sampled | 4 → 64 bounce samples: dust unchanged, so not stochastic at all |
+| shadow rays through the canopy | sun forced fully visible: dust unchanged |
+
+The one that mattered was rendering **albedo alone**, which came back clean: whatever it was lived in
+the lighting, not the surface. From there the sun could be ruled out, and what remained was the
+cosine.
+
+Two things found along the way and deliberately not acted on. Morrowind's cutout art is black
+wherever it is transparent — in the canopy texture, 1,449 of the 1,635 fully transparent blocks
+against one of the 955 opaque ones — so a filtering sampler mixes black into every leaf edge;
+dividing it back out by the alpha changed nothing measurable and was dropped. And `NiStencilProperty`
+would have named which surfaces are two-sided outright, except that the three shipped archives
+contain **no** stencil property at all, so there is no authored answer to read.
+
+### 7.12 The alpha mode says which surfaces are sheets
+
+§7.10's shape test finds a rug and a sail and cannot find a tree. A canopy is hundreds of leaf cards
+joined at the branches, and the cupped cluster they make wraps as much air as a shell around a room
+does — `Flora_BC_Tree_02` scores 0.031 against a cube's 0.068, on the solid side of any threshold
+that keeps a room solid. Splitting the run into connected pieces does not help, because the cards
+really are connected. Measured as geometry, a tree is a solid, and every card facing away from the
+sun is in shade.
+
+**The material knows.** A run whose alpha is anything but opaque is a cutout, and Morrowind has no
+solid cutouts: the mode is set on foliage, thatch, banners, grates and glass, every one of them a
+single layer with nothing behind it. It is authored rather than inferred, it costs a lookup, and it
+is the only signal that catches a canopy. The shape test stays for the opaque sheets — a rug, a
+tapestry, a sail — that carry no alpha to be read.
+
+Together they mark 47 of the shore's 419 runs and 50 of the Census Office's 308. The tree comes out
+3 runs of 5, the other two being the trunk and boughs, which hold most of its triangles. Backlit
+foliage is 27% brighter with no measurable change in noise.
+
 ### 7.8 Costs and risks
 
 - **Water pixels cost roughly twice.** Two rays instead of one, each spawning its own shadow rays.

@@ -561,8 +561,6 @@ struct Surface {
     vec3 geometric;
     // A sheet rather than the skin of something solid, which is what makes it lit from both sides.
     bool thin;
-    // The direction the ray arrived along, which is the only record of which side the viewer is on.
-    vec3 incident;
 };
 
 // One wave component at a point: how much of it the ray cone can still resolve, its wavenumber, and
@@ -848,7 +846,6 @@ Surface trace(vec3 origin, vec3 direction, float cone_width, float cone_spread, 
     surface.water = false;
     surface.geometric = vec3(0.0, 0.0, 1.0);
     surface.thin = false;
-    surface.incident = direction;
 
     // No blanket opacity flag: the per-geometry `OPAQUE` bits the build set from each material are
     // what decide this. Forcing it here would override them and put the cutout back.
@@ -900,6 +897,18 @@ Surface trace(vec3 origin, vec3 direction, float cone_width, float cone_spread, 
     // matrix carries a cross product correctly here for the same reason it carries the normal.
     surface.geometric = normalize(mat3(to_world) * cross(positions[verts.y] - positions[verts.x],
                                                         positions[verts.z] - positions[verts.x]));
+    // Turned to the side the ray came from, so a surface met from behind is shaded as its back
+    // rather than reporting the light landing on its front. Morrowind's foliage is thousands of
+    // single cards wound every which way, and without this two neighbouring pixels landing on
+    // oppositely wound cards come back at opposite brightnesses — the dust over every tree.
+    //
+    // **Decided by the triangle's plane, not by the normal being turned.** An interpolated normal
+    // near a silhouette can point away from a face that is squarely toward the viewer, so testing
+    // it against the ray flips part of a surface and not the rest, along a seam that slides as the
+    // camera moves. A rug seen at a grazing angle gets a hard band of wrong shading across it.
+    // The plane cannot disagree with itself that way: either the ray met the front of the triangle
+    // or it met the back.
+    surface.normal = faceforward(surface.normal, direction, surface.geometric);
     surface.position = origin + direction * hit_t;
     surface.footprint = cone_width + hit_t * cone_spread;
     surface.t = hit_t;
@@ -1078,13 +1087,6 @@ vec3 water_shade(Surface surface, vec3 incident, uvec2 pixel) {
 
 // The cosine-weighted mean radiance arriving at a surface over its hemisphere, one bounce deep.
 //
-// The hemisphere a hit gathers over: its own normal, unless it is a sheet, in which case the face
-// the ray came from — a sheet has no inside for its normal to be pointing into.
-vec3 gathering_side(Surface surface) {
-    return surface.thin ? faceforward(surface.normal, surface.incident, surface.normal)
-                        : surface.normal;
-}
-
 // Multiplying this by albedo is the whole indirect term: sampling by the cosine cancels both the
 // cosine in the rendering equation and the `1/pi` in the Lambertian BRDF, so no other factor
 // belongs here.
@@ -1105,11 +1107,7 @@ vec3 gather_indirect(Surface surface, uvec2 pixel) {
     vec3 total = vec3(0.0);
     for (uint b = 0u; b < frame.bounce_samples; ++b) {
         vec2 u = unit_pair(hash(uvec4(pixel, STREAM_BOUNCE, b)));
-        // A sheet gathers over the side the viewer is on. Its far side contributes too, through
-        // the same transmission the direct term applies, but that half is an ambient seen through
-        // cloth — and sampling only the near one is what keeps an inside-out triangle from
-        // gathering the inside of the hull it is nailed to.
-        vec3 towards = cosine_direction(gathering_side(surface), u);
+        vec3 towards = cosine_direction(surface.normal, u);
         Surface bounce = trace(leaving(surface, towards), towards, surface.footprint,
                                BOUNCE_SPREAD, MASK_ANY);
         // Water counts as an escape rather than a surface: it has no albedo of its own, so

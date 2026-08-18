@@ -37,12 +37,22 @@ fn shade(pixel: &[u8]) -> [u8; 3] {
 }
 
 /// A quad spanned by `across` and `up` from `corner`, with the normal and material given.
+///
+/// Wound so its triangles' own plane comes out along `normal`. That is not decoration: the renderer
+/// shades a hit as whichever face of the triangle the ray met, so a quad whose winding disagrees
+/// with the normal it was handed is a quad lit from the wrong side — and the fixture, not the
+/// renderer, would be what the test then measured.
 fn quad(corner: Vec3, across: Vec3, up: Vec3, normal: Vec3, material: u32) -> Mesh {
+    let wound = if across.cross(up).dot(normal) < 0.0 {
+        vec![0, 2, 1, 0, 3, 2]
+    } else {
+        vec![0, 1, 2, 0, 2, 3]
+    };
     Mesh {
         positions: vec![corner, corner + across, corner + across + up, corner + up],
         normals: vec![normal; 4],
         uvs: vec![Vec2::ZERO, Vec2::X, Vec2::ONE, Vec2::Y],
-        indices: vec![0, 1, 2, 0, 2, 3],
+        indices: wound,
         submeshes: vec![Submesh {
             first_index: 0,
             index_count: 6,
@@ -81,7 +91,7 @@ fn trace_textured(
     forward: Vec3,
 ) -> Vec<u8> {
     let scene = common::scene_of(meshes, materials, instances, &[], Vec3::ONE);
-    trace_scene(&scene, textures, eye, forward, 0)
+    trace_scene(&scene, textures, eye, forward, 0, Read::Radiance)
 }
 
 /// Renders one frame of `scene` through the production renderer and reads it back.
@@ -100,6 +110,7 @@ fn trace_scene(
     eye: Vec3,
     forward: Vec3,
     bounces: u32,
+    read: Read,
 ) -> Vec<u8> {
     let gpu = TestGpu::shared();
     let mut renderer = SceneRenderer::new(
@@ -144,15 +155,29 @@ fn trace_scene(
         .render_once(&mut uploader, &constants)
         .expect("trace should run");
 
-    let pixels = readback::image_to_rgba8(
-        &mut uploader,
-        renderer.target(),
-        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-    )
-    .expect("readback should succeed");
+    let image = match read {
+        Read::Radiance => renderer.target(),
+        Read::Tonemapped => renderer.output(),
+    };
+    let pixels =
+        readback::image_to_rgba8(&mut uploader, image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+            .expect("readback should succeed");
     drop(uploader);
     gpu.assert_no_validation_errors();
     pixels
+}
+
+/// Which of the renderer's images a trace reads back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Read {
+    /// The pass's own output, in the radiance units a test can compute by hand.
+    Radiance,
+    /// After exposure and tonemapping — the bytes the window would show.
+    ///
+    /// What a test wants when it is judging the *image*: a Morrowind interior lit by candles sits
+    /// in the darkest few of 256 levels as raw radiance, so counting distinct colours there counts
+    /// how dim the room is rather than how much of it is textured.
+    Tonemapped,
 }
 
 /// The pixel at `(x, y)`, row-major from the top.
@@ -564,8 +589,8 @@ fn a_light_brightens_what_it_reaches() {
         std::slice::from_ref(&light),
         ambient,
     );
-    let unlit = trace_scene(&dark, &[], Vec3::ZERO, Vec3::X, 0);
-    let lit = trace_scene(&bright, &[], Vec3::ZERO, Vec3::X, 0);
+    let unlit = trace_scene(&dark, &[], Vec3::ZERO, Vec3::X, 0, Read::Radiance);
+    let lit = trace_scene(&bright, &[], Vec3::ZERO, Vec3::X, 0, Read::Radiance);
 
     assert!(
         mean_brightness(&unlit) > 0.0,
@@ -614,8 +639,8 @@ fn an_occluder_between_light_and_surface_casts_a_shadow() {
         std::slice::from_ref(&light),
         ambient,
     );
-    let clear = trace_scene(&open, &[], Vec3::ZERO, Vec3::X, 0);
-    let blocked = trace_scene(&shadowed, &[], Vec3::ZERO, Vec3::X, 0);
+    let clear = trace_scene(&open, &[], Vec3::ZERO, Vec3::X, 0, Read::Radiance);
+    let blocked = trace_scene(&shadowed, &[], Vec3::ZERO, Vec3::X, 0, Read::Radiance);
 
     let centre = WIDTH / 2;
     let sum = |p: &[u8]| p[0] as u32 + p[1] as u32 + p[2] as u32;
@@ -660,7 +685,7 @@ fn a_shadow_edge_is_soft_rather_than_binary() {
             std::slice::from_ref(&light),
             Vec3::ZERO,
         );
-        trace_scene(&scene, &[], Vec3::ZERO, Vec3::X, 0)
+        trace_scene(&scene, &[], Vec3::ZERO, Vec3::X, 0, Read::Radiance)
     };
 
     let clear = trace(std::slice::from_ref(&lit_wall), &[place(0)]);
@@ -721,7 +746,7 @@ fn an_unoccluded_lit_wall_is_smooth() {
         std::slice::from_ref(&light),
         Vec3::ZERO,
     );
-    let pixels = trace_scene(&scene, &[], Vec3::ZERO, Vec3::X, 0);
+    let pixels = trace_scene(&scene, &[], Vec3::ZERO, Vec3::X, 0, Read::Radiance);
 
     // Neighbour-to-neighbour brightness jumps along the centre row. A smooth falloff changes by a
     // few units per pixel; self-occlusion makes it jump by the full lit value at random pixels.
@@ -758,15 +783,20 @@ fn a_real_interior_traces_to_a_recognisable_image() {
         return;
     };
     let missing = cell.missing_textures();
+    let entrances = cell.entrances;
     let scene = cell.scene;
 
-    // The centre of the cell's own geometry, which for this office lands inside the larger room.
-    // There is no general "stand here" rule without tracing probe rays, so this is a fixture choice
-    // that happens to work for this cell rather than something to reuse blindly.
-    let eye = scene
-        .bounds()
-        .expect("a furnished cell has geometry")
-        .centre();
+    // Where the game itself puts a traveller arriving through the door, dropped onto whatever is
+    // under it — the same rule the engine's own viewpoint uses.
+    //
+    // It replaces the centre of the cell's bounds, which this test used to stand at on the grounds
+    // that it "happens to work for this cell". It does not: that point is inside a ceiling pillar,
+    // and the test was reading the dim inside of a beam while claiming to look at a room.
+    let door = entrances.first().expect("a cell with a way in");
+    let feet = scene
+        .ground_below(door.arrival + Vec3::Z * 20.0)
+        .expect("a floor under the doorway");
+    let eye = door.arrival.truncate().extend(feet + 128.0);
 
     let textures = cell.textures;
 
@@ -777,7 +807,7 @@ fn a_real_interior_traces_to_a_recognisable_image() {
         &scene.lights,
         scene.ambient.map_or(Vec3::ZERO, |a| a.colour),
     );
-    let pixels = trace_scene(&lit, &textures, eye, Vec3::X, 0);
+    let pixels = trace_scene(&lit, &textures, eye, door.facing, 0, Read::Tonemapped);
     let hits = hit_count(&pixels);
     let total = (WIDTH * HEIGHT) as usize;
 
@@ -834,7 +864,7 @@ fn a_real_interior_traces_to_a_recognisable_image() {
     // A sealed room is the strong case for the prediction. Almost every bounce ray hits a wall
     // instead of escaping, so the ambient fill is occluded nearly everywhere and the mean has to
     // fall — the flat fill is the ceiling this can approach and never exceed.
-    let bounced = trace_scene(&lit, &textures, eye, Vec3::X, 4);
+    let bounced = trace_scene(&lit, &textures, eye, Vec3::X, 4, Read::Radiance);
     let flat_mean = mean_brightness(&pixels);
     let bounced_mean = mean_brightness(&bounced);
     println!("  mean brightness: {flat_mean:.2} flat, {bounced_mean:.2} with 4 bounces");
@@ -952,8 +982,8 @@ fn a_bounce_carries_the_floors_colour_onto_the_wall_above_it() {
     // at a pixel *is* the indirect term, measured without a reference image.
     let scene = bleed_scene();
 
-    let flat = trace_scene(&scene, &[], BOUNCE_EYE, Vec3::X, 0);
-    let bounced = trace_scene(&scene, &[], BOUNCE_EYE, Vec3::X, 16);
+    let flat = trace_scene(&scene, &[], BOUNCE_EYE, Vec3::X, 0, Read::Radiance);
+    let bounced = trace_scene(&scene, &[], BOUNCE_EYE, Vec3::X, 16, Read::Radiance);
 
     let flat_low = patch_mean(&flat, WIDTH / 2, LOW_ROW);
     let bounced_low = patch_mean(&bounced, WIDTH / 2, LOW_ROW);
@@ -999,8 +1029,8 @@ fn ambient_is_occluded_by_what_a_surface_faces() {
     // it is.
     let scene = bounce_scene(Vec3::ZERO, Vec3::splat(0.5), &[]);
 
-    let flat = trace_scene(&scene, &[], BOUNCE_EYE, Vec3::X, 0);
-    let occluded = trace_scene(&scene, &[], BOUNCE_EYE, Vec3::X, 16);
+    let flat = trace_scene(&scene, &[], BOUNCE_EYE, Vec3::X, 0, Read::Radiance);
+    let occluded = trace_scene(&scene, &[], BOUNCE_EYE, Vec3::X, 16, Read::Radiance);
 
     let flat_low = patch_mean(&flat, WIDTH / 2, LOW_ROW).x;
     let flat_high = patch_mean(&flat, WIDTH / 2, HIGH_ROW).x;
@@ -1057,12 +1087,12 @@ fn the_indirect_estimate_converges_as_its_sample_count_rises() {
     // leave the error flattening out well above zero.
     let scene = bleed_scene();
 
-    let reference = trace_scene(&scene, &[], BOUNCE_EYE, Vec3::X, 256);
+    let reference = trace_scene(&scene, &[], BOUNCE_EYE, Vec3::X, 256, Read::Radiance);
     let errors: Vec<f32> = [1u32, 4, 16]
         .into_iter()
         .map(|samples| {
             rmse(
-                &trace_scene(&scene, &[], BOUNCE_EYE, Vec3::X, samples),
+                &trace_scene(&scene, &[], BOUNCE_EYE, Vec3::X, samples, Read::Radiance),
                 &reference,
             )
         })
@@ -1205,7 +1235,7 @@ fn a_sheet_lit_from_behind_transmits_and_a_solid_one_does_not() {
             Vec3::ZERO,
         );
         patch_mean(
-            &trace_scene(&scene, &[], Vec3::ZERO, Vec3::X, 0),
+            &trace_scene(&scene, &[], Vec3::ZERO, Vec3::X, 0, Read::Radiance),
             WIDTH / 2,
             HEIGHT / 2,
         )

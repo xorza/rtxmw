@@ -6,7 +6,7 @@ use glam::{Mat3, Vec2, Vec3};
 use rtxmw_esm::{CELL_SIZE, GRID, LandRecord, SPACING, TEXTURE_GRID};
 use rtxmw_nif::{Block, GeometryData, Link, NifFile, Transform};
 
-use crate::material::Properties;
+use crate::material::{AlphaMode, Properties};
 use crate::material_table::MaterialTable;
 
 /// Nodes whose subtrees never reach the renderer.
@@ -86,7 +86,15 @@ impl Mesh {
     /// Marks every run that is a *sheet* — cloth, a rug, a banner — rather than part of something
     /// solid, which is what lets the renderer light it from either face.
     ///
-    /// **Two questions, because either one alone gets it wrong on real data.**
+    /// **The material answers first, and answers best.** A run whose alpha is anything but opaque
+    /// is a cutout, and Morrowind has no solid cutouts — the mode is set on foliage, banners,
+    /// grates, thatch and glass, every one of them a single layer with nothing behind it. That is
+    /// authored intent rather than a guess about shape, and it is the only thing that catches a
+    /// tree: a canopy's cards join at the branches into a cupped cluster which, measured as
+    /// geometry, wraps as much air as a shell around a room does.
+    ///
+    /// The rest is for the opaque sheets the mode says nothing about — a rug, a tapestry, a sail.
+    /// **Two questions there, because either one alone gets it wrong on real data.**
     ///
     /// The first is asked of the whole mesh: has it any edge belonging to only one triangle? A
     /// closed surface has none. This cannot be asked of a run, and the temptation to is the trap —
@@ -102,11 +110,12 @@ impl Mesh {
     /// Neither is exact. A flat run of a solid — a floor slab modelled as one plane — passes both
     /// and is called a sheet; it is single-sided with nothing behind it, so being lit from the far
     /// side is the harmless answer anyway.
-    fn classify_sheets(&mut self) {
+    fn classify_sheets(&mut self, materials: &MaterialTable) {
         let open = self.has_border();
         for index in 0..self.submeshes.len() {
             let run = self.submeshes[index];
-            self.submeshes[index].thin = open && self.run_volume(&run) < THIN_VOLUME;
+            let cut_out = materials.materials()[run.material as usize].alpha != AlphaMode::Opaque;
+            self.submeshes[index].thin = cut_out || (open && self.run_volume(&run) < THIN_VOLUME);
         }
     }
 
@@ -318,7 +327,7 @@ impl Mesh {
         }
         // Only once every block has been flattened: a border is a property of the whole model, and
         // a mesh half-built has borders where the rest of it has yet to arrive.
-        mesh.classify_sheets();
+        mesh.classify_sheets(materials);
         mesh
     }
 
@@ -542,6 +551,7 @@ fn is_skippable(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::material::Material;
     use rtxmw_esm::VERTICES;
 
     /// Adds a run covering the indices appended since `first_index`.
@@ -625,18 +635,25 @@ mod tests {
         close_run(mesh, first_index);
     }
 
+    /// A table holding one opaque material, so the geometry half of the test is what answers.
+    fn opaque_table() -> MaterialTable {
+        let mut table = MaterialTable::default();
+        table.intern(Material::default());
+        table
+    }
+
     #[test]
     fn a_sheet_is_told_from_a_solid_by_its_border_and_what_it_wraps() {
         // **What separates a sail from a crate**, on data where nothing says which is which.
         //
         // A closed box has no border at all, so nothing in it is cloth however its runs are split.
         let mut solid = box_mesh(100.0);
-        solid.classify_sheets();
+        solid.classify_sheets(&opaque_table());
         assert!(!solid.submeshes[0].thin, "a closed box is not cloth");
 
         // A flat quad is all border and wraps nothing.
         let mut flat = quad_mesh(100.0);
-        flat.classify_sheets();
+        flat.classify_sheets(&opaque_table());
         assert!(flat.submeshes[0].thin);
 
         // A tube — a mast, or the wall shell of a room — has a border at each end but wraps its own
@@ -645,7 +662,7 @@ mod tests {
         // the wall between them.
         let mut tube = Mesh::default();
         add_tube(&mut tube, 60.0, 200.0, 12);
-        tube.classify_sheets();
+        tube.classify_sheets(&opaque_table());
         assert!(!tube.submeshes[0].thin, "a wall shell is not cloth");
 
         // And the case the *volume* test alone gets wrong: a bottle textured in three parts arrives
@@ -662,7 +679,7 @@ mod tests {
             index_count: top.index_count - 6,
             ..top
         });
-        split.classify_sheets();
+        split.classify_sheets(&opaque_table());
         assert!(
             split.submeshes.iter().all(|run| !run.thin),
             "splitting a solid by material turned it into cloth"
@@ -680,9 +697,25 @@ mod tests {
         boat.uvs.extend_from_slice(&sail.uvs);
         boat.indices.extend(sail.indices.iter().map(|i| i + base));
         close_run(&mut boat, sail_first);
-        boat.classify_sheets();
+        boat.classify_sheets(&opaque_table());
         assert!(!boat.submeshes[0].thin, "the hull");
         assert!(boat.submeshes[1].thin, "the sail");
+
+        // And the material has the last word, over a shape that says the opposite. A canopy's cards
+        // join at the branches into a cupped cluster that wraps as much air as a closed box does,
+        // so nothing about its geometry marks it out — but its alpha does, and Morrowind has no
+        // solid cutouts.
+        let mut cutout = MaterialTable::default();
+        cutout.intern(Material {
+            alpha: AlphaMode::Blend,
+            ..Material::default()
+        });
+        let mut foliage = box_mesh(100.0);
+        foliage.classify_sheets(&cutout);
+        assert!(
+            foliage.submeshes[0].thin,
+            "a cutout is a sheet whatever shape its triangles make"
+        );
     }
 
     /// Texture tiles in a cell, which is how many materials `from_land` wants.

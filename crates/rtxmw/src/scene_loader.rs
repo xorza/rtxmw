@@ -171,6 +171,27 @@ impl Viewpoint {
     }
 }
 
+/// A caller's say over where a camera stands, with whatever it does not say left to the cell.
+///
+/// Two options rather than an optional [`Viewpoint`], so that asking only to turn on the spot is a
+/// thing that can be asked. A place without a direction and a direction without a place are both
+/// useful — the second is how you look at the wall behind the door you came in by.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub(crate) struct ViewpointOverride {
+    pub(crate) position: Option<Vec3>,
+    pub(crate) forward: Option<Vec3>,
+}
+
+impl ViewpointOverride {
+    /// `base` with whichever halves were given replacing it.
+    pub(crate) fn over(&self, base: Viewpoint) -> Viewpoint {
+        Viewpoint {
+            position: self.position.unwrap_or(base.position),
+            forward: self.forward.unwrap_or(base.forward),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

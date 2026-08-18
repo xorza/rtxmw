@@ -38,7 +38,11 @@ fn shadowed_wall(angular_radius: f32) -> StaticScene {
         ],
         normals: vec![Vec3::NEG_X; 4],
         uvs: vec![Vec2::ZERO, Vec2::X, Vec2::ONE, Vec2::Y],
-        indices: vec![0, 1, 2, 0, 2, 3],
+        // Wound so the triangles' own plane agrees with those normals — `cross(p1 - p0, p2 - p0)`
+        // has to come out along -X too. It did not, and nothing noticed while shading consulted
+        // only the authored normal; now that a hit is shaded as whichever face it met, a surface
+        // whose winding disagrees with its normals is a surface lit from the wrong side.
+        indices: vec![0, 2, 1, 0, 3, 2],
         submeshes: vec![Submesh {
             first_index: 0,
             index_count: 6,
@@ -68,7 +72,12 @@ fn shadowed_wall(angular_radius: f32) -> StaticScene {
     scene
 }
 
-fn trace(scene: &StaticScene) -> Vec<u8> {
+/// Traces [`shadowed_wall`] from the spot that fixture is built around.
+fn trace_wall(scene: &StaticScene) -> Vec<u8> {
+    trace(scene, Vec3::new(EYE_X, 0.0, 0.0), Vec3::X)
+}
+
+fn trace(scene: &StaticScene, eye: Vec3, forward: Vec3) -> Vec<u8> {
     let gpu = TestGpu::shared();
     let mut renderer = SceneRenderer::new(
         gpu.device(),
@@ -97,8 +106,13 @@ fn trace(scene: &StaticScene) -> Vec<u8> {
         )
         .expect("scene should load");
 
-    let eye = Vec3::new(EYE_X, 0.0, 0.0);
-    let view = glam::camera::rh::view::look_to_mat4(eye, Vec3::X, Vec3::Z);
+    // Up is world up unless the camera is looking along it, which would leave the view undefined.
+    let up = if forward.normalize().z.abs() > 0.9 {
+        Vec3::Y
+    } else {
+        Vec3::Z
+    };
+    let view = glam::camera::rh::view::look_to_mat4(eye, forward, up);
     let projection =
         glam::camera::rh::proj::vulkan::perspective_infinite_reverse(75f32.to_radians(), 1.0, 0.05);
     let constants = renderer.frame_constants(view, projection, eye);
@@ -139,9 +153,9 @@ fn penumbra_rows(pixels: &[u8]) -> usize {
 
 #[test]
 fn the_suns_disc_is_what_makes_its_shadow_soft() {
-    let real = trace(&shadowed_wall(Sun::default_daylight().angular_radius));
+    let real = trace_wall(&shadowed_wall(Sun::default_daylight().angular_radius));
     // A sun of no size at all: the same light from the same direction, cast by a point.
-    let point = trace(&shadowed_wall(0.0));
+    let point = trace_wall(&shadowed_wall(0.0));
 
     let (dark, lit) = (row(&real, 8), row(&real, HEIGHT - 8));
     println!(
@@ -184,22 +198,29 @@ fn a_cell_with_no_sun_is_lit_by_nothing() {
     // How an interior says it has no sky: a black sun contributes nothing, needing no flag.
     let mut scene = shadowed_wall(Sun::default_daylight().angular_radius);
     scene.sun.as_mut().expect("the fixture has a sun").colour = Vec3::ZERO;
-    let pixels = trace(&scene);
+    let pixels = trace_wall(&scene);
     assert_eq!(row(&pixels, HEIGHT - 8), 0.0);
 }
 
 #[test]
-fn a_single_sided_plane_seen_from_behind_is_still_lit_from_the_front() {
+fn the_back_of_a_sunlit_plane_is_dark_unless_it_is_a_sheet() {
     // **Morrowind hangs single-sided planes everywhere** — every tapestry, sail and leaf card — and
-    // draws them from both sides. Seen from behind, such a surface still shows the light falling on
-    // the face its normal points at, which is what the shading normal already decides.
+    // draws them from both sides. What the far side of one shows depends on what it is: the back of
+    // something solid is in shade, while cloth passes a share of the light through.
     //
-    // What this pins is the *ray offset*. Every ray leaving a surface is pushed off it along the
-    // triangle's own plane, and that push has to go to the side the surface is lit from. Sent to
-    // the side the *viewer* is on instead, a shadow ray from behind the cloth sets off toward the
-    // sun, meets the cloth it started behind, and reports shadow — so every one of those surfaces
-    // goes black. That happened, and no test in the suite noticed.
-    let cloth = Mesh {
+    // Both halves matter, and each guards a different thing.
+    //
+    // The dark half guards the *shading normal*, which faces whichever way the ray came from. Left
+    // as the vertices authored it, the back of this plane reports the light landing on its front —
+    // a surface lit through its own body. On a tree that reads as dark dust: a canopy is thousands
+    // of cards packed below a pixel apiece, and neighbouring pixels landing on cards wound
+    // oppositely came back at opposite brightnesses.
+    //
+    // The lit half guards the *ray offset*. Every ray leaving a surface is pushed off it along the
+    // triangle's own plane, and that push has to go to the side the ray is travelling. Sent to the
+    // viewer's side instead, the shadow ray from behind the cloth sets off toward the sun, meets
+    // the cloth it started behind, and reports shadow — so the transmitted light never arrives.
+    let plane = |thin: bool| Mesh {
         positions: vec![
             Vec3::new(-500.0, -500.0, 0.0),
             Vec3::new(500.0, -500.0, 0.0),
@@ -214,11 +235,88 @@ fn a_single_sided_plane_seen_from_behind_is_still_lit_from_the_front() {
             first_index: 0,
             index_count: 6,
             material: 0,
+            thin,
+        }],
+    };
+
+    let seen_from_below = |thin: bool| {
+        let mut scene = common::scene_of(
+            &[plane(thin)],
+            &[Material {
+                diffuse: Vec3::splat(0.5),
+                ..Material::default()
+            }],
+            &[Instance {
+                mesh: MeshId(0),
+                transform: Affine3A::IDENTITY,
+            }],
+            &[],
+            // No ambient: anything the camera sees came from the sun, through the plane.
+            Vec3::ZERO,
+        );
+        scene.sun = Some(Sun {
+            direction: Vec3::NEG_Z,
+            colour: Vec3::splat(4.0),
+            angular_radius: 0.0,
+        });
+        // Underneath, looking up at the back of it.
+        let pixels = trace(&scene, Vec3::new(0.0, 0.0, -200.0), Vec3::Z);
+        let centre = ((HEIGHT / 2) * WIDTH + WIDTH / 2) as usize * 4;
+        pixels[centre + 1] as f32 / 255.0
+    };
+
+    // Albedo 0.5 against a sun of 4.0 straight on, through the Lambertian `1/pi`, is 0.64 — and
+    // half of that comes through a sheet.
+    let sheet = seen_from_below(true);
+    assert!(
+        (sheet - 0.32).abs() < 0.02,
+        "a sheet backlit by the sun should transmit half of 0.64, got {sheet}"
+    );
+    let solid = seen_from_below(false);
+    assert_eq!(
+        solid, 0.0,
+        "the back of a solid plane was lit through its own body"
+    );
+}
+
+#[test]
+fn a_surface_whose_normals_lean_shades_evenly_at_a_grazing_angle() {
+    // A rug on a floor, seen from across the room. Its vertex normals lean, as Morrowind's do
+    // wherever a flat thing was authored to catch the light — and at a grazing angle the leaning
+    // carries some of them past the viewer, so that they point away from a face the camera is
+    // looking straight at.
+    //
+    // **That is why the side a hit is shaded on is decided by the triangle's plane.** Decided by
+    // the normal instead, the surface splits: the pixels whose interpolated normal happens to lean
+    // away get shaded as the underside of the rug and go black, and the seam between the two halves
+    // slides across the floor as the camera moves.
+    let lean = 0.6f32;
+    let rug = Mesh {
+        positions: vec![
+            Vec3::new(-700.0, -500.0, 0.0),
+            Vec3::new(700.0, -500.0, 0.0),
+            Vec3::new(700.0, 2500.0, 0.0),
+            Vec3::new(-700.0, 2500.0, 0.0),
+        ],
+        // Leaning across the quad, from pointing left at one edge to pointing right at the other.
+        normals: vec![
+            Vec3::new(-lean, 0.0, 1.0 - lean).normalize(),
+            Vec3::new(lean, 0.0, 1.0 - lean).normalize(),
+            Vec3::new(lean, 0.0, 1.0 - lean).normalize(),
+            Vec3::new(-lean, 0.0, 1.0 - lean).normalize(),
+        ],
+        uvs: vec![Vec2::ZERO; 4],
+        // Wound so the plane points up, which is the side the camera is on.
+        indices: vec![0, 1, 2, 0, 2, 3],
+        submeshes: vec![Submesh {
+            first_index: 0,
+            index_count: 6,
+            material: 0,
             thin: false,
         }],
     };
     let mut scene = common::scene_of(
-        &[cloth],
+        &[rug],
         &[Material {
             diffuse: Vec3::splat(0.5),
             ..Material::default()
@@ -228,63 +326,59 @@ fn a_single_sided_plane_seen_from_behind_is_still_lit_from_the_front() {
             transform: Affine3A::IDENTITY,
         }],
         &[],
-        // No ambient: anything the camera sees came from the sun, through nothing.
         Vec3::ZERO,
     );
+    // Straight down, so every normal that still points upward is lit by the same amount and the
+    // only thing that can vary across the rug is which way the shading decided it faces.
     scene.sun = Some(Sun {
         direction: Vec3::NEG_Z,
         colour: Vec3::splat(4.0),
         angular_radius: 0.0,
     });
 
-    let gpu = TestGpu::shared();
-    let mut renderer = SceneRenderer::new(
-        gpu.device(),
-        gpu.physical(),
-        gpu.memory(),
-        vk::Extent2D {
-            width: WIDTH,
-            height: HEIGHT,
-        },
-    )
-    .expect("renderer");
-    renderer.set_bounce_samples(0);
-    renderer.set_denoise_passes(0);
-    let mut uploader = gpu.uploader();
-    renderer
-        .load_scene(
-            gpu.device(),
-            &mut uploader,
-            gpu.physical().limits(),
-            CellId::Interior("cloth".to_owned()),
-            &scene,
-            &[],
-        )
-        .expect("scene should load");
+    // Low and off to one side: the ray reaches the far edge of the rug at a few degrees above it.
+    let pixels = trace(
+        &scene,
+        Vec3::new(0.0, -450.0, 60.0),
+        Vec3::new(0.15, 0.96, -0.12),
+    );
 
-    // Underneath, looking up at the back of it.
-    let eye = Vec3::new(0.0, 0.0, -200.0);
-    let view = glam::camera::rh::view::look_to_mat4(eye, Vec3::Z, Vec3::Y);
-    let projection =
-        glam::camera::rh::proj::vulkan::perspective_infinite_reverse(60f32.to_radians(), 1.0, 0.05);
-    let constants = renderer.frame_constants(view, projection, eye);
-    renderer
-        .render_once(&mut uploader, &constants)
-        .expect("frame should render");
-    let pixels = readback::image_to_rgba8(
-        &mut uploader,
-        renderer.target(),
-        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-    )
-    .expect("readback");
-    drop(uploader);
-    gpu.assert_no_validation_errors();
+    // A row just below the horizon, which is where the rug is most nearly edge-on and so where a
+    // leaning normal is most likely to have been carried past the viewer. Further down the frame
+    // the rays meet the floor too steeply for any of them to flip, and the seam is out of shot.
+    let row = HEIGHT / 2 + 12;
+    //
+    // Every pixel of it, not the ones that happened to hit: the check below reads neighbours as
+    // neighbours, and dropping a miss from the middle of the row would quietly make two pixels
+    // either side of a hole adjacent.
+    let lit: Vec<f32> = (0..WIDTH)
+        .map(|x| {
+            let at = ((row * WIDTH + x) * 4) as usize;
+            assert!(pixels[at + 3] > 128, "pixel {x} of the row missed the rug");
+            pixels[at + 1] as f32 / 255.0
+        })
+        .collect();
 
-    let centre = ((HEIGHT / 2) * WIDTH + WIDTH / 2) as usize * 4;
-    let lit = pixels[centre + 1] as f32 / 255.0;
-    // Albedo 0.5 against a sun of 4.0 straight on, through the Lambertian `1/pi`: 0.64.
+    // The leaning normals make the row legitimately brighter in the middle than at the edges, so
+    // what is asserted is not flatness but *smoothness*: the lean turns gradually, and so must the
+    // shading. Shading a hit as the underside of the rug does not turn gradually — it drops to
+    // black at whichever pixel the interpolated normal crossed the viewer, which is a cliff.
+    let mut steepest = 0.0f32;
+    for pair in lit.windows(2) {
+        steepest = steepest.max((pair[1] - pair[0]).abs());
+    }
+    let brightest = lit.iter().copied().fold(0.0f32, f32::max);
+    let darkest = lit.iter().copied().fold(1.0f32, f32::min);
+    assert!(brightest > 0.2, "the rug is not lit at all: {brightest}");
+    // The fixture has to be leaning enough to be worth the test: a row of one value would pass the
+    // smoothness check without ever exercising it.
     assert!(
-        lit > 0.4,
-        "the back of a sunlit plane should show the light on its front, got {lit}"
+        brightest - darkest > 0.03,
+        "the row barely varies ({darkest} to {brightest}), so the normals are not leaning"
+    );
+    assert!(
+        steepest < 0.05,
+        "the shading steps by {steepest} between neighbouring pixels, from a row spanning \
+         {darkest} to {brightest}"
     );
 }

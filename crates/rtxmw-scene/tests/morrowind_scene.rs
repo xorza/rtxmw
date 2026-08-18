@@ -8,6 +8,9 @@ use rtxmw_vfs::{DATA_DIR_VAR, morrowind_archives, morrowind_data_dir};
 
 const CELL: &str = "Seyda Neen, Census and Excise Office";
 
+/// Seyda Neen's shore, which has the trees, the boat and the silt strider on it.
+const SHORE: CellId = CellId::Exterior { x: -2, y: -9 };
+
 #[test]
 fn a_known_interior_assembles_into_meshes_and_instances() {
     let Some(data) = morrowind_data_dir() else {
@@ -583,5 +586,107 @@ fn the_shipped_models_that_are_cloth_are_the_ones_marked_as_sheets() {
     assert!(
         sheets * 4 < runs,
         "{sheets} of {runs} runs classified as cloth"
+    );
+}
+
+#[test]
+fn the_shipped_meshes_wind_their_triangles_to_agree_with_their_normals() {
+    // **The renderer shades a hit as whichever face of the triangle the ray met**, deciding that
+    // from the winding rather than from the interpolated normal — which near a silhouette can point
+    // away from a face that is squarely toward the viewer. That only gives the right answer if the
+    // two agree in the first place, and nothing in the format enforces it.
+    //
+    // So it is measured. A triangle disagrees when its plane, taken from the order of its corners,
+    // points opposite to the normals its vertices carry.
+    let Some(data) = morrowind_data_dir() else {
+        eprintln!("skipping: {DATA_DIR_VAR} is not configured (set it, or add it to .env)");
+        return;
+    };
+    let vfs = morrowind_archives().expect("the game is available");
+    let bytes = std::fs::read(data.join("Morrowind.esm")).expect("Morrowind.esm should read");
+    let esm = EsmReader::new(&bytes).expect("should parse");
+    let models = ModelIndex::build(&esm).expect("model index should build");
+    let index = CellIndex::build(&esm).expect("cell index should build");
+
+    let mut disagree = 0usize;
+    let mut total = 0usize;
+    // An interior of furniture and cloth, and a stretch of shore with trees, rocks and a boat —
+    // between them most of the shapes the game is built out of.
+    for cell in [CellId::Interior(CELL.into()), SHORE] {
+        let scene = StaticScene::load_cell(&esm, &index, &models, &vfs, &cell).expect("cell loads");
+        for mesh in &scene.meshes {
+            for triangle in mesh.indices.chunks_exact(3) {
+                let corner = |at: usize| mesh.positions[triangle[at] as usize];
+                let plane = (corner(1) - corner(0)).cross(corner(2) - corner(0));
+                let authored: glam::Vec3 =
+                    (0..3).map(|at| mesh.normals[triangle[at] as usize]).sum();
+                // A degenerate triangle has no plane, and a mesh with no normals carries zeroes;
+                // neither is a disagreement.
+                if plane.length_squared() == 0.0 || authored.length_squared() == 0.0 {
+                    continue;
+                }
+                total += 1;
+                if plane.dot(authored) < 0.0 {
+                    disagree += 1;
+                }
+            }
+        }
+    }
+
+    assert!(total > 50_000, "only {total} triangles measured");
+    // A handful of backwards triangles is what the artists left behind; a large share would mean
+    // the convention is the other way round and the renderer has it backwards everywhere.
+    println!("{disagree} of {total} triangles are wound against their own normals");
+    assert!(
+        disagree * 100 < total,
+        "{disagree} of {total} triangles are wound against their own normals"
+    );
+}
+
+#[test]
+fn a_trees_foliage_is_cloth_and_its_trunk_is_not() {
+    // The case no shape test catches. A canopy is hundreds of leaf cards joined at the branches,
+    // and the cupped cluster they make wraps as much air as a shell around a room — measured as
+    // geometry a tree is solid, and every card facing away from the sun goes dark.
+    //
+    // The alpha says otherwise, and it is authored rather than inferred: Morrowind sets a cutout on
+    // foliage, thatch, banners and glass, and on nothing solid.
+    let Some(data) = morrowind_data_dir() else {
+        eprintln!("skipping: {DATA_DIR_VAR} is not configured (set it, or add it to .env)");
+        return;
+    };
+    let vfs = morrowind_archives().expect("the game is available");
+    let bytes = std::fs::read(data.join("Morrowind.esm")).expect("Morrowind.esm should read");
+    let esm = EsmReader::new(&bytes).expect("should parse");
+    let models = ModelIndex::build(&esm).expect("model index should build");
+    let index = CellIndex::build(&esm).expect("cell index should build");
+    let scene = StaticScene::load_cell(&esm, &index, &models, &vfs, &SHORE).expect("cell loads");
+
+    let position = scene
+        .mesh_sources
+        .iter()
+        .position(|source| source.to_lowercase().contains("flora_bc_tree_02"))
+        .expect("a tree on the shore");
+    let tree = &scene.meshes[position];
+    let sheets = tree.submeshes.iter().filter(|run| run.thin).count();
+
+    // Its foliage, and not the trunk and boughs the leaves hang from.
+    assert_eq!(sheets, 3, "of {} runs", tree.submeshes.len());
+    assert!(
+        tree.submeshes.len() > sheets,
+        "every run of the tree came out as cloth, trunk included"
+    );
+
+    // The trunk is the bulk of the model's triangles, so a sheet count that swallowed it would not
+    // show in the run count alone.
+    let solid_triangles: u32 = tree
+        .submeshes
+        .iter()
+        .filter(|run| !run.thin)
+        .map(|run| run.index_count / 3)
+        .sum();
+    assert!(
+        solid_triangles > 300,
+        "only {solid_triangles} solid triangles"
     );
 }

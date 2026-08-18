@@ -33,7 +33,8 @@ fn split_wall() -> StaticScene {
         ],
         normals: vec![Vec3::NEG_X; 4],
         uvs: vec![Vec2::ZERO, Vec2::X, Vec2::ONE, Vec2::Y],
-        indices: vec![0, 1, 2, 0, 2, 3],
+        // Wound so the triangles' plane points along -X too, which is the face the camera is on.
+        indices: vec![0, 2, 1, 0, 3, 2],
         submeshes: vec![Submesh {
             first_index: 0,
             index_count: 6,
