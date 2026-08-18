@@ -56,6 +56,8 @@ pub struct SubmeshRange {
     pub first_index: u32,
     pub index_count: u32,
     pub material: u32,
+    /// Whether this run is a sheet — see [`rtxmw_scene::Submesh::thin`].
+    pub thin: bool,
 }
 
 impl SubmeshRange {
@@ -341,6 +343,7 @@ fn pack(meshes: &[&Mesh], first_vertex: u32, first_index: u32, first_submesh: u3
             first_index: base_index + sub.first_index,
             index_count: sub.index_count,
             material: sub.material,
+            thin: sub.thin,
         }));
 
         positions.extend(mesh.positions.iter().map(|p| p.to_array()));
@@ -373,8 +376,9 @@ mod tests {
         pack(&meshes.iter().collect::<Vec<_>>(), 0, 0, 0)
     }
 
-    /// A mesh whose vertices and normals are distinguishable by index.
-    fn mesh(vertices: u32, indices: &[u32]) -> Mesh {
+    /// A mesh whose vertices and normals are distinguishable by index, and whose run is marked a
+    /// sheet or not so that packing has a value to carry rather than a constant to reproduce.
+    fn mesh(vertices: u32, indices: &[u32], thin: bool) -> Mesh {
         Mesh {
             positions: (0..vertices).map(|i| Vec3::splat(i as f32)).collect(),
             normals: (0..vertices).map(|i| Vec3::X * i as f32).collect(),
@@ -389,6 +393,7 @@ mod tests {
                     first_index: 0,
                     index_count: indices.len() as u32,
                     material: 0,
+                    thin,
                 }]
             },
         }
@@ -397,7 +402,10 @@ mod tests {
     #[test]
     fn packing_concatenates_meshes_and_leaves_indices_mesh_local() {
         // 3 vertices / 1 triangle, then 4 vertices / 2 triangles.
-        let meshes = [mesh(3, &[0, 1, 2]), mesh(4, &[0, 1, 2, 1, 2, 3])];
+        let meshes = [
+            mesh(3, &[0, 1, 2], true),
+            mesh(4, &[0, 1, 2, 1, 2, 3], false),
+        ];
         let Packed {
             positions,
             attributes,
@@ -443,12 +451,14 @@ mod tests {
                 SubmeshRange {
                     first_index: 0,
                     index_count: 3,
-                    material: 0
+                    material: 0,
+                    thin: true
                 },
                 SubmeshRange {
                     first_index: 3,
                     index_count: 6,
-                    material: 0
+                    material: 0,
+                    thin: false
                 },
             ]
         );
@@ -461,7 +471,7 @@ mod tests {
     fn an_append_lands_past_what_the_arena_already_holds() {
         // An arena holding 10 vertices, 30 indices and 2 submeshes takes a 3-vertex, 1-triangle
         // mesh: it starts at vertex 10 and index 30, and its submesh is the third.
-        let meshes = [mesh(3, &[0, 1, 2])];
+        let meshes = [mesh(3, &[0, 1, 2], false)];
         let out = pack(&meshes.iter().collect::<Vec<_>>(), 10, 30, 2);
 
         assert_eq!(
@@ -484,7 +494,7 @@ mod tests {
 
     #[test]
     fn attributes_stay_aligned_with_the_positions_they_belong_to() {
-        let meshes = [mesh(2, &[0, 1, 1]), mesh(2, &[0, 1, 1])];
+        let meshes = [mesh(2, &[0, 1, 1], false), mesh(2, &[0, 1, 1], false)];
         let out = packed(&meshes);
         let (positions, attributes) = (out.positions, out.attributes);
 
@@ -504,7 +514,11 @@ mod tests {
     fn an_empty_mesh_keeps_its_slot_as_a_zero_length_range() {
         // The scene indexes meshes by position, so a mesh that flattened to nothing must not shift
         // the ones after it.
-        let meshes = [mesh(3, &[0, 1, 2]), mesh(0, &[]), mesh(3, &[0, 1, 2])];
+        let meshes = [
+            mesh(3, &[0, 1, 2], false),
+            mesh(0, &[], false),
+            mesh(3, &[0, 1, 2], false),
+        ];
         let ranges = packed(&meshes).ranges;
 
         assert_eq!(ranges.len(), 3);

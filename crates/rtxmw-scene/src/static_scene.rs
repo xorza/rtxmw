@@ -686,6 +686,7 @@ mod tests {
                 first_index: 0,
                 index_count: 6,
                 material: 0,
+                thin: false,
             }],
         }
     }
@@ -743,6 +744,7 @@ mod tests {
                 first_index: 0,
                 index_count: 3,
                 material: 0,
+                thin: false,
             }],
         });
         scene.instances.push(Instance {

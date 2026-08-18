@@ -258,3 +258,42 @@ mod tests {
         assert_eq!((whole.width(), whole.height()), (8, 8));
     }
 }
+
+#[cfg(any(test, feature = "internals"))]
+pub mod internals {
+    //! Building a texture by hand, for tests that need a mip chain a decoder would have supplied.
+
+    use super::{MipLevel, Texture, TextureFormat};
+
+    impl Texture {
+        /// A texture whose levels are given outright, finest first.
+        ///
+        /// [`Texture::from_pixels`] makes a single level, which is all a fixture needs to check a
+        /// colour — but anything about *minification* is invisible without a chain, because a
+        /// sampler asked for a level a texture does not have simply returns the one it has.
+        pub fn from_levels(
+            format: TextureFormat,
+            width: u32,
+            height: u32,
+            levels: &[&[u8]],
+        ) -> Self {
+            let mut data = Vec::new();
+            let mut chain = Vec::with_capacity(levels.len());
+            for (index, bytes) in levels.iter().enumerate() {
+                let scale = 1u32 << index;
+                chain.push(MipLevel {
+                    offset: data.len() as u32,
+                    size: bytes.len() as u32,
+                    width: (width / scale).max(1),
+                    height: (height / scale).max(1),
+                });
+                data.extend_from_slice(bytes);
+            }
+            Self {
+                format,
+                levels: chain,
+                data,
+            }
+        }
+    }
+}

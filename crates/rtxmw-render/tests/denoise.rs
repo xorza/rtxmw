@@ -38,6 +38,7 @@ fn split_wall() -> StaticScene {
             first_index: 0,
             index_count: 6,
             material,
+            thin: false,
         }],
     };
     let floor = Mesh {
@@ -54,6 +55,7 @@ fn split_wall() -> StaticScene {
             first_index: 0,
             index_count: 6,
             material: 2,
+            thin: false,
         }],
     };
     // A panel standing in front of the wall's right-hand side, parallel to it and of the same

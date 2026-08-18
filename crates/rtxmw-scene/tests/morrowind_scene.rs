@@ -535,3 +535,53 @@ fn a_streamed_cell_is_the_same_cell_the_direct_path_loads() {
     assert_eq!(second.id, sea);
     assert!(second.loaded.is_err(), "open sea should not load");
 }
+
+#[test]
+fn the_shipped_models_that_are_cloth_are_the_ones_marked_as_sheets() {
+    let Some(data) = morrowind_data_dir() else {
+        eprintln!("skipping: {DATA_DIR_VAR} is not configured (set it, or add it to .env)");
+        return;
+    };
+    let vfs = morrowind_archives().expect("the game is available");
+    let bytes = std::fs::read(data.join("Morrowind.esm")).expect("Morrowind.esm should read");
+    let esm = EsmReader::new(&bytes).expect("should parse");
+    let models = ModelIndex::build(&esm).expect("model index should build");
+    let index = CellIndex::build(&esm).expect("cell index should build");
+    let scene = StaticScene::load_cell(&esm, &index, &models, &vfs, &CellId::Interior(CELL.into()))
+        .expect("cell should load");
+
+    let sheets_in = |name: &str| {
+        let position = scene
+            .mesh_sources
+            .iter()
+            .position(|source| source.to_lowercase().contains(name))
+            .unwrap_or_else(|| panic!("{name} is not in this cell"));
+        let mesh = &scene.meshes[position];
+        mesh.submeshes.iter().filter(|run| run.thin).count()
+    };
+
+    // A tapestry and a rug are cloth, and each is one hanging run among the frame and rod that
+    // carry it.
+    assert_eq!(sheets_in("furn_com_tapestry_03"), 1);
+    assert_eq!(sheets_in("furn_rug_big_06"), 1);
+
+    // Neither of these is, however its runs are split — a chest and a wine bottle are closed
+    // surfaces, and a room's wall shell wraps the room's air. Measured per run rather than per
+    // mesh, all three come out as cloth, because splitting by material opens every one of them.
+    assert_eq!(sheets_in("contain_com_chest_02"), 1, "the chest's flat lid");
+    assert_eq!(sheets_in("misc_com_bottle_09"), 0);
+    assert_eq!(sheets_in("in_c_plain_room_corner"), 2, "flat wall slabs");
+
+    // And the cell as a whole is mostly solid. The exact fraction is not the property — that a
+    // furnished interior is not seven-eighths cloth is.
+    let (sheets, runs) = scene.meshes.iter().fold((0, 0), |(sheets, runs), mesh| {
+        (
+            sheets + mesh.submeshes.iter().filter(|run| run.thin).count(),
+            runs + mesh.submeshes.len(),
+        )
+    });
+    assert!(
+        sheets * 4 < runs,
+        "{sheets} of {runs} runs classified as cloth"
+    );
+}

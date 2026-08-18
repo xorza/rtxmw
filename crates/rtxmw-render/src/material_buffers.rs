@@ -34,6 +34,12 @@ const KIND_DIFFUSE: u32 = 0;
 /// A water surface, which the shader reflects, refracts and attenuates through rather than lighting.
 const KIND_WATER: u32 = 1;
 
+/// Set on a run whose triangles are a sheet rather than the skin of something solid, which is what
+/// lets the shader light a sail or a rug from whichever side the sun is on.
+///
+/// Declared again in `primary_visibility.comp`.
+pub(crate) const GEOMETRY_THIN: u32 = 1;
+
 /// One acceleration structure geometry, indexed by `instance_custom_index + geometry_index`.
 ///
 /// That sum is the whole reason the geometry table is flat: a hit reports the two halves separately
@@ -46,7 +52,8 @@ pub(crate) struct GpuGeometry {
     /// Added to each index value to reach the shared vertex streams.
     pub(crate) first_vertex: u32,
     pub(crate) material: u32,
-    pub(crate) padding: u32,
+    /// Bit flags describing the run itself rather than its material, currently only [`GEOMETRY_THIN`].
+    pub(crate) flags: u32,
 }
 
 /// One surface description as the shader reads it.
@@ -115,7 +122,7 @@ impl MaterialBuffers {
                     first_index: submesh.first_index,
                     first_vertex: range.first_vertex,
                     material: submesh.material,
-                    padding: 0,
+                    flags: if submesh.thin { GEOMETRY_THIN } else { 0 },
                 });
             }
         }
@@ -186,6 +193,8 @@ mod tests {
         // Likewise the shading models, which the shader compares against literals of its own.
         assert_eq!(KIND_DIFFUSE, 0);
         assert_eq!(KIND_WATER, 1);
+        // And the geometry flag, which the shader tests with a literal mask.
+        assert_eq!(GEOMETRY_THIN, 1);
     }
 
     #[test]

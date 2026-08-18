@@ -286,6 +286,7 @@ mod tests {
                         first_index: 0,
                         index_count: 6,
                         material: 0,
+                        thin: false,
                     }],
                 }],
                 instances: vec![Instance {

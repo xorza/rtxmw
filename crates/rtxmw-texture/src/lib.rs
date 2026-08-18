@@ -10,3 +10,7 @@ mod tga;
 
 pub use crate::error::{Result, TextureError};
 pub use crate::texture::{MipLevel, Texture, TextureFormat};
+
+// The gate must match the module's, or the module is `pub` yet unreachable under cfg(test).
+#[cfg(any(test, feature = "internals"))]
+pub use crate::texture::internals as texture_internals;

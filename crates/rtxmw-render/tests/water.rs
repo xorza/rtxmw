@@ -41,6 +41,7 @@ fn slab(z: f32, material: u32) -> Mesh {
             first_index: 0,
             index_count: 6,
             material,
+            thin: false,
         }],
     }
 }

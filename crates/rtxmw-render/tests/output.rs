@@ -34,6 +34,7 @@ fn backdrop(albedo: Vec3) -> StaticScene {
             first_index: 0,
             index_count: 6,
             material: 0,
+            thin: false,
         }],
     };
     let material = Material {
@@ -75,6 +76,7 @@ fn add_strip(scene: &mut StaticScene, z: std::ops::Range<f32>) {
         first_index,
         index_count: 6,
         material: 1,
+        thin: false,
     });
 }
 

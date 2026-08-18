@@ -23,8 +23,12 @@ struct Geometry {
     uint first_index;
     uint first_vertex;
     uint material;
-    uint padding;
+    // Flags about the run rather than its material. Declared in `material_buffers.rs` too.
+    uint flags;
 };
+
+// This run's triangles are a sheet — a sail, a rug, a leaf — with nothing behind them.
+const uint GEOMETRY_THIN = 1u;
 
 struct Material {
     vec3 diffuse;
@@ -154,6 +158,13 @@ const uint BOUNCE_SHADOW_SAMPLES = 1u;
 // couple of centimetres — enough to clear the interpolation error on a large triangle without
 // letting light leak under a wall.
 const float SHADOW_BIAS = 1.5;
+
+// How much of the light landing on a sheet's far face comes out of the near one.
+//
+// Morrowind's cloth, banners and foliage are a single layer of triangles with no back side to
+// occlude anything, so a sail with the sun behind it glows rather than turning black. Half is the
+// figure for thin cloth; the exact value matters far less than that it is neither 0 nor 1.
+const float TRANSMISSION = 0.5;
 
 // The Lambertian BRDF's normalisation.
 //
@@ -344,14 +355,15 @@ vec3 interpolate_normal(uvec3 verts, vec3 weights) {
 //
 // This is Akenine-Möller's ray-cone method, minus the curvature term, which needs a second
 // derivative the primary ray has no cheap way to get.
-float cone_lod(uvec3 verts, mat4x3 to_world, vec3 direction, vec3 world_normal, float footprint,
+float cone_lod(uvec3 verts, mat4x3 to_world, vec3 direction, float footprint,
                uint texture_slot) {
     // World space throughout. The footprint is a world-space length, so an object-space area here
     // would be wrong by the instance's scale — silently, and only for scaled instances.
     vec3 p0 = to_world * vec4(positions[verts.x], 1.0);
     vec3 p1 = to_world * vec4(positions[verts.y], 1.0);
     vec3 p2 = to_world * vec4(positions[verts.z], 1.0);
-    float world_area = length(cross(p1 - p0, p2 - p0));
+    vec3 face = cross(p1 - p0, p2 - p0);
+    float world_area = length(face);
     vec2 t0 = attributes[verts.x].uv;
     vec2 t1 = attributes[verts.y].uv;
     vec2 t2 = attributes[verts.z].uv;
@@ -365,8 +377,9 @@ float cone_lod(uvec3 verts, mat4x3 to_world, vec3 direction, vec3 world_normal, 
     float texels_per_unit = sqrt(uv_area / world_area) * max(size.x, size.y);
 
     // Widened as the surface tilts away: at grazing incidence a pixel covers far more surface,
-    // which is exactly where the aliasing is worst.
-    float tilted = footprint / max(abs(dot(world_normal, direction)), 0.02);
+    // which is exactly where the aliasing is worst. Measured against the triangle's own plane,
+    // which is what the footprint actually lands on — and which spares every caller a normal.
+    float tilted = footprint / max(abs(dot(face / world_area, direction)), 0.02);
     return max(0.0, log2(tilted * texels_per_unit));
 }
 
@@ -383,18 +396,27 @@ vec4 base_colour(Material material, vec2 uv, float lod) {
 //
 // Only non-opaque geometry reaches this: the build marks a run `OPAQUE` when its material is, and
 // traversal then commits without ever asking.
-bool alpha_passes(uint slot, uint primitive, vec2 bary) {
+bool alpha_passes(uint slot, uint primitive, vec2 bary, mat4x3 to_world, vec3 direction,
+                  float footprint) {
     Geometry geom = geometries[slot];
     Material material = materials[geom.material];
     if (material.alpha_cutoff <= 0.0 || material.base_colour == NO_TEXTURE) {
         return true;
     }
-    // Only the texture coordinate: this runs per non-opaque candidate, which is the busiest of
-    // the three paths, and a normal it would discard costs three more buffer reads each time.
-    vec2 uv = interpolate_uv(triangle_vertices(geom, primitive), corner_weights(bary));
-    // Level zero for the cutout: a mip average blurs a leaf's edge into partial alpha, and the
-    // test would then keep or drop texels the artist put there as fully one or the other.
-    float alpha = base_colour(material, uv, 0.0).a;
+    uvec3 verts = triangle_vertices(geom, primitive);
+    vec2 uv = interpolate_uv(verts, corner_weights(bary));
+    // **The level the cone can actually resolve.** A mask point-sampled at its finest mip answers
+    // for one texel out of the hundreds a distant pixel covers, and a binary test on that is a coin
+    // toss per pixel: the fringe of a rug comes out as crawling sparks and a tree as speckle.
+    // Averaging first costs the edge some of its bite — the alpha a leaf was authored with softens
+    // — and that is the better of the two errors by a long way.
+    //
+    // A footprint of zero means the caller has no cone to resolve with, which is every shadow ray;
+    // those keep the finest level, and skip the work of asking for it.
+    float lod = footprint > 0.0
+              ? cone_lod(verts, to_world, direction, footprint, material.base_colour + 1u)
+              : 0.0;
+    float alpha = base_colour(material, uv, lod).a;
     return alpha >= material.alpha_cutoff;
 }
 
@@ -483,9 +505,15 @@ bool occluded(vec3 origin, vec3 dir, float reach) {
             // A cutout casts the shadow of what survives it, not of its bounding quad — a grate
             // has to throw bars rather than a rectangle.
             //
+            // No cone here: a shadow ray carries no footprint, so its cutout is still decided at
+            // the finest level. A leaf's shadow is a place aliasing is worth far less than it is
+            // on the leaf itself.
             if (alpha_passes(slot,
                              rayQueryGetIntersectionPrimitiveIndexEXT(query, false),
-                             rayQueryGetIntersectionBarycentricsEXT(query, false))) {
+                             rayQueryGetIntersectionBarycentricsEXT(query, false),
+                             rayQueryGetIntersectionObjectToWorldEXT(query, false),
+                             dir,
+                             0.0)) {
                 rayQueryConfirmIntersectionEXT(query);
             }
         }
@@ -518,6 +546,23 @@ struct Surface {
     bool hit;
     // Water shades through `water_shade` rather than `shade`, and has no albedo of its own.
     bool water;
+    // The plane the triangle actually lies in, as wound — with no side chosen for it.
+    //
+    // **Every ray leaving a surface is offset along this and not along `normal`.** A normal comes
+    // from the vertices and is interpolated across the face, which is what a surface should be
+    // *shaded* by; on Morrowind's low-poly rocks it can point tens of degrees away from the
+    // triangle it belongs to. Offsetting along it puts the origin under the surface on some
+    // triangles and over it on others, and a shadow ray that starts underneath finds the surface
+    // it started from — which is the speckle that covers a smooth-shaded rock and the sparkle
+    // along the edge of a rug.
+    //
+    // Which side a given ray should leave from is not a property of the surface, so it is not
+    // decided here — see `leaving`.
+    vec3 geometric;
+    // A sheet rather than the skin of something solid, which is what makes it lit from both sides.
+    bool thin;
+    // The direction the ray arrived along, which is the only record of which side the viewer is on.
+    vec3 incident;
 };
 
 // One wave component at a point: how much of it the ray cone can still resolve, its wavenumber, and
@@ -624,6 +669,35 @@ vec3 sun_through_water(vec3 position, float footprint) {
     return exp(-WATER_EXTINCTION * path) * caustic(position.xy, depth, frame.time, footprint);
 }
 
+// Where a ray leaving `surface` toward `towards` should start.
+//
+// Off the triangle's own plane, on the side the ray is *going* — which is not always the side the
+// viewer is on. Morrowind hangs single-sided planes everywhere, and a shadow ray from the back of a
+// sail heads for a sun on the far side: started on the viewer's side it would be stopped by the
+// sail itself, and every such surface goes black. Deciding this per ray rather than per surface is
+// what lets the shading normal face the viewer without taking the lighting with it.
+vec3 leaving(Surface surface, vec3 towards) {
+    vec3 side = faceforward(surface.geometric, -towards, surface.geometric);
+    return surface.position + side * SHADOW_BIAS;
+}
+
+// How much of the light arriving along `towards` a surface turns back out, per unit irradiance.
+//
+// A solid is lit on the side the light is on and black on the other, because its own body is in the
+// way. A sheet has no body: light landing on its far face comes through, dimmed by what the cloth
+// absorbs on the way but never stopped. That is what a backlit sail is, and it is also what stops
+// the handful of triangles Morrowind wound inside out from reading as holes — they now come back
+// dimmer than their neighbours rather than black.
+//
+// View-independent, as a Lambertian sheet is: the same radiance leaves both faces.
+float lambert(Surface surface, vec3 towards) {
+    float facing = dot(surface.normal, towards);
+    if (surface.thin) {
+        return max(facing, 0.0) + TRANSMISSION * max(-facing, 0.0);
+    }
+    return max(facing, 0.0);
+}
+
 // The sun's contribution, before the surface's albedo.
 //
 // No attenuation and no distance: the sun is far enough away that its rays are parallel and its
@@ -631,7 +705,7 @@ vec3 sun_through_water(vec3 position, float footprint) {
 // much of the disc it can see. That second one is the soft shadow — the same visibility fraction a
 // lamp's sphere gives, over a cone rather than a sphere.
 vec3 sun_light(Surface surface, vec3 origin, uvec2 pixel, uint salt, uint samples) {
-    float facing = dot(surface.normal, -frame.sun_direction);
+    float facing = lambert(surface, -frame.sun_direction);
     // A black sun is how a cell with no sky says so, and a surface facing away needs no rays.
     if (facing <= 0.0 || frame.sun_colour == vec3(0.0)) {
         return vec3(0.0);
@@ -668,9 +742,7 @@ vec3 sun_light(Surface surface, vec3 origin, uvec2 pixel, uint salt, uint sample
 // afterwards; a bounce hit, whose albedo belongs to a different surface, multiplies immediately in
 // `shade`.
 vec3 direct_light(Surface surface, uvec2 pixel, uint salt, uint samples) {
-    // Offset along the normal so the surface does not shadow itself on its own triangle.
-    vec3 origin = surface.position + surface.normal * SHADOW_BIAS;
-    vec3 total = sun_light(surface, origin, pixel, salt, samples);
+    vec3 total = sun_light(surface, leaving(surface, -frame.sun_direction), pixel, salt, samples);
     for (uint i = 0u; i < frame.light_count; ++i) {
         Light light = lights[i];
         vec3 to_light = light.position - surface.position;
@@ -678,7 +750,8 @@ vec3 direct_light(Surface surface, uvec2 pixel, uint salt, uint samples) {
         if (to_light_length >= light.radius) {
             continue;
         }
-        float facing = dot(surface.normal, to_light / to_light_length);
+        vec3 towards = to_light / to_light_length;
+        float facing = lambert(surface, towards);
         if (facing <= 0.0) {
             continue;
         }
@@ -688,6 +761,7 @@ vec3 direct_light(Surface surface, uvec2 pixel, uint salt, uint samples) {
         // samples reach the light and some do not, and the gradient between them is the soft
         // shadow.
         float visible = 0.0;
+        vec3 origin = leaving(surface, towards);
         for (uint s = 0u; s < samples; ++s) {
             vec2 u = unit_pair(hash(uvec4(pixel, salt, i * samples + s)));
             vec3 offset = light.position + sphere_point(u) * light.source_radius - origin;
@@ -772,6 +846,9 @@ Surface trace(vec3 origin, vec3 direction, float cone_width, float cone_spread, 
     surface.t = 0.0;
     surface.hit = false;
     surface.water = false;
+    surface.geometric = vec3(0.0, 0.0, 1.0);
+    surface.thin = false;
+    surface.incident = direction;
 
     // No blanket opacity flag: the per-geometry `OPAQUE` bits the build set from each material are
     // what decide this. Forcing it here would override them and put the cutout back.
@@ -784,9 +861,15 @@ Surface trace(vec3 origin, vec3 direction, float cone_width, float cone_spread, 
             == gl_RayQueryCandidateIntersectionTriangleEXT) {
             uint slot = rayQueryGetIntersectionInstanceCustomIndexEXT(query, false)
                       + rayQueryGetIntersectionGeometryIndexEXT(query, false);
+            // The cone as it is at *this* candidate, which is what decides how much of the mask
+            // one pixel is looking at.
+            float reach = rayQueryGetIntersectionTEXT(query, false);
             if (alpha_passes(slot,
                              rayQueryGetIntersectionPrimitiveIndexEXT(query, false),
-                             rayQueryGetIntersectionBarycentricsEXT(query, false))) {
+                             rayQueryGetIntersectionBarycentricsEXT(query, false),
+                             rayQueryGetIntersectionObjectToWorldEXT(query, false),
+                             direction,
+                             cone_width + reach * cone_spread)) {
                 rayQueryConfirmIntersectionEXT(query);
             }
         }
@@ -813,9 +896,14 @@ Surface trace(vec3 origin, vec3 direction, float cone_width, float cone_spread, 
     // would need the inverse transpose instead.
     mat4x3 to_world = rayQueryGetIntersectionObjectToWorldEXT(query, true);
     surface.normal = normalize(mat3(to_world) * interpolate_normal(verts, weights));
+    // The triangle's own plane, turned to face the ray. Morrowind scales uniformly, so the plain
+    // matrix carries a cross product correctly here for the same reason it carries the normal.
+    surface.geometric = normalize(mat3(to_world) * cross(positions[verts.y] - positions[verts.x],
+                                                        positions[verts.z] - positions[verts.x]));
     surface.position = origin + direction * hit_t;
     surface.footprint = cone_width + hit_t * cone_spread;
     surface.t = hit_t;
+    surface.thin = (geom.flags & GEOMETRY_THIN) != 0u;
     surface.water = material.kind == KIND_WATER;
     if (surface.water) {
         // Nothing to demodulate by and nothing to light: `water_shade` produces the whole of it,
@@ -828,7 +916,7 @@ Surface trace(vec3 origin, vec3 direction, float cone_width, float cone_spread, 
     surface.emissive = material.emissive;
     surface.albedo = material.diffuse;
     if (material.base_colour != NO_TEXTURE) {
-        float lod = cone_lod(verts, to_world, direction, surface.normal, surface.footprint,
+        float lod = cone_lod(verts, to_world, direction, surface.footprint,
                              material.base_colour + 1u);
         surface.albedo *= base_colour(material, interpolate_uv(verts, weights), lod).rgb;
     }
@@ -922,8 +1010,10 @@ vec3 water_shade(Surface surface, vec3 incident, uvec2 pixel) {
     // at a glancing angle a facet can tilt far enough to face away from the ray, and reading that
     // as "the camera is underwater" sends the reflection down into the seabed and turns the far
     // water white.
-    bool from_below = dot(surface.normal, incident) > 0.0;
-    vec3 flat_normal = from_below ? -surface.normal : surface.normal;
+    // Water is the one surface whose sides have absolute names: it is a horizontal plane, so a ray
+    // travelling upward into it came from underneath, whatever the quad's winding says.
+    bool from_below = incident.z > 0.0;
+    vec3 flat_normal = from_below ? vec3(0.0, 0.0, -1.0) : vec3(0.0, 0.0, 1.0);
 
     // The wave normal replaces the quad's flat one. Keyed off world position rather than anything
     // interpolated, so one cell's surface continues into the next without a seam at the boundary.
@@ -988,6 +1078,13 @@ vec3 water_shade(Surface surface, vec3 incident, uvec2 pixel) {
 
 // The cosine-weighted mean radiance arriving at a surface over its hemisphere, one bounce deep.
 //
+// The hemisphere a hit gathers over: its own normal, unless it is a sheet, in which case the face
+// the ray came from — a sheet has no inside for its normal to be pointing into.
+vec3 gathering_side(Surface surface) {
+    return surface.thin ? faceforward(surface.normal, surface.incident, surface.normal)
+                        : surface.normal;
+}
+
 // Multiplying this by albedo is the whole indirect term: sampling by the cosine cancels both the
 // cosine in the rendering equation and the `1/pi` in the Lambertian BRDF, so no other factor
 // belongs here.
@@ -1005,11 +1102,15 @@ vec3 gather_indirect(Surface surface, uvec2 pixel) {
     if (frame.bounce_samples == 0u) {
         return ambient;
     }
-    vec3 origin = surface.position + surface.normal * SHADOW_BIAS;
     vec3 total = vec3(0.0);
     for (uint b = 0u; b < frame.bounce_samples; ++b) {
         vec2 u = unit_pair(hash(uvec4(pixel, STREAM_BOUNCE, b)));
-        Surface bounce = trace(origin, cosine_direction(surface.normal, u), surface.footprint,
+        // A sheet gathers over the side the viewer is on. Its far side contributes too, through
+        // the same transmission the direct term applies, but that half is an ambient seen through
+        // cloth — and sampling only the near one is what keeps an inside-out triangle from
+        // gathering the inside of the hull it is nailed to.
+        vec3 towards = cosine_direction(gathering_side(surface), u);
+        Surface bounce = trace(leaving(surface, towards), towards, surface.footprint,
                                BOUNCE_SPREAD, MASK_ANY);
         // Water counts as an escape rather than a surface: it has no albedo of its own, so
         // shading it here would return black, and what a bounce ray actually finds there is the

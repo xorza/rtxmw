@@ -1,5 +1,7 @@
 //! Flattening a NIF's node graph, or a cell's heightmap, into one renderable mesh.
 
+use std::collections::HashMap;
+
 use glam::{Mat3, Vec2, Vec3};
 use rtxmw_esm::{CELL_SIZE, GRID, LandRecord, SPACING, TEXTURE_GRID};
 use rtxmw_nif::{Block, GeometryData, Link, NifFile, Transform};
@@ -17,6 +19,21 @@ const NON_VISUAL_NODES: &[&str] = &["RootCollisionNode", "AvoidNode"];
 ///
 /// Compared case-insensitively, because the content is inconsistent about it.
 const MARKER_PREFIXES: &[&str] = &["editormarker", "tri editormarker"];
+
+/// A vertex position rounded to eighths of a unit, which is how two triangles agree that they meet.
+type EdgeKey = (i32, i32, i32);
+
+/// How much a run may enclose, by [`Mesh::run_volume`], and still be a sheet.
+///
+/// An order of magnitude below a cube, which scores 0.068.
+const THIN_VOLUME: f32 = 0.006;
+
+/// What fraction of a mesh's edges must be border for it to count as open.
+///
+/// A closed box has none at all; a sheet has its whole perimeter, which even at a fifty-by-fifty
+/// tessellation is a fortieth. What the tolerance buys is room for the odd crack in a solid that
+/// was never quite closed.
+const BORDER_SHARE: usize = 50;
 
 /// One model's visible geometry, with every node transform already applied.
 ///
@@ -48,6 +65,14 @@ pub struct Submesh {
     pub index_count: u32,
     /// Index into the scene's [`MaterialTable`].
     pub material: u32,
+    /// Whether this run is a *sheet* rather than the skin of something solid.
+    ///
+    /// Morrowind's cloth and foliage are single layers of triangles: a sail, a tapestry, a leaf
+    /// card. Light goes through them, and a renderer that lights only the face a normal happens to
+    /// point at gets them wrong twice over — the unlit side is black where it should glow, and a
+    /// triangle whose normal was authored the other way round to its neighbours' stands out as a
+    /// patch. Knowing which runs are sheets is what lets both be answered at once.
+    pub thin: bool,
 }
 
 impl Submesh {
@@ -58,6 +83,94 @@ impl Submesh {
 }
 
 impl Mesh {
+    /// Marks every run that is a *sheet* — cloth, a rug, a banner — rather than part of something
+    /// solid, which is what lets the renderer light it from either face.
+    ///
+    /// **Two questions, because either one alone gets it wrong on real data.**
+    ///
+    /// The first is asked of the whole mesh: has it any edge belonging to only one triangle? A
+    /// closed surface has none. This cannot be asked of a run, and the temptation to is the trap —
+    /// a run is a *material* boundary, so a bottle with three textures on it arrives as three open
+    /// patches and every one of them looks like a sheet. Measured that way, seven eighths of a
+    /// furnished interior classifies as cloth, chests and wine bottles included.
+    ///
+    /// The second is asked of the run: does it enclose anything? That is what separates a sail from
+    /// the hull it is rigged to when both arrive in one file, and a room's wall shell — open at the
+    /// ends where it meets the next section, but wrapped around the room's air — from the rug lying
+    /// inside it.
+    ///
+    /// Neither is exact. A flat run of a solid — a floor slab modelled as one plane — passes both
+    /// and is called a sheet; it is single-sided with nothing behind it, so being lit from the far
+    /// side is the harmless answer anyway.
+    fn classify_sheets(&mut self) {
+        let open = self.has_border();
+        for index in 0..self.submeshes.len() {
+            let run = self.submeshes[index];
+            self.submeshes[index].thin = open && self.run_volume(&run) < THIN_VOLUME;
+        }
+    }
+
+    /// What a run bounds, as a fraction of what a solid of the same surface area would.
+    ///
+    /// Zero for anything flat, whatever its size or its winding, because every tetrahedron about a
+    /// plane's own centroid is degenerate. A cube scores 0.068.
+    fn run_volume(&self, run: &Submesh) -> f32 {
+        let span = run.first_index as usize..(run.first_index + run.index_count) as usize;
+        let indices = &self.indices[span];
+        if indices.is_empty() {
+            return 0.0;
+        }
+        let mut centre = Vec3::ZERO;
+        for &index in indices {
+            centre += self.positions[index as usize];
+        }
+        centre /= indices.len() as f32;
+
+        let mut volume = 0.0;
+        let mut area = 0.0;
+        for triangle in indices.chunks_exact(3) {
+            let a = self.positions[triangle[0] as usize] - centre;
+            let b = self.positions[triangle[1] as usize] - centre;
+            let c = self.positions[triangle[2] as usize] - centre;
+            volume += a.dot(b.cross(c)) / 6.0;
+            area += (b - a).cross(c - a).length() / 2.0;
+        }
+        if area <= 0.0 {
+            return 0.0;
+        }
+        volume.abs() / area.powf(1.5)
+    }
+
+    /// Whether the mesh has a border — an edge with a triangle on one side and nothing on the other.
+    ///
+    /// Edges are keyed by the positions they join rather than by vertex index. Morrowind splits
+    /// vertices wherever a texture seam or a hard crease needs two normals at one corner, so two
+    /// triangles sharing an edge routinely name four different vertices for it; counted by index,
+    /// every seam would read as a border and every solid as a sheet.
+    ///
+    /// [`BORDER_SHARE`] is where the line falls.
+    fn has_border(&self) -> bool {
+        let mut edges: HashMap<(EdgeKey, EdgeKey), u32> = HashMap::new();
+        for triangle in self.indices.chunks_exact(3) {
+            for corner in 0..3 {
+                let a = self.quantised(triangle[corner]);
+                let b = self.quantised(triangle[(corner + 1) % 3]);
+                *edges
+                    .entry(if a <= b { (a, b) } else { (b, a) })
+                    .or_default() += 1;
+            }
+        }
+        let boundary = edges.values().filter(|&&shared| shared == 1).count();
+        boundary * BORDER_SHARE > edges.len()
+    }
+
+    /// A vertex position as a key, rounded fine enough to separate real corners and coarse enough
+    /// that two triangles meeting along an edge agree about where it is.
+    fn quantised(&self, index: u32) -> EdgeKey {
+        let p = self.positions[index as usize] * 8.0;
+        (p.x.round() as i32, p.y.round() as i32, p.z.round() as i32)
+    }
+
     /// A unit quad in the XY plane facing up, which is every water surface in the game.
     ///
     /// A unit rather than a placed one, unlike terrain: water is flat, so every cell's surface is
@@ -86,6 +199,9 @@ impl Mesh {
                 first_index: 0,
                 index_count: 6,
                 material,
+                // A water surface is the thinnest thing there is, but it shades through its own
+                // path and never asks.
+                thin: false,
             }],
         }
     }
@@ -177,6 +293,8 @@ impl Mesh {
                 first_index,
                 index_count: mesh.indices.len() as u32 - first_index,
                 material,
+                // Terrain is a sheet by construction, and the one sheet nothing shines through.
+                thin: false,
             });
         }
         mesh
@@ -198,6 +316,9 @@ impl Mesh {
                 0,
             );
         }
+        // Only once every block has been flattened: a border is a property of the whole model, and
+        // a mesh half-built has borders where the rest of it has yet to arrive.
+        mesh.classify_sheets();
         mesh
     }
 
@@ -342,6 +463,9 @@ impl Mesh {
                 first_index,
                 index_count,
                 material,
+                // Decided in `classify_sheets` once the whole model is flattened: a run still
+                // being extended has not shown what it encloses yet.
+                thin: false,
             }),
         }
     }
@@ -419,6 +543,147 @@ fn is_skippable(name: &str) -> bool {
 mod tests {
     use super::*;
     use rtxmw_esm::VERTICES;
+
+    /// Adds a run covering the indices appended since `first_index`.
+    fn close_run(mesh: &mut Mesh, first_index: u32) {
+        mesh.submeshes.push(Submesh {
+            first_index,
+            index_count: mesh.indices.len() as u32 - first_index,
+            material: 0,
+            thin: false,
+        });
+    }
+
+    /// A closed box of side `size` about the origin, as twelve triangles in one run.
+    fn box_mesh(size: f32) -> Mesh {
+        let h = size / 2.0;
+        let mut mesh = Mesh {
+            positions: [
+                [-1.0, -1.0, -1.0],
+                [1.0, -1.0, -1.0],
+                [1.0, 1.0, -1.0],
+                [-1.0, 1.0, -1.0],
+                [-1.0, -1.0, 1.0],
+                [1.0, -1.0, 1.0],
+                [1.0, 1.0, 1.0],
+                [-1.0, 1.0, 1.0],
+            ]
+            .iter()
+            .map(|c| Vec3::from_array(*c) * h)
+            .collect(),
+            normals: vec![Vec3::Z; 8],
+            uvs: vec![Vec2::ZERO; 8],
+            indices: vec![
+                0, 2, 1, 0, 3, 2, 4, 5, 6, 4, 6, 7, 0, 1, 5, 0, 5, 4, 1, 2, 6, 1, 6, 5, 2, 3, 7, 2,
+                7, 6, 3, 0, 4, 3, 4, 7,
+            ],
+            submeshes: Vec::new(),
+        };
+        close_run(&mut mesh, 0);
+        mesh
+    }
+
+    /// A flat quad of side `size` in the XY plane, as one run.
+    fn quad_mesh(size: f32) -> Mesh {
+        let h = size / 2.0;
+        let mut mesh = Mesh {
+            positions: vec![
+                Vec3::new(-h, -h, 0.0),
+                Vec3::new(h, -h, 0.0),
+                Vec3::new(h, h, 0.0),
+                Vec3::new(-h, h, 0.0),
+            ],
+            normals: vec![Vec3::Z; 4],
+            uvs: vec![Vec2::ZERO; 4],
+            indices: vec![0, 1, 2, 0, 2, 3],
+            submeshes: Vec::new(),
+        };
+        close_run(&mut mesh, 0);
+        mesh
+    }
+
+    /// Appends a cylinder wall of `sides` facets — open at both ends, like a mast or a room's wall
+    /// shell — and closes a run over it.
+    fn add_tube(mesh: &mut Mesh, radius: f32, height: f32, sides: u32) {
+        let first_index = mesh.indices.len() as u32;
+        let base = mesh.positions.len() as u32;
+        for step in 0..sides {
+            let angle = std::f32::consts::TAU * step as f32 / sides as f32;
+            for &z in &[-height / 2.0, height / 2.0] {
+                mesh.positions
+                    .push(Vec3::new(radius * angle.cos(), radius * angle.sin(), z));
+                mesh.normals.push(Vec3::new(angle.cos(), angle.sin(), 0.0));
+                mesh.uvs.push(Vec2::ZERO);
+            }
+        }
+        for step in 0..sides {
+            let here = base + step * 2;
+            let next = base + ((step + 1) % sides) * 2;
+            mesh.indices
+                .extend_from_slice(&[here, next, next + 1, here, next + 1, here + 1]);
+        }
+        close_run(mesh, first_index);
+    }
+
+    #[test]
+    fn a_sheet_is_told_from_a_solid_by_its_border_and_what_it_wraps() {
+        // **What separates a sail from a crate**, on data where nothing says which is which.
+        //
+        // A closed box has no border at all, so nothing in it is cloth however its runs are split.
+        let mut solid = box_mesh(100.0);
+        solid.classify_sheets();
+        assert!(!solid.submeshes[0].thin, "a closed box is not cloth");
+
+        // A flat quad is all border and wraps nothing.
+        let mut flat = quad_mesh(100.0);
+        flat.classify_sheets();
+        assert!(flat.submeshes[0].thin);
+
+        // A tube — a mast, or the wall shell of a room — has a border at each end but wraps its own
+        // air, and that is the case the border test alone gets wrong. Morrowind's interiors are
+        // built from these, and calling one cloth would let a lamp in the next room shine through
+        // the wall between them.
+        let mut tube = Mesh::default();
+        add_tube(&mut tube, 60.0, 200.0, 12);
+        tube.classify_sheets();
+        assert!(!tube.submeshes[0].thin, "a wall shell is not cloth");
+
+        // And the case the *volume* test alone gets wrong: a bottle textured in three parts arrives
+        // as three open patches, each of which encloses nothing by itself. Asking the mesh rather
+        // than the run is what keeps them solid — here, a box whose top is a run of its own.
+        let mut split = box_mesh(100.0);
+        let top = split.submeshes[0];
+        split.submeshes[0] = Submesh {
+            index_count: 6,
+            ..top
+        };
+        split.submeshes.push(Submesh {
+            first_index: 6,
+            index_count: top.index_count - 6,
+            ..top
+        });
+        split.classify_sheets();
+        assert!(
+            split.submeshes.iter().all(|run| !run.thin),
+            "splitting a solid by material turned it into cloth"
+        );
+
+        // The two signals together are still per run, so a sail rigged to a hull in one file is
+        // answered separately from the hull.
+        let mut boat = Mesh::default();
+        add_tube(&mut boat, 60.0, 200.0, 12);
+        let sail_first = boat.indices.len() as u32;
+        let base = boat.positions.len() as u32;
+        let sail = quad_mesh(100.0);
+        boat.positions.extend_from_slice(&sail.positions);
+        boat.normals.extend_from_slice(&sail.normals);
+        boat.uvs.extend_from_slice(&sail.uvs);
+        boat.indices.extend(sail.indices.iter().map(|i| i + base));
+        close_run(&mut boat, sail_first);
+        boat.classify_sheets();
+        assert!(!boat.submeshes[0].thin, "the hull");
+        assert!(boat.submeshes[1].thin, "the sail");
+    }
 
     /// Texture tiles in a cell, which is how many materials `from_land` wants.
     const TILES: usize = TEXTURE_GRID * TEXTURE_GRID;
@@ -588,17 +853,20 @@ mod tests {
                 Submesh {
                     first_index: 0,
                     index_count: 6,
-                    material: 0
+                    material: 0,
+                    thin: false,
                 },
                 Submesh {
                     first_index: 6,
                     index_count: 3,
-                    material: 1
+                    material: 1,
+                    thin: false,
                 },
                 Submesh {
                     first_index: 9,
                     index_count: 3,
-                    material: 0
+                    material: 0,
+                    thin: false,
                 },
             ]
         );

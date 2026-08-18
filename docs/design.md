@@ -1640,6 +1640,62 @@ it idles at 315 MHz here and only ramps to 2,280 under sustained load, so a shor
 ramp. Back-to-back A/B pairs — flat against wavy, guard on against off — are the only comparisons
 that survived, and they are the only kind worth making here.
 
+### 7.9 Shadow acne on Morrowind's geometry
+
+Found from screenshots rather than from a test, and not really a water problem at all — but it was
+water's ray offsets that led to it. Rugs sparkled along their edges, smooth-shaded rocks came out
+under salt-and-pepper, and **the noise changed strength from triangle to triangle**, which is what
+made the diagnosis: every ray leaving a surface was offset along the *interpolated* normal.
+
+That normal comes from the vertices and is what a surface should be shaded by, but on geometry this
+coarse it can point tens of degrees away from the triangle it belongs to. Offsetting along it puts
+the ray origin under the surface on some triangles and over it on others, and a shadow ray that
+starts underneath is stopped by the surface it started from.
+
+Rays now leave along the **triangle's own plane**, from the cross product of its edges. The subtlety
+is which way that plane should face, and getting it wrong blacked out half an interior: turned
+toward the *ray*, a shadow ray leaving the back of a tapestry sets off for the sun, meets the
+tapestry, and reports shadow. Morrowind hangs single-sided planes everywhere — every tapestry, sail
+and leaf card — and draws them from both sides, so the plane has to face the side the surface is
+*lit* from, which is the side its shading normal points at. False-colouring the two against each
+other showed how common that case is: every leaf on every tree is a back-facing hit.
+
+A test now pins it — a single-sided plane seen from behind still shows the light on its front — and
+turning the offset back toward the ray fails it and nothing else. Nothing in the suite had noticed
+those surfaces going black.
+
+### 7.10 Sheets are lit from both sides
+
+The remainder of §7.9's artefact was not acne. A handful of the boat sail's polygons shaded as though
+their normals were inverted — flat, noise-free patches, lit while the cloth around them was not — and
+the tapestries kept a coloured speckle after the offsets were fixed. Both come from the same gap:
+**Morrowind hangs single layers of triangles and the renderer treated every one of them as the skin
+of a solid.** A layer has no inside. Lit from the far side it should glow; shaded as a solid it goes
+black, and a triangle the artist wound backwards takes its whole neighbourhood with it.
+
+A run now carries a `thin` bit into `GpuGeometry`, and the shading term for one is
+`max(N·L, 0) + T·max(−N·L, 0)` with `T = 0.5` — a Lambertian sheet, view-independent, lit from
+whichever side the light is on. The indirect gather takes the hemisphere the ray came from rather
+than the one the normal names, so an inside-out triangle no longer gathers the inside of the hull it
+is nailed to.
+
+**Deciding which runs are sheets is the whole difficulty, and two plausible tests each fail on real
+data.** Asking what a run encloses works for a flat rug and fails for a curved sail, because an open
+surface encloses the cone it subtends from wherever it is measured. Asking whether it has a border —
+an edge with one triangle on it — is exact for closedness but cannot be asked of a *run*: a run is a
+material boundary, so a wine bottle with three textures arrives as three open patches. Measured that
+way, **268 of the Census Office's 308 runs classified as cloth**, chests and bottles included.
+
+The test that holds asks both, at the level each is meaningful: the border of the whole mesh, the
+enclosed volume of the run. That leaves 47 of 308 — the tapestries, the rugs, the flat slabs of the
+wall shells. A room's shell is open at the ends where it meets the next section but wraps the room's
+air, so it stays solid and a lamp next door does not shine through the wall: the wall's brightness
+moves by 0.02% while the tapestries' speckle drops by a quarter.
+
+Edges are keyed by quantised *position*, not by vertex index. Morrowind splits vertices at every
+texture seam, so two triangles sharing an edge routinely name four different vertices for it —
+counted by index, every seam reads as a border and every solid as cloth.
+
 ### 7.8 Costs and risks
 
 - **Water pixels cost roughly twice.** Two rays instead of one, each spawning its own shadow rays.

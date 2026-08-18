@@ -29,6 +29,7 @@ fn distinct_mesh(offset: f32, vertices: u32, indices: &[u32]) -> Mesh {
             first_index: 0,
             index_count: indices.len() as u32,
             material: 0,
+            thin: false,
         }],
     }
 }

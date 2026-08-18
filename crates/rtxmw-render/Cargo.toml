@@ -14,7 +14,7 @@ bytemuck.workspace = true
 glam.workspace = true
 rtxmw-gpu.workspace = true
 rtxmw-scene.workspace = true
-rtxmw-texture.workspace = true
+rtxmw-texture = { workspace = true, features = ["internals"] }
 
 [dev-dependencies]
 dhat.workspace = true

@@ -47,6 +47,7 @@ fn quad(corner: Vec3, across: Vec3, up: Vec3, normal: Vec3, material: u32) -> Me
             first_index: 0,
             index_count: 6,
             material,
+            thin: false,
         }],
     }
 }
@@ -258,6 +259,7 @@ fn two_materials_in_one_mesh_shade_differently() {
         first_index: 6,
         index_count: 6,
         material: 1,
+        thin: false,
     });
 
     // Two materials distinguishable by their own colour. Identity alone is no longer enough now
@@ -1088,5 +1090,151 @@ fn the_indirect_estimate_converges_as_its_sample_count_rises() {
         errors[2] < 0.05,
         "16 samples is still {} from converged, which is a bias rather than noise",
         errors[2]
+    );
+}
+
+/// A cutout mask that alternates texel by texel, over a chain whose coarser levels are solid.
+///
+/// The shape of every alpha-masked thing in the game: a mask whose detail is finer than a distant
+/// pixel, and whose average — which is what the coarser levels hold — is a perfectly good answer
+/// for one.
+fn checkered_cutout() -> Texture {
+    const SIZE: usize = 16;
+    let mut finest = Vec::with_capacity(SIZE * SIZE * 4);
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            finest.extend_from_slice(&[255, 255, 255, if (x + y) % 2 == 0 { 255 } else { 0 }]);
+        }
+    }
+    // Every coarser level solid, which is what averaging a half-and-half checker gives once the
+    // detail is gone — rounded up, so a level that can no longer see the holes keeps the surface.
+    let coarse = |n: usize| vec![255u8; n * n * 4];
+    let levels = [coarse(8), coarse(4), coarse(2), coarse(1)];
+    let refs: Vec<&[u8]> = std::iter::once(finest.as_slice())
+        .chain(levels.iter().map(Vec::as_slice))
+        .collect();
+    Texture::from_levels(TextureFormat::Rgba8, SIZE as u32, SIZE as u32, &refs)
+}
+
+#[test]
+fn a_cutout_seen_from_far_enough_stops_being_a_stipple() {
+    // **A binary test on a point sample is a coin toss once the mask is finer than the pixel.**
+    // Read at its finest level regardless of distance, this checker keeps or drops each pixel at
+    // random — which is the crawling sparkle along the fringe of a rug and the speckle over a tree.
+    // Read at the level the ray cone can actually resolve, the holes have already averaged away and
+    // the surface is simply there.
+    // The mask tiled twenty times across a wall far enough away that one pixel covers several
+    // texels of it — the whole point being minification, which is where a point sample goes wrong.
+    // At 4,000 units a pixel spans about 24 units and a texel about 7.5.
+    let mut wall = uv_wall(4000.0, -1200.0..1200.0, -1200.0..1200.0);
+    for uv in &mut wall.uvs {
+        *uv *= 20.0;
+    }
+    let meshes = [wall];
+    let materials = [Material {
+        base_colour: Some(TextureId(0)),
+        alpha: AlphaMode::Mask(0.5),
+        ..Material::default()
+    }];
+    let instances = [Instance {
+        mesh: MeshId(0),
+        transform: Affine3A::IDENTITY,
+    }];
+    let pixels = trace_textured(
+        &meshes,
+        &materials,
+        &[Some(checkered_cutout())],
+        &instances,
+        Vec3::ZERO,
+        Vec3::X,
+    );
+
+    // The wall is far enough to fill the middle of the frame, so every pixel there lands on it.
+    // Any miss is a hole the cutout punched at random.
+    let mut holes = 0;
+    let mut sampled = 0;
+    // Well inside the wall's own outline: at this distance the frame is far wider than the wall,
+    // so a looser window would count the sky beyond its edges as holes.
+    for y in 3 * HEIGHT / 8..5 * HEIGHT / 8 {
+        for x in 3 * WIDTH / 8..5 * WIDTH / 8 {
+            sampled += 1;
+            if !is_hit(at(&pixels, x, y)) {
+                holes += 1;
+            }
+        }
+    }
+    assert!(
+        holes * 20 < sampled,
+        "{holes} of {sampled} pixels fell through a mask that averages to solid at this distance"
+    );
+}
+
+#[test]
+fn a_sheet_lit_from_behind_transmits_and_a_solid_one_does_not() {
+    // Morrowind hangs single layers of triangles everywhere — sails, banners, rugs — and a layer
+    // has no back for its own shadow to fall on. Lit from the far side it glows; the same quad
+    // marked solid is black there, because a solid's body is in the way.
+    //
+    // The two light positions mirror each other about the wall, so distance, attenuation and the
+    // cosine are identical between them and the only difference left is the side. That is what
+    // makes the expected ratio exactly `TRANSMISSION`, with nothing else to cancel out.
+    let mut sheet = wall(200.0, -150.0..150.0, -150.0..150.0);
+    sheet.submeshes[0].thin = true;
+    let solid = wall(200.0, -150.0..150.0, -150.0..150.0);
+    let materials = [Material::default()];
+    let instances = [Instance {
+        mesh: MeshId(0),
+        transform: Affine3A::IDENTITY,
+    }];
+    // Dim enough that the front value lands mid-range: at full brightness both sides clip at one
+    // and a half is indistinguishable from a whole.
+    let lamp = |x: f32| Light {
+        position: Vec3::new(x, 0.0, 0.0),
+        colour: Vec3::splat(0.15),
+        radius: 400.0,
+    };
+
+    // No ambient at all: the direct term is the whole image, so a transmitted value cannot be a
+    // fill light in disguise.
+    let trace_with = |mesh: &Mesh, light: Light| {
+        let scene = common::scene_of(
+            std::slice::from_ref(mesh),
+            &materials,
+            &instances,
+            &[light],
+            Vec3::ZERO,
+        );
+        patch_mean(
+            &trace_scene(&scene, &[], Vec3::ZERO, Vec3::X, 0),
+            WIDTH / 2,
+            HEIGHT / 2,
+        )
+        .x
+    };
+
+    let front = trace_with(&solid, lamp(100.0));
+    assert!(
+        front > 0.2,
+        "the fixture is too dim to tell a half of it from quantisation: {front}"
+    );
+    assert_eq!(
+        trace_with(&solid, lamp(300.0)),
+        0.0,
+        "a solid wall was lit through from behind"
+    );
+
+    // The near side is untouched — transmission adds a term for the far side rather than splitting
+    // the one the front already had.
+    let sheet_front = trace_with(&sheet, lamp(100.0));
+    assert!(
+        (sheet_front - front).abs() < 0.01,
+        "marking a run thin changed how it is lit from the front: {front} became {sheet_front}"
+    );
+
+    // And the far side arrives at half, which is the transmission the shader declares.
+    let sheet_back = trace_with(&sheet, lamp(300.0));
+    assert!(
+        (sheet_back - front * 0.5).abs() < 0.01,
+        "a sheet lit from behind returned {sheet_back}, not half of {front}"
     );
 }
