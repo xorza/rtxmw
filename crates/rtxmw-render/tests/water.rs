@@ -40,7 +40,7 @@ fn slab(z: f32, material: u32) -> Mesh {
 
 /// A floor `depth` units below water at z = 0, both filling the view.
 fn flooded(depth: f32, floor: Material) -> StaticScene {
-    common::scene_of(
+    let mut scene = common::scene_of(
         &[slab(0.0, 0), slab(-depth, 1)],
         &[
             Material {
@@ -62,7 +62,10 @@ fn flooded(depth: f32, floor: Material) -> StaticScene {
         &[],
         // A dark sky, so a reflection of it is distinguishable from the floor beneath.
         Vec3::splat(0.02),
-    )
+    );
+    // What tells anything below the surface how deep it is, and so how the light reached it.
+    scene.water_level = Some(0.0);
+    scene
 }
 
 /// Water over a floor that emits rather than reflects.
@@ -262,26 +265,44 @@ fn the_sun_reaches_the_bottom_through_water() {
     // surface, and a surface blocks shadow rays — so a seabed that was sunlit before there was a
     // sea has to still be sunlit with one over it, or the whole shallows go black in daylight.
     let depth = 100.0;
-    let dry = centre_radiance(
-        &seabed(depth, false),
-        Vec3::new(0.0, 0.0, 500.0),
-        Vec3::NEG_Z,
-    );
-    let submerged = centre_radiance(
-        &seabed(depth, true),
-        Vec3::new(0.0, 0.0, 500.0),
-        Vec3::NEG_Z,
-    );
+    let eye = Vec3::new(0.0, 0.0, 500.0);
+    let dry = mean_green(&frame_at(&seabed(depth, false), eye, Vec3::NEG_Z, 0.0));
+    let submerged = mean_green(&frame_at(&seabed(depth, true), eye, Vec3::NEG_Z, 0.0));
 
-    // What the water takes is what it absorbs along the camera's path back up: green loses
-    // `exp(-0.001429 * 100)` = 0.867 of itself, and Fresnel reflects 2% of the rest away. So the
-    // submerged floor should be a little dimmer than the dry one — not a fraction of it.
-    let ratio = submerged.y / dry.y;
+    // Green is absorbed over both legs — the sunlight's way down and the camera's way back up — at
+    // `exp(-0.001429 * 100)` = 0.867 each, and Fresnel turns 2% of what is left away at the
+    // surface. That puts the floor at about three quarters of its dry brightness. A *mean* rather
+    // than a pixel because caustics move light around: any one point sits on a bright line or
+    // between two, and only the average says how much arrived.
+    let ratio = submerged / dry;
     assert!(
-        ratio > 0.7 && ratio < 1.0,
+        (0.6..0.85).contains(&ratio),
         "the seabed should keep most of its sunlight under 100 units of water, \
-         got {ratio} ({submerged:?} against {dry:?})"
+         got {ratio} ({submerged} against {dry})"
     );
+}
+
+/// Mean green across the whole frame.
+///
+/// A mean rather than a pixel, because caustics move light *around*: any one point on a seabed sits
+/// on a bright line or between two, and only the average says how much light arrived.
+fn mean_green(pixels: &[u8]) -> f32 {
+    let total: f32 = pixels.chunks_exact(4).map(|p| p[1] as f32).sum();
+    total / (pixels.len() / 4) as f32 / 255.0
+}
+
+/// How much the frame varies about its own mean, as a fraction of it.
+///
+/// The measure of a caustic pattern: light gathered into lines rather than spread evenly.
+fn relative_spread(pixels: &[u8]) -> f32 {
+    let values: Vec<f32> = pixels
+        .chunks_exact(4)
+        .map(|p| p[1] as f32 / 255.0)
+        .collect();
+    let mean = values.iter().sum::<f32>() / values.len() as f32;
+    let variance =
+        values.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / values.len() as f32;
+    variance.sqrt() / mean.max(1e-6)
 }
 
 /// The green channel along the middle row, which is where the surface is looked at edge-on.
@@ -322,5 +343,50 @@ fn waves_break_up_the_surface_and_travel_with_the_clock() {
     assert!(
         moved > 0.005,
         "the surface should have moved in a second; mean change was {moved}"
+    );
+}
+
+#[test]
+fn caustics_gather_the_sunlight_without_creating_any() {
+    // **The property that catches a wrong derivative.** A caustic is light moved, not made: the
+    // pattern on a seabed is the sun's own light redistributed by the surface above it, so however
+    // violently it shifts from moment to moment, the total arriving cannot change.
+    let eye = Vec3::new(0.0, 0.0, 500.0);
+    let scene = seabed(300.0, true);
+
+    let first = frame_at(&scene, eye, Vec3::NEG_Z, 0.0);
+    let second = frame_at(&scene, eye, Vec3::NEG_Z, 1.7);
+
+    let moved: f32 = first
+        .chunks_exact(4)
+        .zip(second.chunks_exact(4))
+        .map(|(a, b)| (a[1] as f32 - b[1] as f32).abs())
+        .sum::<f32>()
+        / (first.len() / 4) as f32
+        / 255.0;
+    let means = (mean_green(&first), mean_green(&second));
+    assert!(
+        moved > 0.01,
+        "the pattern should have moved between the two frames; mean change was {moved}"
+    );
+    assert!(
+        (means.0 - means.1).abs() < 0.1 * means.0,
+        "the light arriving must not change with the pattern: {means:?}"
+    );
+}
+
+#[test]
+fn the_caustic_pattern_sharpens_with_depth() {
+    // A surface is a lens, and a lens needs a throw. Just under the surface the light has had no
+    // room to gather and the bottom is evenly lit; further down the same waves have pulled it into
+    // lines. So contrast has to grow with depth — which is what pins the *depth* term in the
+    // Jacobian rather than merely the curvature.
+    let eye = Vec3::new(0.0, 0.0, 500.0);
+    let shallow = relative_spread(&frame_at(&seabed(10.0, true), eye, Vec3::NEG_Z, 0.0));
+    let deep = relative_spread(&frame_at(&seabed(400.0, true), eye, Vec3::NEG_Z, 0.0));
+
+    assert!(
+        deep > shallow * 3.0,
+        "caustics should be far stronger at depth: {deep} against {shallow}"
     );
 }

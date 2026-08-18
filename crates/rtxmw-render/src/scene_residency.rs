@@ -98,6 +98,7 @@ impl SceneResidency {
                 ambient: Vec3::ZERO,
                 light_count: 0,
                 sun: None,
+                water_level: None,
             },
         })
     }
@@ -145,6 +146,7 @@ impl SceneResidency {
         // would need, and nothing here is one yet.
         self.lighting.ambient = scene.ambient.map_or(Vec3::ZERO, |ambient| ambient.colour);
         self.lighting.sun = scene.sun;
+        self.lighting.water_level = scene.water_level;
         Ok(())
     }
 

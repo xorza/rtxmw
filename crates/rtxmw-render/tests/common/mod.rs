@@ -48,6 +48,8 @@ pub(crate) fn scene_of(
         }),
         // Set by the caller when a fixture wants one; most are indoors and have none.
         sun: None,
+        // Likewise: a fixture that places water sets the level its quad sits at.
+        water_level: None,
         without_model: Vec::new(),
     }
 }

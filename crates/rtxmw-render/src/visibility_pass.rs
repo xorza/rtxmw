@@ -23,6 +23,8 @@ pub(crate) struct Lighting {
     pub(crate) light_count: u32,
     /// The sun, for a cell with a sky.
     pub(crate) sun: Option<Sun>,
+    /// Where the water surface sits, for shading what is under it. Absent for a dry cell.
+    pub(crate) water_level: Option<f32>,
 }
 
 /// What the shader needs to turn a pixel into a ray.
@@ -63,6 +65,11 @@ pub struct FrameConstants {
     /// the estimator collapses back to a flat `albedo * ambient` fill — so it is exactly the
     /// lighting model this had before one bounce existed, and the A/B against it is honest.
     bounce_samples: u32,
+    /// Where the water surface sits, or **negative infinity for a cell with no water**.
+    ///
+    /// A sentinel rather than a flag: every use is `water_level - z > 0`, and negative infinity
+    /// makes that false everywhere without a branch of its own to get wrong.
+    water_level: f32,
     /// Seconds since the engine started, which is what makes water move.
     ///
     /// Zero unless a caller sets one, so a screenshot and a test are reproducible: the surface at
@@ -101,6 +108,7 @@ impl FrameConstants {
             sun_cos_radius: sun.angular_radius.cos(),
             sun_colour: sun.colour.to_array(),
             bounce_samples,
+            water_level: lighting.water_level.unwrap_or(f32::NEG_INFINITY),
             time,
         }
     }
@@ -378,8 +386,9 @@ mod tests {
         assert_eq!(offset_of!(FrameConstants, sun_cos_radius), 108);
         assert_eq!(offset_of!(FrameConstants, sun_colour), 112);
         assert_eq!(offset_of!(FrameConstants, bounce_samples), 124);
-        assert_eq!(offset_of!(FrameConstants, time), 128);
-        assert_eq!(size_of::<FrameConstants>(), 132);
+        assert_eq!(offset_of!(FrameConstants, water_level), 128);
+        assert_eq!(offset_of!(FrameConstants, time), 132);
+        assert_eq!(size_of::<FrameConstants>(), 136);
     }
 
     #[test]
@@ -417,6 +426,7 @@ mod tests {
                 ambient: Vec3::ZERO,
                 light_count: 0,
                 sun: None,
+                water_level: None,
             },
             0.0,
             0,

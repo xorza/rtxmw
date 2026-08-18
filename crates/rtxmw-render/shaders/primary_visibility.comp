@@ -119,6 +119,9 @@ layout(set = 0, binding = 11, scalar) readonly buffer Frame {
     // Zero when the cell has no sky, which costs no branch: every term it feeds is a multiply.
     vec3 sun_colour;
     uint bounce_samples;
+    // Where the water surface sits, or negative infinity where there is none — so `water_level - z`
+    // is simply never positive for a dry cell.
+    float water_level;
     // Seconds since the engine started. Zero in a screenshot and in every test, so the water they
     // see is a definite shape rather than whenever they happened to run.
     float time;
@@ -207,12 +210,13 @@ const vec3 WATER_SCATTER = vec3(0.06, 0.32, 0.28);
 //
 // Wavelengths of 5 to 1.5 metres with amplitudes under a tenth of a metre: gentle enough that the
 // slope stays shallow, which is what keeps the reflection from tearing into noise.
-const vec4 WAVES[5] = vec4[5](
+const vec4 WAVES[6] = vec4[6](
     vec4(0.98, 0.20, 390.0, 3.4),
     vec4(0.55, -0.84, 250.0, 2.1),
     vec4(-0.31, 0.95, 165.0, 1.3),
     vec4(0.87, 0.49, 96.0, 0.7),
-    vec4(-0.72, -0.69, 57.0, 0.35)
+    vec4(-0.72, -0.69, 57.0, 0.35),
+    vec4(0.16, -0.99, 31.0, 0.18)
 );
 
 // Morrowind's gravity, in world units per second squared: 8.96 m/s^2 across 69.99 units to the
@@ -225,6 +229,33 @@ const float TAU = 6.2831853;
 // How squarely a wave facet has to face the ray that found it before it is tilted back toward the
 // plane. Small: this is a guard against a facet turning away entirely, not a limit on the waves.
 const float MIN_FACING = 0.03;
+
+// How far a ray is pushed sideways per unit of depth, per unit of surface slope.
+//
+// A tilted surface bends light toward its normal, and the deflection is the difference between the
+// angle of incidence and the angle of refraction — which for small angles is the slope times
+// `1 - 1/eta`. Multiply by depth and it is how far the light has wandered by the time it reaches
+// the bottom. Derived from the index of refraction rather than written out, so the surface and the
+// pattern it casts cannot come to disagree about what water is.
+const float CAUSTIC_BEND = 1.0 - 1.0 / WATER_IOR;
+
+// A ceiling on how bright a focus is allowed to get.
+//
+// Where the refracted bundle collapses to a line the Jacobian goes to zero and the intensity to
+// infinity — a real caustic *cusp*, and the reason a pool's bright lines are as sharp as they are.
+// A renderer that let it through would produce a pixel no exposure could hold, so the focus is
+// capped and what it would have contributed beyond that is simply not drawn.
+const float CAUSTIC_MAX = 3.0;
+
+// The depth past which the pattern stops sharpening, in world units — about two metres.
+//
+// **The honest edge of the approximation.** `q = p - bend * grad(h)` holds while the refracted
+// bundle has not yet crossed itself; past the first focus the rays have folded over one another and
+// a single Jacobian no longer describes what is there. Evaluated at the seabed rather than at the
+// surface it came from, the model then starts *making* light — measured, three quarters more of it
+// at four hundred units. Holding the depth here keeps it inside the regime where it conserves, and
+// says the true thing anyway: caustics are sharp in a shallow pool and washed out in deep water.
+const float CAUSTIC_MAX_DEPTH = 140.0;
 
 // What a refraction ray that hits nothing has travelled through. Longer than the deepest water in
 // the game — the lowest terrain vertex is 2,152 units down — so nothing is ever *less* absorbed for
@@ -447,6 +478,90 @@ struct Surface {
     bool water;
 };
 
+// One wave component at a point: how much of it the ray cone can still resolve, its wavenumber, and
+// its phase there.
+//
+// **Shared by the normal and the curvature**, which is the whole point: those are the first and
+// second derivatives of one height field, and the dispersion that makes long waves outrun short
+// ones has to be the same physics in both or the light lands where the surface is not.
+struct WaveSample {
+    float detail;
+    float wavenumber;
+    float phase;
+};
+
+WaveSample sample_wave(int index, vec2 p, float time, float footprint) {
+    float wavelength = WAVES[index].z;
+    WaveSample wave;
+    // A wave narrower than the pixel looking at it is averaged away rather than drawn: a ray cone a
+    // wavelength wide covers a crest and a trough whose slopes cancel, and picking one of them
+    // instead is what makes distant water a field of crawling white sparks.
+    wave.detail = 1.0 - smoothstep(0.25 * wavelength, 0.75 * wavelength, footprint);
+    wave.wavenumber = TAU / wavelength;
+    wave.phase = wave.wavenumber * dot(WAVES[index].xy, p)
+               - sqrt(WATER_GRAVITY * wave.wavenumber) * time;
+    return wave;
+}
+
+// How much the sun's light is concentrated or spread by the time it reaches `depth` below the
+// surface, as a multiplier around one.
+//
+// **Caustics are ray density**, and density change is the determinant of the Jacobian of the map
+// from where light met the surface to where it landed. For small slopes that map is
+// `q = p - bend * depth * grad(h)`, so its Jacobian is `I - bend * depth * H` with `H` the Hessian
+// of the same height field the normals come from — and because that field is five sinusoids, `H`
+// is written out here rather than sampled, filtered or splatted. No photons, no buffer, no noise:
+// the light is where the arithmetic says it is.
+//
+// The approximation is the small-angle one, and it is the right one for this game: Vvardenfell's
+// water is thirty metres deep at its very worst and a few at the shore, with slopes under a
+// seventh, so the exact refraction and its linearisation differ by less than the sun's own width.
+//
+// Waves too small for the ray cone are left out of the curvature exactly as they are left out of
+// the normal, and for the same reason — a caustic finer than a pixel is a sparkle, not a pattern.
+float caustic(vec2 p, float depth, float time, float footprint) {
+    // Second derivatives of `sum(A * sin(k * dot(d, p) - w * t))`, which are `-A k^2 d_i d_j sin`.
+    vec3 hessian = vec3(0.0);
+    for (int i = 0; i < WAVES.length(); ++i) {
+        WaveSample wave = sample_wave(i, p, time, footprint);
+        if (wave.detail <= 0.0) {
+            continue;
+        }
+        vec2 direction = WAVES[i].xy;
+        float second = -wave.detail * WAVES[i].w * wave.wavenumber * wave.wavenumber
+                     * sin(wave.phase);
+        hessian += second * vec3(direction.x * direction.x,
+                                 direction.y * direction.y,
+                                 direction.x * direction.y);
+    }
+
+    float bend = CAUSTIC_BEND * min(depth, CAUSTIC_MAX_DEPTH);
+    float determinant = (1.0 - bend * hessian.x) * (1.0 - bend * hessian.y)
+                      - (bend * hessian.z) * (bend * hessian.z);
+    return min(1.0 / max(abs(determinant), 1.0 / CAUSTIC_MAX), CAUSTIC_MAX);
+}
+
+// What the sun's light has left, and how it is gathered, by the time it reaches a point under water.
+//
+// Two things happen on the way down and neither was modelled before: the water absorbs along the
+// path, and the surface acts as a lens that pools the light into the moving lines on a seabed. The
+// shadow ray already passes through the surface — water carries a mask bit that keeps it out of
+// occlusion — so this is the whole of what the surface does to sunlight.
+//
+// Returns white above the water, and for a cell with no water at all, where `water_level` is
+// negative infinity and the depth is never positive.
+vec3 sun_through_water(vec3 position, float footprint) {
+    float depth = frame.water_level - position.z;
+    if (!(depth > 0.0)) {
+        return vec3(1.0);
+    }
+    // The sun refracted at a flat surface: the waves' contribution to *direction* averages out over
+    // the path, and what they do to the light's distribution is the caustic term below.
+    vec3 downward = refract(frame.sun_direction, vec3(0.0, 0.0, 1.0), 1.0 / WATER_IOR);
+    float path = depth / max(-downward.z, 0.05);
+    return exp(-WATER_EXTINCTION * path) * caustic(position.xy, depth, frame.time, footprint);
+}
+
 // The sun's contribution, before the surface's albedo.
 //
 // No attenuation and no distance: the sun is far enough away that its rays are parallel and its
@@ -473,7 +588,8 @@ vec3 sun_light(Surface surface, vec3 origin, uvec2 pixel, uint salt, uint sample
             visible += 1.0;
         }
     }
-    return frame.sun_colour * facing * (visible / float(taken));
+    return frame.sun_colour * facing * (visible / float(taken))
+         * sun_through_water(surface.position, surface.footprint);
 }
 
 // Radiance leaving a diffuse surface toward the viewer from the cell's placed lights.
@@ -651,7 +767,12 @@ Surface trace(vec3 origin, vec3 direction, float cone_width, float cone_spread) 
 // game has: a second water surface behind the first is a case that does not arise.
 vec3 water_ray(vec3 origin, vec3 direction, float footprint, uvec2 pixel, uint salt,
                out float travelled) {
-    Surface hit = trace(origin, direction, footprint, BOUNCE_SPREAD);
+    // The pixel's own cone, not a bounce's. **A reflection and a refraction are specular**: they
+    // carry the footprint the primary ray had, where a diffuse bounce spreads over a hemisphere and
+    // wants the coarse mip that goes with it. Tracing these at the bounce rate put a seabed a
+    // hundred units down under a hundred-unit footprint — every texture at its top mip, and every
+    // wave averaged out of the caustics that the same footprint governs.
+    Surface hit = trace(origin, direction, footprint, frame.cone_spread);
     travelled = hit.hit ? hit.t : WATER_MAX_PATH;
     if (!hit.hit || hit.water) {
         return sky(direction);
@@ -670,21 +791,11 @@ vec3 water_ray(vec3 origin, vec3 direction, float footprint, uvec2 pixel, uint s
 vec3 water_normal(vec2 p, float time, float footprint) {
     vec2 slope = vec2(0.0);
     for (int i = 0; i < WAVES.length(); ++i) {
-        float wavelength = WAVES[i].z;
-        // **A wave narrower than the pixel looking at it is averaged away, not drawn.** This is
-        // mip-mapping applied to a normal: a ray cone a wavelength wide covers a whole crest and
-        // trough, whose slopes cancel, and drawing one of them instead is what makes distant water
-        // a field of crawling white sparks. The cone's width at the hit is already carried for
-        // choosing texture levels; this is the same quantity answering the same question.
-        float detail = 1.0 - smoothstep(0.25 * wavelength, 0.75 * wavelength, footprint);
-        if (detail <= 0.0) {
+        WaveSample wave = sample_wave(i, p, time, footprint);
+        if (wave.detail <= 0.0) {
             continue;
         }
-        vec2 direction = WAVES[i].xy;
-        float k = TAU / wavelength;
-        float speed = sqrt(WATER_GRAVITY * k);
-        float phase = k * dot(direction, p) - speed * time;
-        slope += direction * (detail * WAVES[i].w * k * cos(phase));
+        slope += WAVES[i].xy * (wave.detail * WAVES[i].w * wave.wavenumber * cos(wave.phase));
     }
     return normalize(vec3(-slope, 1.0));
 }

@@ -150,6 +150,12 @@ pub struct StaticScene {
     pub ambient: Option<Ambient>,
     /// The sun, for a cell that has a sky. Absent indoors, where there is none.
     pub sun: Option<Sun>,
+    /// Where the cell's water surface sits, for shading what is *under* it. Absent for a dry cell.
+    ///
+    /// The surface itself is geometry like anything else; this is the same height as a plain number,
+    /// because a point on the seabed has to know how far below it lies to work out how much light
+    /// reached it and how the waves gathered that light on the way down.
+    pub water_level: Option<f32>,
     /// References skipped because their record had no model, for reporting.
     pub without_model: Vec<String>,
 }
@@ -265,6 +271,7 @@ impl StaticScene {
             )
         };
 
+        self.water_level = Some(placement.translation.z);
         let material = self.materials.intern(Material {
             kind: MaterialKind::Water,
             ..Material::default()

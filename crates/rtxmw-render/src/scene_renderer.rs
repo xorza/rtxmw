@@ -366,6 +366,7 @@ impl SceneRenderer {
                 ambient: Vec3::ZERO,
                 light_count: 0,
                 sun: None,
+                water_level: None,
             },
             SceneResidency::lighting,
         );

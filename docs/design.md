@@ -1516,19 +1516,43 @@ from the wave normal — as the first version did — reads a facet tilted away 
 white. A facet that still faces away after that is tilted back toward the plane, standing in for the
 self-occlusion a height field does not model.
 
-**Waves cost about 2.8 ms** at Seyda Neen's shore — 97 fps against 131 flat — and the wave maths is
-not where it goes. Five sines is nothing; the cost is that every water pixel now sends its
-reflection and refraction somewhere slightly different, and incoherent rays traverse far worse than
-the parallel ones a mirror produced. That is inherent to wavy water, and the lever on it is
-amplitude and the damping distance rather than the component count.
+**Waves cost nothing measurable.** Flattening the surface and running the same two thousand frames
+gives 131–134 fps; the waves give 131–133. An earlier reading of 97 fps, and the story about ray
+incoherence built on it, came from a run whose tail had not settled — this machine idles the GPU at
+315 MHz and a short run measures the ramp rather than the frame. Nothing about that story survives
+the A/B, and the lesson is the measurement protocol rather than the shader.
 
 *Tests:* the surface varies across a row where a mirror would not, and moves when the clock does —
 which is also the only end-to-end proof that `time` survives the trip through the new buffer.
 Injection confirms both: flattening the surface and freezing the clock each fail exactly that test.
 
-**Stage 3 — caustics.** The Jacobian term on the refraction path.
-*Tests:* a flat surface gives exactly 1, and the caustic term averages to ~1 over a tile — energy
-conservation, which is the property that catches a wrong derivative.
+**Stage 3 — caustics — done.** The seabed's sunlight is multiplied by `1/|det J|`, with
+`J = I - bend * depth * H` and `H` the Hessian of the same five sinusoids the normals come from —
+written out, not sampled, splatted or filtered. Sunlight is also absorbed on the way *down* now,
+which stage 1 had left out; the two together are the whole of what the surface does to the sun.
+
+**The finding that made it work was not about caustics at all.** `water_ray` traced the reflection
+and the refraction at `BOUNCE_SPREAD`, one unit of cone width per unit travelled — the rate a
+*diffuse* bounce widens at, where a coarse mip is the correct answer. A reflection and a refraction
+are specular and carry the pixel's own cone. At the bounce rate a seabed a hundred units down was
+being sampled with a hundred-unit footprint: every texture at its top mip, and every wave averaged
+out of the caustics that the same footprint governs. Measured, the caustic term was varying by 25%
+on its own and arriving at the frame as 4%. Fixing the cone is what turned the pattern on, and it
+sharpened every reflection in the game as a side effect.
+
+**Where the model stops.** `q = p - bend * grad(h)` holds while the refracted bundle has not yet
+crossed itself. Past the first focus the rays have folded and one Jacobian cannot describe what is
+there — and because the term is evaluated at the seabed rather than at the surface it came from, it
+starts *making* light: measured, three quarters more of it at four hundred units. The depth fed to
+the lens is therefore capped at 140 units, which holds the error to **under 6% at every depth** and
+says something true anyway, that caustics are sharp in a shallow pool and washed out in deep water.
+
+*Tests:* the pattern moves while the mean light does not — energy conservation, the property that
+catches a wrong derivative — and contrast grows with depth, which pins the `depth` term rather than
+merely the curvature. Injection confirms both, plus a third for the downward absorption: a constant
+caustic, a lens with no throw, and unabsorbed sunlight each fail exactly the test that covers them.
+
+**Free, as far as the frame can tell**: 131–133 fps against 131–134 with the water flat.
 
 **Stage 4 — shore and underwater.** Depth fade where water meets land, underwater fog, total
 internal reflection, optionally foam. Last because it is refinement, first in visibility.
