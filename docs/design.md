@@ -717,7 +717,14 @@ own: `CellId::containing` floors the world coordinates by the 8,192-unit grid. F
 truncating matters — truncation puts everything between −8192 and 8192 in cell zero and mirrors the
 western and southern half of the map onto the eastern and northern one.
 
-**Editor markers are excluded, and finding that out is what made this work.** `PrisonMarker` is
+**Editor markers place no geometry either.** The same six meshes are the original engine's
+placement aids and it never drew them, yet 1,145 references to them are placed across the shipped
+game — one `NorthMarker` in the census office alone, a solid 160-unit arrow standing in the room.
+`StaticScene` now skips them on the way in, which is one line and one integration test comparing the
+cell's meshes against the marker's own vertices rather than against a guess at its shape.
+
+**Editor markers are excluded from the door search too, and finding that out is what made this
+work.** `PrisonMarker` is
 filed as a `DOOR`, carries a destination into the census office, and is the *first* such door in
 file order — so the obvious rule picked it, and the camera started inside the furniture. It is where
 the character-generation script drops the player, not a door in a wall. Morrowind names its
@@ -731,19 +738,32 @@ The remaining pieces are conventions worth writing down because neither is guess
 - **Yaw is a compass bearing.** The stored rotation turns about the **negated** Z axis, so zero
   faces `+Y` (north) and a quarter turn faces `+X` (east) — the opposite handedness to what a maths
   library gives by default. OpenMW spells the same rotation out at `mwmechanics/combat.cpp:695`.
-- **The arrival is not the traveller's feet, and its height is approximate.** Measured against the
-  floor directly beneath it — sixteen arrivals across twelve interiors — it sits a median of 89
-  units up, ranging from 22 to 144. It is an authored marker at roughly an actor's centre, and the
-  original engine drops the player to the ground on arrival, which is why the height is allowed to
-  be loose. Taking the median as a half-height, the eye goes about nine tenths of one above the
-  centre, the ratio a human has and the point OpenMW measures line of sight from
-  (`mwphysics/mtphysics.cpp:767`) — 80 units above the arrival, or 81% of the way up a 194-unit
-  door, which is where a person's eyes are in a doorway.
+- **Only the arrival's horizontal position is authored data. Its height is a hint.** Measured
+  against the floor directly beneath it — sixteen arrivals across twelve interiors — it sits a
+  median of 89 units up and ranges from 22 to 144. The original engine throws the stored height
+  away: `World::adjustPosition` (`mwworld/worldimp.cpp:1207`) raises the actor 20 units, traces
+  down, and takes whichever is lower. So this drops too, through `StaticScene::ground_below`, and
+  stands the traveller on what it finds. That is what makes the camera the same height above the
+  floor in every cell, when the authored heights vary by 120 units across the game.
 
-  The first version of this used `MWRender::Camera::mHeight`, 124, on the assumption that the
-  arrival was a standing position. That constant is the *third-person* orbit pivot — `camera.cpp:97`
-  applies it only `if (mMode != Mode::FirstPerson)` — and adding it to a marker that already
-  included a body offset put the camera at 394 in a room whose ceiling is at 420.
+  `ground_below` walks every placed triangle — 0.3 ms over the census office's 46,251, which is
+  nothing once per cell and hopeless per frame. It also queries the *visible* geometry, while
+  Morrowind ships separate collision meshes this does not read yet. Both are fine for the question
+  it answers and neither survives an actor that has to ask every frame; that wants the collision
+  meshes and an acceleration structure over them.
+
+- **Standing eye height is 160 units.** An actor's height is twice the median arrival height above
+  the floor, since the arrival marks roughly an actor's centre, and eyes sit about nine tenths of
+  the way up — the ratio a human has, close to where OpenMW measures line of sight from
+  (`mwphysics/mtphysics.cpp:767`). That lands 83% of the way up a 194-unit door, which is where a
+  person's eyes are in a doorway.
+
+  Two wrong answers came before that one, and the second is the instructive one. The first used the
+  geometry centroid. The second used `MWRender::Camera::mHeight`, 124, on the assumption that the
+  arrival was a standing position — but that constant is the *third-person* orbit pivot, applied at
+  `camera.cpp:97` only `if (mMode != Mode::FirstPerson)`, and adding a body height to a marker that
+  already contained one put the camera at 394 in a room whose ceiling is at 420. A constant lifted
+  from a reference implementation without reading the branch it sits in is not a citation.
 
 **What this exposed:** with the camera inside the room rather than looking out through the roof, the
 frame is nearly black. That is not a regression — it is the §5.1 darkness the old viewpoint was

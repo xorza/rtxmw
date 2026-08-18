@@ -13,6 +13,11 @@ mod mesh;
 mod srgb;
 mod static_scene;
 
+// Re-exported because `Door` carries one and `Door::leading_to` takes one, so a crate above this
+// seam cannot use either without naming the type — and the layering says nothing above here knows
+// about `rtxmw-esm`. This is the published surface saying so.
+pub use rtxmw_esm::CellId;
+
 pub use crate::door::Door;
 pub use crate::error::{Result, SceneError};
 pub use crate::light::{Ambient, Light};

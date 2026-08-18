@@ -3,7 +3,7 @@
 //! Skips when the game is not installed.
 
 use rtxmw_esm::{CellId, EsmReader};
-use rtxmw_scene::{Door, Mesh, ModelIndex, StaticScene};
+use rtxmw_scene::{Door, MaterialTable, Mesh, ModelIndex, StaticScene};
 use rtxmw_vfs::{DATA_DIR_VAR, morrowind_archives, morrowind_data_dir};
 
 const CELL: &str = "Seyda Neen, Census and Excise Office";
@@ -324,10 +324,45 @@ fn the_doors_leading_into_a_cell_land_a_traveller_inside_it() {
     );
 
     // Editor markers place no geometry either: they are the original engine's placement aids and
-    // it never drew them.
+    // it never drew them. This cell places a `NorthMarker`, so the count is the assertion.
     assert!(
         models.is_editor_marker("PrisonMarker") && models.is_editor_marker("NorthMarker"),
         "the marker meshes are no longer being recognised"
     );
     assert!(!models.is_editor_marker("ex_nord_door_01"));
+    // Compared against the mesh itself rather than a guess at its shape: the marker is a solid
+    // arrow 160 units tall, not something a bounding box would tell apart from the furniture.
+    let marker_nif = vfs
+        .read("meshes/Marker_North.nif")
+        .expect("the marker mesh ships");
+    let marker = Mesh::from_nif(
+        &rtxmw_nif::NifFile::parse(&marker_nif).expect("marker should parse"),
+        &mut MaterialTable::default(),
+    );
+    assert!(
+        !marker.is_empty(),
+        "the marker draws nothing, so skipping it proves nothing"
+    );
+    assert!(
+        !scene.meshes.iter().any(|m| m.positions == marker.positions),
+        "the north marker this cell places was built into the geometry"
+    );
+
+    // Every arrival drops onto the same floor, 192 units up, which is what makes standing on it
+    // give the same eye height in every cell — the authored heights themselves range over 80
+    // units here and 120 across the game.
+    for door in &doors {
+        let ground = scene
+            .ground_below(door.arrival + glam::Vec3::Z * 20.0)
+            .expect("a door arrives above a floor");
+        assert!(
+            (ground - 192.0).abs() < 1.0,
+            "arrival {:?} dropped to {ground}, not the cell's floor at 192",
+            door.arrival
+        );
+        assert!(
+            door.arrival.z - ground > 20.0,
+            "the arrival is supposed to sit well above the floor, not on it"
+        );
+    }
 }

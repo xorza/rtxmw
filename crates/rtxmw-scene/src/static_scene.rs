@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use glam::{Affine3A, Mat3, Quat, Vec3};
+use glam::{Affine3A, Mat3, Quat, Vec2, Vec3};
 use rtxmw_esm::{Cell, CellRef, EsmReader, LightRecord, ObjectRecord, Record, RecordName};
 use rtxmw_nif::NifFile;
 use rtxmw_vfs::Vfs;
@@ -161,7 +161,11 @@ impl StaticScene {
 
         for cell_ref in Cell::references(record) {
             let cell_ref = cell_ref?;
-            if cell_ref.deleted {
+            // An editor marker has a model and is deliberately not drawn with it: these are the
+            // original engine's placement aids, and it never rendered them. 1,145 of them are
+            // placed across the shipped game, so leaving them in puts a floating arrow or an
+            // obelisk in a great many cells.
+            if cell_ref.deleted || models.is_editor_marker(&cell_ref.object_id) {
                 continue;
             }
             let Some(path) = models.model_of(&cell_ref.object_id) else {
@@ -223,6 +227,36 @@ impl StaticScene {
         self.meshes.iter().map(Mesh::triangle_count).sum()
     }
 
+    /// Height of the highest surface directly below `from`, or `None` if nothing is under it.
+    ///
+    /// A downward ray against the cell's *visible* geometry, which is an approximation twice over:
+    /// Morrowind ships separate collision meshes that this does not read, and a query that walks
+    /// every placed triangle is linear in the cell. Both are fine for the once-per-cell question it
+    /// answers — where the floor is under a spawn point — and neither survives an actor that has to
+    /// ask every frame. That wants the collision meshes and an acceleration structure over them.
+    ///
+    /// Furniture counts as floor, because to a falling body it is.
+    pub fn ground_below(&self, from: Vec3) -> Option<f32> {
+        let mut highest: Option<f32> = None;
+        for instance in &self.instances {
+            let mesh = &self.meshes[instance.mesh.0 as usize];
+            for triangle in mesh.indices.chunks_exact(3) {
+                let [a, b, c] = [0, 1, 2].map(|corner| {
+                    instance
+                        .transform
+                        .transform_point3(mesh.positions[triangle[corner] as usize])
+                });
+                let Some(z) = height_at(a, b, c, from.truncate()) else {
+                    continue;
+                };
+                if z <= from.z && highest.is_none_or(|best| z > best) {
+                    highest = Some(z);
+                }
+            }
+        }
+        highest
+    }
+
     /// World-space bounds of every placed vertex, or `None` when the cell places nothing.
     ///
     /// Walks the geometry rather than the mesh bounds, because an instance may rotate a mesh and
@@ -248,6 +282,31 @@ impl StaticScene {
     }
 }
 
+/// Where a triangle sits directly above or below `at`, or `None` if it does not cover it.
+///
+/// Barycentric coordinates of the point in the triangle's *plan view*, which is what makes this a
+/// vertical query: a triangle covers `at` when both are in `0..1` and sum to no more than one, and
+/// the same weights then interpolate the height. A triangle seen edge-on from above covers no
+/// ground at all, which is the degenerate denominator.
+fn height_at(a: Vec3, b: Vec3, c: Vec3, at: Vec2) -> Option<f32> {
+    let (edge_u, edge_v, offset) = (
+        b.truncate() - a.truncate(),
+        c.truncate() - a.truncate(),
+        at - a.truncate(),
+    );
+    let area = edge_u.x * edge_v.y - edge_v.x * edge_u.y;
+    let u = (offset.x * edge_v.y - edge_v.x * offset.y) / area;
+    let v = (edge_u.x * offset.y - offset.x * edge_u.y) / area;
+    // Negated rather than `u < 0.0 || ...` so that a NaN fails it. A triangle standing exactly on
+    // its edge — a wall, of which every cell is full — has zero area in plan and divides by it, and
+    // every plain comparison against the NaN that produces would be false, letting it through as a
+    // covered triangle with a NaN height.
+    if !(u >= 0.0 && v >= 0.0 && u + v <= 1.0) {
+        return None;
+    }
+    Some(a.z + u * (b.z - a.z) + v * (c.z - a.z))
+}
+
 /// Builds a reference's model-to-world transform.
 ///
 /// Rotations are radians applied about the **negated** axes in Z, Y, X order — the convention the
@@ -266,6 +325,7 @@ fn world_transform(cell_ref: &CellRef) -> Affine3A {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mesh::Submesh;
 
     fn reference(translation: [f32; 3], rotation: [f32; 3], scale: f32) -> CellRef {
         CellRef {
@@ -307,6 +367,140 @@ mod tests {
             (turned - Vec3::NEG_Y).length() < 1e-4,
             "expected -Y, got {turned:?}"
         );
+    }
+
+    /// A horizontal square floor at height `z`, `size` units on a side from the origin.
+    fn slab(z: f32, size: f32) -> Mesh {
+        Mesh {
+            positions: vec![
+                Vec3::new(0.0, 0.0, z),
+                Vec3::new(size, 0.0, z),
+                Vec3::new(size, size, z),
+                Vec3::new(0.0, size, z),
+            ],
+            normals: vec![Vec3::Z; 4],
+            uvs: vec![Vec2::ZERO; 4],
+            indices: vec![0, 1, 2, 0, 2, 3],
+            submeshes: vec![Submesh {
+                first_index: 0,
+                index_count: 6,
+                material: 0,
+            }],
+        }
+    }
+
+    #[test]
+    fn the_ground_below_a_point_is_the_highest_surface_under_it() {
+        // Three floors stacked at 0, 100 and 250, the top one covering only a quarter of the plan
+        // so a query can fall past it.
+        let mut scene = StaticScene {
+            meshes: vec![slab(0.0, 100.0), slab(100.0, 100.0), slab(250.0, 25.0)],
+            ..StaticScene::default()
+        };
+        for mesh in 0..3u32 {
+            scene.instances.push(Instance {
+                mesh: MeshId(mesh),
+                transform: Affine3A::IDENTITY,
+            });
+        }
+
+        // Standing at (50, 20) there is no third floor overhead, so a drop from 300 lands on the
+        // second at 100 — the highest surface *at or below* the start, not the highest anywhere.
+        assert_eq!(
+            scene.ground_below(Vec3::new(50.0, 20.0, 300.0)),
+            Some(100.0)
+        );
+        // From below that floor, the one under it.
+        assert_eq!(scene.ground_below(Vec3::new(50.0, 20.0, 60.0)), Some(0.0));
+        // Exactly on a surface counts as standing on it rather than falling through.
+        assert_eq!(
+            scene.ground_below(Vec3::new(50.0, 20.0, 100.0)),
+            Some(100.0)
+        );
+        // At (10, 10) the small top slab does cover the point, and a drop from above finds it.
+        assert_eq!(
+            scene.ground_below(Vec3::new(10.0, 10.0, 300.0)),
+            Some(250.0)
+        );
+        // Below everything, and outside the plan entirely.
+        assert_eq!(scene.ground_below(Vec3::new(50.0, 20.0, -1.0)), None);
+        assert_eq!(scene.ground_below(Vec3::new(500.0, 500.0, 300.0)), None);
+
+        // A wall covers no ground: seen from above it is a line, so its plan area is zero and the
+        // coverage test divides by it. Every cell is full of them, and one leaking a NaN height
+        // into the answer would take the floor with it.
+        scene.meshes.push(Mesh {
+            positions: vec![
+                Vec3::new(0.0, 0.0, 0.0),
+                Vec3::new(0.0, 0.0, 400.0),
+                Vec3::new(100.0, 0.0, 400.0),
+            ],
+            normals: vec![Vec3::Y; 3],
+            uvs: vec![Vec2::ZERO; 3],
+            indices: vec![0, 1, 2],
+            submeshes: vec![Submesh {
+                first_index: 0,
+                index_count: 3,
+                material: 0,
+            }],
+        });
+        scene.instances.push(Instance {
+            mesh: MeshId(3),
+            transform: Affine3A::IDENTITY,
+        });
+        assert_eq!(
+            scene.ground_below(Vec3::new(50.0, 20.0, 300.0)),
+            Some(100.0)
+        );
+    }
+
+    #[test]
+    fn a_triangle_seen_edge_on_from_above_covers_no_ground() {
+        // Three points on one line in plan: a wall. Its plan area is zero, so the coverage test
+        // divides by zero and both weights come back NaN. `ground_below` would discard the answer
+        // anyway when it compared the height, but this is the function's own contract — a triangle
+        // that covers nothing reports nothing, rather than leaving a NaN for a caller to catch.
+        let vertical = [
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(0.0, 0.0, 400.0),
+            Vec3::new(100.0, 0.0, 400.0),
+        ];
+        assert_eq!(
+            height_at(vertical[0], vertical[1], vertical[2], Vec2::new(50.0, 20.0)),
+            None
+        );
+        // On the line it lies along, too, where the point genuinely is within the triangle's plan.
+        assert_eq!(
+            height_at(vertical[0], vertical[1], vertical[2], Vec2::new(50.0, 0.0)),
+            None
+        );
+
+        // A triangle that does cover the point reports the height interpolated across it: the
+        // midpoint of a ramp from 0 to 90 over the same span is 45.
+        let ramp = [
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(90.0, 0.0, 90.0),
+            Vec3::new(0.0, 90.0, 0.0),
+        ];
+        assert_eq!(
+            height_at(ramp[0], ramp[1], ramp[2], Vec2::new(45.0, 10.0)),
+            Some(45.0)
+        );
+    }
+
+    #[test]
+    fn an_instance_transform_moves_the_ground_with_it() {
+        // The query has to work in world space: a floor raised by its instance must answer at its
+        // placed height, not its authored one.
+        let scene = StaticScene {
+            meshes: vec![slab(0.0, 100.0)],
+            instances: vec![Instance {
+                mesh: MeshId(0),
+                transform: Affine3A::from_translation(Vec3::new(0.0, 0.0, 40.0)),
+            }],
+            ..StaticScene::default()
+        };
+        assert_eq!(scene.ground_below(Vec3::new(50.0, 20.0, 300.0)), Some(40.0));
     }
 
     fn index_of(models: &[(&str, &str)]) -> ModelIndex {
