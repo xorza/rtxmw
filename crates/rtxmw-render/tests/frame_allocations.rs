@@ -17,7 +17,7 @@ use ash::vk;
 use glam::{Affine3A, Vec2, Vec3};
 use rtxmw_gpu::TestGpu;
 use rtxmw_render::SceneRenderer;
-use rtxmw_scene::{Ambient, Instance, Light, LoadedCell, Material, MeshId, Submesh};
+use rtxmw_scene::{Instance, Light, LoadedCell, Material, MeshId, Submesh};
 
 mod common;
 
@@ -66,7 +66,7 @@ fn synthetic_scene() -> rtxmw_scene::StaticScene {
             material: 0,
         }],
     };
-    let mut scene = common::scene_of(
+    common::scene_of(
         &[quad(200.0), quad(120.0)],
         &[Material::default()],
         &[
@@ -79,17 +79,13 @@ fn synthetic_scene() -> rtxmw_scene::StaticScene {
                 transform: Affine3A::from_translation(Vec3::new(0.0, 100.0, 0.0)),
             },
         ],
-    );
-    scene.lights = vec![Light {
-        position: Vec3::new(100.0, 0.0, 60.0),
-        colour: Vec3::ONE,
-        radius: 400.0,
-    }];
-    scene.ambient = Some(Ambient {
-        colour: Vec3::splat(0.05),
-        ..Ambient::default()
-    });
-    scene
+        &[Light {
+            position: Vec3::new(100.0, 0.0, 60.0),
+            colour: Vec3::ONE,
+            radius: 400.0,
+        }],
+        Vec3::splat(0.05),
+    )
 }
 
 #[test]

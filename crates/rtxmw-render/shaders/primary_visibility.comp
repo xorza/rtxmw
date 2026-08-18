@@ -3,7 +3,7 @@
 #extension GL_EXT_scalar_block_layout : require
 #extension GL_EXT_nonuniform_qualifier : require
 
-// Primary visibility by inline ray query.
+// Primary visibility by inline ray query, with one diffuse bounce of indirect light.
 //
 // Ray queries in a compute shader rather than a ray tracing pipeline: there is one material path
 // and no recursion here, so a shader binding table would buy nothing. The output goes to a storage
@@ -82,7 +82,7 @@ layout(set = 0, binding = 8) uniform sampler2D textures[];
 // constant.
 const uint NO_TEXTURE = 0xFFFFFFFFu;
 
-// 80 bytes. Vulkan only guarantees 128 bytes of push constants, so sending separate inverse view
+// 100 bytes. Vulkan only guarantees 128 bytes of push constants, so sending separate inverse view
 // and projection matrices (144 with the camera) would work on this GPU and fail the guarantee.
 // Their product carries the same information for unprojection.
 layout(push_constant) uniform Frame {
@@ -91,6 +91,7 @@ layout(push_constant) uniform Frame {
     uint light_count;
     vec3 ambient;
     float cone_spread;
+    uint bounce_samples;
 } frame;
 
 // A raytracer has no near plane — that is a rasterization artefact. This is only large enough to
@@ -99,19 +100,43 @@ layout(push_constant) uniform Frame {
 const float RAY_MIN = 0.01;
 // Far enough to cross an exterior cell, which is 8192 world units.
 const float RAY_MAX = 1.0e6;
-// How many shadow rays each light gets. A point light needs one and gives a hard edge; a light
-// with real size needs several, and the penumbra is exactly the disagreement between them.
+// How many shadow rays each light gets at the primary hit. A point light needs one and gives a hard
+// edge; a light with real size needs several, and the penumbra is exactly the disagreement between
+// them.
 const uint SHADOW_SAMPLES = 8u;
+// And how many at a bounce hit. One, because a bounce contributes a fraction of the pixel's
+// radiance and is already being averaged over `bounce_samples` directions — resolving the penumbra
+// of light that arrives indirectly would cost thirteen rays a bounce to change nothing visible.
+const uint BOUNCE_SHADOW_SAMPLES = 1u;
 
 // How far along the normal a shadow ray starts. Morrowind's unit is about 1.4 cm, so this is a
 // couple of centimetres — enough to clear the interpolation error on a large triangle without
 // letting light leak under a wall.
 const float SHADOW_BIAS = 1.5;
 
-// Texture coordinate and object-space normal at a hit, interpolated from the triangle's corners.
+// The Lambertian BRDF's normalisation.
 //
-// Takes the pieces rather than the ray query itself so the candidate loop and the committed hit can
-// share it — they read the same values through different accessors.
+// Absorbed into the host's `INTENSITY` until now, where a single scale on the only lighting term
+// was unobservable. It is observable from here: the indirect estimator below integrates over the
+// hemisphere and picks up a compensating factor of pi, so the ratio between direct and indirect
+// light is only right when this sits where it belongs.
+const float INV_PI = 0.318309886;
+
+// How fast a bounce ray's cone widens, against `frame.cone_spread` for a primary ray.
+//
+// A diffuse bounce spreads over the whole hemisphere, and the indirect term wants the *average*
+// albedo across that solid angle rather than a point sample of it — so a coarse mip is the correct
+// answer here rather than a concession to cost. One unit of width per unit travelled is wide
+// without collapsing every bounce to the top level.
+const float BOUNCE_SPREAD = 1.0;
+
+// Distinct hash streams, so the direction a bounce takes and the shadow rays it then casts are not
+// drawn from the same numbers. Bounce `b`'s shadow rays use `STREAM_INDIRECT + b`, which is why
+// this is the last one.
+const uint STREAM_DIRECT = 0u;
+const uint STREAM_BOUNCE = 1u;
+const uint STREAM_INDIRECT = 2u;
+
 // The three shared-stream vertex indices of a hit triangle.
 //
 // `first_index` locates the run inside the shared index buffer and `first_vertex` rebases the
@@ -142,20 +167,20 @@ vec3 interpolate_normal(uvec3 verts, vec3 weights) {
          + attributes[verts.z].normal * weights.z;
 }
 
-// Mip level for a hit, from the ray cone's footprint on the surface.
+// Mip level for a hit, from the width of the ray's cone where it landed.
 //
 // A rasterizer takes this from screen-space derivatives, which a compute shader does not have, so
-// the level is reconstructed instead: the cone one pixel subtends has width `t * spread` at the
-// hit, spread further by the angle the surface is seen at, and the mip whose texels match that
-// width is the one to sample. Without it every surface samples mip zero, and anything dense or
-// grazing turns to static.
+// the level is reconstructed instead: `footprint` is how wide the cone is at the hit, spread
+// further by the angle the surface is seen at, and the mip whose texels match that width is the one
+// to sample. Without it every surface samples mip zero, and anything dense or grazing turns to
+// static.
 //
 // This is Akenine-Möller's ray-cone method, minus the curvature term, which needs a second
 // derivative the primary ray has no cheap way to get.
-float cone_lod(uvec3 verts, mat4x3 to_world, vec3 direction, vec3 world_normal, float t,
+float cone_lod(uvec3 verts, mat4x3 to_world, vec3 direction, vec3 world_normal, float footprint,
                uint texture_slot) {
-    // World space throughout. The footprint below is a world-space length, so an object-space area
-    // here would be wrong by the instance's scale — silently, and only for scaled instances.
+    // World space throughout. The footprint is a world-space length, so an object-space area here
+    // would be wrong by the instance's scale — silently, and only for scaled instances.
     vec3 p0 = to_world * vec4(positions[verts.x], 1.0);
     vec3 p1 = to_world * vec4(positions[verts.y], 1.0);
     vec3 p2 = to_world * vec4(positions[verts.z], 1.0);
@@ -172,10 +197,10 @@ float cone_lod(uvec3 verts, mat4x3 to_world, vec3 direction, vec3 world_normal, 
     vec2 size = vec2(textureSize(textures[nonuniformEXT(texture_slot)], 0));
     float texels_per_unit = sqrt(uv_area / world_area) * max(size.x, size.y);
 
-    // Cone footprint, widened as the surface tilts away: at grazing incidence a pixel covers far
-    // more surface, which is exactly where the aliasing is worst.
-    float footprint = t * frame.cone_spread / max(abs(dot(world_normal, direction)), 0.02);
-    return max(0.0, log2(footprint * texels_per_unit));
+    // Widened as the surface tilts away: at grazing incidence a pixel covers far more surface,
+    // which is exactly where the aliasing is worst.
+    float tilted = footprint / max(abs(dot(world_normal, direction)), 0.02);
+    return max(0.0, log2(tilted * texels_per_unit));
 }
 
 // The material's base colour texel at `uv`.
@@ -206,17 +231,22 @@ bool alpha_passes(uint slot, uint primitive, vec2 bary) {
     return alpha >= material.alpha_cutoff;
 }
 
-// A cheap, stable hash of three integers, for decorrelating one pixel's samples from its
+// A cheap, stable hash of four integers, for decorrelating one pixel's samples from its
 // neighbours'.
 //
 // Stable rather than per-frame: without temporal accumulation, reseeding every frame turns the
-// penumbra into crawling noise. A fixed pattern dithers instead, which holds still.
-uint hash(uvec3 v) {
-    uint h = v.x * 0x8DA6B343u ^ v.y * 0xD8163841u ^ v.z * 0xCB1AB31Fu;
+// noise into crawling static. A fixed pattern dithers instead, which holds still.
+uint hash(uvec4 v) {
+    uint h = v.x * 0x8DA6B343u ^ v.y * 0xD8163841u ^ v.z * 0xCB1AB31Fu ^ v.w * 0x165667B1u;
     h ^= h >> 15;
     h *= 0x2C1B3C6Du;
     h ^= h >> 12;
     return h;
+}
+
+// Two values in `0..1` from one hash, taking a half each.
+vec2 unit_pair(uint seed) {
+    return vec2(float(seed & 0xFFFFu), float((seed >> 16) & 0xFFFFu)) / 65535.0;
 }
 
 // A point on the unit sphere, from two values in `0..1`.
@@ -225,6 +255,19 @@ vec3 sphere_point(vec2 u) {
     float r = sqrt(max(0.0, 1.0 - z * z));
     float phi = 6.2831853 * u.y;
     return vec3(r * cos(phi), r * sin(phi), z);
+}
+
+// A direction on the hemisphere around `normal`, distributed by the cosine of its angle to it.
+//
+// Malley's method: displacing the normal by a uniform point on the unit sphere lands exactly
+// cosine-distributed, which is the one distribution that cancels the cosine term in the rendering
+// equation and leaves the estimator as albedo times the mean radiance.
+vec3 cosine_direction(vec3 normal, vec2 u) {
+    vec3 d = normal + sphere_point(u);
+    float len = length(d);
+    // The sphere point can land antipodal to the normal and collapse the sum. Vanishingly rare and
+    // not impossible, and normalizing zero would put a NaN in the frame.
+    return len > 1.0e-4 ? d / len : normal;
 }
 
 // Whether anything blocks the segment from `origin` along `dir` within `reach` units.
@@ -236,9 +279,9 @@ bool occluded(vec3 origin, vec3 dir, float reach) {
     rayQueryEXT query;
     rayQueryInitializeEXT(query, scene, gl_RayFlagsTerminateOnFirstHitEXT, 0xFF,
                           origin, RAY_MIN, dir, reach);
-    // The same candidate loop as the visibility ray in `main`, and it cannot be shared: `glslc`
-    // rejects `rayQueryEXT` as an `out` or `inout` parameter, so a traversal cannot be handed to a
-    // function. Any change to the cutout here has to be made in both places.
+    // The same candidate loop as `trace`, and it cannot be shared: `glslc` rejects `rayQueryEXT` as
+    // an `out` or `inout` parameter, so a traversal cannot be handed to a function. Any change to
+    // the cutout here has to be made in both places.
     while (rayQueryProceedEXT(query)) {
         if (rayQueryGetIntersectionTypeEXT(query, false)
             == gl_RayQueryCandidateIntersectionTriangleEXT) {
@@ -256,7 +299,7 @@ bool occluded(vec3 origin, vec3 dir, float reach) {
     return rayQueryGetIntersectionTypeEXT(query, true) != gl_RayQueryCommittedIntersectionNoneEXT;
 }
 
-// How much of a light reaches a point `distance` away.
+// How much of a light reaches a point `reach` units away.
 //
 // Inverse square, windowed so the contribution reaches exactly zero at the light's radius rather
 // than being clipped there. Morrowind's radius is a hard cutoff in the original engine, and a
@@ -268,27 +311,98 @@ float attenuation(float reach, float radius) {
     return window * window / (reach * reach + 1.0);
 }
 
-void main() {
-    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
-    ivec2 size = imageSize(target);
-    if (any(greaterThanEqual(pixel, size))) {
-        return;
-    }
+// What a ray found, resolved down to the shading inputs at the hit.
+struct Surface {
+    vec3 position;
+    vec3 normal;
+    vec3 albedo;
+    vec3 emissive;
+    // How wide the ray's cone was where it landed, so a ray spawned here can carry it on.
+    float footprint;
+    bool hit;
+};
 
-    // Unproject the pixel centre onto the near plane, then aim from the eye through it.
-    //
-    // The projection is reverse-Z, so the near plane is depth 1 and the far plane is depth 0. The
-    // far plane is also at infinity, where w collapses to zero — so the near plane is the only one
-    // that can be unprojected at all.
-    vec2 screen_uv = (vec2(pixel) + 0.5) / vec2(size);
-    vec4 target_point = frame.inverse_view_projection * vec4(screen_uv * 2.0 - 1.0, 1.0, 1.0);
-    vec3 direction = normalize(target_point.xyz / target_point.w - frame.camera_position);
+// Radiance leaving a diffuse surface toward the viewer from the cell's placed lights.
+//
+// Shared by the primary hit and by every bounce hit, which is the whole reason next-event
+// estimation is affordable: a bounce that had to *find* a light by chance would need hundreds of
+// rays to stop being noise, and asking each light directly needs one.
+//
+// `salt` selects the hash stream so two calls for the same pixel do not draw the same sample
+// pattern, and `samples` how finely each light's disc is resolved.
+vec3 direct_light(Surface surface, uvec2 pixel, uint salt, uint samples) {
+    // Offset along the normal so the surface does not shadow itself on its own triangle.
+    vec3 origin = surface.position + surface.normal * SHADOW_BIAS;
+    vec3 total = vec3(0.0);
+    for (uint i = 0u; i < frame.light_count; ++i) {
+        Light light = lights[i];
+        vec3 to_light = light.position - surface.position;
+        float to_light_length = length(to_light);
+        if (to_light_length >= light.radius) {
+            continue;
+        }
+        float facing = dot(surface.normal, to_light / to_light_length);
+        if (facing <= 0.0) {
+            continue;
+        }
+
+        // The light is a sphere, not a point, so visibility is the fraction of it that can be seen
+        // rather than a yes or no. That fraction *is* the penumbra: near a blocker's edge some
+        // samples reach the light and some do not, and the gradient between them is the soft
+        // shadow.
+        float visible = 0.0;
+        for (uint s = 0u; s < samples; ++s) {
+            vec2 u = unit_pair(hash(uvec4(pixel, salt, i * samples + s)));
+            vec3 offset = light.position + sphere_point(u) * light.source_radius - origin;
+            float reach = length(offset);
+            if (!occluded(origin, offset / reach, reach - SHADOW_BIAS)) {
+                visible += 1.0;
+            }
+        }
+        if (visible == 0.0) {
+            continue;
+        }
+        total += light.colour * facing * attenuation(to_light_length, light.radius)
+               * (visible / float(samples));
+    }
+    return surface.albedo * INV_PI * total;
+}
+
+// Radiance leaving a hit toward whatever traced it.
+//
+// One statement of what a diffuse surface does with light, used at both depths: the primary hit and
+// a bounce hit differ only in where `incoming` comes from — a gathered hemisphere for the first, the
+// flat ambient that terminates the path for the second. Writing it twice is how the two would drift.
+vec3 shade(Surface surface, vec3 incoming, uvec2 pixel, uint salt, uint samples) {
+    return surface.emissive + surface.albedo * incoming
+         + direct_light(surface, pixel, salt, samples);
+}
+
+// Traces one ray and resolves the material at whatever it hits.
+//
+// The ray query lives entirely inside here, which is what lets the primary ray and a bounce ray
+// share one traversal: GLSL forbids passing a query to a function, but not owning one in a function
+// that returns a result.
+//
+// `cone_width` is the footprint the ray already carries at its origin and `cone_spread` how fast it
+// widens per unit travelled; together they pick the mip a hit samples.
+Surface trace(vec3 origin, vec3 direction, float cone_width, float cone_spread) {
+    // Every field has to hold something before the miss returns below, and on a miss none of them
+    // is read — `hit` is what a caller branches on. So these are zeroes rather than plausible
+    // stand-ins, which would invite someone to use one.
+    Surface surface;
+    surface.position = vec3(0.0);
+    surface.normal = vec3(0.0);
+    surface.albedo = vec3(0.0);
+    surface.emissive = vec3(0.0);
+    surface.footprint = 0.0;
+    surface.hit = false;
 
     // No blanket opacity flag: the per-geometry `OPAQUE` bits the build set from each material are
-    // what decide this now. Forcing it here would override them and put the cutout back.
+    // what decide this. Forcing it here would override them and put the cutout back.
     rayQueryEXT query;
     rayQueryInitializeEXT(query, scene, gl_RayFlagsNoneEXT, 0xFF,
-                          frame.camera_position, RAY_MIN, direction, RAY_MAX);
+                          origin, RAY_MIN, direction, RAY_MAX);
     // Duplicated in `occluded`, which the language forces — see the note there.
     while (rayQueryProceedEXT(query)) {
         if (rayQueryGetIntersectionTypeEXT(query, false)
@@ -302,85 +416,101 @@ void main() {
             }
         }
     }
+    if (rayQueryGetIntersectionTypeEXT(query, true) == gl_RayQueryCommittedIntersectionNoneEXT) {
+        return surface;
+    }
+    surface.hit = true;
+
+    // The custom index is where this instance's mesh starts in the flat geometry table, and the
+    // geometry index is which of its runs was hit. Their sum is the entry, with no indirection.
+    uint slot = rayQueryGetIntersectionInstanceCustomIndexEXT(query, true)
+              + rayQueryGetIntersectionGeometryIndexEXT(query, true);
+    Geometry geom = geometries[slot];
+    Material material = materials[geom.material];
+    float hit_t = rayQueryGetIntersectionTEXT(query, true);
+    // Fetched once and shared: the texture level needs the same three vertices the shading
+    // attributes come from.
+    uvec3 verts = triangle_vertices(geom, rayQueryGetIntersectionPrimitiveIndexEXT(query, true));
+    vec3 weights = corner_weights(rayQueryGetIntersectionBarycentricsEXT(query, true));
+
+    // The normal is interpolated in object space, so it needs the instance's own transform.
+    // Morrowind scales uniformly, which is why the plain matrix works here — a non-uniform scale
+    // would need the inverse transpose instead.
+    mat4x3 to_world = rayQueryGetIntersectionObjectToWorldEXT(query, true);
+    surface.normal = normalize(mat3(to_world) * interpolate_normal(verts, weights));
+    surface.position = origin + direction * hit_t;
+    surface.footprint = cone_width + hit_t * cone_spread;
+    surface.emissive = material.emissive;
+
+    surface.albedo = material.diffuse;
+    if (material.base_colour != NO_TEXTURE) {
+        float lod = cone_lod(verts, to_world, direction, surface.normal, surface.footprint,
+                             material.base_colour + 1u);
+        surface.albedo *= base_colour(material, interpolate_uv(verts, weights), lod).rgb;
+    }
+    return surface;
+}
+
+// The cosine-weighted mean radiance arriving at a surface over its hemisphere, one bounce deep.
+//
+// Multiplying this by albedo is the whole indirect term: sampling by the cosine cancels both the
+// cosine in the rendering equation and the `1/pi` in the Lambertian BRDF, so no other factor
+// belongs here.
+//
+// `frame.ambient` is the environment's radiance — what a ray that escapes the geometry sees. That
+// reading is what makes zero samples meaningful rather than black: with no bounce rays every
+// direction escapes by definition, the mean is the ambient itself, and the term collapses to the
+// flat `albedo * ambient` fill the original engine applied unconditionally. With rays, geometry
+// occludes that fill where it should and replaces it with what the surroundings actually reflect.
+vec3 gather_indirect(Surface surface, uvec2 pixel) {
+    if (frame.bounce_samples == 0u) {
+        return frame.ambient;
+    }
+    vec3 origin = surface.position + surface.normal * SHADOW_BIAS;
+    vec3 total = vec3(0.0);
+    for (uint b = 0u; b < frame.bounce_samples; ++b) {
+        vec2 u = unit_pair(hash(uvec4(pixel, STREAM_BOUNCE, b)));
+        Surface bounce = trace(origin, cosine_direction(surface.normal, u), surface.footprint,
+                               BOUNCE_SPREAD);
+        if (!bounce.hit) {
+            total += frame.ambient;
+            continue;
+        }
+        // Terminated with a flat ambient rather than a second bounce: the next order is ambient
+        // against an albedo below one against a cosine, so it lands under a tenth of this one, and
+        // the traversal it costs buys nothing visible.
+        total += shade(bounce, frame.ambient, pixel, STREAM_INDIRECT + b, BOUNCE_SHADOW_SAMPLES);
+    }
+    return total / float(frame.bounce_samples);
+}
+
+void main() {
+    // Unsigned, because the hash streams index by it and only `imageSize` and `imageStore` want it
+    // signed. Carrying both would mean two names for one coordinate.
+    uvec2 pixel = gl_GlobalInvocationID.xy;
+    uvec2 size = uvec2(imageSize(target));
+    if (any(greaterThanEqual(pixel, size))) {
+        return;
+    }
+
+    // Unproject the pixel centre onto the near plane, then aim from the eye through it.
+    //
+    // The projection is reverse-Z, so the near plane is depth 1 and the far plane is depth 0. The
+    // far plane is also at infinity, where w collapses to zero — so the near plane is the only one
+    // that can be unprojected at all.
+    vec2 screen_uv = (vec2(pixel) + 0.5) / vec2(size);
+    vec4 target_point = frame.inverse_view_projection * vec4(screen_uv * 2.0 - 1.0, 1.0, 1.0);
+    vec3 direction = normalize(target_point.xyz / target_point.w - frame.camera_position);
+
+    Surface surface = trace(frame.camera_position, direction, 0.0, frame.cone_spread);
 
     vec3 colour = vec3(0.05, 0.07, 0.10);
+    if (surface.hit) {
+        vec3 incoming = gather_indirect(surface, pixel);
+        colour = shade(surface, incoming, pixel, STREAM_DIRECT, SHADOW_SAMPLES);
+    }
     // Alpha carries whether anything was hit at all. Inferring it from the colour worked while the
     // output was barycentric and every hit was bright, but a material can legitimately be dark —
     // so the flag is written rather than guessed at.
-    float hit = 0.0;
-    if (rayQueryGetIntersectionTypeEXT(query, true) != gl_RayQueryCommittedIntersectionNoneEXT) {
-        hit = 1.0;
-        // The custom index is where this instance's mesh starts in the flat geometry table, and the
-        // geometry index is which of its runs was hit. Their sum is the entry, with no indirection.
-        uint slot = rayQueryGetIntersectionInstanceCustomIndexEXT(query, true)
-                  + rayQueryGetIntersectionGeometryIndexEXT(query, true);
-        Geometry geom = geometries[slot];
-        Material material = materials[geom.material];
-        uint primitive = rayQueryGetIntersectionPrimitiveIndexEXT(query, true);
-        float hit_t = rayQueryGetIntersectionTEXT(query, true);
-        // Fetched once and shared: the texture level needs the same three vertices the shading
-        // attributes come from.
-        uvec3 verts = triangle_vertices(geom, primitive);
-
-        vec3 weights = corner_weights(rayQueryGetIntersectionBarycentricsEXT(query, true));
-        vec2 uv = interpolate_uv(verts, weights);
-        vec3 object_normal = interpolate_normal(verts, weights);
-
-        // The normal is interpolated in object space, so it needs the instance's own transform.
-        // Morrowind scales uniformly, which is why the plain matrix works here — a non-uniform
-        // scale would need the inverse transpose instead.
-        mat4x3 to_world = rayQueryGetIntersectionObjectToWorldEXT(query, true);
-        vec3 world_normal = normalize(mat3(to_world) * object_normal);
-        vec3 position = frame.camera_position + direction * hit_t;
-
-        vec3 albedo = material.diffuse;
-        if (material.base_colour != NO_TEXTURE) {
-            float lod = cone_lod(verts, to_world, direction, world_normal, hit_t,
-                                 material.base_colour + 1u);
-            albedo *= base_colour(material, uv, lod).rgb;
-        }
-
-        // Ambient stands in for every bounce there is no path tracer for yet.
-        colour = albedo * frame.ambient;
-        // Offset along the normal so the surface does not shadow itself on its own triangle. The
-        // same for every light, so it is lifted out of the loop.
-        vec3 shadow_origin = position + world_normal * SHADOW_BIAS;
-        for (uint i = 0u; i < frame.light_count; ++i) {
-            Light light = lights[i];
-            vec3 to_light = light.position - position;
-            float to_light_length = length(to_light);
-            if (to_light_length >= light.radius) {
-                continue;
-            }
-            vec3 L = to_light / to_light_length;
-            float facing = dot(world_normal, L);
-            if (facing <= 0.0) {
-                continue;
-            }
-
-            // The light is a sphere, not a point, so visibility is the fraction of it that can be
-            // seen rather than a yes or no. That fraction *is* the penumbra: near a blocker's edge
-            // some samples reach the light and some do not, and the gradient between them is the
-            // soft shadow the milestone is named for.
-            float visible = 0.0;
-            for (uint s = 0u; s < SHADOW_SAMPLES; ++s) {
-                uint seed = hash(uvec3(pixel, i * SHADOW_SAMPLES + s));
-                vec2 u = vec2(float(seed & 0xFFFFu), float((seed >> 16) & 0xFFFFu)) / 65535.0;
-                vec3 target = light.position + sphere_point(u) * light.source_radius;
-                vec3 offset = target - shadow_origin;
-                float reach = length(offset);
-                if (!occluded(shadow_origin, offset / reach, reach - SHADOW_BIAS)) {
-                    visible += 1.0;
-                }
-            }
-            if (visible == 0.0) {
-                continue;
-            }
-            visible /= float(SHADOW_SAMPLES);
-            colour += albedo * light.colour * facing
-                    * attenuation(to_light_length, light.radius) * visible;
-        }
-        colour += material.emissive;
-    }
-    imageStore(target, pixel, vec4(colour, hit));
+    imageStore(target, ivec2(pixel), vec4(colour, surface.hit ? 1.0 : 0.0));
 }

@@ -28,7 +28,12 @@ pub struct GpuLight {
 /// Tuned by eye, and provisional: vanilla albedo already has light painted into it, so every one of
 /// these is fighting illumination that is already in the texture. See `docs/design.md` §5.1 — the
 /// de-lighting spike is what makes this number mean anything.
-const INTENSITY: f32 = 0.25;
+///
+/// The pi is the Lambertian BRDF's `1/pi`, which the shader now applies where it belongs. It lived
+/// here while direct light was the only term and a single scale on it was unobservable; with an
+/// indirect term integrating over the hemisphere the ratio between the two became real, so the
+/// factor moved and this compensates. The lights look exactly as they did.
+const INTENSITY: f32 = 0.25 * std::f32::consts::PI;
 
 /// The emitter's own size, as a fraction of its reach.
 ///

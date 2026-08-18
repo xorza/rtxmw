@@ -10,8 +10,7 @@ use glam::{Affine3A, Vec2, Vec3};
 use rtxmw_gpu::{TestGpu, readback};
 use rtxmw_render::SceneRenderer;
 use rtxmw_scene::{
-    AlphaMode, Ambient, Instance, Light, LoadedCell, Material, Mesh, MeshId, StaticScene, Submesh,
-    TextureId,
+    AlphaMode, Instance, Light, LoadedCell, Material, Mesh, MeshId, StaticScene, Submesh, TextureId,
 };
 use rtxmw_texture::{Texture, TextureFormat};
 use rtxmw_vfs::DATA_DIR_VAR;
@@ -36,39 +35,41 @@ fn shade(pixel: &[u8]) -> [u8; 3] {
     [pixel[0], pixel[1], pixel[2]]
 }
 
-/// An axis-aligned quad in the world's YZ plane, facing back down -X toward a camera at the origin.
-fn wall(x: f32, y: std::ops::Range<f32>, z: std::ops::Range<f32>) -> Mesh {
+/// A quad spanned by `across` and `up` from `corner`, with the normal and material given.
+fn quad(corner: Vec3, across: Vec3, up: Vec3, normal: Vec3, material: u32) -> Mesh {
     Mesh {
-        positions: vec![
-            Vec3::new(x, y.start, z.start),
-            Vec3::new(x, y.end, z.start),
-            Vec3::new(x, y.end, z.end),
-            Vec3::new(x, y.start, z.end),
-        ],
-        normals: vec![Vec3::NEG_X; 4],
+        positions: vec![corner, corner + across, corner + across + up, corner + up],
+        normals: vec![normal; 4],
         uvs: vec![Vec2::ZERO, Vec2::X, Vec2::ONE, Vec2::Y],
         indices: vec![0, 1, 2, 0, 2, 3],
         submeshes: vec![Submesh {
             first_index: 0,
             index_count: 6,
-            material: 0,
+            material,
         }],
     }
 }
 
+/// An axis-aligned quad in the world's YZ plane, facing back down -X toward a camera at the origin.
+fn wall(x: f32, y: std::ops::Range<f32>, z: std::ops::Range<f32>) -> Mesh {
+    quad(
+        Vec3::new(x, y.start, z.start),
+        Vec3::new(0.0, y.end - y.start, 0.0),
+        Vec3::new(0.0, 0.0, z.end - z.start),
+        Vec3::NEG_X,
+        0,
+    )
+}
+
 /// Traces `instances` from `eye` looking along `forward` and returns the image as 8-bit RGBA.
 fn trace(meshes: &[Mesh], instances: &[Instance], eye: Vec3, forward: Vec3) -> Vec<u8> {
-    let mut scene = common::scene_of(meshes, &[Material::default()], instances);
-    // Full ambient and no lights, so an unlit trace shows albedo unchanged — which is what every
-    // test written before lighting existed is asserting about.
-    scene.ambient = Some(Ambient {
-        colour: Vec3::ONE,
-        ..Ambient::default()
-    });
-    trace_scene(&scene, &[], eye, forward)
+    trace_textured(meshes, &[Material::default()], &[], instances, eye, forward)
 }
 
 /// As [`trace`], with textures for the scene's path list to sample.
+///
+/// Full ambient and no lights, so an unlit trace shows albedo unchanged — which is what every test
+/// written before lighting existed is asserting about.
 fn trace_textured(
     meshes: &[Mesh],
     materials: &[Material],
@@ -77,33 +78,8 @@ fn trace_textured(
     eye: Vec3,
     forward: Vec3,
 ) -> Vec<u8> {
-    let mut scene = common::scene_of(meshes, materials, instances);
-    scene.ambient = Some(Ambient {
-        colour: Vec3::ONE,
-        ..Ambient::default()
-    });
-    trace_scene(&scene, textures, eye, forward)
-}
-
-/// As [`trace_textured`], with lights and an ambient term.
-#[allow(clippy::too_many_arguments)]
-fn trace_lit(
-    meshes: &[Mesh],
-    materials: &[Material],
-    textures: &[Option<Texture>],
-    lights: &[Light],
-    ambient: Vec3,
-    instances: &[Instance],
-    eye: Vec3,
-    forward: Vec3,
-) -> Vec<u8> {
-    let mut scene = common::scene_of(meshes, materials, instances);
-    scene.lights = lights.to_vec();
-    scene.ambient = Some(Ambient {
-        colour: ambient,
-        ..Ambient::default()
-    });
-    trace_scene(&scene, textures, eye, forward)
+    let scene = common::scene_of(meshes, materials, instances, &[], Vec3::ONE);
+    trace_scene(&scene, textures, eye, forward, 0)
 }
 
 /// Renders one frame of `scene` through the production renderer and reads it back.
@@ -111,11 +87,17 @@ fn trace_lit(
 /// Deliberately the real `SceneRenderer` rather than a test-local assembly of the same pieces: a
 /// replica would drift from what the engine actually runs, and every one of these assertions is
 /// meant to be about the engine.
+///
+/// `bounces` is how many diffuse bounce rays each pixel casts. Zero everywhere above, because at
+/// zero the indirect estimator collapses to the flat `albedo * ambient` fill those tests were
+/// written against — everything they assert is about geometry, materials or direct light, and
+/// occluded ambient would only add noise to it.
 fn trace_scene(
     scene: &StaticScene,
     textures: &[Option<Texture>],
     eye: Vec3,
     forward: Vec3,
+    bounces: u32,
 ) -> Vec<u8> {
     let gpu = TestGpu::shared();
     let mut renderer = SceneRenderer::new(
@@ -127,6 +109,7 @@ fn trace_scene(
         },
     )
     .expect("renderer should build");
+    renderer.set_bounce_samples(bounces);
 
     // One uploader for the whole trace, held across load and render. It wraps a single queue, so
     // the harness serialises every test through it — which is exactly why the renderer borrows one
@@ -564,26 +547,16 @@ fn a_light_brightens_what_it_reaches() {
         radius: 300.0,
     };
 
-    let unlit = trace_lit(
+    let dark = common::scene_of(&meshes, &materials, &instances, &[], ambient);
+    let bright = common::scene_of(
         &meshes,
         &materials,
-        &[],
-        &[],
-        ambient,
         &instances,
-        Vec3::ZERO,
-        Vec3::X,
-    );
-    let lit = trace_lit(
-        &meshes,
-        &materials,
-        &[],
         std::slice::from_ref(&light),
         ambient,
-        &instances,
-        Vec3::ZERO,
-        Vec3::X,
     );
+    let unlit = trace_scene(&dark, &[], Vec3::ZERO, Vec3::X, 0);
+    let lit = trace_scene(&bright, &[], Vec3::ZERO, Vec3::X, 0);
 
     assert!(
         mean_brightness(&unlit) > 0.0,
@@ -618,26 +591,22 @@ fn an_occluder_between_light_and_surface_casts_a_shadow() {
         transform: Affine3A::IDENTITY,
     };
 
-    let clear = trace_lit(
+    let open = common::scene_of(
         std::slice::from_ref(&lit_wall),
         &materials,
-        &[],
+        &[place(0)],
         std::slice::from_ref(&light),
         ambient,
-        &[place(0)],
-        Vec3::ZERO,
-        Vec3::X,
     );
-    let blocked = trace_lit(
+    let shadowed = common::scene_of(
         &[lit_wall, occluder],
         &materials,
-        &[],
+        &[place(0), place(1)],
         std::slice::from_ref(&light),
         ambient,
-        &[place(0), place(1)],
-        Vec3::ZERO,
-        Vec3::X,
     );
+    let clear = trace_scene(&open, &[], Vec3::ZERO, Vec3::X, 0);
+    let blocked = trace_scene(&shadowed, &[], Vec3::ZERO, Vec3::X, 0);
 
     let centre = WIDTH / 2;
     let sum = |p: &[u8]| p[0] as u32 + p[1] as u32 + p[2] as u32;
@@ -675,16 +644,14 @@ fn a_shadow_edge_is_soft_rather_than_binary() {
         transform: Affine3A::IDENTITY,
     };
     let trace = |meshes: &[Mesh], instances: &[Instance]| {
-        trace_lit(
+        let scene = common::scene_of(
             meshes,
             &materials,
-            &[],
+            instances,
             std::slice::from_ref(&light),
             Vec3::ZERO,
-            instances,
-            Vec3::ZERO,
-            Vec3::X,
-        )
+        );
+        trace_scene(&scene, &[], Vec3::ZERO, Vec3::X, 0)
     };
 
     let clear = trace(std::slice::from_ref(&lit_wall), &[place(0)]);
@@ -738,16 +705,14 @@ fn an_unoccluded_lit_wall_is_smooth() {
         colour: Vec3::ONE,
         radius: 300.0,
     };
-    let pixels = trace_lit(
+    let scene = common::scene_of(
         &meshes,
         &materials,
-        &[],
+        &instances,
         std::slice::from_ref(&light),
         Vec3::ZERO,
-        &instances,
-        Vec3::ZERO,
-        Vec3::X,
     );
+    let pixels = trace_scene(&scene, &[], Vec3::ZERO, Vec3::X, 0);
 
     // Neighbour-to-neighbour brightness jumps along the centre row. A smooth falloff changes by a
     // few units per pixel; self-occlusion makes it jump by the full lit value at random pixels.
@@ -796,16 +761,14 @@ fn a_real_interior_traces_to_a_recognisable_image() {
 
     let textures = cell.textures;
 
-    let pixels = trace_lit(
+    let lit = common::scene_of(
         &scene.meshes,
         scene.materials.materials(),
-        &textures,
+        &scene.instances,
         &scene.lights,
         scene.ambient.map_or(Vec3::ZERO, |a| a.colour),
-        &scene.instances,
-        eye,
-        Vec3::X,
     );
+    let pixels = trace_scene(&lit, &textures, eye, Vec3::X, 0);
     let hits = hit_count(&pixels);
     let total = (WIDTH * HEIGHT) as usize;
 
@@ -854,5 +817,269 @@ fn a_real_interior_traces_to_a_recognisable_image() {
         shades.len() > 500,
         "only {} distinct shades — the textures are not being sampled",
         shades.len()
+    );
+
+    // The same cell with indirect light on, which is the only place the bounce path meets real
+    // geometry: 104 models, cutout materials and thirteen lights rather than two quads.
+    //
+    // A sealed room is the strong case for the prediction. Almost every bounce ray hits a wall
+    // instead of escaping, so the ambient fill is occluded nearly everywhere and the mean has to
+    // fall — the flat fill is the ceiling this can approach and never exceed.
+    let bounced = trace_scene(&lit, &textures, eye, Vec3::X, 4);
+    let flat_mean = mean_brightness(&pixels);
+    let bounced_mean = mean_brightness(&bounced);
+    println!("  mean brightness: {flat_mean:.2} flat, {bounced_mean:.2} with 4 bounces");
+    assert_eq!(
+        hit_count(&bounced),
+        hits,
+        "indirect light changed which pixels hit, which it cannot"
+    );
+    assert!(
+        bounced_mean < flat_mean,
+        "an enclosed room got no darker under occluded ambient: {flat_mean} to {bounced_mean}"
+    );
+}
+
+/// Where the camera sits for every bounce test: half way up the wall it looks at, 100 units back.
+const BOUNCE_EYE: Vec3 = Vec3::new(0.0, 0.0, 40.0);
+
+/// Rows where the centre column meets the wall low down and high up.
+///
+/// The camera is at z = 40 looking east with a 75-degree vertical field of view, so at the wall's
+/// 100-unit distance the view is `2 * 100 * tan(37.5) = 153.5` units tall and one row is 0.6 units.
+/// Row 174 of 256 is therefore `40 - 76.73 * (2 * 174.5 / 256 - 1) = 12.1` units up the wall, and
+/// row 77 is 70.3 — both far enough from the wall's 0..80 edges that a patch around either stays
+/// on it.
+const LOW_ROW: u32 = 174;
+const HIGH_ROW: u32 = 77;
+
+/// A wall to look at with a floor running up to its base, and one light high above the floor.
+///
+/// The two surfaces are the whole point: the wall is white and the light is white, so *every* bit
+/// of colour on the wall arrived by reflection off the floor, and the red and blue channels of one
+/// pixel are a direct measurement of it that needs no second render to compare against.
+///
+fn bounce_scene(floor_albedo: Vec3, ambient: Vec3, lights: &[Light]) -> StaticScene {
+    let meshes = [
+        quad(
+            Vec3::new(100.0, -40.0, 0.0),
+            Vec3::new(0.0, 80.0, 0.0),
+            Vec3::new(0.0, 0.0, 80.0),
+            Vec3::NEG_X,
+            0,
+        ),
+        quad(
+            Vec3::new(40.0, -40.0, 0.0),
+            Vec3::new(60.0, 0.0, 0.0),
+            Vec3::new(0.0, 80.0, 0.0),
+            Vec3::Z,
+            1,
+        ),
+    ];
+    let materials = [
+        Material::default(),
+        Material {
+            diffuse: floor_albedo,
+            ..Material::default()
+        },
+    ];
+    let instances = [
+        Instance {
+            mesh: MeshId(0),
+            transform: Affine3A::IDENTITY,
+        },
+        Instance {
+            mesh: MeshId(1),
+            transform: Affine3A::IDENTITY,
+        },
+    ];
+    common::scene_of(&meshes, &materials, &instances, lights, ambient)
+}
+
+/// The colour-bleed fixture: a red floor under the white wall, lit from nearly overhead.
+///
+/// The light lands square on the floor and glances off the wall at about 0.2 of full incidence,
+/// which keeps the direct term low enough that even a single bounce sample landing on the brightest
+/// part of the floor cannot push a pixel past 1.0. Clipping there would flatten exactly the
+/// differences these tests measure, and the convergence test needs the estimator to stay linear.
+fn bleed_scene() -> StaticScene {
+    bounce_scene(
+        Vec3::new(0.5, 0.05, 0.05),
+        Vec3::ZERO,
+        &[Light {
+            position: Vec3::new(40.0, 0.0, 300.0),
+            colour: Vec3::ONE,
+            radius: 600.0,
+        }],
+    )
+}
+
+/// The mean colour over a square of pixels, in the target's own 0..1 units.
+///
+/// A patch rather than a single pixel, because a handful of bounce rays is far too few for one
+/// pixel to carry a value: each sample returns the floor's radiance or nothing, so a pixel holds
+/// one of five levels. Averaging is what turns that dither back into the quantity it dithers.
+fn patch_mean(pixels: &[u8], centre_x: u32, centre_y: u32) -> Vec3 {
+    /// Half-width of the patch, so 17 by 17 pixels.
+    const HALF: u32 = 8;
+
+    let mut total = Vec3::ZERO;
+    let mut count = 0.0;
+    for y in centre_y - HALF..=centre_y + HALF {
+        for x in centre_x - HALF..=centre_x + HALF {
+            let p = at(pixels, x, y);
+            assert!(is_hit(p), "patch pixel ({x}, {y}) missed the wall");
+            total += Vec3::new(p[0] as f32, p[1] as f32, p[2] as f32) / 255.0;
+            count += 1.0;
+        }
+    }
+    total / count
+}
+
+#[test]
+fn a_bounce_carries_the_floors_colour_onto_the_wall_above_it() {
+    // A red floor under a white wall, lit by a white light. Nothing in the scene can put red on
+    // the wall except light that reflected off the floor to get there, so the red-minus-blue gap
+    // at a pixel *is* the indirect term, measured without a reference image.
+    let scene = bleed_scene();
+
+    let flat = trace_scene(&scene, &[], BOUNCE_EYE, Vec3::X, 0);
+    let bounced = trace_scene(&scene, &[], BOUNCE_EYE, Vec3::X, 16);
+
+    let flat_low = patch_mean(&flat, WIDTH / 2, LOW_ROW);
+    let bounced_low = patch_mean(&bounced, WIDTH / 2, LOW_ROW);
+    let bounced_high = patch_mean(&bounced, WIDTH / 2, HIGH_ROW);
+    println!(
+        "wall at z=12: flat {flat_low:?} bounced {bounced_low:?}\n\
+         wall at z=70: bounced {bounced_high:?}"
+    );
+
+    // With no bounce rays the wall is exactly as achromatic as the light and the albedo make it —
+    // white on white, so the channels agree to the last quantisation step.
+    assert!(
+        (flat_low.x - flat_low.z).abs() < 0.01,
+        "an unbounced white wall under a white light is not grey: {flat_low:?}"
+    );
+
+    // At z = 12 the floor fills the lower half of the hemisphere and then some: the far edge is
+    // 58.5 units away against 12 of height, so every direction steeper than 11.5 degrees below
+    // horizontal lands on it, which is 37% of the cosine-weighted hemisphere. Times the floor's
+    // 0.42 of outgoing red that is 0.16 of red against 0.016 of blue, a gap of about 0.14.
+    let low_gap = bounced_low.x - bounced_low.z;
+    assert!(
+        low_gap > 0.08,
+        "the floor put only {low_gap} of red on the wall above it: {bounced_low:?}"
+    );
+
+    // At z = 70 the floor is below 50 degrees of elevation, which is 6.5% of the same hemisphere —
+    // a fifth of the exposure and so a fifth of the tint. Bleed that did not fall off with distance
+    // from the bleeder would be a constant fudge rather than a gathered quantity.
+    let high_gap = bounced_high.x - bounced_high.z;
+    assert!(
+        low_gap > 3.0 * high_gap,
+        "bleed barely fell off with distance: {low_gap} low against {high_gap} high"
+    );
+}
+
+#[test]
+fn ambient_is_occluded_by_what_a_surface_faces() {
+    // The same geometry with the floor black and the light gone, lit only by ambient. A bounce ray
+    // that escapes sees the ambient; one that lands on the black floor sees nothing. So the wall's
+    // brightness reads off how much sky each part of it can see — which is ambient occlusion, and
+    // it is the half of this milestone that changes how an interior looks rather than what colour
+    // it is.
+    let scene = bounce_scene(Vec3::ZERO, Vec3::splat(0.5), &[]);
+
+    let flat = trace_scene(&scene, &[], BOUNCE_EYE, Vec3::X, 0);
+    let occluded = trace_scene(&scene, &[], BOUNCE_EYE, Vec3::X, 16);
+
+    let flat_low = patch_mean(&flat, WIDTH / 2, LOW_ROW).x;
+    let flat_high = patch_mean(&flat, WIDTH / 2, HIGH_ROW).x;
+    let low = patch_mean(&occluded, WIDTH / 2, LOW_ROW).x;
+    let high = patch_mean(&occluded, WIDTH / 2, HIGH_ROW).x;
+    println!("ambient only: flat {flat_low:.3}/{flat_high:.3}, occluded {low:.3}/{high:.3}");
+
+    // Unoccluded, ambient is a flat fill: a white wall under 0.5 of it is 0.5 everywhere, with no
+    // way to tell the bottom from the top.
+    assert!(
+        (flat_low - 0.5).abs() < 0.01 && (flat_high - 0.5).abs() < 0.01,
+        "unoccluded ambient is not flat: {flat_low} at the bottom, {flat_high} at the top"
+    );
+
+    // 37% of the hemisphere blocked at z = 12 leaves 0.31; 6.5% at z = 70 leaves 0.47. The bounds
+    // are loose either side of those, because what is being asserted is that the occluded fraction
+    // is *gathered from the geometry* — a fixed darkening would fail the second half.
+    assert!(
+        low < 0.40 && low > 0.22,
+        "the wall's foot should keep roughly two thirds of the ambient, got {low}"
+    );
+    assert!(
+        high > 0.42 && high < flat_high,
+        "the wall's top sees nearly all of the ambient but not all of it, got {high}"
+    );
+}
+
+/// Root-mean-square difference between two renders, over the pixels both of them hit.
+///
+/// Against a converged reference this is the Monte Carlo error of the indirect estimate, in the
+/// 0..1 units the target stores — the baseline M7's denoiser has to beat.
+fn rmse(image: &[u8], reference: &[u8]) -> f32 {
+    let mut sum = 0.0f64;
+    let mut count = 0usize;
+    for (a, b) in image.chunks_exact(4).zip(reference.chunks_exact(4)) {
+        if !is_hit(a) || !is_hit(b) {
+            continue;
+        }
+        for channel in 0..3 {
+            let d = (a[channel] as f64 - b[channel] as f64) / 255.0;
+            sum += d * d;
+            count += 1;
+        }
+    }
+    assert!(count > 0, "the two renders share no hit pixels");
+    (sum / count as f64).sqrt() as f32
+}
+
+#[test]
+fn the_indirect_estimate_converges_as_its_sample_count_rises() {
+    // The number M7 needs a baseline for. Sampling is stratified only by the hash, so the error
+    // should fall as one over the square root of the sample count — halving for every quadrupling.
+    // A systematic difference between the sample counts would not shrink at all, and a bias would
+    // leave the error flattening out well above zero.
+    let scene = bleed_scene();
+
+    let reference = trace_scene(&scene, &[], BOUNCE_EYE, Vec3::X, 256);
+    let errors: Vec<f32> = [1u32, 4, 16]
+        .into_iter()
+        .map(|samples| {
+            rmse(
+                &trace_scene(&scene, &[], BOUNCE_EYE, Vec3::X, samples),
+                &reference,
+            )
+        })
+        .collect();
+    println!(
+        "indirect RMSE against 256 samples: 1 spp {:.4}, 4 spp {:.4}, 16 spp {:.4}",
+        errors[0], errors[1], errors[2]
+    );
+
+    // Four times the samples is half the error. Asserting 1.6 rather than 2.0 leaves room for the
+    // reference's own residual error, which adds in quadrature and matters most at the low end.
+    assert!(
+        errors[0] > errors[1] * 1.6,
+        "quadrupling the samples barely helped: {} to {}",
+        errors[0],
+        errors[1]
+    );
+    assert!(
+        errors[1] > errors[2] * 1.6,
+        "quadrupling the samples barely helped: {} to {}",
+        errors[1],
+        errors[2]
+    );
+    assert!(
+        errors[2] < 0.05,
+        "16 samples is still {} from converged, which is a bias rather than noise",
+        errors[2]
     );
 }

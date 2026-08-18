@@ -32,6 +32,12 @@ pub struct FrameConstants {
     /// does not have. This is what replaces them: the cone's width at the hit is its footprint on
     /// the surface, and the mip that matches that footprint is the one to sample.
     cone_spread: f32,
+    /// How many diffuse bounce rays each pixel casts to gather indirect light.
+    ///
+    /// Zero is not "no indirect light" but "every bounce ray escapes", which is the limit in which
+    /// the estimator collapses back to a flat `albedo * ambient` fill — so it is exactly the
+    /// lighting model this had before one bounce existed, and the A/B against it is honest.
+    bounce_samples: u32,
 }
 
 impl FrameConstants {
@@ -46,6 +52,7 @@ impl FrameConstants {
         ambient: Vec3,
         light_count: u32,
         cone_spread: f32,
+        bounce_samples: u32,
     ) -> Self {
         Self {
             inverse_view_projection: (projection * view).inverse().to_cols_array(),
@@ -53,6 +60,7 @@ impl FrameConstants {
             light_count,
             ambient: ambient.to_array(),
             cone_spread,
+            bounce_samples,
         }
     }
 
@@ -436,7 +444,7 @@ mod tests {
     fn the_push_block_fits_the_guaranteed_range() {
         // Vulkan promises 128 bytes and no more; exceeding it works on this GPU and fails elsewhere.
         assert!(size_of::<FrameConstants>() <= 128);
-        assert_eq!(size_of::<FrameConstants>(), 96);
+        assert_eq!(size_of::<FrameConstants>(), 100);
 
         // One pixel of a 90-degree, 100-pixel-tall view subtends 2*tan(45)/100 = 0.02 units per
         // unit of distance.
@@ -463,7 +471,7 @@ mod tests {
             16.0 / 9.0,
             0.05,
         );
-        let constants = FrameConstants::new(view, projection, eye, Vec3::ZERO, 0, 0.0);
+        let constants = FrameConstants::new(view, projection, eye, Vec3::ZERO, 0, 0.0, 0);
 
         // Round-trip a world point through the forward transform and back through the stored
         // inverse. Anything that transposed or reordered the matrix survives multiplication but

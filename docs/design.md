@@ -626,6 +626,75 @@ up with no surface extensions — no window, works headless, ~0.6 s warm against
 the windowed binary. Cost of the whole verification loop: **2.9 s of tests plus 0.6 s for a picture**,
 against ~60 s and a window appearing on the user's screen.
 
+### M6 — indirect lighting — **done**
+
+One diffuse bounce per pixel, cosine-weighted, with next-event estimation at the bounce hit. The
+shader was restructured to get it: `trace` now owns a ray query and returns a resolved `Surface`, so
+the primary ray and a bounce ray share one traversal rather than two copies of a candidate loop, and
+`direct_light` is a function both hits call. `occluded` still keeps its own copy — `glslc` rejects
+`rayQueryEXT` as a parameter, so a traversal genuinely cannot be handed around.
+
+**Ambient became the environment's radiance rather than an unconditional fill.** This is the
+decision the milestone turns on, and it is what makes zero bounce samples meaningful rather than
+black: a bounce ray that escapes the geometry returns the cell's ambient, so with no bounce rays
+every direction escapes by definition, the estimator's mean is the ambient itself, and the term
+collapses *exactly* to the `albedo * ambient` the renderer applied before. With rays, geometry
+occludes that fill where it should. Ambient occlusion is therefore not a separate effect here — it
+is the same integral, sampled.
+
+The consequence is that **interiors get darker, and correctly so**. Seyda Neen's office is sealed,
+so almost every bounce ray finds a wall instead of escaping; the mean frame brightness falls 9%
+(8.36 to 7.60 in 8-bit units) and the loss is concentrated in corners and under furniture, which is
+where a flat fill was most obviously wrong. §5.1 again: the albedo already has ambient occlusion
+painted into it, so this is the second one. That is a content problem, not a lighting-model one.
+
+**The Lambertian `1/pi` moved into the shader.** It had been folded into `LightBuffer::INTENSITY`,
+where a single scale on the only lighting term was unobservable. With a second term integrating over
+the hemisphere the ratio between them became real, so the factor went where it belongs and
+`INTENSITY` was multiplied by pi to compensate. The direct-lit image is unchanged, which the M5
+tests passing untouched is the evidence for.
+
+**Sampling.** Cosine-weighted by Malley's method — a uniform sphere point added to the normal, which
+reuses the sphere sampler the soft shadows already had and is exact rather than an approximation.
+Because the pdf cancels both the cosine and the `1/pi`, the estimator is albedo times the mean
+radiance and carries no other factor. Shadow rays at a bounce hit are cut from eight to one: a bounce
+is a fraction of the pixel's radiance and is already being averaged over four directions, so
+resolving *its* penumbra would cost thirteen rays a bounce to change nothing visible. Four bounce
+samples by default rather than the one the frame budget eventually wants, because nothing accumulates
+or denoises yet; that drops to one at M7.
+
+**The variance baseline M7 needs**, measured as RMSE against a 256-sample reference of the same
+frame, over the pixels both renders hit:
+
+| samples per pixel | RMSE |
+|---|---|
+| 1 | 0.0713 |
+| 4 | 0.0355 |
+| 16 | 0.0174 |
+
+Ratios of 2.01 and 2.04 for each quadrupling — textbook `1/sqrt(N)`, which says the error is Monte
+Carlo noise with no bias underneath it. That is the property the test asserts, and a stuck sample
+index fails it flat (0.0000227 at every count) rather than merely degrading.
+
+The synthetic scenes are worth stating because they are hand-checkable: a white wall with a coloured
+floor at its base, lit by one white light nearly overhead. Every bit of colour on the wall arrived by
+reflection, so the red-minus-blue gap at a pixel *is* the indirect term with no reference render to
+compare against. The predictions were computed before the trace ran and came back within 2% —
+direct 0.188 against 0.188 predicted, indirect 0.151 against 0.156, ambient occlusion 0.323 against
+0.313. Both tests read a 17x17 patch rather than a pixel, because at four samples a pixel holds one
+of five levels and means nothing on its own.
+
+**Cost is not measured yet.** The bounce work is below run-to-run noise in a single headless frame at
+1280x720, which bounds it usefully at neither end. The renderer has no GPU timers, and adding them
+belongs with M7, where the frame budget stops being background and becomes the milestone's own
+done-when.
+
+**Not done, deliberately:** stratifying the bounce directions (the hash is white noise per pixel, and
+a low-discrepancy sequence would cut the same error for the same cost), and sampling one light rather
+than looping all of them — thirteen is cheap and lower-variance, but it is `O(lights)` per bounce and
+does not survive exteriors. ReSTIR is the answer to the second one when it stops being cheap, and the
+plan is still to escalate only when variance demands it.
+
 ### M5 — Direct lighting
 Sun as a directional light with a real angular diameter (so shadows are soft), shadow rays, cell
 ambient, `LIGH` point lights with shadow rays and a defensible attenuation model, emissive surfaces.

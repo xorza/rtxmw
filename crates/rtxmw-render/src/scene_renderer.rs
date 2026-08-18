@@ -28,11 +28,19 @@ pub const TARGET_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 /// 4,311 distinct textures, so this leaves room for a cell far larger than any interior.
 const MAX_TEXTURES: u32 = 8192;
 
+/// Diffuse bounce rays per pixel unless a caller says otherwise.
+///
+/// Four rather than the one the frame budget eventually wants, because nothing accumulates or
+/// denoises yet: at one sample the indirect term is a dither pattern rather than an image. It drops
+/// to one at M7, where the denoiser is what turns a single sample into a smooth field.
+const DEFAULT_BOUNCE_SAMPLES: u32 = 4;
+
 /// A loaded cell and the pass that traces it.
 pub struct SceneRenderer {
     pass: VisibilityPass,
     target: Image,
     scene: Option<LoadedScene>,
+    bounce_samples: u32,
 }
 
 impl std::fmt::Debug for SceneRenderer {
@@ -77,7 +85,17 @@ impl SceneRenderer {
                 vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC,
             )?,
             scene: None,
+            bounce_samples: DEFAULT_BOUNCE_SAMPLES,
         })
+    }
+
+    /// Sets how many diffuse bounce rays each pixel casts.
+    ///
+    /// Zero leaves the cell's ambient as a flat unoccluded fill, which is what the renderer did
+    /// before indirect light existed — the two are the same estimator at its endpoints, so this is
+    /// the honest A/B for what a bounce actually contributes.
+    pub fn set_bounce_samples(&mut self, samples: u32) {
+        self.bounce_samples = samples;
     }
 
     /// Uploads `scene` and builds its acceleration structures, replacing whatever was loaded.
@@ -166,6 +184,7 @@ impl SceneRenderer {
             // From the renderer's own target height, so the mip a surface samples follows the
             // resolution it is being traced at.
             FrameConstants::cone_spread_from(projection, self.target.extent().height),
+            self.bounce_samples,
         )
     }
 
