@@ -2,8 +2,8 @@
 //!
 //! Skips when the game is not installed.
 
-use rtxmw_esm::EsmReader;
-use rtxmw_scene::{Mesh, ModelIndex, StaticScene};
+use rtxmw_esm::{CellId, EsmReader};
+use rtxmw_scene::{Door, Mesh, ModelIndex, StaticScene};
 use rtxmw_vfs::{DATA_DIR_VAR, morrowind_archives, morrowind_data_dir};
 
 const CELL: &str = "Seyda Neen, Census and Excise Office";
@@ -270,4 +270,64 @@ fn flattening_preserves_geometry_and_resolves_every_material() {
         materials.textures().len(),
         unresolved * 100.0
     );
+}
+
+#[test]
+fn the_doors_leading_into_a_cell_land_a_traveller_inside_it() {
+    let Some(data) = morrowind_data_dir() else {
+        eprintln!("skipping: {DATA_DIR_VAR} is not configured (set it, or add it to .env)");
+        return;
+    };
+    let vfs = morrowind_archives().expect("the game is available");
+    let bytes = std::fs::read(data.join("Morrowind.esm")).expect("Morrowind.esm should read");
+    let esm = EsmReader::new(&bytes).expect("should parse");
+    let models = ModelIndex::build(&esm).expect("model index should build");
+
+    let destination = CellId::Interior(CELL.into());
+    let doors = Door::leading_to(&esm, &models, &destination).expect("scan should succeed");
+    let scene = StaticScene::load_interior(&esm, &models, &vfs, CELL).expect("cell should load");
+    let bounds = scene.bounds().expect("a furnished cell has geometry");
+    println!("{} doors lead into {CELL}, bounds {bounds:?}", doors.len());
+    for door in &doors {
+        println!("  arrival {:?} facing {:?}", door.arrival, door.facing);
+    }
+
+    // Four of them, all in Seyda Neen's exterior: the customs door, the north door, and the two
+    // the character-generation sequence uses. `PrisonMarker` also carries a destination into this
+    // cell and is filed as a `DOOR`, but it draws with an editor marker and is excluded — a fifth
+    // here would mean that filter has stopped working.
+    assert_eq!(doors.len(), 4, "{doors:#?}");
+
+    for door in &doors {
+        assert_eq!(door.destination, destination);
+        // Inside the cell's own geometry, which is the check that catches a destination read from
+        // the wrong subrecord: the doors stand in an exterior cell whose coordinates are around
+        // (-10000, -72000), so a position taken from the door rather than its `DODT` would miss
+        // this by four orders of magnitude.
+        assert!(
+            door.arrival.cmpge(bounds.min).all() && door.arrival.cmple(bounds.max).all(),
+            "arrival {:?} is outside the cell's bounds {bounds:?}",
+            door.arrival
+        );
+        // A bearing, so it lies flat and has unit length. A zero vector would leave the camera
+        // pointing at nothing in particular.
+        assert_eq!(door.facing.z, 0.0);
+        assert!((door.facing.length() - 1.0).abs() < 1e-5);
+    }
+
+    // The doors face different ways — they are on different walls. A constant here would mean the
+    // stored yaw is being dropped rather than read.
+    let facings = doors.iter().map(|d| d.facing).collect::<Vec<_>>();
+    assert!(
+        facings.iter().any(|f| (*f - facings[0]).length() > 0.5),
+        "every door faces the same way: {facings:?}"
+    );
+
+    // Editor markers place no geometry either: they are the original engine's placement aids and
+    // it never drew them.
+    assert!(
+        models.is_editor_marker("PrisonMarker") && models.is_editor_marker("NorthMarker"),
+        "the marker meshes are no longer being recognised"
+    );
+    assert!(!models.is_editor_marker("ex_nord_door_01"));
 }

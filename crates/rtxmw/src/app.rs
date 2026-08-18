@@ -166,7 +166,7 @@ impl ApplicationHandler for App {
                     "{}",
                     scene_loader::describe(scene_loader::DEFAULT_CELL, &cell)
                 );
-                self.camera = Camera::new(scene_loader::viewpoint(&cell.scene));
+                self.camera = scene_loader::Viewpoint::entering(&cell).camera();
             }
             Ok(None) => eprintln!(
                 "no game data configured — set MORROWIND_DATA_DIR, or put it in .env at the repo root"

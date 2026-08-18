@@ -1,9 +1,10 @@
 //! Everything a cell needs, assembled from the installed game.
 
-use rtxmw_esm::EsmReader;
+use rtxmw_esm::{CellId, EsmReader};
 use rtxmw_texture::Texture;
 use rtxmw_vfs::morrowind_data_dir;
 
+use crate::door::Door;
 use crate::error::{Result, SceneError};
 use crate::static_scene::{ModelIndex, StaticScene};
 
@@ -20,6 +21,12 @@ pub struct LoadedCell {
     /// A miss is normal rather than an error: the shipped meshes carry a tail of references to art
     /// that was removed, and a renderer substitutes a fallback for them.
     pub textures: Vec<Option<Texture>>,
+    /// Every door elsewhere in the file that leads into this cell.
+    ///
+    /// Each one names a place the game itself puts the player, which is what makes any of them a
+    /// defensible spawn point — see [`Door`]. Empty for a cell nothing leads to, which a cell
+    /// reached only by script or by coordinates legitimately is.
+    pub entrances: Vec<Door>,
 }
 
 impl LoadedCell {
@@ -41,6 +48,7 @@ impl LoadedCell {
         let esm = EsmReader::new(&bytes)?;
         let models = ModelIndex::build(&esm)?;
         let scene = StaticScene::load_interior(&esm, &models, &vfs, cell_name)?;
+        let entrances = Door::leading_to(&esm, &models, &CellId::Interior(cell_name.to_owned()))?;
 
         // A texture that fails to read or decode becomes `None` rather than aborting the load: one
         // dangling reference in a cell of hundreds is not a reason to have no cell.
@@ -55,7 +63,11 @@ impl LoadedCell {
             })
             .collect();
 
-        Ok(Some(Self { scene, textures }))
+        Ok(Some(Self {
+            scene,
+            textures,
+            entrances,
+        }))
     }
 
     /// How many of the cell's texture references resolved to nothing.

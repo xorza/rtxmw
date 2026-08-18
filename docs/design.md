@@ -695,6 +695,53 @@ than looping all of them — thirteen is cheap and lower-variance, but it is `O(
 does not survive exteriors. ReSTIR is the answer to the second one when it stops being cheap, and the
 plan is still to escalate only when variance demands it.
 
+### Spawning: where a cell puts the player
+
+The camera used to start at the cell's geometry centroid, which for Seyda Neen's census office is
+near the ceiling and pointed out through the roof — 47% of primary rays escaped the room. The fix is
+not a better guess, because the game already records the answer.
+
+**Morrowind stores the arrival point on the door you leave through, not in the cell you enter.** A
+door reference carries `DODT`, a position *in its destination cell*, and `DNAM`, that cell's name.
+Two consequences follow, and they pull in opposite directions:
+
+- **Travelling through a door is a local question.** The reference is already in the cell being
+  played, so `Door::from_ref` answers it with no search. That is the whole mechanism door travel
+  will need.
+- **Arriving in a cell without walking through anything is not.** It means finding a door elsewhere
+  that leads there — `Door::leading_to`, one pass over all 316,116 references in `Morrowind.esm`,
+  about 25 ms. There is no cheaper route, because a cell does not record how it is entered.
+
+`DNAM` is absent for a door to an exterior, where the arrival position identifies the cell on its
+own: `CellId::containing` floors the world coordinates by the 8,192-unit grid. Flooring rather than
+truncating matters — truncation puts everything between −8192 and 8192 in cell zero and mirrors the
+western and southern half of the map onto the eastern and northern one.
+
+**Editor markers are excluded, and finding that out is what made this work.** `PrisonMarker` is
+filed as a `DOOR`, carries a destination into the census office, and is the *first* such door in
+file order — so the obvious rule picked it, and the camera started inside the furniture. It is where
+the character-generation script drops the player, not a door in a wall. Morrowind names its
+placement aids `meshes/Marker_*.nif` and ships exactly six: the north arrow, the door and travel
+arrows, the temple and divine intervention targets, and the prison marker. Filtering on that leaves
+four real doors into the cell, and a traveller arriving through any of them stands in the room
+facing into it.
+
+The remaining pieces are conventions worth writing down because neither is guessable:
+
+- **Yaw is a compass bearing.** The stored rotation turns about the **negated** Z axis, so zero
+  faces `+Y` (north) and a quarter turn faces `+X` (east) — the opposite handedness to what a maths
+  library gives by default. OpenMW spells the same rotation out at `mwmechanics/combat.cpp:695`.
+- **The arrival is the traveller's feet.** The eye sits 124 units above it, about 1.77 m at
+  Morrowind's scale; OpenMW carries the same offset as `MWRender::Camera::mHeight`.
+
+**What this exposed:** with the camera inside the room rather than looking out through the roof, the
+frame is nearly black. That is not a regression — it is the §5.1 darkness the old viewpoint was
+hiding behind the miss colour, now unavoidable. The interior renders at roughly 3% of full scale and
+there is no exposure or tone mapping anywhere in the pipeline yet, which is M8.
+
+**Not done:** `StaticScene` does not carry the doors a cell places. That is the one line travel
+needs and nothing consumes it yet, so it waits for the thing that activates a door.
+
 ### M5 — Direct lighting
 Sun as a directional light with a real angular diameter (so shadows are soft), shadow rays, cell
 ambient, `LIGH` point lights with shadow rays and a defensible attenuation model, emissive surfaces.

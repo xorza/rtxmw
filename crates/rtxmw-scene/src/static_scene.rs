@@ -76,6 +76,26 @@ impl ModelIndex {
             .map(String::as_str)
     }
 
+    /// Whether `object_id` draws with an editor marker rather than real art.
+    ///
+    /// Morrowind names them `meshes/Marker_*.nif` and there are six in the shipped game — the north
+    /// arrow, the door and travel arrows, the temple and divine intervention targets, and the
+    /// prison marker. They are placement aids the original engine never drew, and one of them is
+    /// filed as a `DOOR`, which makes the distinction matter to more than rendering: `PrisonMarker`
+    /// carries a teleport destination and is not a door anybody walks through.
+    pub fn is_editor_marker(&self, object_id: &str) -> bool {
+        self.model_of(object_id).is_some_and(|path| {
+            // Both separators: a `MODL` string is Morrowind's own, so it uses backslashes, and only
+            // the `meshes/` this crate prepends is a forward slash. `str::get` rather than an index
+            // because a byte offset that lands mid-character panics, and nothing promises these
+            // paths are ASCII.
+            path.rsplit(['/', '\\'])
+                .next()
+                .and_then(|file| file.get(..7))
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("marker_"))
+        })
+    }
+
     /// How many records carry a model.
     pub fn len(&self) -> usize {
         self.models.len()
@@ -287,5 +307,41 @@ mod tests {
             (turned - Vec3::NEG_Y).length() < 1e-4,
             "expected -Y, got {turned:?}"
         );
+    }
+
+    fn index_of(models: &[(&str, &str)]) -> ModelIndex {
+        ModelIndex {
+            models: models
+                .iter()
+                .map(|(id, path)| (id.to_lowercase(), (*path).to_owned()))
+                .collect(),
+            lights: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn a_marker_mesh_is_recognised_whichever_separator_precedes_it() {
+        let index = index_of(&[
+            ("NorthMarker", "meshes/Marker_North.nif"),
+            // A `MODL` string is Morrowind's own and uses backslashes; only the `meshes/` this
+            // crate prepends is a forward slash, so a marker in a subdirectory has both.
+            ("Nested", "meshes/x\\Marker_Travel.nif"),
+            ("Shouty", "meshes/MARKER_PRISON.NIF"),
+            ("ex_nord_door_01", "meshes/d\\Ex_nord_door_01.NIF"),
+            // Substring, not prefix: the rule is about the filename beginning with it.
+            ("Decoy", "meshes/x\\not_marker_at_all.nif"),
+            // Shorter than the prefix, and one whose seventh byte falls inside a character:
+            // "marker" is six bytes, so the accent spans the boundary a fixed-width slice would
+            // cut at, and an unchecked `&file[..7]` panics rather than answering.
+            ("Tiny", "meshes/m.nif"),
+            ("Accented", "meshes/markeré.nif"),
+        ]);
+
+        for id in ["NorthMarker", "Nested", "Shouty"] {
+            assert!(index.is_editor_marker(id), "{id} should be a marker");
+        }
+        for id in ["ex_nord_door_01", "Decoy", "Tiny", "Accented", "Absent"] {
+            assert!(!index.is_editor_marker(id), "{id} should not be a marker");
+        }
     }
 }

@@ -146,6 +146,26 @@ pub enum CellId {
     Exterior { x: i32, y: i32 },
 }
 
+/// Side of an exterior cell in world units.
+///
+/// Not a tuning value: the worldspace grid is defined by it, and terrain records carry exactly one
+/// cell's worth of heights.
+const CELL_SIZE: f32 = 8192.0;
+
+impl CellId {
+    /// The exterior cell a world position falls in.
+    ///
+    /// Floor division rather than truncation, because truncating puts everything between -8192 and
+    /// 8192 in cell zero and mirrors the whole western and southern half of the map onto the
+    /// eastern and northern one.
+    pub fn containing(world_x: f32, world_y: f32) -> Self {
+        Self::Exterior {
+            x: (world_x / CELL_SIZE).floor() as i32,
+            y: (world_y / CELL_SIZE).floor() as i32,
+        }
+    }
+}
+
 impl std::fmt::Display for CellId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -230,6 +250,7 @@ mod tests {
             .collect();
         let first = position_bytes([1.0, 2.0, 3.0], [0.0, 0.0, 0.5]);
         let second = position_bytes([10.0, 20.0, 30.0], [0.0, 0.0, 0.0]);
+        let destination = position_bytes([100.0, 200.0, 300.0], [0.0, 0.0, 1.0]);
 
         push_record(
             &mut out,
@@ -282,6 +303,45 @@ mod tests {
                     name: b"DELE",
                     data: &0u32.to_le_bytes(),
                 },
+                // A door to an interior: `DODT` is a position in the cell it leads to, and `DNAM`
+                // names that cell.
+                SubrecordSpec {
+                    name: b"FRMR",
+                    data: &3u32.to_le_bytes(),
+                },
+                SubrecordSpec {
+                    name: b"NAME",
+                    data: b"ex_nord_door_01\0",
+                },
+                SubrecordSpec {
+                    name: b"DATA",
+                    data: &second,
+                },
+                SubrecordSpec {
+                    name: b"DODT",
+                    data: &destination,
+                },
+                SubrecordSpec {
+                    name: b"DNAM",
+                    data: b"Balmora, Guild of Mages\0",
+                },
+                // And one to an exterior, which writes `DNAM` with nothing in it.
+                SubrecordSpec {
+                    name: b"FRMR",
+                    data: &4u32.to_le_bytes(),
+                },
+                SubrecordSpec {
+                    name: b"NAME",
+                    data: b"ex_nord_door_01\0",
+                },
+                SubrecordSpec {
+                    name: b"DODT",
+                    data: &destination,
+                },
+                SubrecordSpec {
+                    name: b"DNAM",
+                    data: b"\0",
+                },
             ],
         );
         out
@@ -310,7 +370,7 @@ mod tests {
         let record = esm.records().next().unwrap().unwrap();
 
         let refs: Vec<_> = Cell::references(&record).map(|r| r.unwrap()).collect();
-        assert_eq!(refs.len(), 2, "both references should be yielded");
+        assert_eq!(refs.len(), 4, "every reference should be yielded");
 
         assert_eq!(refs[0].refnum, 1);
         assert_eq!(refs[0].object_id, "in_de_shack");
@@ -329,6 +389,26 @@ mod tests {
         // Absent XSCL means unscaled, not zero.
         assert_eq!(refs[1].scale, 1.0);
         assert!(refs[1].deleted);
+
+        // A door carries two positions, and they are not interchangeable: `DATA` is where the door
+        // stands and `DODT` is where it puts you, in a different cell entirely.
+        assert!(refs[2].is_teleport());
+        assert_eq!(refs[2].position.translation, [10.0, 20.0, 30.0]);
+        assert_eq!(
+            refs[2].destination.unwrap().translation,
+            [100.0, 200.0, 300.0]
+        );
+        assert_eq!(refs[2].destination.unwrap().rotation[2], 1.0);
+        assert_eq!(
+            refs[2].destination_cell.as_deref(),
+            Some("Balmora, Guild of Mages")
+        );
+
+        // An empty name is how a door to an exterior is written and says no more than leaving the
+        // subrecord out; keeping the empty string would send a reader looking for a cell called "".
+        assert!(refs[3].is_teleport());
+        assert_eq!(refs[3].destination_cell, None);
+        assert!(!refs[0].is_teleport());
     }
 
     #[test]

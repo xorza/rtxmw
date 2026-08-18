@@ -18,7 +18,8 @@ pub struct CellRef {
     pub scale: f32,
     /// Marked deleted by this or a later plugin.
     pub deleted: bool,
-    /// For a door, the cell it leads to. Empty name means an exterior destination.
+    /// For a door, the interior cell it leads to. `None` means the destination is an exterior
+    /// cell, which is identified by [`CellRef::destination`] instead of by name.
     pub destination_cell: Option<String>,
     /// For a door, where the player arrives.
     pub destination: Option<Position>,
@@ -39,8 +40,9 @@ impl CellRef {
 
     /// Folds one of the reference's subrecords into it.
     ///
-    /// `DATA` means the reference's own placement, but a preceding `DODT` claims the next `DATA`
-    /// for the teleport destination — so the two are distinguished by order, not by tag.
+    /// `DATA` is the reference's own placement and `DODT` the teleport destination; both are a
+    /// whole [`Position`] in their own right, which is why neither needs the other's context to be
+    /// read. OpenMW reads the same pair at `components/esm3/cellref.cpp:115`.
     pub(crate) fn absorb(&mut self, sub: &Subrecord<'_>) {
         match &sub.name().0 {
             b"NAME" => self.object_id = sub.as_str().into_owned(),
@@ -50,7 +52,14 @@ impl CellRef {
                 }
             }
             b"DODT" => self.destination = Position::parse(sub.data()),
-            b"DNAM" => self.destination_cell = Some(sub.as_str().into_owned()),
+            // An empty name is how a door to an exterior is written, and carries no more than an
+            // absent subrecord — flattening the two here keeps every reader from having to know.
+            b"DNAM" => {
+                let name = sub.as_str();
+                if !name.is_empty() {
+                    self.destination_cell = Some(name.into_owned());
+                }
+            }
             b"DATA" => {
                 if let Some(position) = Position::parse(sub.data()) {
                     self.position = position;

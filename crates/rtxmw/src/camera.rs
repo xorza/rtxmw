@@ -58,6 +58,21 @@ impl Camera {
         }
     }
 
+    /// A camera at `position` aimed along `forward`.
+    ///
+    /// Takes a direction rather than a yaw because the directions worth aiming at come from the
+    /// game's data, whose zero is north, while this camera's is east. Converting at one call site
+    /// each would put that 90-degree difference in as many places as there are callers.
+    pub(crate) fn looking(position: Vec3, forward: Vec3) -> Self {
+        let mut camera = Self::new(position);
+        let flat = forward.truncate().length();
+        if flat > 1e-6 {
+            camera.yaw = forward.y.atan2(forward.x);
+            camera.pitch = (forward.z / flat).atan().clamp(-PITCH_LIMIT, PITCH_LIMIT);
+        }
+        camera
+    }
+
     /// Applies mouse look. Deltas are in pixels; the scale is radians per pixel.
     pub(crate) fn look(&mut self, delta_x: f32, delta_y: f32) {
         const RADIANS_PER_PIXEL: f32 = 0.0022;
@@ -125,6 +140,31 @@ impl Camera {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aiming_at_a_direction_reproduces_it() {
+        // Round-trip, because the yaw this stores is measured from a different zero than any
+        // direction handed to it: a sign or a swapped argument survives one leg but not both.
+        for direction in [
+            Vec3::X,
+            Vec3::Y,
+            Vec3::NEG_X,
+            Vec3::new(1.0, 1.0, 0.0).normalize(),
+            Vec3::new(-3.0, 2.0, 1.0).normalize(),
+        ] {
+            let camera = Camera::looking(Vec3::ZERO, direction);
+            assert!(
+                (camera.forward() - direction).length() < 1e-5,
+                "aimed at {direction:?}, ended up looking at {:?}",
+                camera.forward()
+            );
+        }
+
+        // Straight down has no horizontal component to take a bearing from, so the yaw is left
+        // where it was rather than read out of a zero vector.
+        let level = Camera::looking(Vec3::ZERO, Vec3::NEG_Z);
+        assert_eq!(level.yaw, 0.0);
+    }
 
     #[test]
     fn forward_is_east_at_rest_and_turns_left_with_positive_yaw() {

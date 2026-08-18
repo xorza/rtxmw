@@ -3,6 +3,7 @@
 //! This is the seam between the format crates and the renderer: nothing below it knows about
 //! Vulkan, and nothing above it knows about ESM records or NIF blocks.
 
+mod door;
 mod error;
 mod light;
 mod loaded_cell;
@@ -12,6 +13,7 @@ mod mesh;
 mod srgb;
 mod static_scene;
 
+pub use crate::door::Door;
 pub use crate::error::{Result, SceneError};
 pub use crate::light::{Ambient, Light};
 pub use crate::loaded_cell::LoadedCell;

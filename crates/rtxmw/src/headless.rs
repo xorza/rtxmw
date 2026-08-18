@@ -13,7 +13,6 @@ use rtxmw_gpu::{
 use rtxmw_render::SceneRenderer;
 use rtxmw_scene::LoadedCell;
 
-use crate::camera::Camera;
 use crate::scene_loader;
 
 /// Renders the default cell once and writes it to `path` as a PNG.
@@ -49,7 +48,7 @@ pub(crate) fn screenshot(
         scene_loader::describe(scene_loader::DEFAULT_CELL, &cell)
     );
 
-    let camera = Camera::new(scene_loader::viewpoint(&cell.scene));
+    let camera = scene_loader::Viewpoint::entering(&cell).camera();
     let constants = renderer.frame_constants(
         camera.view(),
         camera.projection(width as f32 / height as f32),
