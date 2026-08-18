@@ -26,7 +26,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(flag) = args.next() {
         if flag != "--screenshot" {
             return Err(format!(
-                "unknown argument {flag:?}; expected --screenshot <path> [WIDTHxHEIGHT]"
+                "unknown argument {flag:?}; expected --screenshot <path> [WIDTHxHEIGHT] [CELLX,CELLY]"
             )
             .into());
         }
@@ -34,6 +34,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             args.next()
                 .ok_or("--screenshot needs a path to write the image to")?,
         );
+        let mut cell = None;
         let (width, height) = match args.next() {
             None => SCREENSHOT_SIZE,
             Some(size) => {
@@ -47,7 +48,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )
             }
         };
-        let hit_fraction = headless::screenshot(&path, width, height)?;
+        // A third argument names an exterior cell by its grid position, which is how anything
+        // out of doors is addressed — interiors have names, exteriors have coordinates.
+        if let Some(grid) = args.next() {
+            let malformed = || format!("expected a cell like -2,-9, got {grid:?}");
+            let (x, y) = grid.split_once(',').ok_or_else(malformed)?;
+            cell = Some((
+                x.parse().map_err(|_| malformed())?,
+                y.parse().map_err(|_| malformed())?,
+            ));
+        }
+        let hit_fraction = headless::screenshot(&path, width, height, cell)?;
         println!(
             "wrote {} ({:.0}% of rays hit geometry)",
             path.display(),

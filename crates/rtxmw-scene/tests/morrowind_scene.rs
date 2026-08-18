@@ -366,3 +366,116 @@ fn the_doors_leading_into_a_cell_land_a_traveller_inside_it() {
         );
     }
 }
+
+#[test]
+fn an_exterior_cell_carries_its_terrain_as_well_as_its_objects() {
+    let Some(data) = morrowind_data_dir() else {
+        eprintln!("skipping: {DATA_DIR_VAR} is not configured (set it, or add it to .env)");
+        return;
+    };
+    let vfs = morrowind_archives().expect("the game is available");
+    let bytes = std::fs::read(data.join("Morrowind.esm")).expect("Morrowind.esm should read");
+    let esm = EsmReader::new(&bytes).expect("should parse");
+    let models = ModelIndex::build(&esm).expect("model index should build");
+
+    // Seyda Neen, where the game opens.
+    let (x, y) = (-2, -9);
+    let scene = StaticScene::load_exterior(&esm, &models, &vfs, x, y).expect("cell should load");
+
+    // The terrain is the one mesh with a vertex per point of the 65×65 grid.
+    let terrain = scene
+        .meshes
+        .iter()
+        .find(|mesh| mesh.positions.len() == rtxmw_esm::VERTICES)
+        .expect("the cell has no terrain mesh");
+    println!(
+        "({x}, {y}): {} meshes, {} instances, terrain in {} submeshes over {} textures",
+        scene.meshes.len(),
+        scene.instances.len(),
+        terrain.submeshes.len(),
+        scene.materials.textures().len()
+    );
+
+    // Placed in the world rather than about its own origin, so its corner is the cell's corner.
+    let cell = 8192.0;
+    let corner = terrain.positions[0];
+    assert_eq!(
+        corner.truncate(),
+        glam::Vec2::new(x as f32 * cell, y as f32 * cell)
+    );
+
+    // Seyda Neen is a coastal marsh: terrain either side of sea level, and nothing like the
+    // thousands of units a mis-decoded delta produces.
+    let (low, high) = terrain
+        .positions
+        .iter()
+        .fold((f32::MAX, f32::MIN), |(l, h), p| (l.min(p.z), h.max(p.z)));
+    assert!(
+        low < 0.0,
+        "no ground below sea level in a coastal cell: {low}"
+    );
+    assert!((0.0..4_000.0).contains(&high), "highest ground at {high}");
+
+    // Split by texture tile, so a cell of marsh, sand and rock is several submeshes rather than
+    // one — and every triangle belongs to exactly one of them.
+    assert!(
+        terrain.submeshes.len() > 2,
+        "terrain came out as {} submeshes, so the texture tiles are not being separated",
+        terrain.submeshes.len()
+    );
+    let covered: u32 = terrain.submeshes.iter().map(|s| s.index_count).sum();
+    assert_eq!(covered as usize, terrain.indices.len());
+
+    let names: Vec<&str> = terrain
+        .submeshes
+        .iter()
+        .map(|submesh| {
+            let material = &scene.materials.materials()[submesh.material as usize];
+            let texture = material.base_colour.expect("terrain draws with a texture");
+            scene.materials.textures()[texture.0 as usize].as_str()
+        })
+        .collect();
+    println!("  terrain textures: {names:?}");
+    for path in &names {
+        assert!(
+            path.starts_with("textures/") && path.ends_with(".dds"),
+            "terrain texture path {path:?} did not get the fixups every other texture gets"
+        );
+    }
+
+    // **The assertion that catches an off-by-one in the palette**, and it has to be the exact set.
+    // Checking the region is not enough: the palette turns out to be *grouped* by region, so
+    // reading a `VTEX` index without its offset still lands on Bitter Coast art — `Tx_BC_rock_01`
+    // where `Tx_BC_rock_03` belongs. Every wrong answer looks as plausible as the right one, so
+    // only naming them works. The content file never changes, which is what makes that reasonable.
+    let mut sorted = names.clone();
+    sorted.sort_unstable();
+    assert_eq!(
+        sorted,
+        [
+            "textures/Tx_BC_dirt.dds",
+            "textures/Tx_BC_grass.dds",
+            "textures/Tx_BC_moss.dds",
+            "textures/Tx_BC_muck_01.dds",
+            "textures/Tx_BC_mud.dds",
+            "textures/Tx_BC_rock_03.dds",
+            "textures/Tx_BC_undergrowth.dds",
+            "textures/Tx_RM_grayrock_01.dds",
+        ],
+        "Seyda Neen's terrain is not textured with the Bitter Coast art it should be"
+    );
+
+    // And it is placed exactly once, with no transform: a heightmap belongs to one cell.
+    let terrain_id = scene
+        .meshes
+        .iter()
+        .position(|m| std::ptr::eq(m, terrain))
+        .expect("terrain is in the mesh list");
+    let placements: Vec<_> = scene
+        .instances
+        .iter()
+        .filter(|i| i.mesh.0 as usize == terrain_id)
+        .collect();
+    assert_eq!(placements.len(), 1);
+    assert_eq!(placements[0].transform, glam::Affine3A::IDENTITY);
+}

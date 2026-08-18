@@ -2,7 +2,7 @@
 
 use rtxmw_esm::{CellId, EsmReader};
 use rtxmw_texture::Texture;
-use rtxmw_vfs::morrowind_data_dir;
+use rtxmw_vfs::{Vfs, morrowind_data_dir};
 
 use crate::door::Door;
 use crate::error::{Result, SceneError};
@@ -15,6 +15,9 @@ use crate::static_scene::{ModelIndex, StaticScene};
 /// wants both.
 #[derive(Debug)]
 pub struct LoadedCell {
+    /// Which cell this is. Carried rather than remembered by the caller, so a report about it
+    /// cannot name a different one than was loaded.
+    pub id: CellId,
     pub scene: StaticScene,
     /// One entry per path in the scene's texture list, `None` where the file could not be decoded.
     ///
@@ -36,6 +39,20 @@ impl LoadedCell {
     /// 79 MB file each time. That is fine for opening one cell at startup and wrong for streaming;
     /// when cells start streaming, the reader wants hoisting above this.
     pub fn load_interior(cell_name: &str) -> Result<Option<Self>> {
+        Self::load(
+            CellId::Interior(cell_name.to_owned()),
+            |esm, models, vfs| StaticScene::load_interior(esm, models, vfs, cell_name),
+        )
+    }
+
+    /// Brings up the game's files, assembles one cell with `build`, and decodes its textures.
+    ///
+    /// The part every cell shares, whichever way it is addressed: the reader, the model index, the
+    /// door search and the texture decode differ only in which scene comes out of the middle.
+    fn load(
+        destination: CellId,
+        build: impl FnOnce(&EsmReader<'_>, &ModelIndex, &Vfs) -> Result<StaticScene>,
+    ) -> Result<Option<Self>> {
         let Some(data) = morrowind_data_dir() else {
             return Ok(None);
         };
@@ -47,8 +64,9 @@ impl LoadedCell {
         let bytes = std::fs::read(data.join("Morrowind.esm")).map_err(SceneError::Io)?;
         let esm = EsmReader::new(&bytes)?;
         let models = ModelIndex::build(&esm)?;
-        let scene = StaticScene::load_interior(&esm, &models, &vfs, cell_name)?;
-        let entrances = Door::leading_to(&esm, &models, &CellId::Interior(cell_name.to_owned()))?;
+        let scene = build(&esm, &models, &vfs)?;
+        let entrances = Door::leading_to(&esm, &models, &destination)?;
+        // `destination` is moved into the result below, so the door search borrows it first.
 
         // A texture that fails to read or decode becomes `None` rather than aborting the load: one
         // dangling reference in a cell of hundreds is not a reason to have no cell.
@@ -64,10 +82,23 @@ impl LoadedCell {
             .collect();
 
         Ok(Some(Self {
+            id: destination,
             scene,
             textures,
             entrances,
         }))
+    }
+
+    /// Loads the exterior cell at grid position `(x, y)`, or `None` when none is configured.
+    ///
+    /// Its entrances come from the same search an interior's do: a door leading outside names no
+    /// cell, so the grid square its arrival point falls in identifies one — which
+    /// [`Door::leading_to`] already resolves. Standing where the game would put someone stepping
+    /// out of a building is as good a viewpoint outdoors as in.
+    pub fn load_exterior(x: i32, y: i32) -> Result<Option<Self>> {
+        Self::load(CellId::Exterior { x, y }, |esm, models, vfs| {
+            StaticScene::load_exterior(esm, models, vfs, x, y)
+        })
     }
 
     /// How many of the cell's texture references resolved to nothing.

@@ -10,15 +10,17 @@ pub(crate) const DEFAULT_CELL: &str = "Seyda Neen, Census and Excise Office";
 
 /// A one-line summary of what was loaded, for startup output.
 ///
-/// Takes the name rather than assuming [`DEFAULT_CELL`]: there is only one cell today, and a
-/// summary that hardcoded its name would start printing the wrong one the moment there are two.
+/// The name comes from the cell itself rather than from the caller, so a summary cannot announce a
+/// different cell than the one it is describing — an interior is named and an exterior is a grid
+/// position, and `CellId` is what knows how each is written down.
 ///
 /// Missing textures are worth naming rather than swallowing: the shipped meshes reference art that
 /// was removed, so a small count is expected and a large one means the path fixups have drifted.
-pub(crate) fn describe(name: &str, cell: &LoadedCell) -> String {
+pub(crate) fn describe(cell: &LoadedCell) -> String {
     let missing = cell.missing_textures();
     format!(
-        "{name}: {} meshes, {} instances, {} lights, {} textures ({missing} missing)",
+        "{}: {} meshes, {} instances, {} lights, {} textures ({missing} missing)",
+        cell.id,
         cell.scene.meshes.len(),
         cell.scene.instances.len(),
         cell.scene.lights.len(),
@@ -103,6 +105,7 @@ mod tests {
     /// A cell whose only geometry is a wide floor at `floor`, with `entrances` leading into it.
     fn cell_with(floor: f32, entrances: Vec<Door>) -> LoadedCell {
         LoadedCell {
+            id: CellId::Interior("a test cell".into()),
             scene: StaticScene {
                 meshes: vec![Mesh {
                     positions: vec![

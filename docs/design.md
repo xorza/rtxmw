@@ -945,6 +945,57 @@ that the trace outweighs the composite, and — as a pure function, since this m
 all 64 bits valid and so never exercises it — that a duration masks off the bits a queue does not
 promise, including across a wrap.
 
+### M9 — exteriors: the ground under the world
+
+The first half of the milestone: a named exterior cell loads with its terrain and its objects, and
+renders. Streaming, the active grid and distant statics are not built.
+
+**`LAND` is two encodings that both look plausible when decoded wrongly**, which is what the tests
+are shaped around:
+
+- **`VHGT` stores gradients, not heights.** Each row's first column steps from the row above it and
+  every other column steps from its left-hand neighbour, over a float offset for the whole cell. So
+  one cell is a running total down its western edge and 65 running totals across. Read as absolute
+  values it still produces a surface — just not this one.
+- **`VTEX` is sixteen 4×4 blocks, not a 16×16 grid.** Read flat it scrambles the texturing into the
+  right textures in the wrong places.
+- **A `VTEX` index is one past its `LTEX` index**, because zero means the region's default rather
+  than the palette's first entry. OpenMW resolves the same way at
+  `components/esmterrain/storage.cpp:376`, and the default is `_land_default.dds`.
+
+Verified against every `LAND` record in `Morrowind.esm`: 1,292 cells of terrain from −2,152 to
+18,952 units, neighbouring vertices never more than 1,016 apart, 548 cells centred below sea level.
+Those are Vvardenfell's shape — sea level at zero, Red Mountain at eighteen thousand, an island —
+and they are what a corpus catches that a round trip cannot. A further **98 `LAND` records carry no
+terrain at all**, only coordinates and a flag word; they are cells that exist for their objects, and
+treating them as parse failures would discard 7% of the world's records silently.
+
+**Terrain is placed rather than instanced.** A NIF is authored about its own origin and an instance
+transform puts it somewhere; a heightmap belongs to exactly one cell and could never appear
+elsewhere, so `Mesh::from_land` writes world coordinates and the instance carries no transform. Its
+65×65 grid shares its last row and column with the neighbouring cell, which is what makes adjacent
+terrain meet without a seam and why 65 vertices span 64 quads.
+
+Texture tiles become submeshes: the quads of every tile sharing a material are emitted together, so
+a cell of marsh, sand and rock is a handful of contiguous runs rather than 256 of them. Seyda Neen
+comes out as **eight submeshes over 84 meshes and 289 instances, loading in 19 ms**.
+
+The test that matters names the eight textures exactly. Asserting they belong to the Bitter Coast —
+Seyda Neen's region — was not enough, because **the palette turns out to be grouped by region**, so
+dropping the index offset still lands on Bitter Coast art: `Tx_BC_rock_01` where `Tx_BC_rock_03`
+belongs. Every wrong answer looks as plausible as the right one, so the set has to be spelled out.
+
+**A fault-injection harness reported four false negatives** before that was noticed. It treated a
+compile failure as "the test passed", and `mesh.rs`'s unit tests had stopped compiling when
+`from_land` changed signature. It now distinguishes *did not build* from *not caught*, which is the
+second time in this project that a verification step quietly reported success for work it never ran.
+
+**Not built, and needed before this milestone closes:** the 3×3 active grid and streaming; distant
+statics; blending between neighbouring texture layers, which the original engine did and this
+replaces with a hard edge per tile; and **the sun**. An exterior carries no `AMBI`, so out of doors
+there is nothing lighting the world at all — the placeholder is a fixed overcast daylight standing
+in for a sky the weather system will eventually drive.
+
 ### M5 — Direct lighting
 Sun as a directional light with a real angular diameter (so shadows are soft), shadow rays, cell
 ambient, `LIGH` point lights with shadow rays and a defensible attenuation model, emissive surfaces.

@@ -3,15 +3,25 @@
 use std::collections::HashMap;
 
 use glam::{Affine3A, Mat3, Quat, Vec2, Vec3};
-use rtxmw_esm::{Cell, CellRef, EsmReader, LightRecord, ObjectRecord, Record, RecordName};
+use rtxmw_esm::{
+    Cell, CellId, CellRef, EsmReader, LandRecord, LandTexture, LightRecord, ObjectRecord, Record,
+    RecordName, TEXTURE_GRID,
+};
 use rtxmw_nif::NifFile;
 use rtxmw_vfs::Vfs;
 
 use crate::error::{Result, SceneError};
 use crate::light::{Ambient, Light};
+use crate::material::{self, Material};
 use crate::material_table::MaterialTable;
 use crate::mesh::{Bounds, Mesh};
 use crate::srgb;
+
+/// What a terrain tile draws with when its index is zero, or names a palette entry that is absent.
+///
+/// Zero is not "the first texture" but "the region's default", which the shipped art supplies under
+/// this name; OpenMW resolves it identically at `components/esmterrain/storage.cpp:376`.
+const DEFAULT_TERRAIN_TEXTURE: &str = "_land_default.dds";
 
 /// Index of a mesh within [`StaticScene::meshes`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -152,6 +162,76 @@ impl StaticScene {
             return Ok(scene);
         }
         Err(SceneError::NoSuchCell(cell_name.to_owned()))
+    }
+
+    /// Loads the exterior cell at grid position `(x, y)`, terrain included.
+    ///
+    /// Two records make a cell out of doors: the `CELL` that places its objects and the `LAND` that
+    /// shapes the ground under them. They are not adjacent in the file, so this walks it once and
+    /// takes whichever it meets.
+    ///
+    /// A cell with no `LAND`, or one whose record carries no heightmap, is legal — a hundred of
+    /// them ship — and comes back as its objects over flat ground at the default height.
+    pub fn load_exterior(
+        esm: &EsmReader<'_>,
+        models: &ModelIndex,
+        vfs: &Vfs,
+        x: i32,
+        y: i32,
+    ) -> Result<Self> {
+        let cell_tag = RecordName::new(b"CELL");
+        let land_tag = RecordName::new(b"LAND");
+        let texture_tag = RecordName::new(b"LTEX");
+        let mut scene: Option<Self> = None;
+        let mut land: Option<LandRecord> = None;
+        let mut palette: Vec<String> = Vec::new();
+
+        for record in esm.records() {
+            let record = record?;
+            if record.name() == texture_tag
+                && let Some(entry) = LandTexture::parse(&record)?
+            {
+                let index = entry.index as usize;
+                if palette.len() <= index {
+                    palette.resize(index + 1, String::new());
+                }
+                palette[index] = entry.texture;
+            } else if record.name() == cell_tag {
+                let cell = Cell::parse(&record)?;
+                if !cell.is_interior() && cell.grid_x == x && cell.grid_y == y {
+                    scene = Some(Self::from_cell(&record, models, vfs)?);
+                }
+            } else if record.name() == land_tag
+                && let Some(parsed) = LandRecord::parse(&record)?
+                && (parsed.grid_x, parsed.grid_y) == (x, y)
+            {
+                land = Some(parsed);
+            }
+        }
+
+        let mut scene =
+            scene.ok_or_else(|| SceneError::NoSuchCell(CellId::Exterior { x, y }.to_string()))?;
+        // An exterior carries no `AMBI`: out of doors the ambient *is* the sky, which the original
+        // engine drove from weather and time of day. Until that exists this is a fixed overcast
+        // daylight, and it is the only thing lighting an exterior at all — there is no sun yet
+        // either. Blue-shifted because sky light is, and bright enough that auto-exposure has
+        // something to work from.
+        scene.ambient = Some(Ambient {
+            colour: Vec3::new(0.35, 0.42, 0.55),
+            ..Ambient::default()
+        });
+        if let Some(land) = land {
+            let tile_materials = terrain_materials(&land, &palette, &mut scene.materials);
+            let mesh = MeshId(scene.meshes.len() as u32);
+            scene.meshes.push(Mesh::from_land(&land, &tile_materials));
+            // No transform: `Mesh::from_land` places its vertices in the world already, because a
+            // heightmap belongs to exactly one cell and could never be instanced elsewhere.
+            scene.instances.push(Instance {
+                mesh,
+                transform: Affine3A::IDENTITY,
+            });
+        }
+        Ok(scene)
     }
 
     /// Builds a scene from an already-located cell record.
@@ -307,6 +387,38 @@ fn height_at(a: Vec3, b: Vec3, c: Vec3, at: Vec2) -> Option<f32> {
     Some(a.z + u * (b.z - a.z) + v * (c.z - a.z))
 }
 
+/// A material for every terrain tile, interned into the scene's table.
+///
+/// **A `VTEX` index is one past its `LTEX` index.** Zero is not the palette's first entry but the
+/// default texture every cell falls back to, so everything real is offset by one — reading them as
+/// the same numbering textures the whole world one slot out, and plausibly, because the palette is
+/// grouped by region and the neighbouring entry is usually more of the same terrain.
+fn terrain_materials(
+    land: &LandRecord,
+    palette: &[String],
+    materials: &mut MaterialTable,
+) -> Vec<u32> {
+    (0..TEXTURE_GRID * TEXTURE_GRID)
+        .map(|tile| {
+            let name = match land.textures.get(tile).copied().unwrap_or(0) {
+                0 => DEFAULT_TERRAIN_TEXTURE,
+                index => palette
+                    .get(index as usize - 1)
+                    // A hole rather than a name: the palette is filled by index as records arrive,
+                    // so an index no `LTEX` record ever claimed leaves an empty string behind, and
+                    // `get` hands that back as happily as a real one.
+                    .filter(|name| !name.is_empty())
+                    .map_or(DEFAULT_TERRAIN_TEXTURE, String::as_str),
+            };
+            let texture = materials.intern_texture(&material::texture_path(name));
+            materials.intern(Material {
+                base_colour: Some(texture),
+                ..Material::default()
+            })
+        })
+        .collect()
+}
+
 /// Builds a reference's model-to-world transform.
 ///
 /// Rotations are radians applied about the **negated** axes in Z, Y, X order — the convention the
@@ -325,6 +437,67 @@ fn world_transform(cell_ref: &CellRef) -> Affine3A {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rtxmw_esm::LandRecord;
+
+    fn land_with(textures: Vec<u16>) -> LandRecord {
+        LandRecord {
+            grid_x: 0,
+            grid_y: 0,
+            heights: vec![0.0; rtxmw_esm::VERTICES],
+            normals: Vec::new(),
+            textures,
+        }
+    }
+
+    /// The texture path a tile's material ends up naming.
+    fn tile_texture(materials: &MaterialTable, tile_material: u32) -> &str {
+        let material = &materials.materials()[tile_material as usize];
+        let id = material.base_colour.expect("terrain draws with a texture");
+        &materials.textures()[id.0 as usize]
+    }
+
+    #[test]
+    fn a_texture_index_addresses_one_past_its_palette_entry() {
+        let palette = ["sand.tga".to_owned(), "rock.tga".to_owned()];
+        // Index 1 is the *first* palette entry, not the second; index 0 is not an entry at all.
+        let land = land_with(vec![0, 1, 2]);
+        let mut materials = MaterialTable::default();
+        let tiles = terrain_materials(&land, &palette, &mut materials);
+
+        assert_eq!(tiles.len(), TEXTURE_GRID * TEXTURE_GRID);
+        assert_eq!(
+            tile_texture(&materials, tiles[0]),
+            "textures/_land_default.dds"
+        );
+        assert_eq!(tile_texture(&materials, tiles[1]), "textures/sand.dds");
+        assert_eq!(tile_texture(&materials, tiles[2]), "textures/rock.dds");
+        // Tiles the record says nothing about fall back the same way the zero index does.
+        assert_eq!(
+            tile_texture(&materials, tiles[3]),
+            "textures/_land_default.dds"
+        );
+        // One material per distinct texture, not one per tile.
+        assert_eq!(materials.textures().len(), 3);
+    }
+
+    #[test]
+    fn an_index_no_palette_entry_claimed_falls_back_rather_than_naming_nothing() {
+        // The palette is filled by index as records arrive, so a gap is an empty string rather
+        // than a missing element — and `get` returns it as readily as a real name. Left alone it
+        // becomes the path "textures/.dds", which resolves to nothing and silently swaps a
+        // texture for the renderer's magenta fallback.
+        let palette = ["sand.tga".to_owned(), String::new(), "rock.tga".to_owned()];
+        let land = land_with(vec![2, 3]);
+        let mut materials = MaterialTable::default();
+        let tiles = terrain_materials(&land, &palette, &mut materials);
+
+        assert_eq!(
+            tile_texture(&materials, tiles[0]),
+            "textures/_land_default.dds"
+        );
+        assert_eq!(tile_texture(&materials, tiles[1]), "textures/rock.dds");
+    }
+
     use crate::mesh::Submesh;
 
     fn reference(translation: [f32; 3], rotation: [f32; 3], scale: f32) -> CellRef {

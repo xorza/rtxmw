@@ -123,7 +123,7 @@ impl Properties {
 /// Two fixups the original data needs, both quirks rather than conventions: the name is relative to
 /// `textures/`, and it routinely claims an extension the shipped file does not have — the game
 /// converted its art to DDS and never updated the references.
-fn texture_path(name: &str) -> String {
+pub(crate) fn texture_path(name: &str) -> String {
     let slashed = name.replace('\\', "/");
     let stem = slashed
         .rsplit_once('.')

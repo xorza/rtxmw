@@ -1,6 +1,7 @@
-//! Flattening a NIF's node graph into one renderable mesh.
+//! Flattening a NIF's node graph, or a cell's heightmap, into one renderable mesh.
 
 use glam::{Mat3, Vec2, Vec3};
+use rtxmw_esm::{GRID, LandRecord, SPACING, TEXTURE_GRID};
 use rtxmw_nif::{Block, GeometryData, Link, NifFile, Transform};
 
 use crate::material::Properties;
@@ -57,6 +58,99 @@ impl Submesh {
 }
 
 impl Mesh {
+    /// Turns one exterior cell's heightmap into terrain, in world space.
+    ///
+    /// **Already placed, unlike a model.** A NIF is authored about its own origin and an instance
+    /// transform puts it somewhere; a heightmap is only ever the cell it belongs to, so baking the
+    /// cell's corner in costs nothing and spares the caller a transform that could only ever have
+    /// one value.
+    ///
+    /// The grid's last row and column are shared with the neighbouring cell rather than being this
+    /// one's own — which is what makes adjacent terrain meet without a seam, and why a cell spans
+    /// 64 quads across 65 vertices.
+    /// `tile_materials` gives the material of each of the cell's `TEXTURE_GRID` squared texture
+    /// tiles, row-major. Quads are emitted grouped by it, so each distinct material comes out as
+    /// one contiguous submesh — which is what the acceleration structure wants, and what lets a hit
+    /// on a patch of sand resolve to sand.
+    ///
+    /// One texture per tile with a hard edge between them, where the original engine blended
+    /// neighbouring layers across the seam. That is the next thing to fix here and needs a blend
+    /// map rather than a material split.
+    pub fn from_land(land: &LandRecord, tile_materials: &[u32]) -> Self {
+        assert_eq!(
+            tile_materials.len(),
+            TEXTURE_GRID * TEXTURE_GRID,
+            "a cell has one texture tile per {TEXTURE_GRID} squared"
+        );
+        let cell_size = SPACING * (GRID - 1) as f32;
+        let origin = Vec2::new(
+            land.grid_x as f32 * cell_size,
+            land.grid_y as f32 * cell_size,
+        );
+
+        let mut mesh = Self {
+            positions: Vec::with_capacity(land.heights.len()),
+            normals: Vec::with_capacity(land.heights.len()),
+            uvs: Vec::with_capacity(land.heights.len()),
+            indices: Vec::with_capacity((GRID - 1) * (GRID - 1) * 6),
+            submeshes: Vec::new(),
+        };
+        for row in 0..GRID {
+            for column in 0..GRID {
+                let index = row * GRID + column;
+                mesh.positions.push(Vec3::new(
+                    origin.x + column as f32 * SPACING,
+                    origin.y + row as f32 * SPACING,
+                    land.height(column, row),
+                ));
+                // Per-vertex normals come from the file, so terrain is smooth-shaded without the
+                // loader averaging anything. A cell carrying none leaves zeroes, which is the same
+                // signal a NIF without normals gives.
+                mesh.normals.push(
+                    land.normals
+                        .get(index)
+                        .map_or(Vec3::ZERO, |n| Vec3::from_array(*n)),
+                );
+                // One texture repeat per four vertex spacings, which is the 512-unit tile the
+                // texture indices are laid out on.
+                mesh.uvs.push(Vec2::new(column as f32, row as f32) / 4.0);
+            }
+        }
+
+        // Each tile spans four quads a side, since 16 tiles cover the 64 quads of a cell.
+        const QUADS: usize = (GRID - 1) / TEXTURE_GRID;
+        let mut distinct: Vec<u32> = tile_materials.to_vec();
+        distinct.sort_unstable();
+        distinct.dedup();
+
+        for material in distinct {
+            let first_index = mesh.indices.len() as u32;
+            for (tile, &tile_material) in tile_materials.iter().enumerate() {
+                if tile_material != material {
+                    continue;
+                }
+                let (tile_x, tile_y) = (tile % TEXTURE_GRID, tile / TEXTURE_GRID);
+                for quad_y in 0..QUADS {
+                    for quad_x in 0..QUADS {
+                        let row = tile_y * QUADS + quad_y;
+                        let column = tile_x * QUADS + quad_x;
+                        let corner = (row * GRID + column) as u32;
+                        let above = corner + GRID as u32;
+                        // Counter-clockwise seen from above, matching the upward normals.
+                        mesh.indices.extend([corner, corner + 1, above + 1]);
+                        mesh.indices.extend([corner, above + 1, above]);
+                    }
+                }
+            }
+            mesh.submeshes.push(Submesh {
+                first_index,
+                index_count: mesh.indices.len() as u32 - first_index,
+                material,
+            });
+        }
+        mesh
+    }
+
     /// Flattens every visible geometry block in `nif` into one mesh, interning its materials.
     ///
     /// The table is shared across the whole scene rather than per model, so the indices in
@@ -293,6 +387,96 @@ fn is_skippable(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rtxmw_esm::VERTICES;
+
+    /// Texture tiles in a cell, which is how many materials `from_land` wants.
+    const TILES: usize = TEXTURE_GRID * TEXTURE_GRID;
+
+    /// A heightmap sloping up to the east, on the cell at `(grid_x, grid_y)`.
+    fn sloping_land(grid_x: i32, grid_y: i32) -> LandRecord {
+        LandRecord {
+            grid_x,
+            grid_y,
+            heights: (0..VERTICES).map(|i| (i % GRID) as f32 * 10.0).collect(),
+            normals: vec![[0.0, 0.0, 1.0]; VERTICES],
+            textures: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn terrain_lands_where_its_cell_is() {
+        // Cell (-2, -9) is Seyda Neen's, and its south-west corner is at -2 and -9 times the
+        // 8,192-unit cell. A heightmap placed at the origin regardless would put every cell in the
+        // world on top of every other.
+        let mesh = Mesh::from_land(&sloping_land(-2, -9), &[0; TILES]);
+        assert_eq!(mesh.positions.len(), VERTICES);
+        assert_eq!(
+            mesh.positions[0].truncate(),
+            glam::Vec2::new(-16384.0, -73728.0)
+        );
+
+        // The far corner is one cell along in each direction, *not* one vertex short of it: the
+        // shared edge is what makes neighbouring cells meet.
+        let far = mesh.positions[VERTICES - 1];
+        assert_eq!(
+            far.truncate(),
+            glam::Vec2::new(-16384.0 + 8192.0, -73728.0 + 8192.0)
+        );
+
+        // Height comes through unscaled — the record already decoded it into world units.
+        assert_eq!(mesh.positions[0].z, 0.0);
+        assert_eq!(mesh.positions[GRID - 1].z, 640.0);
+    }
+
+    #[test]
+    fn every_quad_becomes_two_triangles_covering_it() {
+        let mesh = Mesh::from_land(&sloping_land(0, 0), &[3; TILES]);
+        // 64 quads a side, two triangles each.
+        assert_eq!(mesh.triangle_count(), (GRID - 1) * (GRID - 1) * 2);
+        // One material across every tile, so one submesh.
+        assert_eq!(mesh.submeshes.len(), 1);
+        assert_eq!(mesh.submeshes[0].material, 3);
+        assert_eq!(mesh.submeshes[0].index_count as usize, mesh.indices.len());
+        assert!(mesh.indices.iter().all(|i| (*i as usize) < VERTICES));
+
+        // Wound counter-clockwise seen from above, so a face normal computed from the winding
+        // points up rather than into the ground.
+        let corner = |i: usize| mesh.positions[mesh.indices[i] as usize];
+        let face = (corner(1) - corner(0)).cross(corner(2) - corner(0));
+        assert!(face.z > 0.0, "first triangle faces {face:?}");
+    }
+
+    #[test]
+    fn tiles_are_grouped_into_one_submesh_per_material() {
+        // Two materials in a chequer, which is the case a single run cannot represent: each
+        // submesh has to gather the quads of every tile using its material, wherever they are.
+        let tiles: Vec<u32> = (0..TILES)
+            .map(|t| ((t / TEXTURE_GRID + t % TEXTURE_GRID) % 2) as u32)
+            .collect();
+        let mesh = Mesh::from_land(&sloping_land(0, 0), &tiles);
+
+        assert_eq!(mesh.submeshes.len(), 2);
+        // Between them they cover every quad exactly once. Comparing the submeshes against the
+        // buffer only proves they agree with each other — a grouping that emitted every tile under
+        // *every* material would pass that and draw the cell twice.
+        assert_eq!(mesh.indices.len(), (GRID - 1) * (GRID - 1) * 6);
+        let covered: u32 = mesh.submeshes.iter().map(|s| s.index_count).sum();
+        assert_eq!(covered as usize, mesh.indices.len());
+        assert_eq!(mesh.submeshes[0].first_index, 0);
+        assert_eq!(mesh.submeshes[1].first_index, mesh.submeshes[0].index_count);
+        // A chequer splits them evenly.
+        assert_eq!(mesh.submeshes[0].index_count, mesh.submeshes[1].index_count);
+    }
+
+    #[test]
+    fn a_cell_without_normals_leaves_them_zero_rather_than_guessing() {
+        let mut land = sloping_land(0, 0);
+        land.normals.clear();
+        let mesh = Mesh::from_land(&land, &[0; TILES]);
+        // Parallel to positions either way, which is what every consumer relies on.
+        assert_eq!(mesh.normals.len(), mesh.positions.len());
+        assert!(mesh.normals.iter().all(|n| *n == Vec3::ZERO));
+    }
 
     #[test]
     fn a_row_major_rotation_is_transposed_on_the_way_in() {

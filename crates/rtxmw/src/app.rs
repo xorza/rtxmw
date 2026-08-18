@@ -162,10 +162,7 @@ impl ApplicationHandler for App {
                     event_loop.exit();
                     return;
                 }
-                println!(
-                    "{}",
-                    scene_loader::describe(scene_loader::DEFAULT_CELL, &cell)
-                );
+                println!("{}", scene_loader::describe(&cell));
                 self.camera = scene_loader::Viewpoint::entering(&cell).camera();
             }
             Ok(None) => eprintln!(
