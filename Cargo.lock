@@ -1296,6 +1296,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rtxmw-nif"
+version = "0.1.0"
+dependencies = [
+ "rtxmw-vfs",
+]
+
+[[package]]
 name = "rtxmw-vfs"
 version = "0.1.0"
 dependencies = [
