@@ -1585,10 +1585,30 @@ The lesson is where the bug was found. Every test passed throughout: the waterli
 units of water, twice the offset, and the artefact lives below it. It now checks both sides of that
 number.
 
+**The waves were woven, and the fix was the spectrum.** Six components with hand-picked directions
+interfere into a quasi-periodic pattern that reads as fabric — visible across a whole bay. Nine
+octaves, each turned by the **golden angle** and each 0.618 of the last in wavelength and 0.55 in
+height, never come back into alignment; that product being below one is what keeps steepness falling
+as the detail gets finer, which is the opposite of what makes a distant sea sparkle. The spectrum is
+now a rule rather than a table, and the compiler folds all of it away when it unrolls the loop.
+
+**What a ray cone cannot resolve is not gone, it is rough.** Averaging a crest and a trough into a
+flat facet throws away real slope, and a surface that lost its slope reflects like polished plastic —
+which is what distant water looked like. The variance of the discarded octaves is kept and comes back
+as a widened specular lobe: *LEAN mapping*'s argument, in the one dimension it needs. Its most
+visible consequence is the sun. A mirror shows one hard dot; a mile of ruffled water shows a
+shimmering road, because the glitter path **is** the wave-slope distribution made visible — which is
+how Cox and Munk measured sea roughness from photographs in 1954. The disc is widened by the lobe
+and dimmed by the same factor, so a rougher sea spreads the sun without adding any light to the
+scene.
+
 **M10 is done.** Standing on Seyda Neen's shore: the seabed is visible through moving water, the
 surface reflects the sky and the coast, caustics play on the bottom, and the frame is inside §5.3.
-A precise cost is not worth quoting from this machine — measurements across the session ranged 116
-to 150 fps at 1920x1080 depending on what else held the GPU, against a budget of 125.
+**No absolute frame rate from this machine is worth quoting.** Measurements across the session
+ranged from 116 to 382 fps for the same scene, and the reason turned out to be the GPU's own clock:
+it idles at 315 MHz here and only ramps to 2,280 under sustained load, so a short run measures the
+ramp. Back-to-back A/B pairs — flat against wavy, guard on against off — are the only comparisons
+that survived, and they are the only kind worth making here.
 
 ### 7.8 Costs and risks
 

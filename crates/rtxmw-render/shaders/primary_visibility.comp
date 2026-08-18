@@ -211,14 +211,35 @@ const vec3 WATER_SCATTER = vec3(0.06, 0.32, 0.28);
 //
 // Wavelengths of 5 to 1.5 metres with amplitudes under a tenth of a metre: gentle enough that the
 // slope stays shallow, which is what keeps the reflection from tearing into noise.
-const vec4 WAVES[6] = vec4[6](
-    vec4(0.98, 0.20, 390.0, 3.4),
-    vec4(0.55, -0.84, 250.0, 2.1),
-    vec4(-0.31, 0.95, 165.0, 1.3),
-    vec4(0.87, 0.49, 96.0, 0.7),
-    vec4(-0.72, -0.69, 57.0, 0.35),
-    vec4(0.16, -0.99, 31.0, 0.18)
-);
+// **A spectrum stated as a rule, not a table.** Six waves with hand-picked directions interfere
+// into a weave: the pattern is quasi-periodic, and the eye finds the repeat immediately. Nine
+// octaves whose directions each turn by the golden angle never come back into alignment, which is
+// what a sum of sinusoids needs to read as fractal rather than woven.
+//
+// Every term is constant per octave and the loop unrolls, so most of this folds away: the compiled
+// module holds one sine and one cosine per octave per derivative and no per-octave direction at
+// all. The two `pow`s do survive — eleven of them across the shader — which is nothing beside the
+// two rays every water pixel already traces, but it is not nothing, so it is written down here
+// rather than assumed away.
+const int WAVE_OCTAVES = 9;
+
+// The longest wave, in world units: six metres, the swell of a sheltered bay rather than an ocean.
+const float WAVE_LONGEST = 420.0;
+
+// Each octave is this fraction of the last in wavelength and this fraction in height. Their product
+// is below one, so **steepness falls as the waves get finer** — the opposite makes small detail the
+// steepest thing on the surface, which is what turns a distant sea into a field of white sparks.
+const float WAVE_LACUNARITY = 0.618;
+const float WAVE_GAIN = 0.55;
+
+// The tallest wave, in world units. Chosen for the total slope it gives across all nine octaves:
+// the steepnesses form a geometric series in `WAVE_GAIN / WAVE_LACUNARITY`, summing to 0.222 — a
+// slope of twelve and a half degrees at its worst, which is a breeze rather than a sea.
+const float WAVE_TALLEST = 2.5;
+
+// The golden angle. Turning each octave by it distributes the directions about as evenly as any
+// sequence can while never repeating, so no two octaves ever line up to draw a grain.
+const float WAVE_TURN = 2.39996;
 
 // Morrowind's gravity, in world units per second squared: 8.96 m/s^2 across 69.99 units to the
 // metre. It sets the dispersion — long waves travel faster than short ones, by `sqrt(g/k)` — which
@@ -231,14 +252,15 @@ const float TAU = 6.2831853;
 // plane. Small: this is a guard against a facet turning away entirely, not a limit on the waves.
 const float MIN_FACING = 0.03;
 
-// How far a ray is pushed sideways per unit of depth, per unit of surface slope.
+// How far refraction deflects a ray, per unit of surface slope.
 //
 // A tilted surface bends light toward its normal, and the deflection is the difference between the
-// angle of incidence and the angle of refraction — which for small angles is the slope times
-// `1 - 1/eta`. Multiply by depth and it is how far the light has wandered by the time it reaches
-// the bottom. Derived from the index of refraction rather than written out, so the surface and the
-// pattern it casts cannot come to disagree about what water is.
-const float CAUSTIC_BEND = 1.0 - 1.0 / WATER_IOR;
+// angle of incidence and the angle of refraction — which for small angles is the slope times this.
+// Multiplied by depth it is how far the light has wandered by the time it reaches the bottom, which
+// is what makes caustics; multiplied by a lobe it is how much less a refraction is blurred by rough
+// water than a reflection is. Derived from the index of refraction rather than written out, so
+// nothing here can come to disagree about what water is.
+const float REFRACTION_BEND = 1.0 - 1.0 / WATER_IOR;
 
 // A ceiling on how bright a focus is allowed to get.
 //
@@ -498,17 +520,23 @@ struct WaveSample {
     float detail;
     float wavenumber;
     float phase;
+    float amplitude;
+    vec2 direction;
 };
 
 WaveSample sample_wave(int index, vec2 p, float time, float footprint) {
-    float wavelength = WAVES[index].z;
+    float octave = float(index);
+    float wavelength = WAVE_LONGEST * pow(WAVE_LACUNARITY, octave);
+    float angle = WAVE_TURN * octave;
     WaveSample wave;
+    wave.amplitude = WAVE_TALLEST * pow(WAVE_GAIN, octave);
+    wave.direction = vec2(cos(angle), sin(angle));
     // A wave narrower than the pixel looking at it is averaged away rather than drawn: a ray cone a
     // wavelength wide covers a crest and a trough whose slopes cancel, and picking one of them
     // instead is what makes distant water a field of crawling white sparks.
     wave.detail = 1.0 - smoothstep(0.25 * wavelength, 0.75 * wavelength, footprint);
     wave.wavenumber = TAU / wavelength;
-    wave.phase = wave.wavenumber * dot(WAVES[index].xy, p)
+    wave.phase = wave.wavenumber * dot(wave.direction, p)
                - sqrt(WATER_GRAVITY * wave.wavenumber) * time;
     return wave;
 }
@@ -532,20 +560,19 @@ WaveSample sample_wave(int index, vec2 p, float time, float footprint) {
 float caustic(vec2 p, float depth, float time, float footprint) {
     // Second derivatives of `sum(A * sin(k * dot(d, p) - w * t))`, which are `-A k^2 d_i d_j sin`.
     vec3 hessian = vec3(0.0);
-    for (int i = 0; i < WAVES.length(); ++i) {
+    for (int i = 0; i < WAVE_OCTAVES; ++i) {
         WaveSample wave = sample_wave(i, p, time, footprint);
         if (wave.detail <= 0.0) {
             continue;
         }
-        vec2 direction = WAVES[i].xy;
-        float second = -wave.detail * WAVES[i].w * wave.wavenumber * wave.wavenumber
+        float second = -wave.detail * wave.amplitude * wave.wavenumber * wave.wavenumber
                      * sin(wave.phase);
-        hessian += second * vec3(direction.x * direction.x,
-                                 direction.y * direction.y,
-                                 direction.x * direction.y);
+        hessian += second * vec3(wave.direction.x * wave.direction.x,
+                                 wave.direction.y * wave.direction.y,
+                                 wave.direction.x * wave.direction.y);
     }
 
-    float bend = CAUSTIC_BEND * min(depth, CAUSTIC_MAX_DEPTH);
+    float bend = REFRACTION_BEND * min(depth, CAUSTIC_MAX_DEPTH);
     float determinant = (1.0 - bend * hessian.x) * (1.0 - bend * hessian.y)
                       - (bend * hessian.z) * (bend * hessian.z);
     return min(1.0 / max(abs(determinant), 1.0 / CAUSTIC_MAX), CAUSTIC_MAX);
@@ -673,15 +700,30 @@ vec3 shade(Surface surface, vec3 incoming, uvec2 pixel, uint salt, uint samples)
 // radiance is its irradiance divided by the solid angle it subtends, which for half a degree is
 // some sixty thousand times the value used here. Making the two agree means turning the directional
 // light into an area light, which is a larger change than drawing a bright circle.
-vec3 sky(vec3 direction) {
+vec3 sky_seen_through(vec3 direction, float lobe) {
     // Brighter overhead than at the horizon, which is the one feature of a sky worth having before
     // there is a weather system to ask.
     float height = clamp(direction.z * 0.5 + 0.5, 0.0, 1.0);
     vec3 colour = frame.ambient * mix(0.75, 1.35, height);
-    if (dot(direction, -frame.sun_direction) > frame.sun_cos_radius) {
-        colour = frame.sun_colour;
+
+    // **`lobe` is how far a rough surface smears the sun**, in radians. Water too fine to resolve
+    // is not flat — the slopes are still there, they are simply smaller than a pixel — and what
+    // they do to a reflected sun is spread it. That spreading *is* the glitter path: a mirror shows
+    // one hard dot, and a mile of ruffled water shows a shimmering road to the horizon. Cox and
+    // Munk measured sea roughness by photographing exactly this in 1954.
+    float widened = cos(acos(clamp(frame.sun_cos_radius, -1.0, 1.0)) + lobe);
+    if (dot(direction, -frame.sun_direction) > widened) {
+        // The same flux over a larger cap, so a broader glitter is a dimmer one and the total light
+        // the sun contributes does not grow with the wind.
+        float spread = max(1.0 - widened, 1e-6);
+        colour = frame.sun_colour * min((1.0 - frame.sun_cos_radius) / spread, 1.0);
     }
     return colour;
+}
+
+// What a ray that hits nothing sees, from a surface sharp enough not to smear it.
+vec3 sky(vec3 direction) {
+    return sky_seen_through(direction, 0.0);
 }
 
 // Traces one ray and resolves the material at whatever it hits.
@@ -779,17 +821,20 @@ Surface trace(vec3 origin, vec3 direction, float cone_width, float cone_spread, 
 // ground wherever the bed is nearer the surface than the offset itself, then travels down through
 // open air and reports water of infinite depth. On a gentle slope that band is metres wide, and it
 // drew a flat ribbon of scattering colour along the whole waterline.
-vec3 water_ray(vec3 origin, vec3 direction, float footprint, uvec2 pixel, uint salt,
+vec3 water_ray(vec3 origin, vec3 direction, float footprint, float lobe, uvec2 pixel, uint salt,
                out float travelled) {
     // The pixel's own cone, not a bounce's. **A reflection and a refraction are specular**: they
     // carry the footprint the primary ray had, where a diffuse bounce spreads over a hemisphere and
     // wants the coarse mip that goes with it. Tracing these at the bounce rate put a seabed a
     // hundred units down under a hundred-unit footprint — every texture at its top mip, and every
     // wave averaged out of the caustics that the same footprint governs.
-    Surface hit = trace(origin, direction, footprint, frame.cone_spread, MASK_SOLID);
+    // The cone widens by the lobe as well as by the pixel: a reflection off water too fine to
+    // resolve is blurred by the slopes that were averaged away, and what it reflects should blur
+    // with it rather than staying mirror-sharp against a matt sea.
+    Surface hit = trace(origin, direction, footprint, frame.cone_spread + lobe, MASK_SOLID);
     travelled = hit.hit ? hit.t : WATER_MAX_PATH;
     if (!hit.hit) {
-        return sky(direction);
+        return sky_seen_through(direction, lobe);
     }
     return shade(hit, frame.ambient, pixel, salt, BOUNCE_SHADOW_SAMPLES);
 }
@@ -802,14 +847,22 @@ vec3 water_ray(vec3 origin, vec3 direction, float footprint, uvec2 pixel, uint s
 //
 // The quad itself stays flat. Displacing two triangles would buy nothing a normal does not, and the
 // silhouette of water against a shore is set by the terrain behind it rather than by the surface.
-vec3 water_normal(vec2 p, float time, float footprint) {
+vec3 water_normal(vec2 p, float time, float footprint, out float unresolved) {
     vec2 slope = vec2(0.0);
-    for (int i = 0; i < WAVES.length(); ++i) {
+    unresolved = 0.0;
+    for (int i = 0; i < WAVE_OCTAVES; ++i) {
         WaveSample wave = sample_wave(i, p, time, footprint);
+        float steepness = wave.amplitude * wave.wavenumber;
+        // **What the cone could not resolve is not gone, it is rough.** Averaging a crest and a
+        // trough into a flat facet throws away real slope, and a surface that lost its slope
+        // reflects like polished plastic. Keeping the variance of what was dropped — a sinusoid of
+        // steepness `s` has mean square slope `s^2 / 2` — is what lets it come back as a widened
+        // specular lobe instead. This is LEAN mapping's argument, in the one dimension it needs.
+        unresolved += (1.0 - wave.detail * wave.detail) * 0.5 * steepness * steepness;
         if (wave.detail <= 0.0) {
             continue;
         }
-        slope += WAVES[i].xy * (wave.detail * WAVES[i].w * wave.wavenumber * cos(wave.phase));
+        slope += wave.direction * (wave.detail * steepness * cos(wave.phase));
     }
     return normalize(vec3(-slope, 1.0));
 }
@@ -842,7 +895,11 @@ vec3 water_shade(Surface surface, vec3 incident, uvec2 pixel) {
 
     // The wave normal replaces the quad's flat one. Keyed off world position rather than anything
     // interpolated, so one cell's surface continues into the next without a seam at the boundary.
-    vec3 waves = water_normal(surface.position.xy, frame.time, surface.footprint);
+    float unresolved;
+    vec3 waves = water_normal(surface.position.xy, frame.time, surface.footprint, unresolved);
+    // A normal tilting by an angle turns its reflection by twice that, so the lobe the lost slopes
+    // leave behind is twice their root mean square.
+    float lobe = 2.0 * sqrt(unresolved);
     vec3 n = from_below ? -waves : waves;
 
     // A facet that still faces away is one the surface would have hidden behind the wave in front
@@ -871,7 +928,7 @@ vec3 water_shade(Surface surface, vec3 incident, uvec2 pixel) {
     // travelled no water at all. Attenuating the wrong one turns that window green.
     float mirrored;
     vec3 reflected = water_ray(surface.position + flat_normal * SHADOW_BIAS, reflect(incident, n),
-                               surface.footprint, pixel, STREAM_WATER_REFLECT, mirrored);
+                               surface.footprint, lobe, pixel, STREAM_WATER_REFLECT, mirrored);
     if (from_below) {
         reflected = absorbed_by_water(reflected, mirrored);
     }
@@ -884,8 +941,11 @@ vec3 water_shade(Surface surface, vec3 incident, uvec2 pixel) {
     }
 
     float depth;
+    // Refraction bends by a third of what reflection does, so what is seen *through* the surface
+    // is blurred correspondingly less by the same lost slopes.
     vec3 behind = water_ray(surface.position + flat_normal * SHADOW_BIAS, through,
-                            surface.footprint, pixel, STREAM_WATER_REFRACT, depth);
+                            surface.footprint, lobe * REFRACTION_BEND, pixel,
+                            STREAM_WATER_REFRACT, depth);
     vec3 refracted = from_below ? behind : absorbed_by_water(behind, depth);
 
     // With no water left between the surface and the ground, this is the ground. Only from above:
