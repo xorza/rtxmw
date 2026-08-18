@@ -1,12 +1,32 @@
 //! Which cell the engine opens in, where to stand in it, and how to report it.
 
 use glam::Vec3;
-use rtxmw_scene::LoadedCell;
+use rtxmw_scene::{CellId, LoadedCell};
 
 use crate::camera::Camera;
 
-/// The cell the engine opens in until there is a way to choose one.
+/// The cell the engine opens in when the command line names none.
 pub(crate) const DEFAULT_CELL: &str = "Seyda Neen, Census and Excise Office";
+
+/// The cell a command-line argument names, or [`DEFAULT_CELL`] when there is none.
+///
+/// **A pair of integers is an exterior and anything else is an interior's name**, which is exactly
+/// how Morrowind addresses the two: outdoors has coordinates, indoors has a name. So `-2,-9` is
+/// Seyda Neen's shore and `"Balmora, Guild of Mages"` is a building, with no flag to say which.
+///
+/// Takes the absent case too, because every caller has one and each writing out the default meant
+/// three copies of it.
+pub(crate) fn cell_argument(argument: Option<&str>) -> CellId {
+    let Some(argument) = argument else {
+        return CellId::Interior(DEFAULT_CELL.to_owned());
+    };
+    if let Some((x, y)) = argument.split_once(',')
+        && let (Ok(x), Ok(y)) = (x.trim().parse(), y.trim().parse())
+    {
+        return CellId::Exterior { x, y };
+    }
+    CellId::Interior(argument.to_owned())
+}
 
 /// A one-line summary of what was loaded, for startup output.
 ///
@@ -99,6 +119,34 @@ impl Viewpoint {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_pair_of_integers_is_an_exterior_and_anything_else_is_a_name() {
+        let cell = |argument| cell_argument(Some(argument));
+        assert_eq!(cell("-2,-9"), CellId::Exterior { x: -2, y: -9 });
+        // Spaces around the comma are what a shell leaves behind after quoting.
+        assert_eq!(cell(" 3 , 4 "), CellId::Exterior { x: 3, y: 4 });
+
+        // Interior names contain commas — most of them do — so a comma alone cannot be the test.
+        // Only a pair that *parses* as integers is a grid position.
+        assert_eq!(
+            cell("Balmora, Guild of Mages"),
+            CellId::Interior("Balmora, Guild of Mages".into())
+        );
+        assert_eq!(
+            cell("Seyda Neen, Census and Excise Office"),
+            CellId::Interior("Seyda Neen, Census and Excise Office".into())
+        );
+        assert_eq!(cell("Nowhere"), CellId::Interior("Nowhere".into()));
+        // Half a pair is a name too, not an error: there is a cell called that or there is not.
+        assert_eq!(cell("-2,"), CellId::Interior("-2,".into()));
+
+        // No argument at all is the cell the engine opens in.
+        assert_eq!(
+            cell_argument(None),
+            CellId::Interior(DEFAULT_CELL.to_owned())
+        );
+    }
     use glam::{Affine3A, Vec2};
     use rtxmw_scene::{CellId, Door, Instance, Mesh, MeshId, StaticScene, Submesh};
 

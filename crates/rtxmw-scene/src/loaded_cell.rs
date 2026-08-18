@@ -33,6 +33,17 @@ pub struct LoadedCell {
 }
 
 impl LoadedCell {
+    /// Loads whichever cell `id` names, or `None` when no game data is configured.
+    ///
+    /// The dispatch a caller holding a `CellId` wants: an interior is found by name and an exterior
+    /// by grid position, and nothing above here should have to know which of those it is holding.
+    pub fn load_at(id: CellId) -> Result<Option<Self>> {
+        match id {
+            CellId::Interior(name) => Self::load_interior(&name),
+            CellId::Exterior { x, y } => Self::load_exterior(x, y),
+        }
+    }
+
     /// Loads the named interior from the installed game, or `None` when none is configured.
     ///
     /// Reads the whole of `Morrowind.esm` each call, so loading several cells this way rereads a

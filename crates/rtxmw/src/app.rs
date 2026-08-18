@@ -9,7 +9,7 @@ use winit::event_loop::ActiveEventLoop;
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowId};
 
-use rtxmw_scene::LoadedCell;
+use rtxmw_scene::{CellId, LoadedCell};
 
 use crate::camera::{Camera, Movement};
 use crate::renderer::Renderer;
@@ -44,6 +44,8 @@ impl Keys {
 /// Application state for the winit event loop.
 #[derive(Debug)]
 pub(crate) struct App {
+    /// Which cell to open in, from the command line.
+    cell: CellId,
     window: Option<Window>,
     renderer: Option<Renderer>,
     camera: Camera,
@@ -55,10 +57,21 @@ pub(crate) struct App {
     frames_since_title: u32,
 }
 
+impl App {
+    /// An app that opens in `cell`.
+    pub(crate) fn opening_in(cell: CellId) -> Self {
+        Self {
+            cell,
+            ..Self::default()
+        }
+    }
+}
+
 impl Default for App {
     fn default() -> Self {
         let now = Instant::now();
         Self {
+            cell: scene_loader::cell_argument(None),
             window: None,
             renderer: None,
             // Replaced by the loaded cell's own centre in `resumed`; this only matters if no game
@@ -154,11 +167,11 @@ impl ApplicationHandler for App {
         // Content after the device, because uploading needs one. A missing install is not fatal:
         // the window still comes up and reports the device, which is what makes it obvious that the
         // path is what is wrong rather than the GPU.
-        match LoadedCell::load_interior(scene_loader::DEFAULT_CELL) {
+        match LoadedCell::load_at(self.cell.clone()) {
             Ok(Some(cell)) => {
                 let renderer = self.renderer.as_mut().expect("renderer was just created");
                 if let Err(e) = renderer.load_scene(&cell.scene, &cell.textures) {
-                    eprintln!("could not upload {}: {e}", scene_loader::DEFAULT_CELL);
+                    eprintln!("could not upload {}: {e}", cell.id);
                     event_loop.exit();
                     return;
                 }

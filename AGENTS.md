@@ -127,8 +127,14 @@ the same `SceneRenderer` the engine runs rather than a replica of it, headlessly
 screen and costs tens of seconds; almost everything it would confirm is already covered:
 
 ```
-cargo run -- --screenshot out.png    # one frame, no window, no swapchain, ~0.6 s warm
+cargo run -- --screenshot out.png                       # one frame, no window, ~0.6 s warm
+cargo run -- --screenshot out.png 1920x1080 -2,-9       # at the §5.3 internal size, outdoors
 ```
+
+Both the windowed binary and `--screenshot` take an optional cell as their last argument, and
+address it the way Morrowind does: **a pair of integers is an exterior and anything else is an
+interior's name.** So `-2,-9` is Seyda Neen's shore and `"Balmora, Guild of Mages"` is a building.
+Without one, both open in the default interior.
 
 That path brings up a device with no surface extensions at all, so it works over ssh and in a
 script, and it reports the fraction of rays that hit geometry — enough to tell "the cell rendered"

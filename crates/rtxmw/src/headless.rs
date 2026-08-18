@@ -11,7 +11,7 @@ use rtxmw_gpu::{
     Device, Instance, Memory, PhysicalDevice, Presentation, Uploader, Validation, readback,
 };
 use rtxmw_render::SceneRenderer;
-use rtxmw_scene::LoadedCell;
+use rtxmw_scene::{CellId, LoadedCell};
 
 use crate::scene_loader;
 
@@ -23,7 +23,7 @@ pub(crate) fn screenshot(
     path: &Path,
     width: u32,
     height: u32,
-    cell: Option<(i32, i32)>,
+    cell: CellId,
 ) -> Result<f32, Box<dyn std::error::Error>> {
     // No surface extensions and no swapchain: this device could not present if asked.
     let instance = Instance::new(c"rtxmw", &[], Validation::for_build())?;
@@ -35,11 +35,8 @@ pub(crate) fn screenshot(
     let extent = vk::Extent2D { width, height };
     let mut renderer = SceneRenderer::new(&device, &physical, &memory, extent)?;
 
-    let missing = "no game data configured — set MORROWIND_DATA_DIR, or put it in .env";
-    let cell = match cell {
-        Some((x, y)) => LoadedCell::load_exterior(x, y)?.ok_or(missing)?,
-        None => LoadedCell::load_interior(scene_loader::DEFAULT_CELL)?.ok_or(missing)?,
-    };
+    let cell = LoadedCell::load_at(cell)?
+        .ok_or("no game data configured — set MORROWIND_DATA_DIR, or put it in .env")?;
     renderer.load_scene(
         &device,
         &mut uploader,
