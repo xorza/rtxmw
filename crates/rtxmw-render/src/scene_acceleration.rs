@@ -2,7 +2,7 @@
 
 use ash::vk;
 use rtxmw_gpu::{Buffer, BufferMemory, Device, RayTracingLimits, Uploader, memory_barrier};
-use rtxmw_scene::{AlphaMode, Instance, Material};
+use rtxmw_scene::{AlphaMode, Instance, Material, MaterialKind};
 
 use crate::acceleration_structure::AccelerationStructure;
 use crate::geometry_buffers::GeometryBuffers;
@@ -23,6 +23,8 @@ pub struct SceneAcceleration {
     blas: Vec<AccelerationStructure>,
     /// Which entry of `blas` each mesh slot built into, or [`NO_BLAS`] for one with no triangles.
     by_mesh: Vec<u32>,
+    /// Whether each mesh slot is water, which decides the mask its instances carry.
+    is_water: Vec<bool>,
     tlas: AccelerationStructure,
     /// Owned so it outlives the top-level build, and because a refit will rewrite it in place.
     instances: Buffer,
@@ -47,6 +49,7 @@ impl SceneAcceleration {
         Ok(Self {
             blas: Vec::new(),
             by_mesh: Vec::new(),
+            is_water: Vec::new(),
             tlas,
             instances,
             instance_count: 0,
@@ -73,7 +76,7 @@ impl SceneAcceleration {
             by_mesh,
             uncompacted_bytes,
             compacted_sizes,
-        } = build_bottom_level(device, uploader, limits, geometry, materials, slots)?;
+        } = build_bottom_level(device, uploader, limits, geometry, materials, slots.clone())?;
         let base = self.blas.len() as u32;
         self.blas
             .extend(compact(device, uploader, structures, &compacted_sizes)?);
@@ -84,6 +87,14 @@ impl SceneAcceleration {
                 slot + base
             }
         }));
+        // A mesh is water when its geometry says so, which for the shared water quad is all of it.
+        for range in &geometry.ranges()[slots.start as usize..slots.end as usize] {
+            let water = geometry
+                .submeshes_of(range)
+                .iter()
+                .all(|submesh| materials[submesh.material as usize].kind == MaterialKind::Water);
+            self.is_water.push(water && range.submesh_count > 0);
+        }
         self.uncompacted_blas_bytes += uncompacted_bytes;
         Ok(())
     }
@@ -101,7 +112,13 @@ impl SceneAcceleration {
         instances: &[Instance],
     ) -> rtxmw_gpu::Result<()> {
         let first_submesh: Vec<u32> = geometry.ranges().iter().map(|r| r.first_submesh).collect();
-        let records = describe_instances(&self.by_mesh, &self.blas, &first_submesh, instances);
+        let records = describe_instances(
+            &self.by_mesh,
+            &self.blas,
+            &first_submesh,
+            &self.is_water,
+            instances,
+        );
         if records.len() as vk::DeviceSize * INSTANCE_SIZE > self.instances.size() {
             self.instances = instance_buffer(uploader, records.len())?;
         }
@@ -143,6 +160,18 @@ impl SceneAcceleration {
         self.uncompacted_blas_bytes
     }
 }
+
+/// The mask bit ordinary geometry carries, and the one a shadow ray tests against.
+///
+/// **Water is deliberately absent from it.** Sunlight reaching a seabed has passed *through* the
+/// surface, so water must not occlude — and the mask is how traversal is told that, at no cost.
+/// Doing it in the any-hit loop instead, by building water non-opaque, measured at half the frame
+/// rate: every shadow ray crossing the sea would invoke a shader where hardware had been enough.
+const MASK_SOLID: u8 = 0x01;
+
+/// The mask bit water carries. Visible to a ray that asks for everything, invisible to one that
+/// asks only for [`MASK_SOLID`].
+const MASK_WATER: u8 = 0x02;
 
 /// Alignment a top-level build requires of its instance buffer's address.
 const INSTANCE_ADDRESS_ALIGNMENT: vk::DeviceSize = 16;
@@ -451,6 +480,7 @@ fn describe_instances(
     by_mesh: &[u32],
     blas: &[AccelerationStructure],
     first_submesh: &[u32],
+    is_water: &[bool],
     instances: &[Instance],
 ) -> Vec<vk::AccelerationStructureInstanceKHR> {
     let mut out = Vec::with_capacity(instances.len());
@@ -471,7 +501,11 @@ fn describe_instances(
             // material lookup a single indexed read with no per-mesh indirection.
             instance_custom_index_and_mask: vk::Packed24_8::new(
                 first_submesh[instance.mesh.0 as usize],
-                0xFF,
+                if is_water[instance.mesh.0 as usize] {
+                    MASK_WATER
+                } else {
+                    MASK_SOLID
+                },
             ),
             instance_shader_binding_table_record_offset_and_flags: vk::Packed24_8::new(
                 0,
@@ -639,6 +673,16 @@ fn align_up(value: vk::DeviceSize, alignment: vk::DeviceSize) -> vk::DeviceSize 
 mod tests {
     use super::*;
     use glam::{Affine3A, Mat3, Vec3};
+
+    #[test]
+    fn a_shadow_ray_asking_for_solid_geometry_cannot_see_water() {
+        // `occluded` spells `MASK_SOLID` out as `0x01u`, because a shader cannot see a Rust
+        // constant. What matters is not either value but that they do not overlap: an overlapping
+        // bit would put the whole seabed back in the shadow of its own sea.
+        assert_eq!(MASK_SOLID, 0x01);
+        assert_eq!(MASK_WATER, 0x02);
+        assert_eq!(MASK_SOLID & MASK_WATER, 0);
+    }
 
     #[test]
     fn a_column_major_transform_is_written_out_by_rows() {

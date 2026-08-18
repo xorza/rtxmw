@@ -1,7 +1,7 @@
 //! Flattening a NIF's node graph, or a cell's heightmap, into one renderable mesh.
 
 use glam::{Mat3, Vec2, Vec3};
-use rtxmw_esm::{GRID, LandRecord, SPACING, TEXTURE_GRID};
+use rtxmw_esm::{CELL_SIZE, GRID, LandRecord, SPACING, TEXTURE_GRID};
 use rtxmw_nif::{Block, GeometryData, Link, NifFile, Transform};
 
 use crate::material::Properties;
@@ -58,6 +58,38 @@ impl Submesh {
 }
 
 impl Mesh {
+    /// A unit quad in the XY plane facing up, which is every water surface in the game.
+    ///
+    /// A unit rather than a placed one, unlike terrain: water is flat, so every cell's surface is
+    /// the *same* geometry moved and scaled, and one mesh with an instance per cell is what the
+    /// acceleration structure wants. Terrain cannot be shared that way; water is the case where
+    /// sharing is free.
+    ///
+    /// Two triangles. Subdividing it would only matter once the surface displaces, and the wave
+    /// model planned for that perturbs the normal rather than the position.
+    pub fn water_plane(material: u32) -> Self {
+        Self {
+            positions: vec![
+                Vec3::new(-0.5, -0.5, 0.0),
+                Vec3::new(0.5, -0.5, 0.0),
+                Vec3::new(0.5, 0.5, 0.0),
+                Vec3::new(-0.5, 0.5, 0.0),
+            ],
+            normals: vec![Vec3::Z; 4],
+            // Nothing reads these and nothing will: water has no texture, and the wave model
+            // planned for it keys off world position, which a hit already knows. Interpolated UVs
+            // could not serve that anyway — the instance scale multiplies the quad, not its UVs, so
+            // the same range would cover a cell and a puddle alike.
+            uvs: vec![Vec2::ZERO; 4],
+            indices: vec![0, 1, 2, 0, 2, 3],
+            submeshes: vec![Submesh {
+                first_index: 0,
+                index_count: 6,
+                material,
+            }],
+        }
+    }
+
     /// Turns one exterior cell's heightmap into terrain, in world space.
     ///
     /// **Already placed, unlike a model.** A NIF is authored about its own origin and an instance
@@ -82,10 +114,9 @@ impl Mesh {
             TEXTURE_GRID * TEXTURE_GRID,
             "a cell has one texture tile per {TEXTURE_GRID} squared"
         );
-        let cell_size = SPACING * (GRID - 1) as f32;
         let origin = Vec2::new(
-            land.grid_x as f32 * cell_size,
-            land.grid_y as f32 * cell_size,
+            land.grid_x as f32 * CELL_SIZE,
+            land.grid_y as f32 * CELL_SIZE,
         );
 
         let mut mesh = Self {

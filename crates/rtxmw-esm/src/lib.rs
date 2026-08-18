@@ -13,7 +13,7 @@ mod object_record;
 mod position;
 mod record_name;
 
-pub use crate::cell::{Cell, CellAmbient, CellId, CellRefIter};
+pub use crate::cell::{CELL_SIZE, Cell, CellAmbient, CellId, CellRefIter};
 pub use crate::cell_index::{CellIndex, CellOffsets};
 pub use crate::cell_ref::CellRef;
 pub use crate::error::{EsmError, Result};

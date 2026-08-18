@@ -26,7 +26,7 @@ pub use crate::door::Door;
 pub use crate::error::{Result, SceneError};
 pub use crate::light::{Ambient, Light};
 pub use crate::loaded_cell::LoadedCell;
-pub use crate::material::{AlphaMode, Material, TextureId};
+pub use crate::material::{AlphaMode, Material, MaterialKind, TextureId};
 pub use crate::material_table::MaterialTable;
 pub use crate::mesh::{Bounds, Mesh, Submesh};
 pub use crate::srgb::to_linear;

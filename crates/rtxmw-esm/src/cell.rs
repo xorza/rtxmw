@@ -101,8 +101,13 @@ impl Cell {
     }
 
     /// Whether the cell has a water plane.
+    ///
+    /// **An exterior always does**, flag or no flag: out of doors the sea is the world's, not the
+    /// cell's, and the record has no say in it. Every one of the shipped exteriors sets the flag
+    /// anyway, so this only matters for content that does not — which is exactly the case where
+    /// inferring it from the flag would leave a hole in the sea.
     pub fn has_water(&self) -> bool {
-        self.flags & FLAG_HAS_WATER != 0
+        self.flags & FLAG_HAS_WATER != 0 || !self.is_interior()
     }
 
     /// Whether sleeping here without a bed is disallowed.
@@ -150,7 +155,12 @@ pub enum CellId {
 ///
 /// Not a tuning value: the worldspace grid is defined by it, and terrain records carry exactly one
 /// cell's worth of heights.
-const CELL_SIZE: f32 = 8192.0;
+pub const CELL_SIZE: f32 = 8192.0;
+
+// The terrain grid says the same thing a different way — 64 spans of 128 units — and a renderer
+// placing water or heightmaps needs them to agree exactly. Checked here rather than trusted.
+const _: () =
+    assert!(CELL_SIZE == crate::land_record::SPACING * (crate::land_record::GRID - 1) as f32);
 
 impl CellId {
     /// The exterior cell a world position falls in.

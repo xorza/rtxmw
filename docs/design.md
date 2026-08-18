@@ -1463,15 +1463,35 @@ depth before it lights anything. Sun shafts are a later want, not part of this.
 
 Four stages, each independently verifiable, each leaving the tree green.
 
-**Stage 1 — the plane exists.** `has_water`/`water_height` reach `StaticScene`; the shared quad and
-its per-cell instance; a water kind on `Material` (`GpuMaterial` has spare padding for the flag);
-the shader branch doing Fresnel, one reflection ray, one refraction ray, Beer–Lambert, written to
-the emissive channel. Flat — no waves.
-*Tests:* a headless quad over a coloured floor pins Fresnel at normal versus grazing incidence,
-absorption exact at a hand-computed depth, and the reflection showing what is above. Plus a data
-test pinning §7.1's two load-bearing facts: no exterior carries a `WHGT`, and interiors carry a
-height whether or not they have water.
-*Done when:* Seyda Neen's shore has a sea, with the seabed visible through it.
+**Stage 1 — the plane exists — done.** `has_water` reaches `StaticScene`, one shared quad is
+instanced per water cell, `MaterialKind::Water` selects the model, and the shader branch does
+Fresnel, one reflection ray, one refraction ray and Beer–Lambert into the emissive channel. Flat —
+no waves.
+
+`Cell::has_water` now encodes the format's rule rather than the flag alone: an exterior has water
+whatever the record says. Every shipped exterior sets the flag anyway, so this only matters for
+content that does not — which is exactly the case where trusting the flag leaves a hole in the sea.
+
+**It made the frame faster.** At Seyda Neen's shore, 900 frames under sustained load: **134 fps with
+water against 108–116 without**. Water was expected to cost about double; instead a water pixel
+*replaces* a diffuse one, and a diffuse pixel is the expensive kind — sixteen shadow rays and four
+bounce rays, against water's two deterministic rays and their cheap shading. Screenshot timings are
+useless for this comparison on a desktop that keeps the GPU at its idle 315 MHz: five runs of the
+same frame spanned 6.2 to 11.0 ms, which is why the number above comes from a sustained run.
+
+**Water must not cast a shadow**, and the way it is told not to matters. A surface in the
+acceleration structure blocks shadow rays, so the first version of this put every seabed in the
+shade of its own sea — measured, the bottom kept 3.6% of its sunlight instead of 85%. Building the
+water non-opaque so the any-hit loop could wave shadow rays past *works* and **costs half the frame
+rate**: 68 fps against 134, because every shadow ray crossing the sea then invokes a shader where
+traversal alone had been enough. Water carries a mask bit of its own instead, and `occluded` asks
+only for solid geometry — free, and back to 134 fps. The light is not attenuated on the way *down*
+either, which the caustics stage replaces rather than a claim about water.
+
+Verified by four headless tests, each catching one thing a plausible implementation gets wrong —
+proven by injection: collapsing the extinction to one channel, dropping the angle from Fresnel,
+shading water as an ordinary surface, and letting water occlude each fail exactly one test and no
+others.
 
 **Stage 2 — waves.** Four to six trochoidal components plus a detail normal.
 *Blocked on one thing:* the push-constant block is **exactly 128 bytes and full**, and waves need

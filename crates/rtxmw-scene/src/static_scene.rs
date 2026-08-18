@@ -4,19 +4,28 @@ use std::collections::HashMap;
 
 use glam::{Affine3A, Mat3, Quat, Vec2, Vec3};
 use rtxmw_esm::{
-    Cell, CellId, CellIndex, CellRef, EsmReader, LandRecord, LightRecord, ObjectRecord, Record,
-    RecordName, TEXTURE_GRID,
+    CELL_SIZE, Cell, CellId, CellIndex, CellRef, EsmReader, LandRecord, LightRecord, ObjectRecord,
+    Record, RecordName, TEXTURE_GRID,
 };
 use rtxmw_nif::NifFile;
 use rtxmw_vfs::Vfs;
 
 use crate::error::{Result, SceneError};
 use crate::light::{Ambient, Light};
-use crate::material::{self, Material};
+use crate::material::{self, Material, MaterialKind};
 use crate::material_table::MaterialTable;
 use crate::mesh::{Bounds, Mesh};
 use crate::srgb;
 use crate::sun::Sun;
+
+/// The one mesh every water surface in the game is, shared across every cell that has one.
+const WATER_SOURCE: &str = "water";
+
+/// Sea level out of doors, in world units.
+///
+/// Not a tuning value: none of the 1,404 shipped exterior cells carries a water height of its own,
+/// so this is what the game means by the sea rather than a choice about it.
+const SEA_LEVEL: f32 = 0.0;
 
 /// What a terrain tile draws with when its index is zero, or names a palette entry that is absent.
 ///
@@ -178,6 +187,7 @@ impl StaticScene {
                 sunlight: srgb::to_linear(a.sunlight),
                 fog: srgb::to_linear(a.fog),
             });
+            scene.add_water(&cell);
             return Ok(scene);
         }
 
@@ -191,6 +201,8 @@ impl StaticScene {
         });
         // Fixed for now: the orbit is a function of time of day, and nothing tracks that yet.
         scene.sun = Some(Sun::default_daylight());
+
+        scene.add_water(&cell);
 
         if let Some(offset) = offsets.land
             && let Some(land) = LandRecord::parse(&esm.record_at(offset)?)?
@@ -211,6 +223,61 @@ impl StaticScene {
             });
         }
         Ok(scene)
+    }
+
+    /// Adds the cell's water surface, if it has one.
+    ///
+    /// **The flag decides, not the height.** Every one of the game's 1,134 interiors carries a water
+    /// height whether or not it has water, so reading the value and taking its presence as an
+    /// answer would flood 941 dry rooms; `has_water` is the question — set explicitly for an
+    /// interior, true for every exterior.
+    ///
+    /// Not one of the shipped exteriors carries a height of its own, so the sea is at zero
+    /// everywhere out of doors: Vvardenfell is one body of water, and a cell needs no more than its
+    /// own footprint of it. An interior's pool sits at the height its record names and spans what
+    /// the room contains, which is as much as a flat quad can know about a cave.
+    fn add_water(&mut self, cell: &Cell) {
+        if !cell.has_water() {
+            return;
+        }
+        let placement = if cell.is_interior() {
+            // Nothing placed means nothing to put water in, and no bounds to size it by.
+            let Some(bounds) = self.bounds() else {
+                return;
+            };
+            let level = cell.water_height.unwrap_or_default();
+            let centre = (bounds.min + bounds.max) * 0.5;
+            let size = bounds.max - bounds.min;
+            Affine3A::from_scale_rotation_translation(
+                Vec3::new(size.x, size.y, 1.0),
+                Quat::IDENTITY,
+                Vec3::new(centre.x, centre.y, level),
+            )
+        } else {
+            Affine3A::from_scale_rotation_translation(
+                Vec3::new(CELL_SIZE, CELL_SIZE, 1.0),
+                Quat::IDENTITY,
+                Vec3::new(
+                    (cell.grid_x as f32 + 0.5) * CELL_SIZE,
+                    (cell.grid_y as f32 + 0.5) * CELL_SIZE,
+                    SEA_LEVEL,
+                ),
+            )
+        };
+
+        let material = self.materials.intern(Material {
+            kind: MaterialKind::Water,
+            ..Material::default()
+        });
+        let mesh = MeshId(self.meshes.len() as u32);
+        self.meshes.push(Mesh::water_plane(material));
+        // One source for every cell's water, because it really is one mesh: the renderer uploads it
+        // once and instances it wherever there is water.
+        self.mesh_sources.push(WATER_SOURCE.to_owned());
+        self.instances.push(Instance {
+            mesh,
+            transform: placement,
+        });
     }
 
     /// Adds everything one cell record places to this scene.
@@ -425,6 +492,73 @@ fn world_transform(cell_ref: &CellRef) -> Affine3A {
 mod tests {
     use super::*;
     use rtxmw_esm::LandRecord;
+
+    /// `Interior` and `HasWater` from a cell record's flags. Spelled out because the reader keeps
+    /// them private, and the shape of the bits belongs to the format rather than to us.
+    const INTERIOR: i32 = 0x01;
+    const HAS_WATER: i32 = 0x02;
+
+    /// A cell record carrying only what water placement reads.
+    fn cell_with(flags: i32, grid_x: i32, grid_y: i32, water_height: Option<f32>) -> Cell {
+        Cell {
+            name: String::new(),
+            flags,
+            grid_x,
+            grid_y,
+            region: None,
+            water_height,
+            ambient: None,
+        }
+    }
+
+    #[test]
+    fn water_covers_an_exterior_cell_and_an_interior_only_when_it_says_so() {
+        // An exterior's water is its own 8,192-unit footprint at sea level. Cell (1, -2) spans x
+        // from 8,192 to 16,384 and y from -16,384 to -8,192.
+        let mut shore = StaticScene::default();
+        shore.add_water(&cell_with(0, 1, -2, None));
+        assert_eq!(shore.instances.len(), 1);
+        assert_eq!(shore.mesh_sources, ["water"]);
+        let placed = shore.instances[0].transform;
+        assert_eq!(
+            placed.transform_point3(Vec3::new(-0.5, -0.5, 0.0)),
+            Vec3::new(8192.0, -16384.0, 0.0)
+        );
+        assert_eq!(
+            placed.transform_point3(Vec3::new(0.5, 0.5, 0.0)),
+            Vec3::new(16384.0, -8192.0, 0.0)
+        );
+
+        // An interior with a height but no flag is a dry room, and there are 941 of them: taking
+        // the height's presence as the answer is what would flood every one.
+        let mut dry = StaticScene::default();
+        dry.add_water(&cell_with(INTERIOR, 0, 0, Some(-32.0)));
+        assert!(dry.instances.is_empty());
+
+        // One that does have water gets it at the height it names, spanning what the room holds:
+        // a 200 by 100 floor about the origin.
+        let mut cave = StaticScene::default();
+        let material = cave.materials.intern(Material::default());
+        cave.meshes.push(Mesh::water_plane(material));
+        cave.mesh_sources.push("floor".to_owned());
+        cave.instances.push(Instance {
+            mesh: MeshId(0),
+            transform: Affine3A::from_scale(Vec3::new(200.0, 100.0, 1.0)),
+        });
+        cave.add_water(&cell_with(INTERIOR | HAS_WATER, 0, 0, Some(-32.0)));
+        assert_eq!(cave.instances.len(), 2);
+        assert_eq!(
+            cave.instances[1]
+                .transform
+                .transform_point3(Vec3::new(-0.5, -0.5, 0.0)),
+            Vec3::new(-100.0, -50.0, -32.0)
+        );
+
+        // And nothing at all where there is nothing to put it in.
+        let mut empty = StaticScene::default();
+        empty.add_water(&cell_with(INTERIOR | HAS_WATER, 0, 0, Some(0.0)));
+        assert!(empty.instances.is_empty());
+    }
 
     fn land_with(textures: Vec<u16>) -> LandRecord {
         LandRecord {

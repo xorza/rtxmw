@@ -32,10 +32,18 @@ struct Material {
     vec3 emissive;
     float alpha_cutoff;
     uint base_colour;
+    // Which shading model this surface runs. Declared in `material_buffers.rs` too, and pinned
+    // there by a test, because a shader cannot see a Rust constant.
+    uint kind;
     uint padding0;
     uint padding1;
-    uint padding2;
 };
+
+const uint KIND_DIFFUSE = 0u;
+const uint KIND_WATER = 1u;
+
+// Instance mask bits. A ray asking for `MASK_SOLID` alone cannot see water.
+const uint MASK_SOLID = 0x01u;
 
 // Scalar layout so these match the host structs field for field. Under the default std430 rules a
 // `vec3` would be padded to sixteen bytes and every entry after the first would be misread.
@@ -165,6 +173,31 @@ const uint STREAM_BOUNCE = 1u;
 const uint STREAM_INDIRECT = 2u;
 // Added to whichever stream is asking, so the sun's samples never repeat a lamp's.
 const uint STREAM_SUN = 4096u;
+const uint STREAM_WATER_REFLECT = 8192u;
+const uint STREAM_WATER_REFRACT = 8193u;
+
+// Water's index of refraction, and the reflectance it gives at normal incidence: `((1.33 - 1) /
+// (1.33 + 1))^2`, which is why water is a window head-on and a mirror at a glancing angle.
+const float WATER_IOR = 1.333;
+const float WATER_F0 = 0.02;
+
+// Extinction per world unit, per channel — how fast water swallows light along a path through it.
+//
+// Coastal rather than open-ocean values: dissolved organic matter absorbs blue hardest and lets
+// green through furthest, which is *why* Vvardenfell's shallows read green while a deep ocean reads
+// blue. Quoted in the literature per metre — here 0.45, 0.10 and 0.16 — and divided by the game's
+// 69.99 units to the metre. Provisional in the way `INTENSITY` is: the shape is physical, the
+// magnitude is a coastal water type picked by eye.
+const vec3 WATER_EXTINCTION = vec3(0.00643, 0.001429, 0.002286);
+
+// The fraction of extinction that was scattering rather than absorption, which is the part the
+// water gives back as its own glow instead of swallowing.
+const vec3 WATER_SCATTER = vec3(0.06, 0.32, 0.28);
+
+// What a refraction ray that hits nothing has travelled through. Longer than the deepest water in
+// the game — the lowest terrain vertex is 2,152 units down — so nothing is ever *less* absorbed for
+// having missed the seabed.
+const float WATER_MAX_PATH = 4096.0;
 
 // The three shared-stream vertex indices of a hit triangle.
 //
@@ -328,7 +361,11 @@ vec3 cosine_direction(vec3 normal, vec2 u) {
 // shadow ray is cheaper than a visibility ray.
 bool occluded(vec3 origin, vec3 dir, float reach) {
     rayQueryEXT query;
-    rayQueryInitializeEXT(query, scene, gl_RayFlagsTerminateOnFirstHitEXT, 0xFF,
+    // Solid geometry only. Water carries a mask bit of its own and is skipped here in hardware:
+    // sunlight reaching a seabed has passed through the surface, and a sea that occluded would
+    // black out every shallow in the game. `MASK_SOLID` in `scene_acceleration.rs`, pinned there
+    // by a test, because a shader cannot see a Rust constant.
+    rayQueryInitializeEXT(query, scene, gl_RayFlagsTerminateOnFirstHitEXT, MASK_SOLID,
                           origin, RAY_MIN, dir, reach);
     // The same candidate loop as `trace`, and it cannot be shared: `glslc` rejects `rayQueryEXT` as
     // an `out` or `inout` parameter, so a traversal cannot be handed to a function. Any change to
@@ -340,6 +377,7 @@ bool occluded(vec3 origin, vec3 dir, float reach) {
                       + rayQueryGetIntersectionGeometryIndexEXT(query, false);
             // A cutout casts the shadow of what survives it, not of its bounding quad — a grate
             // has to throw bars rather than a rectangle.
+            //
             if (alpha_passes(slot,
                              rayQueryGetIntersectionPrimitiveIndexEXT(query, false),
                              rayQueryGetIntersectionBarycentricsEXT(query, false))) {
@@ -373,6 +411,8 @@ struct Surface {
     // Distance from the ray's origin, which for a primary ray is the depth a filter compares.
     float t;
     bool hit;
+    // Water shades through `water_shade` rather than `shade`, and has no albedo of its own.
+    bool water;
 };
 
 // The sun's contribution, before the surface's albedo.
@@ -506,6 +546,7 @@ Surface trace(vec3 origin, vec3 direction, float cone_width, float cone_spread) 
     surface.footprint = 0.0;
     surface.t = 0.0;
     surface.hit = false;
+    surface.water = false;
 
     // No blanket opacity flag: the per-geometry `OPAQUE` bits the build set from each material are
     // what decide this. Forcing it here would override them and put the cutout back.
@@ -550,8 +591,16 @@ Surface trace(vec3 origin, vec3 direction, float cone_width, float cone_spread) 
     surface.position = origin + direction * hit_t;
     surface.footprint = cone_width + hit_t * cone_spread;
     surface.t = hit_t;
-    surface.emissive = material.emissive;
+    surface.water = material.kind == KIND_WATER;
+    if (surface.water) {
+        // Nothing to demodulate by and nothing to light: `water_shade` produces the whole of it,
+        // and neither the material's colour nor its texture has any say.
+        surface.albedo = vec3(0.0);
+        surface.emissive = vec3(0.0);
+        return surface;
+    }
 
+    surface.emissive = material.emissive;
     surface.albedo = material.diffuse;
     if (material.base_colour != NO_TEXTURE) {
         float lod = cone_lod(verts, to_world, direction, surface.normal, surface.footprint,
@@ -559,6 +608,65 @@ Surface trace(vec3 origin, vec3 direction, float cone_width, float cone_spread) 
         surface.albedo *= base_colour(material, interpolate_uv(verts, weights), lod).rgb;
     }
     return surface;
+}
+
+// What a ray spawned at the water surface brings back.
+//
+// Shaded but not bounced, terminated with the flat ambient a diffuse bounce ends with — the light
+// reaching the seabed through two more surfaces is not what anyone is looking at.
+//
+// Water hit again comes back as sky. GLSL has no recursion, and one sea at one level is what the
+// game has: a second water surface behind the first is a case that does not arise.
+vec3 water_ray(vec3 origin, vec3 direction, float footprint, uvec2 pixel, uint salt,
+               out float travelled) {
+    Surface hit = trace(origin, direction, footprint, BOUNCE_SPREAD);
+    travelled = hit.hit ? hit.t : WATER_MAX_PATH;
+    if (!hit.hit || hit.water) {
+        return sky(direction);
+    }
+    return shade(hit, frame.ambient, pixel, salt, BOUNCE_SHADOW_SAMPLES);
+}
+
+// Radiance leaving a water surface toward whatever traced it.
+//
+// Two rays and no sampling, which is the point: a mirror reflection and a refraction are
+// *deterministic*, so water carries no noise and needs no denoising — which is what lets it write
+// straight to the output past a filter that has no albedo to demodulate it by.
+//
+// The normal is flipped to face the ray so one path serves both sides of the surface; `eta` is what
+// distinguishes them, and total internal reflection then falls out of `refract` returning zero
+// rather than needing the critical angle spelled out.
+vec3 water_shade(Surface surface, vec3 incident, uvec2 pixel) {
+    bool from_below = dot(surface.normal, incident) > 0.0;
+    vec3 n = from_below ? -surface.normal : surface.normal;
+    float eta = from_below ? WATER_IOR : 1.0 / WATER_IOR;
+
+    float cosine = clamp(dot(-incident, n), 0.0, 1.0);
+    float fresnel = WATER_F0 + (1.0 - WATER_F0) * pow(1.0 - cosine, 5.0);
+
+    // Only the refraction needs to know how far its ray went; nothing is absorbed above the
+    // surface, so the reflection's distance is discarded.
+    float discarded;
+    vec3 reflected = water_ray(surface.position + n * SHADOW_BIAS, reflect(incident, n),
+                               surface.footprint, pixel, STREAM_WATER_REFLECT, discarded);
+
+    vec3 through = refract(incident, n, eta);
+    if (dot(through, through) < 1e-6) {
+        // Past the critical angle looking up from underwater, where the surface is a mirror and
+        // there is nothing behind it to see.
+        return reflected;
+    }
+
+    float depth;
+    vec3 behind = water_ray(surface.position - n * SHADOW_BIAS, through, surface.footprint, pixel,
+                            STREAM_WATER_REFRACT, depth);
+    // Beer-Lambert along the path the refracted ray actually travelled, so shallow water is nearly
+    // clear and the same water is opaque where the ground falls away.
+    vec3 transmittance = exp(-WATER_EXTINCTION * depth);
+    vec3 scattered = WATER_SCATTER * (1.0 - transmittance) * frame.ambient;
+    vec3 refracted = behind * transmittance + scattered;
+
+    return mix(refracted, reflected, fresnel);
 }
 
 // The cosine-weighted mean radiance arriving at a surface over its hemisphere, one bounce deep.
@@ -582,7 +690,11 @@ vec3 gather_indirect(Surface surface, uvec2 pixel) {
         vec2 u = unit_pair(hash(uvec4(pixel, STREAM_BOUNCE, b)));
         Surface bounce = trace(origin, cosine_direction(surface.normal, u), surface.footprint,
                                BOUNCE_SPREAD);
-        if (!bounce.hit) {
+        // Water counts as an escape rather than a surface: it has no albedo of its own, so
+        // shading it here would return black, and what a bounce ray actually finds there is the
+        // sky reflected off it or the ground through it — both far closer to the ambient this
+        // terminates with than to nothing at all.
+        if (!bounce.hit || bounce.water) {
             total += frame.ambient;
             continue;
         }
@@ -620,7 +732,11 @@ void main() {
     // since a real hit is always at least `RAY_MIN` away.
     vec3 emitted = sky(direction);
     vec3 lighting = vec3(0.0);
-    if (surface.hit) {
+    if (surface.water) {
+        // Written whole to the output rather than through the G-buffer: there is no albedo to
+        // demodulate by, and nothing noisy for the filter to improve.
+        emitted = water_shade(surface, direction, pixel);
+    } else if (surface.hit) {
         emitted = surface.emissive;
         lighting = gather_indirect(surface, pixel)
                  + direct_light(surface, pixel, STREAM_DIRECT, SHADOW_SAMPLES);

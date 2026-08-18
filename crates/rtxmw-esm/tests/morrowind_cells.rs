@@ -276,3 +276,61 @@ fn the_index_finds_every_cell_a_walk_finds_and_points_straight_at_it() {
         index.land_textures().len()
     );
 }
+
+#[test]
+fn water_is_a_flag_indoors_and_a_certainty_outdoors() {
+    let Some(bytes) = morrowind_esm() else {
+        eprintln!("skipping: Morrowind.esm is not available");
+        return;
+    };
+    let esm = EsmReader::new(&bytes).expect("should parse");
+
+    let mut exteriors = 0;
+    let mut exteriors_flagged = 0;
+    let mut exteriors_with_height = 0;
+    let mut interiors = 0;
+    let mut interiors_with_water = 0;
+    let mut interiors_with_height = 0;
+
+    for record in esm.records() {
+        let record = record.expect("record should parse");
+        if record.name() != RecordName::new(b"CELL") {
+            continue;
+        }
+        let cell = Cell::parse(&record).expect("cell should parse");
+        if cell.is_interior() {
+            interiors += 1;
+            interiors_with_water += usize::from(cell.has_water());
+            interiors_with_height += usize::from(cell.water_height.is_some());
+        } else {
+            exteriors += 1;
+            exteriors_with_height += usize::from(cell.water_height.is_some());
+            // The flag itself, not `has_water`, which answers for an exterior without consulting
+            // it. 0x02 is `HasWater`, spelled out because the point here is what the *data* says.
+            exteriors_flagged += usize::from(cell.flags & 0x02 != 0);
+        }
+    }
+
+    // **No exterior names a water height**, so sea level is one number for the whole world rather
+    // than something to look up or interpolate across a cell boundary.
+    assert_eq!(
+        exteriors_with_height, 0,
+        "{exteriors_with_height} of {exteriors} exteriors carry a water height"
+    );
+
+    // Every shipped exterior sets the flag as well, so the rule above is belt to that brace
+    // rather than a correction of the data.
+    assert_eq!(exteriors_flagged, exteriors);
+
+    // **Every interior carries a height whether or not it has water**, which is why the flag is
+    // what a renderer must ask: taking the presence of a height as the answer floods every room.
+    assert_eq!(interiors_with_height, interiors);
+    assert!(
+        interiors_with_water > 100 && interiors_with_water < interiors / 2,
+        "{interiors_with_water} of {interiors} interiors have water"
+    );
+    println!(
+        "{exteriors} exteriors, all with water at sea level; \
+         {interiors_with_water} of {interiors} interiors have water"
+    );
+}

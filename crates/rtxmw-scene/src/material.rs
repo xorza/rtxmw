@@ -24,6 +24,21 @@ pub enum AlphaMode {
     Blend,
 }
 
+/// Which shading model a surface is rendered with.
+///
+/// Not a parameter of one model but a choice between models: water is not a diffuse surface with
+/// unusual settings, it reflects and refracts and absorbs along the path behind it, and none of
+/// that is expressible as a colour. Morrowind's lava and slime will want entries of their own for
+/// the same reason.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MaterialKind {
+    /// Everything a NIF describes: a base colour lit by what reaches it.
+    #[default]
+    Diffuse,
+    /// A water surface. Its `diffuse` and texture are ignored — the shader owns its appearance.
+    Water,
+}
+
 /// One surface description, resolved from a NIF's property stack.
 ///
 /// Vanilla Morrowind has no normal or roughness maps — the NIF format at this version cannot carry
@@ -39,6 +54,10 @@ pub struct Material {
     /// Constant opacity from the material property, before any texture alpha.
     pub opacity: f32,
     pub alpha: AlphaMode,
+    /// Which shading model this surface uses. Everything loaded from a NIF is [`Diffuse`].
+    ///
+    /// [`Diffuse`]: MaterialKind::Diffuse
+    pub kind: MaterialKind,
 }
 
 impl Default for Material {
@@ -51,6 +70,7 @@ impl Default for Material {
             emissive: Vec3::ZERO,
             opacity: 1.0,
             alpha: AlphaMode::Opaque,
+            kind: MaterialKind::Diffuse,
         }
     }
 }

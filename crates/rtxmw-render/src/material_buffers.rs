@@ -3,7 +3,7 @@
 use ash::vk;
 use bytemuck::{Pod, Zeroable};
 use rtxmw_gpu::{Buffer, BufferMemory, Uploader};
-use rtxmw_scene::{AlphaMode, Material};
+use rtxmw_scene::{AlphaMode, Material, MaterialKind};
 
 use crate::geometry_buffers::GeometryBuffers;
 
@@ -23,6 +23,16 @@ const BLEND_CUTOFF: f32 = 0.5;
 /// Declared again as `NO_TEXTURE` in `primary_visibility.comp`, because a GLSL shader cannot see a
 /// Rust constant. The test below pins the literal so the two cannot drift apart silently.
 pub(crate) const NO_TEXTURE: u32 = u32::MAX;
+
+/// A surface lit by what reaches it, which is everything a NIF describes.
+///
+/// Declared again in `primary_visibility.comp`; the test below pins both literals, because a shader
+/// cannot see a Rust constant and a silent disagreement would shade every surface as water or none
+/// of them.
+const KIND_DIFFUSE: u32 = 0;
+
+/// A water surface, which the shader reflects, refracts and attenuates through rather than lighting.
+const KIND_WATER: u32 = 1;
 
 /// One acceleration structure geometry, indexed by `instance_custom_index + geometry_index`.
 ///
@@ -50,7 +60,12 @@ pub(crate) struct GpuMaterial {
     pub(crate) alpha_cutoff: f32,
     /// Index into the bindless texture array, or [`NO_TEXTURE`].
     pub(crate) base_colour: u32,
-    pub(crate) padding: [u32; 3],
+    /// Which shading model the hit runs, matching [`MaterialKind`]'s discriminants.
+    ///
+    /// A number rather than a flag bit because it selects between models rather than modifying one,
+    /// and Morrowind's lava and slime will each want a value of their own.
+    pub(crate) kind: u32,
+    pub(crate) padding: [u32; 2],
 }
 
 impl GpuMaterial {
@@ -68,7 +83,11 @@ impl GpuMaterial {
                 AlphaMode::Opaque => 0.0,
             },
             base_colour: material.base_colour.map_or(NO_TEXTURE, |id| id.0),
-            padding: [0; 3],
+            kind: match material.kind {
+                MaterialKind::Diffuse => KIND_DIFFUSE,
+                MaterialKind::Water => KIND_WATER,
+            },
+            padding: [0; 2],
         }
     }
 }
@@ -164,6 +183,22 @@ mod tests {
         // The shader spells this out as `0xFFFFFFFFu`; changing it here alone would leave every
         // untextured surface sampling slot zero of the array instead of taking the fallback branch.
         assert_eq!(NO_TEXTURE, 0xFFFF_FFFF);
+        // Likewise the shading models, which the shader compares against literals of its own.
+        assert_eq!(KIND_DIFFUSE, 0);
+        assert_eq!(KIND_WATER, 1);
+    }
+
+    #[test]
+    fn water_is_the_only_material_that_reaches_the_shader_as_water() {
+        assert_eq!(GpuMaterial::new(Material::default()).kind, KIND_DIFFUSE);
+        assert_eq!(
+            GpuMaterial::new(Material {
+                kind: MaterialKind::Water,
+                ..Material::default()
+            })
+            .kind,
+            KIND_WATER
+        );
     }
 
     #[test]
