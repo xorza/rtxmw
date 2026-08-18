@@ -75,6 +75,8 @@ pub(crate) struct App {
     /// Mouse look is only applied while the cursor is captured.
     mouse_captured: bool,
     last_frame: Instant,
+    /// When the engine started, which is the clock the water's waves move against.
+    started: Instant,
     last_title_update: Instant,
     frames_since_title: u32,
 }
@@ -210,6 +212,7 @@ impl Default for App {
             keys: Keys::default(),
             mouse_captured: false,
             last_frame: now,
+            started: now,
             last_title_update: now,
             frames_since_title: 0,
         }
@@ -391,6 +394,7 @@ impl ApplicationHandler for App {
 
                 if let (Some(renderer), Some(window)) = (&mut self.renderer, &self.window) {
                     let size = window.inner_size();
+                    renderer.set_time(self.started.elapsed().as_secs_f32());
                     let constants = renderer.frame_constants(
                         self.camera.view(),
                         self.camera.projection(renderer.aspect_ratio()),

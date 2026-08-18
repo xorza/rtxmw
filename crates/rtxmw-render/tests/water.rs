@@ -38,11 +38,8 @@ fn slab(z: f32, material: u32) -> Mesh {
     }
 }
 
-/// Water at z = 0 over a white floor `depth` units below it.
-///
-/// The floor is emissive rather than lit, so what reaches the camera is a known quantity attenuated
-/// by the water and nothing else — no shadow rays, no bounce, no dependence on the sun.
-fn pool(depth: f32) -> StaticScene {
+/// A floor `depth` units below water at z = 0, both filling the view.
+fn flooded(depth: f32, floor: Material) -> StaticScene {
     common::scene_of(
         &[slab(0.0, 0), slab(-depth, 1)],
         &[
@@ -50,11 +47,7 @@ fn pool(depth: f32) -> StaticScene {
                 kind: MaterialKind::Water,
                 ..Material::default()
             },
-            Material {
-                emissive: Vec3::ONE,
-                diffuse: Vec3::ZERO,
-                ..Material::default()
-            },
+            floor,
         ],
         &[
             Instance {
@@ -72,8 +65,67 @@ fn pool(depth: f32) -> StaticScene {
     )
 }
 
-/// Traces `scene` from `eye` toward `forward` and returns the middle pixel's linear radiance.
+/// Water over a floor that emits rather than reflects.
+///
+/// Emissive so that what reaches the camera is a known quantity attenuated by the water and nothing
+/// else — no shadow rays, no bounce, no dependence on the sun.
+fn pool(depth: f32) -> StaticScene {
+    flooded(
+        depth,
+        Material {
+            emissive: Vec3::ONE,
+            diffuse: Vec3::ZERO,
+            ..Material::default()
+        },
+    )
+}
+
+/// A sunlit sand floor `depth` below, with water over it when `covered`.
+///
+/// Diffuse rather than emissive, unlike [`pool`], because what is being measured here is whether the
+/// *sun* reaches the bottom — which an emissive floor would answer for free.
+fn seabed(depth: f32, covered: bool) -> StaticScene {
+    let sand = Material {
+        diffuse: Vec3::splat(0.5),
+        ..Material::default()
+    };
+    let mut scene = if covered {
+        flooded(depth, sand)
+    } else {
+        common::scene_of(
+            &[slab(-depth, 0)],
+            &[sand],
+            &[Instance {
+                mesh: MeshId(0),
+                transform: Affine3A::IDENTITY,
+            }],
+            &[],
+            Vec3::splat(0.02),
+        )
+    };
+    // Straight down, so the floor faces it squarely and the geometry adds nothing to reason about.
+    scene.sun = Some(Sun {
+        direction: Vec3::NEG_Z,
+        colour: Vec3::splat(2.0),
+        angular_radius: 0.0,
+    });
+    scene
+}
+
+/// Traces `scene` from `eye` toward `forward` at time zero and returns the middle pixel's radiance.
 fn centre_radiance(scene: &StaticScene, eye: Vec3, forward: Vec3) -> Vec3 {
+    let pixels = frame_at(scene, eye, forward, 0.0);
+    let index = ((HEIGHT / 2) * WIDTH + WIDTH / 2) as usize * 4;
+    // The target is the trace's own image, before any tone curve, quantised on the way back.
+    Vec3::new(
+        pixels[index] as f32,
+        pixels[index + 1] as f32,
+        pixels[index + 2] as f32,
+    ) / 255.0
+}
+
+/// Traces `scene` from `eye` toward `forward` with the clock at `time`, and returns the frame.
+fn frame_at(scene: &StaticScene, eye: Vec3, forward: Vec3, time: f32) -> Vec<u8> {
     let gpu = TestGpu::shared();
     let mut renderer = SceneRenderer::new(
         gpu.device(),
@@ -90,6 +142,7 @@ fn centre_radiance(scene: &StaticScene, eye: Vec3, forward: Vec3) -> Vec3 {
     // Unfiltered: every number here is one the trace computes, and smoothing is what would hide a
     // wrong one.
     renderer.set_denoise_passes(0);
+    renderer.set_time(time);
 
     let mut uploader = gpu.uploader();
     renderer
@@ -130,14 +183,7 @@ fn centre_radiance(scene: &StaticScene, eye: Vec3, forward: Vec3) -> Vec3 {
     drop(uploader);
     gpu.assert_no_validation_errors();
 
-    // The middle pixel, as the linear radiance it was written with: the target is the trace's own
-    // image, before any tone curve, quantised to eight bits on the way back.
-    let index = ((HEIGHT / 2) * WIDTH + WIDTH / 2) as usize * 4;
-    Vec3::new(
-        pixels[index] as f32,
-        pixels[index + 1] as f32,
-        pixels[index + 2] as f32,
-    ) / 255.0
+    pixels
 }
 
 #[test]
@@ -210,57 +256,6 @@ fn a_water_surface_writes_no_albedo_for_the_denoiser_to_multiply_by() {
     );
 }
 
-/// A sunlit sand floor `depth` below, with water over it when `flooded`.
-///
-/// Diffuse rather than emissive, unlike [`pool`], because what is being measured here is whether
-/// the *sun* reaches the bottom — which an emissive floor would answer for free.
-fn seabed(depth: f32, flooded: bool) -> StaticScene {
-    let sand = Material {
-        diffuse: Vec3::splat(0.5),
-        ..Material::default()
-    };
-    let water = Material {
-        kind: MaterialKind::Water,
-        ..Material::default()
-    };
-    let mut scene = if flooded {
-        common::scene_of(
-            &[slab(0.0, 0), slab(-depth, 1)],
-            &[water, sand],
-            &[
-                Instance {
-                    mesh: MeshId(0),
-                    transform: Affine3A::IDENTITY,
-                },
-                Instance {
-                    mesh: MeshId(1),
-                    transform: Affine3A::IDENTITY,
-                },
-            ],
-            &[],
-            Vec3::splat(0.02),
-        )
-    } else {
-        common::scene_of(
-            &[slab(-depth, 0)],
-            &[sand],
-            &[Instance {
-                mesh: MeshId(0),
-                transform: Affine3A::IDENTITY,
-            }],
-            &[],
-            Vec3::splat(0.02),
-        )
-    };
-    // Straight down, so the floor faces it squarely and the geometry adds nothing to reason about.
-    scene.sun = Some(Sun {
-        direction: Vec3::NEG_Z,
-        colour: Vec3::splat(2.0),
-        angular_radius: 0.0,
-    });
-    scene
-}
-
 #[test]
 fn the_sun_reaches_the_bottom_through_water() {
     // **Water must not cast a shadow.** It is built into the acceleration structure like any other
@@ -272,7 +267,7 @@ fn the_sun_reaches_the_bottom_through_water() {
         Vec3::new(0.0, 0.0, 500.0),
         Vec3::NEG_Z,
     );
-    let flooded = centre_radiance(
+    let submerged = centre_radiance(
         &seabed(depth, true),
         Vec3::new(0.0, 0.0, 500.0),
         Vec3::NEG_Z,
@@ -280,11 +275,52 @@ fn the_sun_reaches_the_bottom_through_water() {
 
     // What the water takes is what it absorbs along the camera's path back up: green loses
     // `exp(-0.001429 * 100)` = 0.867 of itself, and Fresnel reflects 2% of the rest away. So the
-    // flooded floor should be a little dimmer than the dry one — not a fraction of it.
-    let ratio = flooded.y / dry.y;
+    // submerged floor should be a little dimmer than the dry one — not a fraction of it.
+    let ratio = submerged.y / dry.y;
     assert!(
         ratio > 0.7 && ratio < 1.0,
         "the seabed should keep most of its sunlight under 100 units of water, \
-         got {ratio} ({flooded:?} against {dry:?})"
+         got {ratio} ({submerged:?} against {dry:?})"
+    );
+}
+
+/// The green channel along the middle row, which is where the surface is looked at edge-on.
+fn middle_row(pixels: &[u8]) -> Vec<f32> {
+    let row = (HEIGHT / 2) as usize;
+    (0..WIDTH as usize)
+        .map(|x| pixels[(row * WIDTH as usize + x) * 4 + 1] as f32 / 255.0)
+        .collect()
+}
+
+#[test]
+fn waves_break_up_the_surface_and_travel_with_the_clock() {
+    // Edge-on, where Fresnel is steepest and so most sensitive to the surface tilting: a flat
+    // mirror gives one reflectance across the whole row, and waves give a different one per pixel.
+    let eye = Vec3::new(0.0, -2000.0, 30.0);
+    let forward = Vec3::new(0.0, 1.0, -0.012).normalize();
+    let scene = pool(400.0);
+
+    let still = middle_row(&frame_at(&scene, eye, forward, 0.0));
+    let spread = still.iter().copied().fold(f32::MIN, f32::max)
+        - still.iter().copied().fold(f32::MAX, f32::min);
+    assert!(
+        spread > 0.02,
+        "a wavy surface should vary across the row; got a spread of {spread}"
+    );
+
+    // **The clock has to reach the shader**, which after moving the frame constants out of push
+    // constants and into a buffer is not a given. A second later the same waves are somewhere else:
+    // the shortest of them is 85 units long and travels at `sqrt(g/k)`, about 3 metres a second, so
+    // a second moves it well past its own wavelength.
+    let later = middle_row(&frame_at(&scene, eye, forward, 1.0));
+    let moved: f32 = still
+        .iter()
+        .zip(&later)
+        .map(|(a, b)| (a - b).abs())
+        .sum::<f32>()
+        / still.len() as f32;
+    assert!(
+        moved > 0.005,
+        "the surface should have moved in a second; mean change was {moved}"
     );
 }

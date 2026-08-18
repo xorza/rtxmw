@@ -1493,12 +1493,38 @@ proven by injection: collapsing the extinction to one channel, dropping the angl
 shading water as an ordinary surface, and letting water occlude each fail exactly one test and no
 others.
 
-**Stage 2 — waves.** Four to six trochoidal components plus a detail normal.
-*Blocked on one thing:* the push-constant block is **exactly 128 bytes and full**, and waves need
-`time`. That forces the frame constants into a uniform buffer — which M7 needs anyway for motion
-vectors, so the blocker is work already owed rather than new work.
-*Tests:* height at t = 0 reproducible; normals average to vertical over a tile; two amplitudes
-produce measurably different surfaces.
+**Stage 2 — waves — done.** Five trochoidal components, wavelengths 390 down to 57 units,
+amplitudes under a tenth of a metre. Real dispersion — `sqrt(gk)` with Morrowind's own gravity — so
+the long waves outrun the short ones and the pattern never sets into one rigid shape. The quad stays
+flat and only the normal moves: displacing two triangles buys nothing a normal does not, and the
+silhouette against a shore comes from the terrain behind it.
+
+**The frame constants moved out of push constants into a storage buffer**, which the block reaching
+exactly 128 bytes had made unavoidable — M7's motion vectors would have forced the same move. Read
+with `scalar` layout, which packs a `vec3` at four-byte alignment and so matches the `repr(C)` struct
+field for field; a test pins every offset, and earned its place immediately by catching `time`
+inserted on the wrong side of `bounce_samples`, where the shader would have read each as the other.
+
+**A wave shorter than the pixel looking at it is averaged away rather than drawn.** This is
+mip-mapping applied to a normal, using the ray cone footprint already carried for choosing texture
+levels: a cone a wavelength wide covers a crest and a trough whose slopes cancel, and picking one of
+them instead is what makes distant water a field of crawling white sparks.
+
+**Which side of the surface a ray is on is a question about the plane, not about a wave.** Taking it
+from the wave normal — as the first version did — reads a facet tilted away at a glancing angle as
+"the camera is underwater", sends the reflection down into the seabed, and turns the far water
+white. A facet that still faces away after that is tilted back toward the plane, standing in for the
+self-occlusion a height field does not model.
+
+**Waves cost about 2.8 ms** at Seyda Neen's shore — 97 fps against 131 flat — and the wave maths is
+not where it goes. Five sines is nothing; the cost is that every water pixel now sends its
+reflection and refraction somewhere slightly different, and incoherent rays traverse far worse than
+the parallel ones a mirror produced. That is inherent to wavy water, and the lever on it is
+amplitude and the damping distance rather than the component count.
+
+*Tests:* the surface varies across a row where a mirror would not, and moves when the clock does —
+which is also the only end-to-end proof that `time` survives the trip through the new buffer.
+Injection confirms both: flattening the surface and freezing the clock each fail exactly that test.
 
 **Stage 3 — caustics.** The Jacobian term on the refraction path.
 *Tests:* a flat surface gives exactly 1, and the caustic term averages to ~1 over a tile — energy

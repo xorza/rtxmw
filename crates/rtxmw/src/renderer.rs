@@ -153,6 +153,11 @@ impl Renderer {
             .commit(&self.device, &mut self.uploader, self.physical.limits())
     }
 
+    /// Sets the clock the water's waves move against, in seconds since the engine started.
+    pub(crate) fn set_time(&mut self, seconds: f32) {
+        self.scene.set_time(seconds);
+    }
+
     /// The frame constants for a camera, filled in with the loaded cell's lighting.
     pub(crate) fn frame_constants(
         &self,

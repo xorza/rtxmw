@@ -96,30 +96,32 @@ layout(set = 0, binding = 10, rgba16f) uniform writeonly image2D illumination_ta
 // Last binding, and the only runtime-sized one: Vulkan allows a variable descriptor count only on
 // the final element of a set. Slot zero is the fallback, so a material's texture id addresses
 // `id + 1`.
-layout(set = 0, binding = 11) uniform sampler2D textures[];
+layout(set = 0, binding = 12) uniform sampler2D textures[];
 
 // Stands in for a material with no base colour texture. Declared as `NO_TEXTURE` in
 // `material_buffers.rs` too, and pinned there by a test, because a shader cannot see a Rust
 // constant.
 const uint NO_TEXTURE = 0xFFFFFFFFu;
 
-// 100 bytes. Vulkan only guarantees 128 bytes of push constants, so sending separate inverse view
-// and projection matrices (144 with the camera) would work on this GPU and fail the guarantee.
-// Their product carries the same information for unprojection.
-layout(push_constant) uniform Frame {
+// A buffer rather than push constants: the block reached the 128 bytes Vulkan guarantees, and then
+// waves needed a clock. Scalar layout, so it matches the `repr(C)` struct in `visibility_pass.rs`
+// field for field. The matrices arrive already multiplied — their product is all unprojection
+// needs, and it is one thing to send rather than two to keep consistent.
+layout(set = 0, binding = 11, scalar) readonly buffer Frame {
     mat4 inverse_view_projection;
     vec3 camera_position;
     uint light_count;
     vec3 ambient;
     float cone_spread;
-    // The direction the sun's light *travels*, so the direction to it is the negation. Its radius
-    // sits between the two vectors because std430 puts a `vec3` on a sixteen-byte boundary, and the
-    // block is exactly the 128 bytes Vulkan guarantees — there is no room to order it prettily.
+    // The direction the sun's light *travels*, so the direction to it is the negation.
     vec3 sun_direction;
     float sun_cos_radius;
     // Zero when the cell has no sky, which costs no branch: every term it feeds is a multiply.
     vec3 sun_colour;
     uint bounce_samples;
+    // Seconds since the engine started. Zero in a screenshot and in every test, so the water they
+    // see is a definite shape rather than whenever they happened to run.
+    float time;
 } frame;
 
 // A raytracer has no near plane — that is a rasterization artefact. This is only large enough to
@@ -193,6 +195,36 @@ const vec3 WATER_EXTINCTION = vec3(0.00643, 0.001429, 0.002286);
 // The fraction of extinction that was scattering rather than absorption, which is the part the
 // water gives back as its own glow instead of swallowing.
 const vec3 WATER_SCATTER = vec3(0.06, 0.32, 0.28);
+
+// Waves, as a sum of trochoidal components: `xy` is the direction they travel, `z` the wavelength
+// in world units, `w` the amplitude.
+//
+// Four of them, not a spectrum. An FFT ocean exists to sum thousands of components cheaply for
+// deep water at kilometre scale with a horizon; Vvardenfell's water is a coastal shallows thirty
+// metres deep at its worst, and what is wanted here is a surface that *glitters* rather than one
+// that swells. Four components stay analytic — and differentiable in closed form, which is what
+// the caustics work needs and what a texture-based surface could not give.
+//
+// Wavelengths of 5 to 1.5 metres with amplitudes under a tenth of a metre: gentle enough that the
+// slope stays shallow, which is what keeps the reflection from tearing into noise.
+const vec4 WAVES[5] = vec4[5](
+    vec4(0.98, 0.20, 390.0, 3.4),
+    vec4(0.55, -0.84, 250.0, 2.1),
+    vec4(-0.31, 0.95, 165.0, 1.3),
+    vec4(0.87, 0.49, 96.0, 0.7),
+    vec4(-0.72, -0.69, 57.0, 0.35)
+);
+
+// Morrowind's gravity, in world units per second squared: 8.96 m/s^2 across 69.99 units to the
+// metre. It sets the dispersion — long waves travel faster than short ones, by `sqrt(g/k)` — which
+// is what stops the components drifting as one rigid pattern.
+const float WATER_GRAVITY = 627.1;
+
+const float TAU = 6.2831853;
+
+// How squarely a wave facet has to face the ray that found it before it is tilted back toward the
+// plane. Small: this is a guard against a facet turning away entirely, not a limit on the waves.
+const float MIN_FACING = 0.03;
 
 // What a refraction ray that hits nothing has travelled through. Longer than the deepest water in
 // the game — the lowest terrain vertex is 2,152 units down — so nothing is ever *less* absorbed for
@@ -627,6 +659,36 @@ vec3 water_ray(vec3 origin, vec3 direction, float footprint, uvec2 pixel, uint s
     return shade(hit, frame.ambient, pixel, salt, BOUNCE_SHADOW_SAMPLES);
 }
 
+// The surface normal at a point, from the gradient of the wave height field.
+//
+// The height is `sum(A * sin(k * dot(d, p) - w * t))` and this is its slope, so the two cannot
+// disagree — which matters more than it sounds: the caustics stage differentiates this same field
+// again, and a normal that did not come from the height would put the light in the wrong place.
+//
+// The quad itself stays flat. Displacing two triangles would buy nothing a normal does not, and the
+// silhouette of water against a shore is set by the terrain behind it rather than by the surface.
+vec3 water_normal(vec2 p, float time, float footprint) {
+    vec2 slope = vec2(0.0);
+    for (int i = 0; i < WAVES.length(); ++i) {
+        float wavelength = WAVES[i].z;
+        // **A wave narrower than the pixel looking at it is averaged away, not drawn.** This is
+        // mip-mapping applied to a normal: a ray cone a wavelength wide covers a whole crest and
+        // trough, whose slopes cancel, and drawing one of them instead is what makes distant water
+        // a field of crawling white sparks. The cone's width at the hit is already carried for
+        // choosing texture levels; this is the same quantity answering the same question.
+        float detail = 1.0 - smoothstep(0.25 * wavelength, 0.75 * wavelength, footprint);
+        if (detail <= 0.0) {
+            continue;
+        }
+        vec2 direction = WAVES[i].xy;
+        float k = TAU / wavelength;
+        float speed = sqrt(WATER_GRAVITY * k);
+        float phase = k * dot(direction, p) - speed * time;
+        slope += direction * (detail * WAVES[i].w * k * cos(phase));
+    }
+    return normalize(vec3(-slope, 1.0));
+}
+
 // Radiance leaving a water surface toward whatever traced it.
 //
 // Two rays and no sampling, which is the point: a mirror reflection and a refraction are
@@ -637,8 +699,29 @@ vec3 water_ray(vec3 origin, vec3 direction, float footprint, uvec2 pixel, uint s
 // distinguishes them, and total internal reflection then falls out of `refract` returning zero
 // rather than needing the critical angle spelled out.
 vec3 water_shade(Surface surface, vec3 incident, uvec2 pixel) {
+    // Which side of the water the ray is on is a question about the *plane*, not about a wave:
+    // at a glancing angle a facet can tilt far enough to face away from the ray, and reading that
+    // as "the camera is underwater" sends the reflection down into the seabed and turns the far
+    // water white.
     bool from_below = dot(surface.normal, incident) > 0.0;
-    vec3 n = from_below ? -surface.normal : surface.normal;
+    vec3 flat_normal = from_below ? -surface.normal : surface.normal;
+
+    // The wave normal replaces the quad's flat one. Keyed off world position rather than anything
+    // interpolated, so one cell's surface continues into the next without a seam at the boundary.
+    vec3 waves = water_normal(surface.position.xy, frame.time, surface.footprint);
+    vec3 n = from_below ? -waves : waves;
+
+    // A facet that still faces away is one the surface would have hidden behind the wave in front
+    // of it. Tilting it back toward the plane until it faces the ray is the cheap stand-in for the
+    // self-occlusion that is missing, and it is what keeps a glancing reflection finite.
+    float facing = dot(-incident, n);
+    float flat_facing = dot(-incident, flat_normal);
+    if (facing < MIN_FACING) {
+        // How far toward the plane the facet has to come back. The dot is linear in the blend, so
+        // this is the exact fraction that brings it to `MIN_FACING` — solved rather than iterated.
+        float t = (MIN_FACING - facing) / max(flat_facing - facing, 1e-4);
+        n = normalize(mix(n, flat_normal, clamp(t, 0.0, 1.0)));
+    }
     float eta = from_below ? WATER_IOR : 1.0 / WATER_IOR;
 
     float cosine = clamp(dot(-incident, n), 0.0, 1.0);
@@ -646,8 +729,10 @@ vec3 water_shade(Surface surface, vec3 incident, uvec2 pixel) {
 
     // Only the refraction needs to know how far its ray went; nothing is absorbed above the
     // surface, so the reflection's distance is discarded.
+    // Offset along the *plane*, not the facet: what a ray has to clear to avoid finding this
+    // surface again is the quad, and only the plane's normal is guaranteed to take it off that.
     float discarded;
-    vec3 reflected = water_ray(surface.position + n * SHADOW_BIAS, reflect(incident, n),
+    vec3 reflected = water_ray(surface.position + flat_normal * SHADOW_BIAS, reflect(incident, n),
                                surface.footprint, pixel, STREAM_WATER_REFLECT, discarded);
 
     vec3 through = refract(incident, n, eta);
@@ -658,8 +743,8 @@ vec3 water_shade(Surface surface, vec3 incident, uvec2 pixel) {
     }
 
     float depth;
-    vec3 behind = water_ray(surface.position - n * SHADOW_BIAS, through, surface.footprint, pixel,
-                            STREAM_WATER_REFRACT, depth);
+    vec3 behind = water_ray(surface.position - flat_normal * SHADOW_BIAS, through,
+                            surface.footprint, pixel, STREAM_WATER_REFRACT, depth);
     // Beer-Lambert along the path the refracted ray actually travelled, so shallow water is nearly
     // clear and the same water is opaque where the ground falls away.
     vec3 transmittance = exp(-WATER_EXTINCTION * depth);

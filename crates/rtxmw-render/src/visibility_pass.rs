@@ -3,7 +3,7 @@
 use ash::vk;
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3};
-use rtxmw_gpu::{Binding, ComputePipeline, Device, Image};
+use rtxmw_gpu::{Binding, Buffer, BufferMemory, ComputePipeline, Device, Image, Memory};
 use rtxmw_scene::Sun;
 
 use crate::acceleration_structure::AccelerationStructure;
@@ -25,17 +25,17 @@ pub(crate) struct Lighting {
     pub(crate) sun: Option<Sun>,
 }
 
-/// What the shader needs to turn a pixel into a ray, as its push constant block.
+/// What the shader needs to turn a pixel into a ray.
 ///
-/// The combined inverse view-projection rather than the two matrices separately: Vulkan guarantees
-/// only 128 bytes of push constants, and sending both plus the camera would need 144. Their product
-/// carries everything unprojection requires.
+/// **A buffer, not push constants.** It was the latter until it reached exactly the 128 bytes
+/// Vulkan guarantees and waves needed a clock as well; M7's motion vectors would have forced the
+/// same move. Read with `scalar` layout, which packs a `vec3` tightly at four-byte alignment and so
+/// matches this `repr(C)` struct field for field — under std430's sixteen-byte vector alignment the
+/// two would disagree from the first `vec3` onward. Every offset is pinned by a test below.
 ///
-/// **This block is now exactly 128 bytes — the guarantee, in full.** The field order is not
-/// cosmetic either: std430 aligns a `vec3` to sixteen bytes, so each one has to land on a multiple
-/// of sixteen or the shader reads the block shifted. That is why the sun's radius sits between its
-/// direction and its colour rather than after both. Anything further has to move the block into a
-/// buffer, which is also what motion vectors will need.
+/// The combined inverse view-projection rather than the two matrices separately. That began as a
+/// way to fit the old 128-byte block and is kept because it is simply less to send and less to get
+/// wrong: their product is all unprojection needs.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub struct FrameConstants {
@@ -63,6 +63,11 @@ pub struct FrameConstants {
     /// the estimator collapses back to a flat `albedo * ambient` fill — so it is exactly the
     /// lighting model this had before one bounce existed, and the A/B against it is honest.
     bounce_samples: u32,
+    /// Seconds since the engine started, which is what makes water move.
+    ///
+    /// Zero unless a caller sets one, so a screenshot and a test are reproducible: the surface at
+    /// time zero is a definite shape rather than whatever the clock happened to say.
+    time: f32,
 }
 
 impl FrameConstants {
@@ -77,6 +82,7 @@ impl FrameConstants {
         lighting: Lighting,
         cone_spread: f32,
         bounce_samples: u32,
+        time: f32,
     ) -> Self {
         // No sun is a black one: every term it feeds is a multiplication, so the shader needs no
         // flag to branch on and an interior costs nothing for having no sky.
@@ -95,6 +101,7 @@ impl FrameConstants {
             sun_cos_radius: sun.angular_radius.cos(),
             sun_colour: sun.colour.to_array(),
             bounce_samples,
+            time,
         }
     }
 
@@ -132,6 +139,8 @@ pub(crate) struct SceneBindings<'a> {
 #[derive(Debug)]
 pub(crate) struct VisibilityPass {
     pipeline: ComputePipeline,
+    /// The frame's constants, mapped and rewritten each frame.
+    constants: Buffer,
 }
 
 /// Matches `local_size_x`/`local_size_y` in `primary_visibility.comp`.
@@ -145,8 +154,23 @@ impl VisibilityPass {
     ///
     /// `max_textures` sizes the bindless array's binding. It is a ceiling rather than a count: the
     /// set is allocated with room for it and each scene writes as many slots as it actually has.
-    pub(crate) fn new(device: &Device, max_textures: u32) -> rtxmw_gpu::Result<Self> {
+    pub(crate) fn new(
+        device: &Device,
+        memory: &Memory,
+        max_textures: u32,
+    ) -> rtxmw_gpu::Result<Self> {
+        // Host-visible and mapped for the life of the pass: the constants change every frame and
+        // are a hundred-odd bytes, so staging them through a transfer would cost a submission to
+        // move less than a cache line.
+        let constants = Buffer::new(
+            memory,
+            "frame constants",
+            size_of::<FrameConstants>() as vk::DeviceSize,
+            vk::BufferUsageFlags::STORAGE_BUFFER,
+            BufferMemory::Upload,
+        )?;
         Ok(Self {
+            constants,
             pipeline: ComputePipeline::new(
                 device,
                 &[
@@ -162,12 +186,16 @@ impl VisibilityPass {
                     Binding::storage_image(8),
                     Binding::storage_image(9),
                     Binding::storage_image(10),
+                    // The frame's own constants. They were push constants until waves needed a
+                    // clock and the block was already exactly the 128 bytes Vulkan guarantees —
+                    // see `FrameConstants`. Motion vectors at M7 would have forced the same move.
+                    Binding::storage_buffer(11),
                     // Last, because Vulkan allows a variable descriptor count only on a set's final
                     // binding. Adding anything after this one moves it — validation rejects the set
                     // outright, which is how this was caught.
-                    Binding::variable_samplers(11, max_textures),
+                    Binding::variable_samplers(12, max_textures),
                 ],
-                size_of::<FrameConstants>() as u32,
+                0,
                 shaders::primary_visibility(),
             )?,
         })
@@ -192,6 +220,15 @@ impl VisibilityPass {
             .push_next(&mut acceleration);
         scene_write.descriptor_count = 1;
 
+        let frame_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.constants.raw())
+            .range(vk::WHOLE_SIZE)];
+        let frame_write = vk::WriteDescriptorSet::default()
+            .dst_set(self.pipeline.set())
+            .dst_binding(11)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(&frame_info);
+
         let geometry_info = [vk::DescriptorBufferInfo::default()
             .buffer(scene.tables.geometries().raw())
             .range(vk::WHOLE_SIZE)];
@@ -213,7 +250,7 @@ impl VisibilityPass {
         let texture_infos = scene.textures.descriptors();
         let texture_write = vk::WriteDescriptorSet::default()
             .dst_set(self.pipeline.set())
-            .dst_binding(11)
+            .dst_binding(12)
             .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
             .image_info(&texture_infos);
 
@@ -270,6 +307,7 @@ impl VisibilityPass {
             self.pipeline.device().update_descriptor_sets(
                 &[
                     scene_write,
+                    frame_write,
                     geometry_write,
                     material_write,
                     texture_write,
@@ -292,11 +330,19 @@ impl VisibilityPass {
     /// `command_buffer` must be in the recording state, and [`VisibilityPass::bind`] must have run
     /// for the scene and target in use.
     pub(crate) unsafe fn record(
-        &self,
+        &mut self,
         command_buffer: vk::CommandBuffer,
         extent: vk::Extent2D,
         constants: &FrameConstants,
     ) {
+        // Written straight into mapped memory rather than staged. The renderer keeps one frame in
+        // flight and has already waited for it, so nothing is reading these while they change.
+        self.constants
+            .mapped_mut()
+            .expect("frame constants are host-visible by construction")
+            [..size_of::<FrameConstants>()]
+            .copy_from_slice(bytemuck::bytes_of(constants));
+
         // SAFETY: the caller guarantees the command buffer is recording and the set is bound.
         unsafe {
             self.pipeline.dispatch(
@@ -306,7 +352,7 @@ impl VisibilityPass {
                     extent.height.div_ceil(WORKGROUP),
                     1,
                 ],
-                bytemuck::bytes_of(constants),
+                &[],
             );
         }
     }
@@ -315,55 +361,29 @@ impl VisibilityPass {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::mem::offset_of;
 
     #[test]
-    fn the_push_block_fits_the_guaranteed_range() {
-        // Vulkan promises 128 bytes and no more; exceeding it works on this GPU and fails elsewhere.
-        assert!(size_of::<FrameConstants>() <= 128);
-        // Exactly the guarantee, with nothing to spare. The field order is load-bearing too:
-        // std430 aligns a `vec3` to sixteen bytes, so each has to land on a multiple of sixteen or
-        // the shader reads the whole block shifted.
-        assert_eq!(size_of::<FrameConstants>(), 128);
-        let constants = FrameConstants::new(
-            Mat4::IDENTITY,
-            Mat4::IDENTITY,
-            Vec3::ZERO,
-            Lighting {
-                ambient: Vec3::ZERO,
-                light_count: 0,
-                sun: None,
-            },
-            0.0,
-            0,
-        );
-        let base = std::ptr::from_ref(&constants).cast::<u8>();
-        for (name, field) in [
-            (
-                "camera_position",
-                std::ptr::from_ref(&constants.camera_position).cast::<u8>(),
-            ),
-            (
-                "ambient",
-                std::ptr::from_ref(&constants.ambient).cast::<u8>(),
-            ),
-            (
-                "sun_direction",
-                std::ptr::from_ref(&constants.sun_direction).cast::<u8>(),
-            ),
-            (
-                "sun_colour",
-                std::ptr::from_ref(&constants.sun_colour).cast::<u8>(),
-            ),
-        ] {
-            // SAFETY: both pointers are into the same live value.
-            let at = unsafe { field.offset_from(base) };
-            assert_eq!(
-                at % 16,
-                0,
-                "{name} sits at {at}, where std430 will not look for it"
-            );
-        }
+    fn the_frame_block_matches_the_scalar_layout_the_shader_reads() {
+        // Scalar layout puts every field at its natural alignment — a `vec3` is twelve bytes
+        // aligned to four — so the block the shader reads is this struct packed tightly, with no
+        // padding anywhere. A field inserted in the middle, or one Rust chose to align, shifts
+        // everything after it and the shader reads the whole frame displaced.
+        assert_eq!(offset_of!(FrameConstants, inverse_view_projection), 0);
+        assert_eq!(offset_of!(FrameConstants, camera_position), 64);
+        assert_eq!(offset_of!(FrameConstants, light_count), 76);
+        assert_eq!(offset_of!(FrameConstants, ambient), 80);
+        assert_eq!(offset_of!(FrameConstants, cone_spread), 92);
+        assert_eq!(offset_of!(FrameConstants, sun_direction), 96);
+        assert_eq!(offset_of!(FrameConstants, sun_cos_radius), 108);
+        assert_eq!(offset_of!(FrameConstants, sun_colour), 112);
+        assert_eq!(offset_of!(FrameConstants, bounce_samples), 124);
+        assert_eq!(offset_of!(FrameConstants, time), 128);
+        assert_eq!(size_of::<FrameConstants>(), 132);
+    }
 
+    #[test]
+    fn a_pixels_cone_widens_with_the_angle_it_subtends() {
         // One pixel of a 90-degree, 100-pixel-tall view subtends 2*tan(45)/100 = 0.02 units per
         // unit of distance.
         let projection = glam::camera::rh::proj::vulkan::perspective_infinite_reverse(
@@ -400,6 +420,7 @@ mod tests {
             },
             0.0,
             0,
+            0.0,
         );
 
         // Round-trip a world point through the forward transform and back through the stored

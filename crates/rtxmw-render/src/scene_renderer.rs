@@ -110,6 +110,7 @@ pub struct SceneRenderer {
     scene: Option<SceneResidency>,
     bounce_samples: u32,
     denoise_passes: u32,
+    time: f32,
     timestamps: Timestamps,
 }
 
@@ -145,7 +146,7 @@ impl SceneRenderer {
         extent: vk::Extent2D,
     ) -> rtxmw_gpu::Result<Self> {
         let mut renderer = Self {
-            pass: VisibilityPass::new(device, MAX_TEXTURES)?,
+            pass: VisibilityPass::new(device, memory, MAX_TEXTURES)?,
             gbuffer: GBuffer::new(memory, extent)?,
             denoiser: Denoiser::new(device)?,
             composite: Composite::new(device)?,
@@ -155,6 +156,7 @@ impl SceneRenderer {
             scene: None,
             bounce_samples: DEFAULT_BOUNCE_SAMPLES,
             denoise_passes: DEFAULT_PASSES,
+            time: 0.0,
             // One more than the stages, since a duration needs a timestamp either side of it.
             timestamps: Timestamps::new(device, physical, FrameTimings::STAGES as u32 + 1)?,
         };
@@ -191,6 +193,14 @@ impl SceneRenderer {
     /// Zero leaves the cell's ambient as a flat unoccluded fill, which is what the renderer did
     /// before indirect light existed — the two are the same estimator at its endpoints, so this is
     /// the honest A/B for what a bounce actually contributes.
+    /// Sets the clock the water's waves move against, in seconds.
+    ///
+    /// Zero unless something sets it, which is what keeps a screenshot and a test reproducible: the
+    /// surface at time zero is one definite shape rather than whenever the frame happened to run.
+    pub fn set_time(&mut self, seconds: f32) {
+        self.time = seconds;
+    }
+
     pub fn set_bounce_samples(&mut self, samples: u32) {
         self.bounce_samples = samples;
     }
@@ -368,6 +378,7 @@ impl SceneRenderer {
             // resolution it is being traced at.
             FrameConstants::cone_spread_from(projection, self.target.extent().height),
             self.bounce_samples,
+            self.time,
         )
     }
 
@@ -389,7 +400,7 @@ impl SceneRenderer {
     /// # Safety
     /// `command_buffer` must be in the recording state, and `device` must own this renderer.
     pub unsafe fn record(
-        &self,
+        &mut self,
         device: &ash::Device,
         command_buffer: vk::CommandBuffer,
         constants: &FrameConstants,
@@ -461,7 +472,7 @@ impl SceneRenderer {
 
     /// Records one trace and waits for it, for a caller with no frame loop of its own.
     pub fn render_once(
-        &self,
+        &mut self,
         uploader: &mut Uploader,
         constants: &FrameConstants,
     ) -> rtxmw_gpu::Result<()> {
