@@ -2,23 +2,14 @@
 //!
 //! Synthetic archives prove the parser handles the format as documented; only the shipped data
 //! proves it handles the format as Bethesda actually wrote it. Skips with a note when
-//! `MORROWIND_DATA_DIR` is unset, so the suite still runs on a machine without the game.
+//! the game is not installed (see `.env`), so the suite still runs on a machine without the game.
 
-use std::path::PathBuf;
-
-use rtxmw_vfs::Vfs;
-
-/// The `Data Files` directory, or `None` when the game is not available here.
-fn data_dir() -> Option<PathBuf> {
-    let raw = std::env::var_os("MORROWIND_DATA_DIR")?;
-    let path = PathBuf::from(raw);
-    path.is_dir().then_some(path)
-}
+use rtxmw_vfs::{DATA_DIR_VAR, Vfs, morrowind_data_dir};
 
 #[test]
 fn reads_the_shipped_archives() {
-    let Some(data) = data_dir() else {
-        eprintln!("skipping: MORROWIND_DATA_DIR is not set to a directory");
+    let Some(data) = morrowind_data_dir() else {
+        eprintln!("skipping: {DATA_DIR_VAR} is not configured (set it, or add it to .env)");
         return;
     };
 
@@ -81,8 +72,8 @@ fn reads_the_shipped_archives() {
 
 #[test]
 fn every_indexed_path_in_morrowind_bsa_reads_back_at_its_stated_size() {
-    let Some(data) = data_dir() else {
-        eprintln!("skipping: MORROWIND_DATA_DIR is not set to a directory");
+    let Some(data) = morrowind_data_dir() else {
+        eprintln!("skipping: {DATA_DIR_VAR} is not configured (set it, or add it to .env)");
         return;
     };
     let path = data.join("Morrowind.bsa");

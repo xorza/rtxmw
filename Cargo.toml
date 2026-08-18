@@ -8,6 +8,7 @@ rust-version = "1.97"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
+rtxmw-esm = { path = "crates/rtxmw-esm" }
 rtxmw-gpu = { path = "crates/rtxmw-gpu" }
 rtxmw-vfs = { path = "crates/rtxmw-vfs" }
 
@@ -15,6 +16,7 @@ ash = "0.38"
 ash-window = "0.13"
 bytemuck = { version = "1", features = ["derive"] }
 dhat = "0.3"
+dotenvy = "0.15"
 raw-window-handle = "0.6"
 glam = "0.33"
 half = "2"

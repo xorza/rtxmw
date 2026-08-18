@@ -1,0 +1,18 @@
+[package]
+name = "rtxmw-esm"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+# Exposes synthetic record construction so the reader can be tested without game data.
+internals = []
+
+[lints]
+workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+rtxmw-vfs = { workspace = true, features = ["internals"] }

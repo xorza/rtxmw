@@ -8,9 +8,13 @@ license.workspace = true
 [features]
 # Exposes synthetic BSA construction so downstream crates can test against archives without
 # shipping game data.
-internals = []
+internals = ["dep:dotenvy"]
 
 [lints]
 workspace = true
 
 [dependencies]
+dotenvy = { workspace = true, optional = true }
+
+[dev-dependencies]
+dotenvy = "0.15.7"

@@ -28,6 +28,7 @@ pub use crate::validation_log::{ValidationLog, ValidationMessage};
 #[cfg(any(test, feature = "internals"))]
 mod testing;
 
-// Only external consumers need the re-export; this crate's own tests use the module path.
-#[cfg(feature = "internals")]
+// The gate must match the module's: a module compiled under cfg(test) but not re-exported
+// there would be `pub` yet unreachable, which `unreachable_pub` rightly rejects.
+#[cfg(any(test, feature = "internals"))]
 pub use crate::testing::{golden, render_target::RenderTarget, test_gpu::TestGpu};
