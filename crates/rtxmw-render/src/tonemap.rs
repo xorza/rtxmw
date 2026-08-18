@@ -51,6 +51,23 @@ impl Tonemap {
         })
     }
 
+    /// Replaces the output image at a new size. The pipeline and its set are untouched; the
+    /// caller rebinds.
+    pub(crate) fn resize(
+        &mut self,
+        memory: &Memory,
+        extent: vk::Extent2D,
+    ) -> rtxmw_gpu::Result<()> {
+        self.output = Image::new(
+            memory,
+            "tonemapped output",
+            extent,
+            OUTPUT_FORMAT,
+            vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC,
+        )?;
+        Ok(())
+    }
+
     /// The display-ready image, in `TRANSFER_SRC_OPTIMAL` once [`Tonemap::record`] has run.
     pub(crate) fn output(&self) -> &Image {
         &self.output

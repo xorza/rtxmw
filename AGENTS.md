@@ -131,6 +131,10 @@ cargo run -- --screenshot out.png                       # one frame, no window, 
 cargo run -- --screenshot out.png 1920x1080 -2,-9       # at the §5.3 internal size, outdoors
 ```
 
+`cargo run -- [CELL] --frames N` draws N frames and exits through the ordinary shutdown path, which
+is what makes the windowed path scriptable — the one crash it hid was a drop-order bug that only
+fires on a clean exit.
+
 Both the windowed binary and `--screenshot` take an optional cell as their last argument, and
 address it the way Morrowind does: **a pair of integers is an exterior and anything else is an
 interior's name.** So `-2,-9` is Seyda Neen's shore and `"Balmora, Guild of Mages"` is a building.

@@ -126,6 +126,17 @@ impl std::fmt::Debug for SceneRenderer {
     }
 }
 
+/// The image the trace writes its radiance into.
+fn target_image(memory: &Memory, extent: vk::Extent2D) -> rtxmw_gpu::Result<Image> {
+    Image::new(
+        memory,
+        "primary visibility target",
+        extent,
+        TARGET_FORMAT,
+        vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC,
+    )
+}
+
 /// A cell's device-side data.
 ///
 /// Every field is a lifetime anchor as much as a value: the descriptor set holds the top-level
@@ -153,39 +164,33 @@ impl SceneRenderer {
         memory: &Memory,
         extent: vk::Extent2D,
     ) -> rtxmw_gpu::Result<Self> {
-        let target = Image::new(
-            memory,
-            "primary visibility target",
-            extent,
-            TARGET_FORMAT,
-            vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC,
-        )?;
-        let gbuffer = GBuffer::new(memory, extent)?;
-        let mut denoiser = Denoiser::new(device)?;
-        denoiser.bind(&gbuffer);
-        let mut composite = Composite::new(device)?;
-        composite.bind(&target, &gbuffer);
-        let mut exposure = AutoExposure::new(device, memory)?;
-        let mut tonemap = Tonemap::new(device, memory, extent)?;
-        // The post passes read the target and each other's buffers, none of which a scene change
-        // touches — so unlike the trace's descriptors these are written once, here.
-        exposure.bind(&target);
-        tonemap.bind(&target, exposure.buffer());
-
-        Ok(Self {
+        let mut renderer = Self {
             pass: VisibilityPass::new(device, MAX_TEXTURES)?,
-            gbuffer,
-            denoiser,
-            composite,
-            exposure,
-            tonemap,
-            target,
+            gbuffer: GBuffer::new(memory, extent)?,
+            denoiser: Denoiser::new(device)?,
+            composite: Composite::new(device)?,
+            exposure: AutoExposure::new(device, memory)?,
+            tonemap: Tonemap::new(device, memory, extent)?,
+            target: target_image(memory, extent)?,
             scene: None,
             bounce_samples: DEFAULT_BOUNCE_SAMPLES,
             denoise_passes: DEFAULT_PASSES,
             // One more than the stages, since a duration needs a timestamp either side of it.
             timestamps: Timestamps::new(device, physical, FrameTimings::STAGES as u32 + 1)?,
-        })
+        };
+        renderer.bind_targets();
+        Ok(renderer)
+    }
+
+    /// Points the post passes at the images they read and write.
+    ///
+    /// Separate from [`SceneRenderer::bind_scene`] because the two go stale for different reasons:
+    /// these follow the images, which only a resize replaces, and that one follows the cell.
+    fn bind_targets(&mut self) {
+        self.exposure.bind(&self.target);
+        self.tonemap.bind(&self.target, self.exposure.buffer());
+        self.denoiser.bind(&self.gbuffer);
+        self.composite.bind(&self.target, &self.gbuffer);
     }
 
     /// Sets how many à-trous passes smooth the lighting. Zero leaves it as traced.
@@ -243,17 +248,6 @@ impl SceneRenderer {
         );
         let lights = LightBuffer::upload(uploader, &scene.lights)?;
 
-        self.pass.bind(
-            SceneBindings {
-                structure: acceleration.tlas(),
-                geometry: &geometry,
-                tables: &tables,
-                lights: &lights,
-                textures: &array,
-            },
-            &self.target,
-            &self.gbuffer,
-        );
         let light_count = lights.count();
         self.scene = Some(LoadedScene {
             geometry,
@@ -269,6 +263,46 @@ impl SceneRenderer {
                 sun: scene.sun,
             },
         });
+        self.bind_scene();
+        Ok(())
+    }
+
+    /// Points the trace at the loaded cell and the images it writes.
+    ///
+    /// Called after a cell loads and again after a resize, because both replace one side of that
+    /// pairing: the scene changes, or the images it writes into do.
+    fn bind_scene(&mut self) {
+        let Some(scene) = &self.scene else {
+            return;
+        };
+        self.pass.bind(
+            SceneBindings {
+                structure: scene.acceleration.tlas(),
+                geometry: &scene.geometry,
+                tables: &scene.tables,
+                lights: &scene.lights,
+                textures: &scene.textures,
+            },
+            &self.target,
+            &self.gbuffer,
+        );
+    }
+
+    /// Rebuilds every image at `extent`, keeping the loaded cell.
+    ///
+    /// The pipelines and descriptor sets survive — only what they point at changes — so this is
+    /// several image allocations and a round of descriptor writes, not a rebuild.
+    ///
+    /// The caller must have waited for device idle: these are the images a queued frame reads.
+    pub fn resize(&mut self, memory: &Memory, extent: vk::Extent2D) -> rtxmw_gpu::Result<()> {
+        if self.target.extent() == extent {
+            return Ok(());
+        }
+        self.target = target_image(memory, extent)?;
+        self.gbuffer = GBuffer::new(memory, extent)?;
+        self.tonemap.resize(memory, extent)?;
+        self.bind_targets();
+        self.bind_scene();
         Ok(())
     }
 

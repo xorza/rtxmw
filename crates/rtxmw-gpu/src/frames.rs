@@ -6,7 +6,17 @@ use crate::device::Device;
 use crate::error::Result;
 
 /// How many frames the CPU may run ahead of the GPU.
-pub(crate) const FRAMES_IN_FLIGHT: usize = 2;
+///
+/// **One, because the renderer above this is single-buffered.** `SceneRenderer` owns exactly one
+/// target, one G-buffer, one histogram and one timestamp query pool, and every frame writes all of
+/// them. A second frame in flight would trace into the target before the first had finished tone
+/// mapping it, and — worse — would record `vkCmdResetQueryPool` over queries still executing, which
+/// the specification calls undefined and which faulted the driver outright.
+///
+/// Raising it means duplicating that whole set per frame: about 88 MB of images, the query pool, and
+/// a descriptor set for every pass. Worth doing when the CPU is the thing waiting; it is not, at
+/// roughly 3 ms of GPU work against a frame of CPU bookkeeping.
+pub(crate) const FRAMES_IN_FLIGHT: usize = 1;
 
 /// Command buffers and sync objects for the frame ring.
 ///
@@ -138,7 +148,12 @@ impl Frames {
 
     /// Advances to the next frame in the ring.
     pub fn advance(&mut self) {
-        self.current = (self.current + 1) % FRAMES_IN_FLIGHT;
+        // Degenerate while the ring holds one slot, and written for the ring rather than for that:
+        // the modulo is what stays correct if `FRAMES_IN_FLIGHT` goes back up.
+        #[allow(clippy::modulo_one)]
+        {
+            self.current = (self.current + 1) % FRAMES_IN_FLIGHT;
+        }
     }
 
     fn destroy_present_semaphores(&mut self) {

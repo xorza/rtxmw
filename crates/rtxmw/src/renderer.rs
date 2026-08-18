@@ -12,12 +12,29 @@ use rtxmw_render::{FrameConstants, OUTPUT_FORMAT, SceneRenderer, TARGET_FORMAT};
 use rtxmw_scene::StaticScene;
 use rtxmw_texture::Texture;
 
-/// Rendering resolution, independent of the window. The design budgets for 1920x1080 internal
-/// upscaled to 3840x2160; the blit to the swapchain is what bridges the two.
-const RENDER_SIZE: vk::Extent2D = vk::Extent2D {
-    width: 1920,
-    height: 1080,
-};
+/// Rows the trace renders, independent of the window's own height.
+///
+/// The design budgets for 1080 internal rows upscaled to a 2160-row display (`docs/design.md`
+/// §5.3), and the blit to the swapchain is what bridges the two.
+const RENDER_HEIGHT: u32 = 1080;
+
+/// The internal size for a given window.
+///
+/// **The width follows the window's aspect ratio rather than being fixed.** A fixed 16:9 target
+/// blitted into a window of any other shape is stretched — which is what an ultrawide or a
+/// half-screen window got — and no projection can undo that, because the distortion happens after
+/// the image is drawn. Matching the aspect makes the blit a pure scale.
+///
+/// Never taller than the window either: rendering 1080 rows into a 400-row window is work whose
+/// result is thrown away by the downscale.
+fn internal_extent(window: vk::Extent2D) -> vk::Extent2D {
+    let height = window.height.clamp(1, RENDER_HEIGHT);
+    let width = (height as f64 * window.width as f64 / window.height.max(1) as f64).round();
+    vk::Extent2D {
+        width: (width as u32).max(1),
+        height,
+    }
+}
 
 /// The whole GPU side of the engine.
 ///
@@ -70,7 +87,7 @@ impl Renderer {
 
         let memory = Memory::new(&instance, &physical, &device)?;
         let uploader = Uploader::new(&device, &memory, physical.graphics_queue_family())?;
-        let scene = SceneRenderer::new(&device, &physical, &memory, RENDER_SIZE)?;
+        let scene = SceneRenderer::new(&device, &physical, &memory, internal_extent(extent))?;
 
         Ok(Self {
             scene,
@@ -145,8 +162,8 @@ impl Renderer {
             extent.height,
             self.swapchain.images().len(),
             TARGET_FORMAT,
-            RENDER_SIZE.width,
-            RENDER_SIZE.height,
+            self.scene.target().extent().width,
+            self.scene.target().extent().height,
             OUTPUT_FORMAT,
             support.position_fetch,
             support.maintenance1,
@@ -162,10 +179,12 @@ impl Renderer {
 
     /// Aspect ratio of the offscreen target, which is what the projection must match.
     ///
-    /// Not the swapchain's: the trace happens at [`RENDER_SIZE`] and is stretched to the window, so
-    /// a projection built for the window would letterbox or distort as soon as the two differ.
+    /// Read from the target rather than from the window: they now agree by construction, and taking
+    /// it from the image that is actually traced means they cannot drift if that ever stops being
+    /// true.
     pub(crate) fn aspect_ratio(&self) -> f32 {
-        RENDER_SIZE.width as f32 / RENDER_SIZE.height as f32
+        let extent = self.scene.target().extent();
+        extent.width as f32 / extent.height as f32
     }
 
     /// Flags the swapchain as stale, e.g. after the window is resized.
@@ -298,6 +317,13 @@ impl Renderer {
             .recreate(&self.physical, &self.surface, extent)?;
         self.frames
             .resize_present_semaphores(self.swapchain.images().len())?;
+        // Against the *swapchain's* extent rather than the one asked for: a compositor may hand
+        // back something else, and the internal image has to match what is actually presented or
+        // the aspect correction is computed for a window that does not exist.
+        self.scene.resize(
+            self.uploader.memory(),
+            internal_extent(self.swapchain.extent()),
+        )?;
         self.needs_recreate = false;
         Ok(())
     }
@@ -310,5 +336,58 @@ impl Drop for Renderer {
         unsafe {
             let _ = self.device.raw().device_wait_idle();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn extent(width: u32, height: u32) -> vk::Extent2D {
+        vk::Extent2D { width, height }
+    }
+
+    #[test]
+    fn the_internal_size_keeps_the_windows_shape() {
+        // A 16:9 window at or above the design's height renders exactly the budgeted 1920x1080.
+        assert_eq!(internal_extent(extent(1920, 1080)), extent(1920, 1080));
+        assert_eq!(internal_extent(extent(3840, 2160)), extent(1920, 1080));
+
+        // An ultrawide gets a wider target, not a stretched one: 1080 rows at 21:9.
+        assert_eq!(internal_extent(extent(3440, 1440)), extent(2580, 1080));
+        // And a tall window a narrower one.
+        assert_eq!(internal_extent(extent(1080, 1920)), extent(608, 1080));
+
+        // Every case keeps the window's aspect ratio to within a pixel of rounding, which is the
+        // whole point — the blit is a scale, and a scale cannot undo a shape change.
+        for (w, h) in [
+            (1920, 1080),
+            (3440, 1440),
+            (1080, 1920),
+            (2560, 1600),
+            (800, 600),
+        ] {
+            let internal = internal_extent(extent(w, h));
+            let window = f64::from(w) / f64::from(h);
+            let target = f64::from(internal.width) / f64::from(internal.height);
+            assert!(
+                (window - target).abs() < 0.01,
+                "{w}x{h} window against a {}x{} target",
+                internal.width,
+                internal.height
+            );
+        }
+    }
+
+    #[test]
+    fn a_window_shorter_than_the_budget_is_not_oversampled() {
+        // Rendering more rows than the window shows is work the downscale throws away.
+        assert_eq!(internal_extent(extent(800, 600)), extent(800, 600));
+        assert_eq!(internal_extent(extent(640, 360)), extent(640, 360));
+
+        // And nothing degenerate at the limits, where a zero would divide by it or allocate an
+        // image with no pixels.
+        assert_eq!(internal_extent(extent(1, 1)), extent(1, 1));
+        assert_eq!(internal_extent(extent(0, 0)), extent(1, 1));
     }
 }

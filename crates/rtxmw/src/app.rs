@@ -11,6 +11,7 @@ use winit::window::{CursorGrabMode, Window, WindowId};
 
 use rtxmw_scene::{CellId, LoadedCell};
 
+use crate::WindowOptions;
 use crate::camera::{Camera, Movement};
 use crate::renderer::Renderer;
 use crate::scene_loader;
@@ -46,8 +47,16 @@ impl Keys {
 pub(crate) struct App {
     /// Which cell to open in, from the command line.
     cell: CellId,
-    window: Option<Window>,
+    /// **Before `window`, and that is load-bearing.** Fields drop in declaration order, and the
+    /// renderer holds a `VkSurfaceKHR` and a swapchain built from this window — destroying the
+    /// window first leaves the WSI layer dereferencing a freed surface as it tears them down, which
+    /// segfaulted on exit. `Renderer` carries the same warning about its own fields; this is the
+    /// same rule one level up.
     renderer: Option<Renderer>,
+    window: Option<Window>,
+    /// Frames to draw before exiting, for scripting the windowed path.
+    exit_after: Option<u32>,
+    frames_drawn: u32,
     camera: Camera,
     keys: Keys,
     /// Mouse look is only applied while the cursor is captured.
@@ -58,10 +67,15 @@ pub(crate) struct App {
 }
 
 impl App {
-    /// An app that opens in `cell`.
-    pub(crate) fn opening_in(cell: CellId) -> Self {
+    /// An app configured from the command line.
+    ///
+    /// The frame limit exists because the shutdown path had no way to be exercised: the crash it
+    /// was hiding — the window being destroyed before the surface built from it — only happens on a
+    /// clean exit, which nothing but a person pressing a key could reach.
+    pub(crate) fn opening_in(options: WindowOptions) -> Self {
         Self {
-            cell,
+            cell: options.cell,
+            exit_after: options.exit_after,
             ..Self::default()
         }
     }
@@ -72,8 +86,10 @@ impl Default for App {
         let now = Instant::now();
         Self {
             cell: scene_loader::cell_argument(None),
-            window: None,
             renderer: None,
+            window: None,
+            exit_after: None,
+            frames_drawn: 0,
             // Replaced by the loaded cell's own centre in `resumed`; this only matters if no game
             // data is configured and there is nothing to look at anyway.
             camera: Camera::new(Vec3::ZERO),
@@ -265,6 +281,15 @@ impl ApplicationHandler for App {
                         event_loop.exit();
                         return;
                     }
+                }
+
+                self.frames_drawn += 1;
+                if self
+                    .exit_after
+                    .is_some_and(|limit| self.frames_drawn >= limit)
+                {
+                    event_loop.exit();
+                    return;
                 }
 
                 self.frames_since_title += 1;
