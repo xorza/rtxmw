@@ -26,7 +26,7 @@ pub struct VertexAttributes {
 /// mesh's index data does not depend on where in the buffer it landed, which is what keeps meshes
 /// relocatable once cells start streaming.
 ///
-/// Host-side only. The per-geometry struct a hit shader reads is [`crate::GpuGeometry`], which
+/// Host-side only. The per-geometry struct a hit shader reads is `GpuGeometry`, which
 /// carries a material alongside its offsets; nothing uploads this one, so its layout is not pinned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MeshRange {

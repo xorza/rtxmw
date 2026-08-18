@@ -12,13 +12,16 @@ use rtxmw_scene::StaticScene;
 use rtxmw_texture::Texture;
 
 use crate::auto_exposure::AutoExposure;
+use crate::composite::Composite;
+use crate::denoiser::{DEFAULT_PASSES, Denoiser};
+use crate::gbuffer::GBuffer;
 use crate::geometry_buffers::GeometryBuffers;
 use crate::light_buffer::LightBuffer;
 use crate::material_buffers::MaterialBuffers;
 use crate::scene_acceleration::SceneAcceleration;
 use crate::texture_array::TextureArray;
 use crate::tonemap::Tonemap;
-use crate::visibility_pass::{FrameConstants, VisibilityPass};
+use crate::visibility_pass::{FrameConstants, SceneBindings, VisibilityPass};
 
 /// Half-float rather than 8-bit: the trace writes linear radiance that tone mapping consumes at M8,
 /// and an 8-bit intermediate would clip highlights before anything got the chance to.
@@ -40,11 +43,15 @@ const DEFAULT_BOUNCE_SAMPLES: u32 = 4;
 /// A loaded cell and the passes that turn it into a picture.
 pub struct SceneRenderer {
     pass: VisibilityPass,
+    gbuffer: GBuffer,
+    denoiser: Denoiser,
+    composite: Composite,
     exposure: AutoExposure,
     tonemap: Tonemap,
     target: Image,
     scene: Option<LoadedScene>,
     bounce_samples: u32,
+    denoise_passes: u32,
 }
 
 impl std::fmt::Debug for SceneRenderer {
@@ -86,6 +93,11 @@ impl SceneRenderer {
             TARGET_FORMAT,
             vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC,
         )?;
+        let gbuffer = GBuffer::new(memory, extent)?;
+        let mut denoiser = Denoiser::new(device)?;
+        denoiser.bind(&gbuffer);
+        let mut composite = Composite::new(device)?;
+        composite.bind(&target, &gbuffer);
         let mut exposure = AutoExposure::new(device, memory)?;
         let mut tonemap = Tonemap::new(device, memory, extent)?;
         // The post passes read the target and each other's buffers, none of which a scene change
@@ -95,12 +107,29 @@ impl SceneRenderer {
 
         Ok(Self {
             pass: VisibilityPass::new(device, MAX_TEXTURES)?,
+            gbuffer,
+            denoiser,
+            composite,
             exposure,
             tonemap,
             target,
             scene: None,
             bounce_samples: DEFAULT_BOUNCE_SAMPLES,
+            denoise_passes: DEFAULT_PASSES,
         })
+    }
+
+    /// Sets how many à-trous passes smooth the lighting. Zero leaves it as traced.
+    ///
+    /// Must be even: the filter ping-pongs between two images and an odd count would finish in the
+    /// one nothing reads.
+    pub fn set_denoise_passes(&mut self, passes: u32) {
+        assert_eq!(
+            passes % 2,
+            0,
+            "the ping-pong has to land back on the first image"
+        );
+        self.denoise_passes = passes;
     }
 
     /// Sets how many diffuse bounce rays each pixel casts.
@@ -146,12 +175,15 @@ impl SceneRenderer {
         let lights = LightBuffer::upload(uploader, &scene.lights)?;
 
         self.pass.bind(
-            acceleration.tlas(),
+            SceneBindings {
+                structure: acceleration.tlas(),
+                geometry: &geometry,
+                tables: &tables,
+                lights: &lights,
+                textures: &array,
+            },
             &self.target,
-            &geometry,
-            &tables,
-            &lights,
-            &array,
+            &self.gbuffer,
         );
         let light_count = lights.count();
         self.scene = Some(LoadedScene {
@@ -228,35 +260,41 @@ impl SceneRenderer {
         if !self.has_scene() {
             return;
         }
+        let extent = self.target.extent();
         // SAFETY: the caller guarantees the command buffer is recording, and every object below
         // belongs to this device and outlives the submission.
         unsafe {
-            // The previous frame left it in TRANSFER_SRC; `UNDEFINED` discards those contents,
-            // which is wanted since every pixel is about to be rewritten.
-            image_barrier::transition(
-                device,
-                command_buffer,
-                self.target.raw(),
-                vk::ImageLayout::UNDEFINED,
-                vk::ImageLayout::GENERAL,
-            );
-            self.pass
-                .record(command_buffer, self.target.extent(), constants);
+            // Every image a frame writes starts from `UNDEFINED`, which discards whatever the last
+            // one left there. That is wanted rather than tolerated: each is rewritten in full, so
+            // preserving the old contents would cost a transition and buy nothing.
+            for image in [&self.target]
+                .into_iter()
+                .chain(self.gbuffer.images())
+                .chain([self.tonemap.output()])
+            {
+                image_barrier::transition(
+                    device,
+                    command_buffer,
+                    image.raw(),
+                    vk::ImageLayout::UNDEFINED,
+                    vk::ImageLayout::GENERAL,
+                );
+            }
+
+            self.pass.record(command_buffer, extent, constants);
             memory_barrier::full(device, command_buffer);
 
-            // The output starts undefined every frame for the same reason the target does: the
-            // tonemap writes every pixel of it, so preserving the last frame's would cost a
-            // transition and buy nothing.
-            image_barrier::transition(
-                device,
-                command_buffer,
-                self.tonemap.output().raw(),
-                vk::ImageLayout::UNDEFINED,
-                vk::ImageLayout::GENERAL,
-            );
-            self.exposure
-                .record(device, command_buffer, self.target.extent());
-            self.tonemap.record(command_buffer, self.target.extent());
+            // The filter leaves the lighting back in the G-buffer's first illumination image, which
+            // is the one the composite is bound to.
+            self.denoiser
+                .record(device, command_buffer, extent, self.denoise_passes);
+            self.composite.record(command_buffer, extent);
+            memory_barrier::full(device, command_buffer);
+
+            // Exposure is measured on the composed frame, so it has to follow the composite rather
+            // than run alongside the trace.
+            self.exposure.record(device, command_buffer, extent);
+            self.tonemap.record(command_buffer, extent);
             memory_barrier::full(device, command_buffer);
 
             for image in [self.target.raw(), self.tonemap.output().raw()] {

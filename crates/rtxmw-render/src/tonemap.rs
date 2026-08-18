@@ -58,33 +58,16 @@ impl Tonemap {
 
     /// Points the pass at the radiance it reads and the exposure to apply.
     pub(crate) fn bind(&mut self, source: &Image, exposure: &Buffer) {
-        let source_info = [vk::DescriptorImageInfo::default()
-            .image_view(source.view())
-            .image_layout(vk::ImageLayout::GENERAL)];
-        let target_info = [vk::DescriptorImageInfo::default()
-            .image_view(self.output.view())
-            .image_layout(vk::ImageLayout::GENERAL)];
+        self.pass.bind_storage_images(0, &[source, &self.output]);
+
         let exposure_info = [vk::DescriptorBufferInfo::default()
             .buffer(exposure.raw())
             .range(vk::WHOLE_SIZE)];
-
-        let writes = [
-            vk::WriteDescriptorSet::default()
-                .dst_set(self.pass.set())
-                .dst_binding(0)
-                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
-                .image_info(&source_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(self.pass.set())
-                .dst_binding(1)
-                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
-                .image_info(&target_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(self.pass.set())
-                .dst_binding(2)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&exposure_info),
-        ];
+        let writes = [vk::WriteDescriptorSet::default()
+            .dst_set(self.pass.set())
+            .dst_binding(2)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(&exposure_info)];
         // SAFETY: every write names this pass's own set, and no dispatch using it is in flight.
         unsafe { self.pass.device().update_descriptor_sets(&writes, &[]) };
     }

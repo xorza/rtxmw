@@ -110,6 +110,10 @@ fn trace_scene(
     )
     .expect("renderer should build");
     renderer.set_bounce_samples(bounces);
+    // Unfiltered, because every assertion in this file is about what the *trace* computes: radiance
+    // worked out by hand, the Monte Carlo error of the indirect estimator, the fraction of rays
+    // that hit. Smoothing the lighting is exactly what would hide the last of those.
+    renderer.set_denoise_passes(0);
 
     // One uploader for the whole trace, held across load and render. It wraps a single queue, so
     // the harness serialises every test through it — which is exactly why the renderer borrows one

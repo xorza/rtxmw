@@ -22,7 +22,7 @@ const BLEND_CUTOFF: f32 = 0.5;
 ///
 /// Declared again as `NO_TEXTURE` in `primary_visibility.comp`, because a GLSL shader cannot see a
 /// Rust constant. The test below pins the literal so the two cannot drift apart silently.
-pub const NO_TEXTURE: u32 = u32::MAX;
+pub(crate) const NO_TEXTURE: u32 = u32::MAX;
 
 /// One acceleration structure geometry, indexed by `instance_custom_index + geometry_index`.
 ///
@@ -30,27 +30,27 @@ pub const NO_TEXTURE: u32 = u32::MAX;
 /// and adding them lands on this entry with no per-mesh indirection to chase first.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Pod, Zeroable)]
-pub struct GpuGeometry {
+pub(crate) struct GpuGeometry {
     /// Where this run starts in the shared index buffer.
-    pub first_index: u32,
+    pub(crate) first_index: u32,
     /// Added to each index value to reach the shared vertex streams.
-    pub first_vertex: u32,
-    pub material: u32,
-    pub padding: u32,
+    pub(crate) first_vertex: u32,
+    pub(crate) material: u32,
+    pub(crate) padding: u32,
 }
 
 /// One surface description as the shader reads it.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Pod, Zeroable)]
-pub struct GpuMaterial {
-    pub diffuse: [f32; 3],
-    pub opacity: f32,
-    pub emissive: [f32; 3],
+pub(crate) struct GpuMaterial {
+    pub(crate) diffuse: [f32; 3],
+    pub(crate) opacity: f32,
+    pub(crate) emissive: [f32; 3],
     /// Texels below this are absent. Zero when the surface is not alpha tested.
-    pub alpha_cutoff: f32,
+    pub(crate) alpha_cutoff: f32,
     /// Index into the bindless texture array, or [`NO_TEXTURE`].
-    pub base_colour: u32,
-    pub padding: [u32; 3],
+    pub(crate) base_colour: u32,
+    pub(crate) padding: [u32; 3],
 }
 
 impl GpuMaterial {
@@ -75,14 +75,14 @@ impl GpuMaterial {
 
 /// The two tables that turn a hit into a surface.
 #[derive(Debug)]
-pub struct MaterialBuffers {
+pub(crate) struct MaterialBuffers {
     geometries: Buffer,
     materials: Buffer,
 }
 
 impl MaterialBuffers {
     /// Builds and uploads both tables for an already-packed scene.
-    pub fn upload(
+    pub(crate) fn upload(
         uploader: &mut Uploader,
         geometry: &GeometryBuffers,
         materials: &[Material],
@@ -131,12 +131,12 @@ impl MaterialBuffers {
     }
 
     /// One entry per acceleration structure geometry.
-    pub fn geometries(&self) -> &Buffer {
+    pub(crate) fn geometries(&self) -> &Buffer {
         &self.geometries
     }
 
     /// One entry per distinct material.
-    pub fn materials(&self) -> &Buffer {
+    pub(crate) fn materials(&self) -> &Buffer {
         &self.materials
     }
 }

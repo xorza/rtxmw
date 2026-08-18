@@ -9,7 +9,7 @@ use rtxmw_texture::{Texture, TextureFormat};
 /// One descriptor binding holding a runtime-sized array, indexed at a hit by a value read from the
 /// material table. That indexing is divergent across a warp, which is why the shader has to mark it
 /// `nonuniformEXT` and why the device enables non-uniform sampled-image indexing.
-pub struct TextureArray {
+pub(crate) struct TextureArray {
     device: ash::Device,
     /// Slot zero, and the view every unresolvable slot points at. A material with no texture, or
     /// one naming a file that does not exist, samples this — 45 of the shipped library's 4,311
@@ -37,7 +37,7 @@ impl TextureArray {
     ///
     /// Slot `n` is the texture the scene's path list names at `n`, offset by one — slot zero is
     /// always the fallback, so a material's texture id maps to `id + 1`.
-    pub fn upload(
+    pub(crate) fn upload(
         device: &Device,
         uploader: &mut Uploader,
         textures: &[Option<Texture>],
@@ -75,19 +75,14 @@ impl TextureArray {
     }
 
     /// How many slots the array holds, fallback included.
-    pub fn len(&self) -> u32 {
+    pub(crate) fn len(&self) -> u32 {
         self.slots.len() as u32 + 1
-    }
-
-    /// Whether the scene named no textures at all.
-    pub fn is_empty(&self) -> bool {
-        self.slots.is_empty()
     }
 
     /// The descriptor image infos for the whole array, in slot order.
     ///
     /// Slot zero is the fallback, so a material's texture id addresses `id + 1`.
-    pub fn descriptors(&self) -> Vec<vk::DescriptorImageInfo> {
+    pub(crate) fn descriptors(&self) -> Vec<vk::DescriptorImageInfo> {
         let info = |image: &Image| {
             vk::DescriptorImageInfo::default()
                 .sampler(self.sampler)

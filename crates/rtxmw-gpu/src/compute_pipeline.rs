@@ -213,6 +213,39 @@ impl ComputePipeline {
         &self.device
     }
 
+    /// Points a run of bindings starting at `first` at `images`, in order.
+    ///
+    /// The shape every pass here has somewhere in its set: consecutive storage images differing
+    /// only in the binding number. Writing them out was thirty lines apiece of
+    /// `DescriptorImageInfo` and `WriteDescriptorSet` saying the same thing.
+    ///
+    /// All in `GENERAL`, because a compute shader reading and writing images has no other layout
+    /// available to it.
+    pub fn bind_storage_images(&self, first: u32, images: &[&crate::image::Image]) {
+        let infos: Vec<_> = images
+            .iter()
+            .map(|image| {
+                [vk::DescriptorImageInfo::default()
+                    .image_view(image.view())
+                    .image_layout(vk::ImageLayout::GENERAL)]
+            })
+            .collect();
+        let writes: Vec<_> = infos
+            .iter()
+            .enumerate()
+            .map(|(binding, info)| {
+                vk::WriteDescriptorSet::default()
+                    .dst_set(self.set)
+                    .dst_binding(first + binding as u32)
+                    .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                    .image_info(info)
+            })
+            .collect();
+        // SAFETY: every write names this pipeline's own set, and the caller rebinds only when the
+        // resources change, never with a dispatch in flight.
+        unsafe { self.device.update_descriptor_sets(&writes, &[]) };
+    }
+
     /// Binds the pipeline and its set, pushes `constants`, and dispatches.
     ///
     /// # Safety

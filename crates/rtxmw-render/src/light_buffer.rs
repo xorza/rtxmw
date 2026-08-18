@@ -8,14 +8,14 @@ use rtxmw_scene::Light;
 /// One point light.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Pod, Zeroable)]
-pub struct GpuLight {
-    pub position: [f32; 3],
+pub(crate) struct GpuLight {
+    pub(crate) position: [f32; 3],
     /// Reach in world units. Nothing beyond this receives any of the light.
-    pub radius: f32,
+    pub(crate) radius: f32,
     /// Linear RGB, already scaled by the intensity the record does not carry.
-    pub colour: [f32; 3],
+    pub(crate) colour: [f32; 3],
     /// How large the emitter itself is, which is what gives its shadows a penumbra.
-    pub source_radius: f32,
+    pub(crate) source_radius: f32,
 }
 
 /// Converts Morrowind's radius into radiant intensity.
@@ -52,14 +52,14 @@ const MIN_SOURCE_RADIUS: f32 = 10.0;
 
 /// A cell's lights, uploaded once.
 #[derive(Debug)]
-pub struct LightBuffer {
+pub(crate) struct LightBuffer {
     buffer: Buffer,
     count: u32,
 }
 
 impl LightBuffer {
     /// Uploads every light in `lights`.
-    pub fn upload(uploader: &mut Uploader, lights: &[Light]) -> rtxmw_gpu::Result<Self> {
+    pub(crate) fn upload(uploader: &mut Uploader, lights: &[Light]) -> rtxmw_gpu::Result<Self> {
         let table: Vec<GpuLight> = lights.iter().map(|light| GpuLight::new(*light)).collect();
         let bytes: &[u8] = bytemuck::cast_slice(&table);
 
@@ -82,12 +82,12 @@ impl LightBuffer {
     }
 
     /// The lights, indexed `0..count`.
-    pub fn buffer(&self) -> &Buffer {
+    pub(crate) fn buffer(&self) -> &Buffer {
         &self.buffer
     }
 
     /// How many lights the buffer holds.
-    pub fn count(&self) -> u32 {
+    pub(crate) fn count(&self) -> u32 {
         self.count
     }
 }

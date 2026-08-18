@@ -1,0 +1,85 @@
+#version 460
+
+// Edge-stopping à-trous wavelet filter over the lighting.
+//
+// One pass of a 5x5 B3-spline blur whose taps are spread `step` pixels apart. Run repeatedly with
+// the step doubling, a handful of passes reach a radius of tens of pixels for the cost of 25 taps
+// each — which is the whole trick: a direct blur of that radius would need hundreds.
+//
+// It filters *lighting*, never the finished image. The albedo a ray reads from a texture is exact
+// and carries all the surface detail; blurring it would be destroying information to hide noise
+// that is not in it.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0, rgba16f) uniform readonly image2D normal_depth;
+layout(set = 0, binding = 1, rgba16f) uniform readonly image2D source;
+layout(set = 0, binding = 2, rgba16f) uniform writeonly image2D target;
+
+layout(push_constant) uniform Pass {
+    // Spacing between taps, in pixels. Doubles every pass; the holes it leaves are what the name
+    // "à trous" refers to.
+    int step;
+} pass;
+
+// The B3 spline `[1, 4, 6, 4, 1] / 16` as a separable 5x5 kernel.
+const float KERNEL[3] = float[](0.375, 0.25, 0.0625);
+
+// How sharply the filter stops at a change of normal. A high power means two surfaces have to be
+// very nearly parallel to blur into each other, which is what keeps a wall's lighting off the floor
+// it meets.
+const float NORMAL_SHARPNESS = 64.0;
+
+// How much of a *relative* depth difference is tolerated. Relative rather than absolute because
+// Morrowind's units put a room's walls tens of units apart and a hillside thousands, and one
+// absolute threshold cannot serve both.
+const float DEPTH_TOLERANCE = 0.02;
+
+float tap_weight(vec4 centre, vec4 neighbour) {
+    // A zero depth is a pixel no ray hit, which has no lighting to contribute. Belt and braces
+    // rather than the thing doing the work: a miss also stores a zero *normal*, so the facing term
+    // below would raise zero to the sharpness power and reach the same answer. Removing this
+    // changes no pixel in any scene — it is here to say what the zeroes mean.
+    if (neighbour.w <= 0.0) {
+        return 0.0;
+    }
+    float facing = max(dot(centre.xyz, neighbour.xyz), 0.0);
+    float depth = abs(centre.w - neighbour.w) / (DEPTH_TOLERANCE * centre.w + 1e-4);
+    return pow(facing, NORMAL_SHARPNESS) * exp(-depth);
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(source);
+    if (any(greaterThanEqual(pixel, size))) {
+        return;
+    }
+
+    vec4 centre = imageLoad(normal_depth, pixel);
+    if (centre.w <= 0.0) {
+        // Nothing was hit here, so there is nothing to filter and nothing that will read it.
+        imageStore(target, pixel, imageLoad(source, pixel));
+        return;
+    }
+
+    vec3 total = vec3(0.0);
+    float weight_total = 0.0;
+    for (int y = -2; y <= 2; ++y) {
+        for (int x = -2; x <= 2; ++x) {
+            ivec2 at = pixel + ivec2(x, y) * pass.step;
+            if (any(lessThan(at, ivec2(0))) || any(greaterThanEqual(at, size))) {
+                continue;
+            }
+            float kernel = KERNEL[abs(x)] * KERNEL[abs(y)];
+            float weight = kernel * tap_weight(centre, imageLoad(normal_depth, at));
+            total += imageLoad(source, at).rgb * weight;
+            weight_total += weight;
+        }
+    }
+
+    // The centre tap always passes its own test, so the total can only be zero if the kernel and
+    // the weights both vanished — which they cannot. Guarded anyway, because dividing the frame by
+    // zero is not a failure worth discovering in a screenshot.
+    vec3 filtered = weight_total > 0.0 ? total / weight_total : imageLoad(source, pixel).rgb;
+    imageStore(target, pixel, vec4(filtered, 1.0));
+}

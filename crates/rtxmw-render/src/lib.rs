@@ -4,6 +4,9 @@ pub mod shaders;
 
 mod acceleration_structure;
 mod auto_exposure;
+mod composite;
+mod denoiser;
+mod gbuffer;
 mod geometry_buffers;
 mod light_buffer;
 mod material_buffers;
@@ -13,12 +16,11 @@ mod texture_array;
 mod tonemap;
 mod visibility_pass;
 
-pub use crate::acceleration_structure::AccelerationStructure;
-pub use crate::geometry_buffers::{GeometryBuffers, MeshRange, SubmeshRange, VertexAttributes};
-pub use crate::light_buffer::{GpuLight, LightBuffer};
-pub use crate::material_buffers::{GpuGeometry, GpuMaterial, MaterialBuffers, NO_TEXTURE};
+// Only what a crate above this one reaches for. Everything else a frame is made of — the passes,
+// their buffers, the G-buffer between them — is assembled by `SceneRenderer` and never named
+// outside; publishing it was letting `unreachable_pub` pass on types nothing could reach.
+pub use crate::geometry_buffers::{GeometryBuffers, MeshRange, VertexAttributes};
 pub use crate::scene_acceleration::SceneAcceleration;
 pub use crate::scene_renderer::{SceneRenderer, TARGET_FORMAT};
-pub use crate::texture_array::TextureArray;
 pub use crate::tonemap::OUTPUT_FORMAT;
-pub use crate::visibility_pass::{FrameConstants, VisibilityPass};
+pub use crate::visibility_pass::FrameConstants;

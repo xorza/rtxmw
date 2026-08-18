@@ -13,6 +13,9 @@
 layout(local_size_x = 8, local_size_y = 8) in;
 
 layout(set = 0, binding = 0) uniform accelerationStructureEXT scene;
+// Emissive surfaces and the sky, which the composite adds the lit result on top of. Keeping them
+// here rather than in an image of their own costs nothing: they are the one part of the frame that
+// is neither noisy nor demodulated, so they want neither the denoiser nor an albedo to divide by.
 layout(set = 0, binding = 1, rgba16f) uniform writeonly image2D target;
 
 // One entry per acceleration structure geometry, addressed by the two halves a hit reports.
@@ -72,10 +75,20 @@ layout(set = 0, binding = 7, scalar) readonly buffer Positions {
     vec3 positions[];
 };
 
+// The G-buffer. Splitting the frame into what a surface *is* and what light reaches it is what
+// makes denoising possible at all: the noise lives entirely in the lighting, and filtering that on
+// its own leaves every texel of albedo detail untouched. Recombining is one multiply.
+//
+// Depth rides in the normal's fourth channel because the two are always wanted together — they are
+// the pair an edge-stopping filter tests to decide whether two pixels are the same surface.
+layout(set = 0, binding = 8, rgba16f) uniform writeonly image2D albedo_target;
+layout(set = 0, binding = 9, rgba16f) uniform writeonly image2D normal_depth_target;
+layout(set = 0, binding = 10, rgba16f) uniform writeonly image2D illumination_target;
+
 // Last binding, and the only runtime-sized one: Vulkan allows a variable descriptor count only on
 // the final element of a set. Slot zero is the fallback, so a material's texture id addresses
 // `id + 1`.
-layout(set = 0, binding = 8) uniform sampler2D textures[];
+layout(set = 0, binding = 11) uniform sampler2D textures[];
 
 // Stands in for a material with no base colour texture. Declared as `NO_TEXTURE` in
 // `material_buffers.rs` too, and pinned there by a test, because a shader cannot see a Rust
@@ -319,6 +332,8 @@ struct Surface {
     vec3 emissive;
     // How wide the ray's cone was where it landed, so a ray spawned here can carry it on.
     float footprint;
+    // Distance from the ray's origin, which for a primary ray is the depth a filter compares.
+    float t;
     bool hit;
 };
 
@@ -330,6 +345,11 @@ struct Surface {
 //
 // `salt` selects the hash stream so two calls for the same pixel do not draw the same sample
 // pattern, and `samples` how finely each light's disc is resolved.
+//
+// **Returns light arriving, not light leaving** — the surface's own albedo is deliberately left
+// out. That is what lets the primary hit's lighting be filtered on its own and multiplied back
+// afterwards; a bounce hit, whose albedo belongs to a different surface, multiplies immediately in
+// `shade`.
 vec3 direct_light(Surface surface, uvec2 pixel, uint salt, uint samples) {
     // Offset along the normal so the surface does not shadow itself on its own triangle.
     vec3 origin = surface.position + surface.normal * SHADOW_BIAS;
@@ -365,7 +385,7 @@ vec3 direct_light(Surface surface, uvec2 pixel, uint salt, uint samples) {
         total += light.colour * facing * attenuation(to_light_length, light.radius)
                * (visible / float(samples));
     }
-    return surface.albedo * INV_PI * total;
+    return INV_PI * total;
 }
 
 // Radiance leaving a hit toward whatever traced it.
@@ -374,8 +394,8 @@ vec3 direct_light(Surface surface, uvec2 pixel, uint salt, uint samples) {
 // a bounce hit differ only in where `incoming` comes from — a gathered hemisphere for the first, the
 // flat ambient that terminates the path for the second. Writing it twice is how the two would drift.
 vec3 shade(Surface surface, vec3 incoming, uvec2 pixel, uint salt, uint samples) {
-    return surface.emissive + surface.albedo * incoming
-         + direct_light(surface, pixel, salt, samples);
+    return surface.emissive
+         + surface.albedo * (incoming + direct_light(surface, pixel, salt, samples));
 }
 
 // Traces one ray and resolves the material at whatever it hits.
@@ -396,6 +416,7 @@ Surface trace(vec3 origin, vec3 direction, float cone_width, float cone_spread) 
     surface.albedo = vec3(0.0);
     surface.emissive = vec3(0.0);
     surface.footprint = 0.0;
+    surface.t = 0.0;
     surface.hit = false;
 
     // No blanket opacity flag: the per-geometry `OPAQUE` bits the build set from each material are
@@ -440,6 +461,7 @@ Surface trace(vec3 origin, vec3 direction, float cone_width, float cone_spread) 
     surface.normal = normalize(mat3(to_world) * interpolate_normal(verts, weights));
     surface.position = origin + direction * hit_t;
     surface.footprint = cone_width + hit_t * cone_spread;
+    surface.t = hit_t;
     surface.emissive = material.emissive;
 
     surface.albedo = material.diffuse;
@@ -504,13 +526,22 @@ void main() {
 
     Surface surface = trace(frame.camera_position, direction, 0.0, frame.cone_spread);
 
-    vec3 colour = vec3(0.05, 0.07, 0.10);
+    // A miss contributes only the sky, and writes zeroes across the G-buffer rather than leaving
+    // it alone. That is not tidiness: the filter reads a neighbourhood, and an untouched pixel
+    // holds whatever the last frame or the allocator left there. A zero depth is the flag it tests,
+    // since a real hit is always at least `RAY_MIN` away.
+    vec3 emitted = vec3(0.05, 0.07, 0.10);
+    vec3 lighting = vec3(0.0);
     if (surface.hit) {
-        vec3 incoming = gather_indirect(surface, pixel);
-        colour = shade(surface, incoming, pixel, STREAM_DIRECT, SHADOW_SAMPLES);
+        emitted = surface.emissive;
+        lighting = gather_indirect(surface, pixel)
+                 + direct_light(surface, pixel, STREAM_DIRECT, SHADOW_SAMPLES);
     }
+    imageStore(albedo_target, ivec2(pixel), vec4(surface.albedo, 1.0));
+    imageStore(normal_depth_target, ivec2(pixel), vec4(surface.normal, surface.t));
+    imageStore(illumination_target, ivec2(pixel), vec4(lighting, 1.0));
     // Alpha carries whether anything was hit at all. Inferring it from the colour worked while the
     // output was barycentric and every hit was bright, but a material can legitimately be dark —
     // so the flag is written rather than guessed at.
-    imageStore(target, ivec2(pixel), vec4(colour, surface.hit ? 1.0 : 0.0));
+    imageStore(target, ivec2(pixel), vec4(emitted, surface.hit ? 1.0 : 0.0));
 }

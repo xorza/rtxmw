@@ -38,6 +38,16 @@ pub fn exposure() -> &'static [u32] {
     include_spirv!("exposure.comp")
 }
 
+/// One edge-stopping à-trous pass over the G-buffer's lighting.
+pub fn denoise() -> &'static [u32] {
+    include_spirv!("denoise.comp")
+}
+
+/// Recombines the G-buffer: albedo times lighting, on top of what a surface emits.
+pub fn composite() -> &'static [u32] {
+    include_spirv!("composite.comp")
+}
+
 /// Exposure, tone curve and sRGB encoding, from linear radiance to display bytes.
 pub fn tonemap() -> &'static [u32] {
     include_spirv!("tonemap.comp")
@@ -56,6 +66,8 @@ mod tests {
             ("primary_visibility", primary_visibility()),
             ("luminance_histogram", luminance_histogram()),
             ("exposure", exposure()),
+            ("denoise", denoise()),
+            ("composite", composite()),
             ("tonemap", tonemap()),
         ] {
             assert!(!module.is_empty(), "{name} is empty");

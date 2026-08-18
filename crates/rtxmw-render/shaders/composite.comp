@@ -1,0 +1,30 @@
+#version 460
+
+// Puts the frame back together: albedo times the light that reached it, on top of what it emits.
+//
+// The inverse of the split the trace writes, and the reason the split is worth making — everything
+// between the two can work on lighting alone, where the noise is, without ever touching a texel of
+// albedo detail.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0, rgba16f) uniform image2D target;
+layout(set = 0, binding = 1, rgba16f) uniform readonly image2D albedo_source;
+layout(set = 0, binding = 2, rgba16f) uniform readonly image2D illumination_source;
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(pixel, imageSize(target)))) {
+        return;
+    }
+
+    // The target already holds what this pixel emits, and its alpha whether a ray hit anything at
+    // all. A miss has no surface to light, and the G-buffer was never written there.
+    vec4 emitted = imageLoad(target, pixel);
+    if (emitted.a == 0.0) {
+        return;
+    }
+    vec3 albedo = imageLoad(albedo_source, pixel).rgb;
+    vec3 lighting = imageLoad(illumination_source, pixel).rgb;
+    imageStore(target, pixel, vec4(emitted.rgb + albedo * lighting, emitted.a));
+}

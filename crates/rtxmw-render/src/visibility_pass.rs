@@ -6,6 +6,7 @@ use glam::{Mat4, Vec3};
 use rtxmw_gpu::{Binding, ComputePipeline, Device, Image};
 
 use crate::acceleration_structure::AccelerationStructure;
+use crate::gbuffer::GBuffer;
 use crate::geometry_buffers::GeometryBuffers;
 use crate::light_buffer::LightBuffer;
 use crate::material_buffers::MaterialBuffers;
@@ -45,7 +46,7 @@ impl FrameConstants {
     ///
     /// `projection` must be the reverse-Z Vulkan projection the shader assumes — it unprojects the
     /// near plane at depth 1, which is the only plane an infinite projection leaves invertible.
-    pub fn new(
+    pub(crate) fn new(
         view: Mat4,
         projection: Mat4,
         camera_position: Vec3,
@@ -69,11 +70,25 @@ impl FrameConstants {
     /// Two pixels' worth of vertical field of view divided by the height, which is the angle one
     /// pixel subtends. Derived from the projection rather than passed separately so it cannot
     /// disagree with the matrix the same frame is unprojected with.
-    pub fn cone_spread_from(projection: Mat4, height: u32) -> f32 {
+    pub(crate) fn cone_spread_from(projection: Mat4, height: u32) -> f32 {
         // The projection's [1][1] is `1 / tan(fov_y / 2)`, negated by the Vulkan Y flip.
         let cot_half_fov = projection.y_axis.y.abs();
         2.0 / (cot_half_fov * height as f32)
     }
+}
+
+/// Everything a trace reads that changes when the cell does.
+///
+/// A bundle rather than seven more parameters: they arrive and go stale together — one cell's worth
+/// of device data — and as a positional list of references, four of which are buffers, transposing
+/// two would compile and then read the wrong table.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SceneBindings<'a> {
+    pub(crate) structure: &'a AccelerationStructure,
+    pub(crate) geometry: &'a GeometryBuffers,
+    pub(crate) tables: &'a MaterialBuffers,
+    pub(crate) lights: &'a LightBuffer,
+    pub(crate) textures: &'a TextureArray,
 }
 
 /// Descriptors for tracing primary rays, over a compute pipeline.
@@ -82,7 +97,7 @@ impl FrameConstants {
 /// material path and no recursion, so a shader binding table would add a build step and a dispatch
 /// indirection for nothing. Revisit when a hit needs to launch further rays it cannot inline.
 #[derive(Debug)]
-pub struct VisibilityPass {
+pub(crate) struct VisibilityPass {
     pipeline: ComputePipeline,
 }
 
@@ -97,7 +112,7 @@ impl VisibilityPass {
     ///
     /// `max_textures` sizes the bindless array's binding. It is a ceiling rather than a count: the
     /// set is allocated with room for it and each scene writes as many slots as it actually has.
-    pub fn new(device: &Device, max_textures: u32) -> rtxmw_gpu::Result<Self> {
+    pub(crate) fn new(device: &Device, max_textures: u32) -> rtxmw_gpu::Result<Self> {
         Ok(Self {
             pipeline: ComputePipeline::new(
                 device,
@@ -110,10 +125,14 @@ impl VisibilityPass {
                     Binding::storage_buffer(5),
                     Binding::storage_buffer(6),
                     Binding::storage_buffer(7),
+                    // The G-buffer the trace splits itself into.
+                    Binding::storage_image(8),
+                    Binding::storage_image(9),
+                    Binding::storage_image(10),
                     // Last, because Vulkan allows a variable descriptor count only on a set's final
                     // binding. Adding anything after this one moves it — validation rejects the set
                     // outright, which is how this was caught.
-                    Binding::variable_samplers(8, max_textures),
+                    Binding::variable_samplers(11, max_textures),
                 ],
                 size_of::<FrameConstants>() as u32,
                 shaders::primary_visibility(),
@@ -126,16 +145,8 @@ impl VisibilityPass {
     /// Takes `&mut self` because it rewrites the one descriptor set the pass owns, which must not
     /// happen while a dispatch using it is in flight. One set is deliberate: the scene changes per
     /// cell, not per frame.
-    pub fn bind(
-        &mut self,
-        scene: &AccelerationStructure,
-        target: &Image,
-        geometry: &GeometryBuffers,
-        tables: &MaterialBuffers,
-        lights: &LightBuffer,
-        textures: &TextureArray,
-    ) {
-        let structures = [scene.raw()];
+    pub(crate) fn bind(&mut self, scene: SceneBindings<'_>, target: &Image, gbuffer: &GBuffer) {
+        let structures = [scene.structure.raw()];
         let mut acceleration = vk::WriteDescriptorSetAccelerationStructureKHR::default()
             .acceleration_structures(&structures);
         // Set by hand because the count lives on the write while the handles live on the chained
@@ -148,17 +159,8 @@ impl VisibilityPass {
             .push_next(&mut acceleration);
         scene_write.descriptor_count = 1;
 
-        let images = [vk::DescriptorImageInfo::default()
-            .image_view(target.view())
-            .image_layout(vk::ImageLayout::GENERAL)];
-        let image_write = vk::WriteDescriptorSet::default()
-            .dst_set(self.pipeline.set())
-            .dst_binding(1)
-            .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
-            .image_info(&images);
-
         let geometry_info = [vk::DescriptorBufferInfo::default()
-            .buffer(tables.geometries().raw())
+            .buffer(scene.tables.geometries().raw())
             .range(vk::WHOLE_SIZE)];
         let geometry_write = vk::WriteDescriptorSet::default()
             .dst_set(self.pipeline.set())
@@ -167,7 +169,7 @@ impl VisibilityPass {
             .buffer_info(&geometry_info);
 
         let material_info = [vk::DescriptorBufferInfo::default()
-            .buffer(tables.materials().raw())
+            .buffer(scene.tables.materials().raw())
             .range(vk::WHOLE_SIZE)];
         let material_write = vk::WriteDescriptorSet::default()
             .dst_set(self.pipeline.set())
@@ -175,15 +177,27 @@ impl VisibilityPass {
             .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
             .buffer_info(&material_info);
 
-        let texture_infos = textures.descriptors();
+        let texture_infos = scene.textures.descriptors();
         let texture_write = vk::WriteDescriptorSet::default()
             .dst_set(self.pipeline.set())
-            .dst_binding(8)
+            .dst_binding(11)
             .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
             .image_info(&texture_infos);
 
+        // The storage images go through the pipeline's own helper: the emissive-and-sky target at
+        // binding one, and the G-buffer as a run from eight.
+        self.pipeline.bind_storage_images(1, &[target]);
+        self.pipeline.bind_storage_images(
+            8,
+            &[
+                gbuffer.albedo(),
+                gbuffer.normal_depth(),
+                gbuffer.illumination(),
+            ],
+        );
+
         let position_info = [vk::DescriptorBufferInfo::default()
-            .buffer(geometry.positions().raw())
+            .buffer(scene.geometry.positions().raw())
             .range(vk::WHOLE_SIZE)];
         let position_write = vk::WriteDescriptorSet::default()
             .dst_set(self.pipeline.set())
@@ -192,7 +206,7 @@ impl VisibilityPass {
             .buffer_info(&position_info);
 
         let light_info = [vk::DescriptorBufferInfo::default()
-            .buffer(lights.buffer().raw())
+            .buffer(scene.lights.buffer().raw())
             .range(vk::WHOLE_SIZE)];
         let light_write = vk::WriteDescriptorSet::default()
             .dst_set(self.pipeline.set())
@@ -201,7 +215,7 @@ impl VisibilityPass {
             .buffer_info(&light_info);
 
         let index_info = [vk::DescriptorBufferInfo::default()
-            .buffer(geometry.indices().raw())
+            .buffer(scene.geometry.indices().raw())
             .range(vk::WHOLE_SIZE)];
         let index_write = vk::WriteDescriptorSet::default()
             .dst_set(self.pipeline.set())
@@ -210,7 +224,7 @@ impl VisibilityPass {
             .buffer_info(&index_info);
 
         let attribute_info = [vk::DescriptorBufferInfo::default()
-            .buffer(geometry.attributes().raw())
+            .buffer(scene.geometry.attributes().raw())
             .range(vk::WHOLE_SIZE)];
         let attribute_write = vk::WriteDescriptorSet::default()
             .dst_set(self.pipeline.set())
@@ -223,7 +237,6 @@ impl VisibilityPass {
             self.pipeline.device().update_descriptor_sets(
                 &[
                     scene_write,
-                    image_write,
                     geometry_write,
                     material_write,
                     texture_write,
@@ -245,7 +258,7 @@ impl VisibilityPass {
     /// # Safety
     /// `command_buffer` must be in the recording state, and [`VisibilityPass::bind`] must have run
     /// for the scene and target in use.
-    pub unsafe fn record(
+    pub(crate) unsafe fn record(
         &self,
         command_buffer: vk::CommandBuffer,
         extent: vk::Extent2D,

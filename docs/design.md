@@ -836,6 +836,65 @@ That is the argument for having done this first.
 frame delta this renderer does not yet plumb through and which is only observable once the camera
 moves between a lit and an unlit space; and HDR output.
 
+### M7 groundwork — a G-buffer and a denoiser over it
+
+With the frame finally visible, the dominant artefact was the indirect lighting's noise. This is the
+half of M7 that needs no external SDK, and none of it is throwaway: DLSS Ray Reconstruction consumes
+the same G-buffer, so only the filter itself is replaced.
+
+**The trace no longer writes a picture. It writes what a surface is, separately from what light
+reaches it.** That split is the whole idea: all the noise is in the lighting, while the albedo a ray
+reads from a texture is exact. Filtering the lighting alone smooths the noise without touching a
+texel of surface detail, and recombining is one multiply. A filter run on the composed frame cannot
+tell the two apart and blurs both.
+
+- `albedo` — base colour, **half float, not the eight bits a reflectance in `0..1` appears to
+  need.** The error does not stay small: the composite multiplies albedo by unbounded illumination,
+  so a quantisation step is scaled by however bright the light is. Measured against the same frame
+  rendered without the split, eight bits moved the mean pixel by 0.32 of 255 and the worst by 37;
+  half float moves the worst by 1. Exact recombination is what the split rests on.
+- `normal_depth` — world normal and distance from the eye, together because they are the pair an
+  edge-stopping filter tests to decide whether two pixels are the same surface.
+- `illumination` — light arriving, albedo divided out, double-buffered for the ping-pong.
+- Emissive surfaces and the sky stay in the existing target, which the composite adds on top of.
+  They are the one part of the frame that is neither noisy nor demodulated, so they need neither the
+  filter nor an albedo to divide by, and keeping them there costs no image at all.
+
+A miss now writes **zeroes** across the G-buffer rather than being skipped. Not tidiness: the filter
+reads a neighbourhood, and an untouched pixel holds whatever the allocator left there.
+
+**The filter is an edge-stopping à-trous wavelet**, four passes with the tap spacing doubling each
+time — 5×5 taps reaching sixteen pixels either way, where a direct blur of that radius would need
+nearly a thousand. Weights are a normal term and a *relative* depth term; relative because
+Morrowind's units put a room's walls tens apart and a hillside thousands, and one absolute threshold
+cannot serve both. Two pipelines over one shader, differing only in which way their descriptor sets
+point, because a pass reads a whole image and writes a whole image and cannot work in place.
+
+Measured on a fixture built to hold three different edges at once:
+
+| | unfiltered | filtered |
+|---|---|---|
+| neighbour-to-neighbour roughness on a flat lit surface | 8.8 | 0.07 |
+| width of an albedo step, in columns | 0 | 0 |
+
+A hundredfold drop in noise with the albedo step still one pixel wide. Fault injection covers each
+term separately, and the fixture had to grow twice to earn that: with only a wall and a floor, whose
+normals are perpendicular, deleting the *depth* term changed nothing, so a panel parallel to the
+wall and identically surfaced was added — two surfaces nothing but depth distinguishes. Composing the
+lighting before filtering, the regression this design exists to prevent, spreads the albedo step
+over fifteen columns.
+
+**What it cost the test suite:** the M6 convergence test measures the estimator's Monte Carlo error,
+which is precisely what a denoiser removes, so it started failing. Every assertion in
+`primary_visibility.rs` is about what the *trace* computes — hand-worked radiance, `1/sqrt(N)`
+convergence, the fraction of rays that hit — so that file now traces unfiltered, and the denoiser
+has a test file of its own.
+
+**Not built: motion vectors.** They need the previous frame's view-projection, and the frame
+constants are already at 100 of Vulkan's guaranteed 128 push-constant bytes — a second matrix does
+not fit, so they need a small per-frame buffer written with `vkCmdUpdateBuffer`. That is
+straightforward, but nothing reads a motion vector until temporal reuse exists, which is M7 proper.
+
 ### M5 — Direct lighting
 Sun as a directional light with a real angular diameter (so shadows are soft), shadow rays, cell
 ambient, `LIGH` point lights with shadow rays and a defensible attenuation model, emissive surfaces.
