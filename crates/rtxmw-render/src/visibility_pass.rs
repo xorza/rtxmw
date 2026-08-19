@@ -32,6 +32,24 @@ pub(crate) struct Lighting {
     /// trace has only its two halves.
     pub(crate) fog: Vec3,
     pub(crate) fog_density: f32,
+    /// Whether the fog forms banks. Weather does that to a landscape; a room's air is still.
+    pub(crate) fog_banked: bool,
+}
+
+impl Default for Lighting {
+    /// Nothing resident, so nothing lights anything.
+    fn default() -> Self {
+        Self {
+            ambient: Vec3::ZERO,
+            light_grid: LightGridExtent::default(),
+            sun: None,
+            water_level: None,
+            fog: Vec3::ZERO,
+            fog_density: 0.0,
+            // Unobservable at zero density, and this is what a cell gets until one records its own.
+            fog_banked: true,
+        }
+    }
 }
 
 /// What the shader needs to turn a pixel into a ray.
@@ -149,6 +167,8 @@ pub struct FrameConstants {
     fog: [f32; 3],
     fog_density: f32,
     fog_strength: f32,
+    /// One where the fog is an even haze rather than banks, which is what a room wants.
+    fog_uniform: f32,
     /// The sinusoids the water surface is summed from — see [`crate::wave_spectrum`].
     ///
     /// Static for the life of a sea state, and carried here rather than in a buffer of its own
@@ -217,6 +237,7 @@ impl FrameConstants {
             fog: lighting.fog.to_array(),
             fog_density: lighting.fog_density,
             fog_strength: sampling.fog,
+            fog_uniform: if lighting.fog_banked { 0.0 } else { 1.0 },
             // Rebuilt each frame rather than cached: it is a few hundred floats of arithmetic once
             // per frame against a million rays that read it, and a cache would need invalidating
             // the moment the sea state becomes something a cell can set.
@@ -600,9 +621,10 @@ mod tests {
         assert_eq!(offset_of!(FrameConstants, fog), 316);
         assert_eq!(offset_of!(FrameConstants, fog_density), 328);
         assert_eq!(offset_of!(FrameConstants, fog_strength), 332);
+        assert_eq!(offset_of!(FrameConstants, fog_uniform), 336);
         // The wave table follows, twenty tightly packed bytes apiece.
-        assert_eq!(offset_of!(FrameConstants, waves), 336);
-        assert_eq!(size_of::<FrameConstants>(), 336 + 20 * WAVE_COUNT);
+        assert_eq!(offset_of!(FrameConstants, waves), 340);
+        assert_eq!(size_of::<FrameConstants>(), 340 + 20 * WAVE_COUNT);
     }
 
     #[test]
@@ -654,14 +676,7 @@ mod tests {
         FrameConstants::new(
             now.viewpoint(projection),
             before.viewpoint(projection),
-            Lighting {
-                ambient: Vec3::ZERO,
-                light_grid: LightGridExtent::default(),
-                sun: None,
-                water_level: None,
-                fog: Vec3::ZERO,
-                fog_density: 0.0,
-            },
+            Lighting::default(),
             Sampling::default(),
             0.0,
             0.0,

@@ -12,14 +12,12 @@ use rtxmw_texture::Texture;
 
 use crate::geometry_buffers::GeometryBuffers;
 use crate::gpu_light::GpuLight;
-use crate::light_grid::{LightGrid, LightGridExtent};
+use crate::light_grid::LightGrid;
 use crate::material_buffers::MaterialBuffers;
 use crate::scene_acceleration::SceneAcceleration;
 use crate::texture_array::TextureArray;
 use crate::visibility_pass::Lighting;
 
-/// One cell's placements, held for as long as it is resident.
-///
 /// How thick an exterior's fog is, until the weather system says.
 ///
 /// The record carries fog only for interiors; an exterior's belongs to the weather, which is per
@@ -34,7 +32,12 @@ const OUTDOOR_FOG_DENSITY: f32 = 0.75;
 /// 0.75 filled a valley — very different amounts of air. This renderer's extinction is absolute, so
 /// the conversion has to be explicit: without it a room reads as a smoke-filled cellar at the
 /// setting that gives a landscape its haze.
-const INDOOR_FOG_SCALE: f32 = 0.035;
+///
+/// **Retuned when the outdoor extinction moved and not before**, which is how the census office
+/// turned into a steam room: this was chosen against an extinction of 1.2e-4 and left alone while
+/// that went to 5e-4, so every interior was silently four times as thick as it had been looked at.
+/// The rest of the drop below that factor is by eye, indoors reading better as a veil than as air.
+const INDOOR_FOG_SCALE: f32 = 0.006;
 
 /// Placements only. Everything a cell *names* — its meshes, its textures, its materials — belongs
 /// to the renderer rather than to the cell, because the cell next door names most of the same
@@ -119,14 +122,7 @@ impl SceneResidency {
             tables,
             lights,
             light_grid,
-            lighting: Lighting {
-                ambient: Vec3::ZERO,
-                light_grid: LightGridExtent::default(),
-                sun: None,
-                water_level: None,
-                fog: Vec3::ZERO,
-                fog_density: 0.0,
-            },
+            lighting: Lighting::default(),
         })
     }
 
@@ -174,22 +170,23 @@ impl SceneResidency {
         self.lighting.ambient = scene.ambient.map_or(Vec3::ZERO, |ambient| ambient.colour);
         self.lighting.sun = scene.sun;
         self.lighting.water_level = scene.water_level;
-        // **Only interiors carry fog in the record.** An exterior's comes from the weather system —
+        // **Only interiors carry fog in the record**, so a recorded density is what identifies one
+        // and settles all three of these together. An exterior's fog belongs to the weather system —
         // per region and per weather, out of the original engine's ini fallbacks rather than the
         // ESM — and none of that is read yet. Until it is, the sky is the honest stand-in: fog is
         // lit by it, so a fog the colour of the sky is what aerial perspective looks like anyway.
-        let ambient = scene.ambient;
-        self.lighting.fog = match ambient {
-            Some(ambient) if ambient.fog_density > 0.0 => ambient.fog,
-            _ => self.lighting.ambient,
-        };
-        self.lighting.fog_density = ambient.map_or(OUTDOOR_FOG_DENSITY, |ambient| {
-            if ambient.fog_density > 0.0 {
-                ambient.fog_density * INDOOR_FOG_SCALE
-            } else {
-                OUTDOOR_FOG_DENSITY
+        match scene.ambient {
+            Some(ambient) if ambient.fog_density > 0.0 => {
+                self.lighting.fog = ambient.fog;
+                self.lighting.fog_density = ambient.fog_density * INDOOR_FOG_SCALE;
+                self.lighting.fog_banked = false;
             }
-        });
+            _ => {
+                self.lighting.fog = self.lighting.ambient;
+                self.lighting.fog_density = OUTDOOR_FOG_DENSITY;
+                self.lighting.fog_banked = true;
+            }
+        }
         Ok(())
     }
 

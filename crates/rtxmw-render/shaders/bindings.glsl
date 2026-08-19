@@ -193,6 +193,9 @@ layout(set = 0, binding = 14, scalar) readonly buffer Frame {
     vec3 fog;
     float fog_density;
     float fog_strength;
+    // One where the fog should be an even haze rather than banks — indoors, where the air is still
+    // and a room is smaller than a single bank would be.
+    float fog_uniform;
     // The sinusoids the sea is summed from, built on the host from an empirical spectrum rather
     // than a series chosen by eye — see `wave_spectrum.rs`.
     Wave waves[WAVE_COUNT];

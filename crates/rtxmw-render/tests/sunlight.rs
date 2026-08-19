@@ -93,6 +93,9 @@ fn trace(scene: &StaticScene, eye: Vec3, forward: Vec3) -> Vec<u8> {
     // question here is what the shadow ray found.
     renderer.set_denoise_passes(0);
     renderer.set_bounce_samples(0);
+    // And no fog, which scatters light into the shadow and would soften an edge these tests need
+    // sharp — the whole measurement here is how wide the sun's own penumbra is.
+    renderer.set_fog(0.0);
 
     let mut uploader = gpu.uploader();
     renderer

@@ -15,10 +15,16 @@ mod common;
 const WIDTH: u32 = 128;
 const HEIGHT: u32 = 128;
 
-/// What the fog scatters, and how thickly. Bright and red so that neither can be confused with the
-/// wall's own colour or with the lamp's.
+/// What the fog scatters. Bright and red so that it cannot be confused with the wall's own colour
+/// or with the lamp's.
 const FOG_COLOUR: Vec3 = Vec3::new(0.6, 0.05, 0.05);
-const FOG_DENSITY: f32 = 12.0;
+
+/// How thickly, which is far above anything an interior ships.
+///
+/// An interior's recorded density is scaled down hard before it reaches the march — a room is meant
+/// to hold a veil, and a veil across a fixture this small measures as noise. What is under test is
+/// the integral over distance, and this buys enough of one to see.
+const FOG_DENSITY: f32 = 140.0;
 
 /// A white wall filling the view `distance` away, facing the camera.
 fn wall(distance: f32, lights: &[Light]) -> StaticScene {

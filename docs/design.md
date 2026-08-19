@@ -2326,7 +2326,7 @@ it is what turns "pools in the valleys" into "the far hillside is paler".
 with. At 1920×1080 and above the difference is inside the run-to-run spread and cannot be measured
 this way.
 
-Four test files now turn fog off, each for a reason already written beside them: `output.rs` because
+Three test files now turn fog off, each for a reason already written beside them: `output.rs` because
 an unlit surface with fog on it is a lit one and that is half of what it measures, `primary_visibility.rs`
 and `terrain.rs` because their assertions are hand-computed radiance and blend weights, and fog is
 atmosphere between the eye and the surface rather than anything the surface does — it also varies
@@ -2334,3 +2334,123 @@ with world position, which is what caught the scene-far-from-the-origin test.
 
 Not done: shafts. Shadowing the fog needs a ray per light per step, which is a different order of
 cost from this, and the lit fog here is a halo around a lantern rather than a beam through a doorway.
+
+### 8.39 Fog that gathers over water, and stops looking like a texture
+
+Two things were wrong with the first version: it was measured from the origin rather than from the
+water, and one noise field scrolling rigidly past reads as a pattern in motion rather than as air.
+
+**It pools where water is.** The density now falls off from the cell's own water level, and the
+`FOG_FLOOR` that kept a fraction of it at every altitude is gone — so a hill stands clear of the
+layer and looking down from one shows the fog below rather than through it. A dry cell has no water
+level, and the shader is handed negative infinity for one, so it falls back to the origin rather than
+putting the fog infinitely far down.
+
+**Three octaves, each on its own heading at its own speed.** The differing speeds are the point:
+[a single field scrolling is a texture sliding past](https://godotshaders.com/shader/moving-gradient-noise-fog-mist-for-godot-4/),
+where octaves shearing against each other make the shapes themselves form and pull apart. The third
+carries a little vertical drift so banks rise and settle. The frequency step is 2.27 rather than 2 so
+the lattices never line up and repeat.
+
+**And a coverage band, which is what makes it patchy rather than merely uneven.** Scaling density by
+a noise gives fog that is everywhere and varies; mapping a band of the noise onto clear-to-thick
+gives banks with gaps between them.
+
+**The band has to sit inside the noise's own range, and getting that wrong made the fog vanish.**
+Averaging octaves narrows the distribution — three of them land mostly within a quarter either side
+of a half — so `smoothstep(0.42, 1.0, fbm)` squared left average coverage near a third of a percent
+and the effect disappeared. At `0.30..0.70`, unsquared, it is fog again. Worth doing the arithmetic
+on a threshold rather than picking one that looks reasonable for a single octave's spread.
+
+The larger structures needed a thicker layer and more extinction to read at all: `FOG_HEIGHT` 520
+against 280, and `FOG_EXTINCTION` 2.6e-4 against 1.2e-4, because a band that is clear half the time
+needs the other half to count for twice as much.
+
+### 8.40 Higher, and warped so it stops looking like a gradient
+
+The layer's scale height goes from 520 units to 2600, so fog fills the air rather than hugging the
+shore — a valley seen from a ridge is now hazed through rather than merely floored with it.
+
+**And the domain is warped**, which §8.39 had listed as not taken further. Before the fbm is
+sampled, the coordinate is displaced sideways by a noise of its own:
+[Quilez's `fbm(p + w·fbm(p))`](https://iquilezles.org/articles/warp/), at one level and with a
+single-octave warp rather than the full construction's fbm-per-component-per-level. Two extra noise
+samples instead of six. Horizontal only: the vertical shape of this fog is the height falloff, and
+warping across that would blur the layer it exists to have.
+
+**The thing that made the difference was making the noise *coarser*, which is the opposite of the
+instinct.** Twenty-four steps over a ray that can run thirty thousand units puts more than a thousand
+between samples, so structure finer than that is not something the frame can show — it aliases into
+noise that the jittered start and the temporal filter then take back out. Adding octaves buys
+nothing at distance. What reads as a bank of fog is the *coarsest* octave, so its cells went from
+1,400 units to 3,000 and the warp to 1,500, and the coverage band narrowed to `0.40..0.56` for a
+harder edge. That is what turned a smooth gradient into something with shape.
+
+**Cost**, minimum of four traces at 960×540: 3.09 ms without fog, 2.94 with — the two are inside this
+laptop's thermal spread and the warp's two extra samples cannot be separated from it at this size.
+
+### 8.41 Structure you can see from the ground, which took two wrong diagnoses
+
+§8.40 said the march's step size was the limit and that coarser noise was the answer. That produced
+fog whose shape was visible only from a ridge, because from the ground everything is near and the
+coarse octave has no cells in view.
+
+**Wrong diagnosis one: uniform steps.** A ray running thirty thousand units gives the first hundred a
+twentieth of one sample and lays the other twenty-three across ground too far to resolve. `fog_depth`
+now squares the parameter so the first step spans about fifty units and the last a couple of
+thousand, which is the same reasoning that makes a froxel grid slice its frustum exponentially. That
+let the grain come back down from 3,000 units to 900.
+
+**Wrong diagnosis two, and the one that mattered: it was never a sampling problem.** Sampling finely
+where the fog is *thin* buys nothing. What the eye reads over a distant hillside is thousands of
+units of integration, and structure at any scale averages out of it — the mean is all that survives.
+Fog has visible shape when it is optically thick over a short distance, so a bank reads white while
+the air beside it is clear.
+
+So the fix was **sparse and dense rather than uniform and thin**: the coverage band moved up to
+`0.44..0.66`, which clears more of the volume, and extinction doubled to 5e-4 to pay for it. That is
+what puts holes in the fog — and holes are what non-uniformity looks like, where a smooth modulation
+of a thin haze is just a gradient.
+
+Overshooting it is instructive too: at `0.55..0.65` with 2e-3 the distance becomes a white wall with
+hard-edged dark blobs punched through it, which is the narrow band's edges meeting a step count that
+cannot resolve them.
+
+**Still not taken**: Perlin-Worley for the base shape with high-frequency Worley eroding the
+silhouette, as [Horizon Zero Dawn's clouds](https://www.slideshare.net/slideshow/the-realtime-volumetric-cloudscapes-of-horizon-zero-dawn/51996465)
+do. Worth revisiting now that the near field is sampled finely, since the reason given for skipping it
+was a sampling rate that no longer applies close to the camera.
+
+A fourth test file turns fog off: the sun's penumbra width, because fog scatters light into a shadow
+and would soften the very edge that test measures.
+
+### 8.42 A room is not a valley, and the census office was a steam room
+
+§8.41 doubled the outdoor extinction to 5e-4 to buy the fog its holes. `INDOOR_FOG_SCALE` had been
+chosen against 1.2e-4 and was not touched, so every interior in the game silently became four times
+as thick as the value anyone had looked at. Seyda Neen's census office rendered as a sauna: the far
+wall gone, the candle a bloom, the room unreadable.
+
+**Two things were wrong, and only one of them was the number.** The other was that interiors were
+running the outdoor coverage field — the same `smoothstep` over warped fractal noise that puts banks
+in a valley. Banks are a landscape feature. Inside a room they are a patch of thick air across one
+corner with none in the next, which reads as a rendering fault rather than as weather, and there is
+nothing indoors for a wind term to mean.
+
+So the coverage field is now selected rather than assumed. `fog_uniform` is a frame constant, and
+`fog_density > 0` in the cell's own record — which only interiors carry — is what sets it:
+
+```glsl
+float banks = smoothstep(FOG_CLEARING, FOG_SOLID, fog_fbm(position));
+float coverage = mix(banks, FOG_EVEN, frame.fog_uniform);
+```
+
+`FOG_EVEN` is 0.5, the middle of what the banked field spans, so switching between them changes the
+shape without changing how much air there is. Then `INDOOR_FOG_SCALE` went from 0.035 to 0.006 —
+rather more than the factor of four the extinction accounts for, the rest by eye, because a room
+reads better holding a veil than holding air.
+
+The fog test caught the retune, which is the useful part: its fixture is an interior, so both changes
+landed on it at once and its gradient fell under the threshold. Raising the fixture's recorded density
+to 140 — far above anything the game ships — is the honest fix, because what it tests is the integral
+over distance and an interior no longer buys enough of one at any density a cell actually has.
