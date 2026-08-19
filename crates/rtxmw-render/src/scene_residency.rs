@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use glam::Vec3;
-use rtxmw_gpu::{Device, RayTracingLimits, Uploader};
+use rtxmw_gpu::{Buffer, Device, RayTracingLimits, Uploader};
 use rtxmw_scene::{
     CellId, Instance, Light, MaterialKind, MaterialTable, Mesh, MeshId, StaticScene, TerrainLayers,
     TextureId,
@@ -11,7 +11,8 @@ use rtxmw_scene::{
 use rtxmw_texture::Texture;
 
 use crate::geometry_buffers::GeometryBuffers;
-use crate::light_buffer::LightBuffer;
+use crate::gpu_light::GpuLight;
+use crate::light_grid::{LightGrid, LightGridExtent};
 use crate::material_buffers::MaterialBuffers;
 use crate::scene_acceleration::SceneAcceleration;
 use crate::texture_array::TextureArray;
@@ -58,7 +59,10 @@ pub(crate) struct SceneResidency {
     cells: Vec<ResidentCell>,
     acceleration: SceneAcceleration,
     tables: MaterialBuffers,
-    lights: LightBuffer,
+    /// Every light every resident cell places, as the shader indexes them.
+    lights: Buffer,
+    /// Which of those lights reach where, so a shading point walks a handful rather than all.
+    light_grid: LightGrid,
     lighting: Lighting,
 }
 
@@ -86,7 +90,8 @@ impl SceneResidency {
         let acceleration = SceneAcceleration::new(device, uploader, limits)?;
         let materials = MaterialTable::default();
         let tables = MaterialBuffers::upload(uploader, &geometry, materials.materials())?;
-        let lights = LightBuffer::upload(uploader, &[])?;
+        let lights = Buffer::storage_of(uploader, "scene lights", &[])?;
+        let light_grid = LightGrid::build(uploader, &[])?;
         Ok(Self {
             geometry,
             textures,
@@ -97,9 +102,10 @@ impl SceneResidency {
             acceleration,
             tables,
             lights,
+            light_grid,
             lighting: Lighting {
                 ambient: Vec3::ZERO,
-                light_count: 0,
+                light_grid: LightGridExtent::default(),
                 sun: None,
                 water_level: None,
             },
@@ -183,14 +189,15 @@ impl SceneResidency {
         self.tables =
             MaterialBuffers::upload(uploader, &self.geometry, self.materials.materials())?;
 
-        let lights: Vec<Light> = self
+        let table: Vec<GpuLight> = self
             .cells
             .iter()
             .flat_map(|cell| cell.lights.iter())
-            .copied()
+            .map(|light| GpuLight::new(*light))
             .collect();
-        self.lights = LightBuffer::upload(uploader, &lights)?;
-        self.lighting.light_count = self.lights.count();
+        self.lights = Buffer::storage_of(uploader, "scene lights", bytemuck::cast_slice(&table))?;
+        self.light_grid = LightGrid::build(uploader, &table)?;
+        self.lighting.light_grid = self.light_grid.extent();
 
         let instances: Vec<Instance> = self
             .cells
@@ -219,7 +226,11 @@ impl SceneResidency {
         &self.tables
     }
 
-    pub(crate) fn lights(&self) -> &LightBuffer {
+    pub(crate) fn light_grid(&self) -> &LightGrid {
+        &self.light_grid
+    }
+
+    pub(crate) fn lights(&self) -> &Buffer {
         &self.lights
     }
 

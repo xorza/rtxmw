@@ -6,6 +6,7 @@ use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc, AllocationScheme};
 
 use crate::error::Result;
 use crate::memory::Memory;
+use crate::uploader::Uploader;
 
 /// Where a buffer's memory lives and which side writes it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,6 +47,28 @@ impl Buffer {
     /// needs valid handles to bind, so callers clamp an empty payload up to this rather than
     /// special-casing the descriptor.
     pub const MIN_SIZE: vk::DeviceSize = 4;
+
+    /// A device-local storage buffer holding `bytes`, uploaded before it is returned.
+    ///
+    /// The shape every table the renderer sends the shader has: sized to its payload, clamped up to
+    /// [`Self::MIN_SIZE`] because an empty one is legal — a scene with no lights, a cell with no
+    /// geometry — and Vulkan rejects a zero-sized buffer, and carrying its own device address so a
+    /// shader can reach it either way. Four tables spelled this out identically before it was one
+    /// call; the flags in particular are a set that has to agree across all of them.
+    pub fn storage_of(uploader: &mut Uploader, name: &str, bytes: &[u8]) -> Result<Self> {
+        let buffer = Self::new(
+            uploader.memory(),
+            name,
+            (bytes.len() as vk::DeviceSize).max(Self::MIN_SIZE),
+            vk::BufferUsageFlags::STORAGE_BUFFER
+                | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
+                | vk::BufferUsageFlags::TRANSFER_DST
+                | vk::BufferUsageFlags::TRANSFER_SRC,
+            BufferMemory::Device,
+        )?;
+        uploader.upload(&buffer, bytes)?;
+        Ok(buffer)
+    }
 
     /// Creates a buffer of `size` bytes and binds memory to it.
     ///

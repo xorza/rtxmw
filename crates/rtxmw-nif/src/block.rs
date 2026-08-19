@@ -523,9 +523,11 @@ impl Block {
             }
             "NiStencilProperty" => {
                 let _net = ObjectNet::read(cursor, ver)?;
-                cursor.skip(2)?;
-                cursor.bool(ver)?;
-                cursor.skip(4 * 5)?;
+                // Flags, then a **one-byte** enabled flag — a `char` in the format, not the
+                // four-byte `bool` this version uses elsewhere — and then seven words: the test
+                // function, the reference and mask, the fail, z-fail and pass actions, and the
+                // draw mode. `components/nif/property.cpp:539`.
+                cursor.skip(2 + 1 + 4 * 7)?;
                 Self::Other {
                     kind: "NiStencilProperty",
                 }
@@ -836,6 +838,64 @@ mod tests {
     fn a_strip_shorter_than_three_indices_yields_nothing() {
         assert!(triangles_from_strip(&[]).is_empty());
         assert!(triangles_from_strip(&[0, 1]).is_empty());
+    }
+
+    /// One property block's bytes: a `NiObjectNET` header naming nothing, then `tail` zero bytes.
+    ///
+    /// The header is what every property starts with — a length-prefixed name and two links — so a
+    /// block that reads its own tail correctly consumes exactly this and stops.
+    fn property_bytes(tail: usize) -> Vec<u8> {
+        let mut bytes = vec![0u8; 4];
+        bytes.extend([0u8; 8]);
+        bytes.extend(std::iter::repeat_n(0u8, tail));
+        bytes
+    }
+
+    #[test]
+    fn every_fixed_size_property_consumes_exactly_its_own_bytes() {
+        // **Blocks in this version carry no size**, so a property that reads one field too few
+        // leaves the file pointing into its own tail and every block after it decodes as garbage.
+        // Nothing downstream notices — the next block type is read from a table, not from the
+        // stream — which is why this is asserted per block rather than left to the corpus.
+        //
+        // Each tail is spelled out from `components/nif/property.cpp`:
+        let properties = [
+            // Flags alone. The test function these gained is 4.1.0.12 and later.
+            ("NiZBufferProperty", 2),
+            ("NiShadeProperty", 2),
+            ("NiSpecularProperty", 2),
+            ("NiWireframeProperty", 2),
+            ("NiDitherProperty", 2),
+            // Flags, then the vertex and lighting modes.
+            ("NiVertexColorProperty", 2 + 4 + 4),
+            // Flags, a byte for enabled, then seven words.
+            ("NiStencilProperty", 2 + 1 + 4 * 7),
+            // Flags and a one-byte threshold.
+            ("NiAlphaProperty", 2 + 1),
+        ];
+        let version = crate::nif_file::version(4, 0, 0, 2);
+        for (kind, tail) in properties {
+            let bytes = property_bytes(tail);
+            let mut cursor = Cursor::new(&bytes);
+            Block::read(kind, &mut cursor, version)
+                .unwrap_or_else(|e| panic!("{kind} should parse: {e}"))
+                .unwrap_or_else(|| panic!("{kind} should be a known block"));
+            assert_eq!(
+                cursor.remaining(),
+                0,
+                "{kind} left {} of its {tail} tail bytes unread",
+                cursor.remaining()
+            );
+
+            // And it must not be satisfied by fewer: one byte short has to fail rather than
+            // quietly stop, which is the half of this a length check alone would miss.
+            let short = property_bytes(tail - 1);
+            let mut cursor = Cursor::new(&short);
+            assert!(
+                Block::read(kind, &mut cursor, version).is_err(),
+                "{kind} read a block one byte shorter than the format allows"
+            );
+        }
     }
 
     #[test]

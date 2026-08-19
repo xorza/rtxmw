@@ -9,7 +9,7 @@ use rtxmw_scene::Sun;
 use crate::acceleration_structure::AccelerationStructure;
 use crate::gbuffer::GBuffer;
 use crate::geometry_buffers::GeometryBuffers;
-use crate::light_buffer::LightBuffer;
+use crate::light_grid::{LightGrid, LightGridExtent};
 use crate::material_buffers::MaterialBuffers;
 use crate::shaders;
 use crate::texture_array::TextureArray;
@@ -20,8 +20,8 @@ use crate::wave_spectrum::{GpuWave, SeaState, WAVE_COUNT};
 pub(crate) struct Lighting {
     /// Sky light outdoors, the cell's own fixed term indoors.
     pub(crate) ambient: Vec3,
-    /// How many entries of the light buffer to read.
-    pub(crate) light_count: u32,
+    /// Where the light grid sits, which is how a shading point finds the lights that reach it.
+    pub(crate) light_grid: LightGridExtent,
     /// The sun, for a cell with a sky.
     pub(crate) sun: Option<Sun>,
     /// Where the water surface sits, for shading what is under it. Absent for a dry cell.
@@ -44,7 +44,15 @@ pub(crate) struct Lighting {
 pub struct FrameConstants {
     inverse_view_projection: [f32; 16],
     camera_position: [f32; 3],
-    light_count: u32,
+    /// Reciprocal of the light grid's cell size, so a lookup multiplies rather than divides.
+    light_grid_scale: f32,
+    /// The corner the light grid is addressed from, and how many cells it spans.
+    ///
+    /// **Zero dimensions is a scene with no lights**, and needs no flag of its own: the shader's
+    /// bounds test rejects every lookup against an empty grid, which is the same code path as a
+    /// point standing outside a grid that does have lights.
+    light_grid_origin: [f32; 3],
+    light_grid_dimensions: [u32; 3],
     /// The cell's fixed lighting, standing in for every bounce the original engine could not
     /// compute. Interiors are mostly this.
     ambient: [f32; 3],
@@ -108,7 +116,9 @@ impl FrameConstants {
         Self {
             inverse_view_projection: (projection * view).inverse().to_cols_array(),
             camera_position: camera_position.to_array(),
-            light_count: lighting.light_count,
+            light_grid_scale: lighting.light_grid.scale,
+            light_grid_origin: lighting.light_grid.origin.to_array(),
+            light_grid_dimensions: lighting.light_grid.dimensions,
             ambient: lighting.ambient.to_array(),
             cone_spread,
             sun_direction: sun.direction.to_array(),
@@ -146,7 +156,8 @@ pub(crate) struct SceneBindings<'a> {
     pub(crate) structure: &'a AccelerationStructure,
     pub(crate) geometry: &'a GeometryBuffers,
     pub(crate) tables: &'a MaterialBuffers,
-    pub(crate) lights: &'a LightBuffer,
+    pub(crate) lights: &'a Buffer,
+    pub(crate) light_grid: &'a LightGrid,
     pub(crate) textures: &'a TextureArray,
 }
 
@@ -209,10 +220,13 @@ impl VisibilityPass {
                     // clock and the block was already exactly the 128 bytes Vulkan guarantees —
                     // see `FrameConstants`. Motion vectors at M7 would have forced the same move.
                     Binding::storage_buffer(11),
+                    // The light grid: prefix offsets, then the light indices they address.
+                    Binding::storage_buffer(12),
+                    Binding::storage_buffer(13),
                     // Last, because Vulkan allows a variable descriptor count only on a set's final
                     // binding. Adding anything after this one moves it — validation rejects the set
                     // outright, which is how this was caught.
-                    Binding::variable_samplers(12, max_textures),
+                    Binding::variable_samplers(14, max_textures),
                 ],
                 0,
                 shaders::primary_visibility(),
@@ -269,7 +283,7 @@ impl VisibilityPass {
         let texture_infos = scene.textures.descriptors();
         let texture_write = vk::WriteDescriptorSet::default()
             .dst_set(self.pipeline.set())
-            .dst_binding(12)
+            .dst_binding(14)
             .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
             .image_info(&texture_infos);
 
@@ -295,13 +309,31 @@ impl VisibilityPass {
             .buffer_info(&position_info);
 
         let light_info = [vk::DescriptorBufferInfo::default()
-            .buffer(scene.lights.buffer().raw())
+            .buffer(scene.lights.raw())
             .range(vk::WHOLE_SIZE)];
         let light_write = vk::WriteDescriptorSet::default()
             .dst_set(self.pipeline.set())
             .dst_binding(6)
             .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
             .buffer_info(&light_info);
+
+        let grid_offset_info = [vk::DescriptorBufferInfo::default()
+            .buffer(scene.light_grid.offsets().raw())
+            .range(vk::WHOLE_SIZE)];
+        let grid_offset_write = vk::WriteDescriptorSet::default()
+            .dst_set(self.pipeline.set())
+            .dst_binding(12)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(&grid_offset_info);
+
+        let grid_index_info = [vk::DescriptorBufferInfo::default()
+            .buffer(scene.light_grid.indices().raw())
+            .range(vk::WHOLE_SIZE)];
+        let grid_index_write = vk::WriteDescriptorSet::default()
+            .dst_set(self.pipeline.set())
+            .dst_binding(13)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(&grid_index_info);
 
         let index_info = [vk::DescriptorBufferInfo::default()
             .buffer(scene.geometry.indices().raw())
@@ -333,6 +365,8 @@ impl VisibilityPass {
                     index_write,
                     attribute_write,
                     light_write,
+                    grid_offset_write,
+                    grid_index_write,
                     position_write,
                 ],
                 &[],
@@ -390,18 +424,20 @@ mod tests {
         // everything after it and the shader reads the whole frame displaced.
         assert_eq!(offset_of!(FrameConstants, inverse_view_projection), 0);
         assert_eq!(offset_of!(FrameConstants, camera_position), 64);
-        assert_eq!(offset_of!(FrameConstants, light_count), 76);
-        assert_eq!(offset_of!(FrameConstants, ambient), 80);
-        assert_eq!(offset_of!(FrameConstants, cone_spread), 92);
-        assert_eq!(offset_of!(FrameConstants, sun_direction), 96);
-        assert_eq!(offset_of!(FrameConstants, sun_cos_radius), 108);
-        assert_eq!(offset_of!(FrameConstants, sun_colour), 112);
-        assert_eq!(offset_of!(FrameConstants, bounce_samples), 124);
-        assert_eq!(offset_of!(FrameConstants, water_level), 128);
-        assert_eq!(offset_of!(FrameConstants, time), 132);
+        assert_eq!(offset_of!(FrameConstants, light_grid_scale), 76);
+        assert_eq!(offset_of!(FrameConstants, light_grid_origin), 80);
+        assert_eq!(offset_of!(FrameConstants, light_grid_dimensions), 92);
+        assert_eq!(offset_of!(FrameConstants, ambient), 104);
+        assert_eq!(offset_of!(FrameConstants, cone_spread), 116);
+        assert_eq!(offset_of!(FrameConstants, sun_direction), 120);
+        assert_eq!(offset_of!(FrameConstants, sun_cos_radius), 132);
+        assert_eq!(offset_of!(FrameConstants, sun_colour), 136);
+        assert_eq!(offset_of!(FrameConstants, bounce_samples), 148);
+        assert_eq!(offset_of!(FrameConstants, water_level), 152);
+        assert_eq!(offset_of!(FrameConstants, time), 156);
         // The wave table follows, twenty tightly packed bytes apiece.
-        assert_eq!(offset_of!(FrameConstants, waves), 136);
-        assert_eq!(size_of::<FrameConstants>(), 136 + 20 * WAVE_COUNT);
+        assert_eq!(offset_of!(FrameConstants, waves), 160);
+        assert_eq!(size_of::<FrameConstants>(), 160 + 20 * WAVE_COUNT);
     }
 
     #[test]
@@ -437,7 +473,7 @@ mod tests {
             eye,
             Lighting {
                 ambient: Vec3::ZERO,
-                light_count: 0,
+                light_grid: LightGridExtent::default(),
                 sun: None,
                 water_level: None,
             },

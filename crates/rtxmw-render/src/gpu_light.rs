@@ -1,13 +1,11 @@
-//! The point lights a cell places, as the shader reads them.
+//! One point light, as the shader reads it.
 
-use ash::vk;
 use bytemuck::{Pod, Zeroable};
-use rtxmw_gpu::{Buffer, BufferMemory, Uploader};
 use rtxmw_scene::Light;
 
 /// One point light.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Default, PartialEq, Pod, Zeroable)]
+#[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable)]
 pub(crate) struct GpuLight {
     pub(crate) position: [f32; 3],
     /// Reach in world units. Nothing beyond this receives any of the light.
@@ -50,51 +48,9 @@ const SOURCE_FRACTION: f32 = 0.08;
 /// come out as points again and their shadows would snap back to hard edges.
 const MIN_SOURCE_RADIUS: f32 = 10.0;
 
-/// A cell's lights, uploaded once.
-#[derive(Debug)]
-pub(crate) struct LightBuffer {
-    buffer: Buffer,
-    count: u32,
-}
-
-impl LightBuffer {
-    /// Uploads every light in `lights`.
-    pub(crate) fn upload(uploader: &mut Uploader, lights: &[Light]) -> rtxmw_gpu::Result<Self> {
-        let table: Vec<GpuLight> = lights.iter().map(|light| GpuLight::new(*light)).collect();
-        let bytes: &[u8] = bytemuck::cast_slice(&table);
-
-        let buffer = Buffer::new(
-            uploader.memory(),
-            "scene lights",
-            (bytes.len() as vk::DeviceSize).max(Buffer::MIN_SIZE),
-            vk::BufferUsageFlags::STORAGE_BUFFER
-                | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
-                | vk::BufferUsageFlags::TRANSFER_DST
-                | vk::BufferUsageFlags::TRANSFER_SRC,
-            BufferMemory::Device,
-        )?;
-        uploader.upload(&buffer, bytes)?;
-
-        Ok(Self {
-            buffer,
-            count: table.len() as u32,
-        })
-    }
-
-    /// The lights, indexed `0..count`.
-    pub(crate) fn buffer(&self) -> &Buffer {
-        &self.buffer
-    }
-
-    /// How many lights the buffer holds.
-    pub(crate) fn count(&self) -> u32 {
-        self.count
-    }
-}
-
 impl GpuLight {
     /// Flattens a scene light, folding its intensity into the colour.
-    fn new(light: Light) -> Self {
+    pub(crate) fn new(light: Light) -> Self {
         let scale = light.radius * light.radius * INTENSITY;
         Self {
             position: light.position.to_array(),

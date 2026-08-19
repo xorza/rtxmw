@@ -18,6 +18,7 @@ use crate::auto_exposure::AutoExposure;
 use crate::composite::Composite;
 use crate::denoiser::{DEFAULT_PASSES, Denoiser};
 use crate::gbuffer::GBuffer;
+use crate::light_grid::LightGridExtent;
 use crate::scene_residency::SceneResidency;
 use crate::tonemap::Tonemap;
 use crate::visibility_pass::{FrameConstants, Lighting, SceneBindings, VisibilityPass};
@@ -308,6 +309,7 @@ impl SceneRenderer {
                 geometry: scene.geometry(),
                 tables: scene.tables(),
                 lights: scene.lights(),
+                light_grid: scene.light_grid(),
                 textures: scene.textures(),
             },
             &self.target,
@@ -364,7 +366,7 @@ impl SceneRenderer {
         let lighting = self.scene.as_ref().map_or(
             Lighting {
                 ambient: Vec3::ZERO,
-                light_count: 0,
+                light_grid: LightGridExtent::default(),
                 sun: None,
                 water_level: None,
             },

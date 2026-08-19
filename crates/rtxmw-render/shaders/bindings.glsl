@@ -101,7 +101,17 @@ layout(set = 0, binding = 10, rgba16f) uniform writeonly image2D illumination_ta
 // Last binding, and the only runtime-sized one: Vulkan allows a variable descriptor count only on
 // the final element of a set. Slot zero is the fallback, so a material's texture id addresses
 // `id + 1`.
-layout(set = 0, binding = 12) uniform sampler2D textures[];
+// The light grid: cell `i` owns `light_grid_indices[light_grid_offsets[i] .. [i + 1]]`, which is
+// why the offsets carry a trailing sentinel. Built in `light_grid.rs`.
+layout(set = 0, binding = 12, scalar) readonly buffer LightGridOffsets {
+    uint light_grid_offsets[];
+};
+
+layout(set = 0, binding = 13, scalar) readonly buffer LightGridIndices {
+    uint light_grid_indices[];
+};
+
+layout(set = 0, binding = 14) uniform sampler2D textures[];
 
 // Stands in for a material with no base colour texture. Declared as `NO_TEXTURE` in
 // `material_buffers.rs` too, and pinned there by a test, because a shader cannot see a Rust
@@ -131,7 +141,11 @@ struct Wave {
 layout(set = 0, binding = 11, scalar) readonly buffer Frame {
     mat4 inverse_view_projection;
     vec3 camera_position;
-    uint light_count;
+    // Reciprocal of the light grid's cell size, then the corner it is addressed from and how many
+    // cells it spans. Zero dimensions is a scene with no lights.
+    float light_grid_scale;
+    vec3 light_grid_origin;
+    uvec3 light_grid_dimensions;
     vec3 ambient;
     float cone_spread;
     // The direction the sun's light *travels*, so the direction to it is the negation.

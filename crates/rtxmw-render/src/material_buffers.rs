@@ -1,8 +1,7 @@
 //! The per-geometry and per-material tables a hit reads.
 
-use ash::vk;
 use bytemuck::{Pod, Zeroable};
-use rtxmw_gpu::{Buffer, BufferMemory, Uploader};
+use rtxmw_gpu::{Buffer, Uploader};
 use rtxmw_scene::{AlphaMode, Material, MaterialKind, TerrainLayers};
 
 use crate::geometry_buffers::GeometryBuffers;
@@ -160,26 +159,9 @@ impl MaterialBuffers {
         let geometry_bytes: &[u8] = bytemuck::cast_slice(&geometry_table);
         let material_bytes: &[u8] = bytemuck::cast_slice(&material_table);
 
-        let geometries = Buffer::new(
-            uploader.memory(),
-            "scene geometry table",
-            (geometry_bytes.len() as vk::DeviceSize).max(Buffer::MIN_SIZE),
-            usage(),
-            BufferMemory::Device,
-        )?;
-        let materials_buffer = Buffer::new(
-            uploader.memory(),
-            "scene material table",
-            (material_bytes.len() as vk::DeviceSize).max(Buffer::MIN_SIZE),
-            usage(),
-            BufferMemory::Device,
-        )?;
-        uploader.upload(&geometries, geometry_bytes)?;
-        uploader.upload(&materials_buffer, material_bytes)?;
-
         Ok(Self {
-            geometries,
-            materials: materials_buffer,
+            geometries: Buffer::storage_of(uploader, "scene geometry table", geometry_bytes)?,
+            materials: Buffer::storage_of(uploader, "scene material table", material_bytes)?,
         })
     }
 
@@ -195,13 +177,6 @@ impl MaterialBuffers {
 }
 
 /// Read-only in a shader and written by a staging copy.
-fn usage() -> vk::BufferUsageFlags {
-    vk::BufferUsageFlags::STORAGE_BUFFER
-        | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
-        | vk::BufferUsageFlags::TRANSFER_DST
-        | vk::BufferUsageFlags::TRANSFER_SRC
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

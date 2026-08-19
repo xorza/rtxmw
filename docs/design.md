@@ -2258,6 +2258,70 @@ fully resident:
 What made one a time the rule was the top-level rebuild, and that happens once per frame however many
 cells landed in it.
 
+### 7.24 The lights were walked one at a time, and that was most of a town's frame
+
+Two things were wrong with point lights, and only the second was visible as a number at first.
+
+**A distant cell's lamps reach nothing and cost everything.** §7.23 has the measurement: the 229
+`LIGH` references in the cells beyond the streaming window cost 3.8 ms of a 5–6 ms trace, because
+the shader walked every light in the scene for every shading point — primary and bounce alike — with
+no bound on count or distance. Distant cells now place their lamps and drop their lights.
+
+**That left the shape of the problem, which is that the loop is linear in the whole world.** Even a
+light nowhere near the point costs a fetch and a distance test: **0.031 ms per light per frame at
+1920×1080**, whether or not it contributes. Three filters were tried on the geometry before the
+lights were suspected, and their failure is what pointed at them — removing 99% of the *instances*
+saved 0.9 ms while removing the lights saved 3.8.
+
+**The fix is a uniform grid over the lights**, in world space rather than screen space, because a
+bounce hit is not on screen and a screen-space cluster list could not answer for it. Cell `i` owns
+`indices[offsets[i]..offsets[i + 1]]` — a prefix sum with a trailing sentinel, so the whole structure
+is two buffers however many cells it has, built by a counting sort at the same commit that rebuilds
+the top level. The cell size starts at one terrain tile and **doubles until the grid fits two
+budgets**: 65,536 cells, and 262,144 index entries. The second is not redundant — a wide world
+overruns the first, and one light with an enormous reach overruns the second while the grid is still
+small.
+
+**What it is worth.** Vivec is the worst light density that exists in the game: 173 lights in one
+7×7 window, against 53 in Balmora and 20 in a typical interior. At 1920×1080, extra lights scattered
+over the loaded window:
+
+| lights | with the grid | walking them all |
+|---|---|---|
+| 173, as shipped | **4.78 ms** | 6.91 ms |
+| +500 | 5.06 ms | 19.03 ms |
+| +2,000 | 5.05 ms | 66.00 ms |
+
+Flat where the old loop was linear, and 1.8 ms — a quarter of the trace — on the real scene. Below
+about fifty lights the two are within noise, which is the honest bound on it: this buys a town, not
+a room.
+
+**The output is bit-identical.** Forcing the grid to a single cell reproduces the old walk through
+the same code path, and the two renders differ in 0 of 2,073,600 pixels. The grid may offer a light
+that turns out not to reach — it bins by bounding box and the shader's distance test settles it —
+but it must never withhold one that does, and that one-sidedness is asserted against the brute-force
+answer over a sweep of probes rather than assumed. Binning by a light's centre instead of its reach
+fails it.
+
+### 7.25 A stencil property was five bytes short, and nothing could have noticed
+
+`NiStencilProperty` read flags, a versioned `bool` and five words. The format is flags, a **one-byte**
+enabled flag — a `char`, not the four-byte `bool` this NIF version uses elsewhere — and seven words:
+test function, reference, mask, the fail, z-fail and pass actions, and the draw mode. Twenty-six
+bytes read against thirty-one.
+
+**Blocks in this version carry no size**, so the next block's type comes from a table in the header
+rather than from the stream: a property that reads one field too few leaves the file pointing into
+its own tail and everything after it decodes as garbage, silently. No shipped mesh could catch it —
+**0 of 7,319 name the block** — which is exactly why the corpus test passed and why this needed
+pinning per block rather than by parsing more files.
+
+Every fixed-size property now has its byte count asserted directly: a synthetic block of exactly the
+documented length must be consumed whole, and one byte shorter must fail rather than quietly stop.
+The old reading fails it with "left 5 of its 31 tail bytes unread". The same mistake in the other
+direction is already annotated three blocks away at `NiSourceTexture`, where a `char` read as a
+`bool` over-consumed by three.
+
 ### 7.8 Costs and risks
 
 - **Water pixels cost roughly twice.** Two rays instead of one, each spawning its own shadow rays.
