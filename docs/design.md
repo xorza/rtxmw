@@ -2085,6 +2085,34 @@ are ever regenerated from a spectrum rather than a fixed ratio.
 4. **TMA plus Donelan-Banner** replacing the geometric series, which is the correctness rework and
    the one that would want its own before-and-after.
 
+### 7.20 The visibility shader is six files
+
+`primary_visibility.comp` had reached 1,243 lines and was more than half water. It is now 78 — a
+header, six includes and `main` — with the rest in `.glsl` modules beside it. The build already
+excluded `.glsl` from compilation and already rebuilt on any change under `shaders/`, so the
+machinery for this existed and had simply never been used.
+
+The split is not by topic but by **dependency order**, which is the only order GLSL allows:
+
+| | |
+|---|---|
+| `bindings.glsl` | the descriptor set and the structs in it — the whole of what the host must agree with |
+| `sampling.glsl` | hashing and direction sampling, no bindings touched |
+| `surface.glsl` | attribute fetch, cone LOD, the cutout test, and both traversals |
+| `lighting.glsl` | next-event estimation, the sky, one bounce |
+| `waves.glsl` | the height field and its gradient |
+| `water.glsl` | Fresnel, absorption, caustics |
+
+**One forward declaration in the whole file set.** Lighting needs the sun dimmed on its way down
+through water and water needs a surface shaded, which is a cycle; declaring `sun_through_water` and
+`daylight_reaching` at the top of `lighting.glsl` breaks it and everything else falls in a line.
+Putting water first instead would have cost three.
+
+Two Rust files crossed the threshold this repository sets for splitting tests out — `wave_spectrum`
+at 176 lines and 43%, `geometry_buffers` at 180 — and are now `{mod.rs, tests.rs}` directories.
+
+The whole refactor is **pixel-identical**, which is the only claim worth making about it.
+
 ### 7.8 Costs and risks
 
 - **Water pixels cost roughly twice.** Two rays instead of one, each spawning its own shadow rays.
