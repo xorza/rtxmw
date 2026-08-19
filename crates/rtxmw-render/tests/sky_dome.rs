@@ -9,12 +9,16 @@ use ash::vk;
 use glam::{Vec2, Vec3};
 use rtxmw_gpu::{TestGpu, readback};
 use rtxmw_render::SceneRenderer;
-use rtxmw_scene::{CellId, Sky, TimeOfDay};
+use rtxmw_scene::{CellId, Moon, Sky, WorldTime};
 
 mod common;
 
 const WIDTH: u32 = 160;
 const HEIGHT: u32 = 160;
+
+/// The view the dome is checked across, and the one a moon is.
+const WIDE: f32 = 75.0;
+const NARROW: f32 = 10.0;
 
 /// A cell with nothing in it, so every ray escapes and every pixel is sky.
 ///
@@ -26,8 +30,12 @@ fn empty() -> rtxmw_scene::StaticScene {
     scene
 }
 
-/// The frame a camera at `forward` sees, and the direction each of its pixels looked along.
-fn looking(sky: Sky, forward: Vec3) -> (Vec<u8>, Vec<Vec3>) {
+/// The frame a camera at `forward` sees across `fov`, and the direction each pixel looked along.
+///
+/// **The field of view is a parameter because the moons need a narrow one.** Masser is 5.4 degrees
+/// across, which in the 75 the dome tests use is ten pixels of a 160-square frame — too few to say
+/// anything about a terminator. A ten-degree view puts the same disc across half the frame.
+fn looking(sky: Sky, forward: Vec3, degrees: f32) -> (Vec<u8>, Vec<Vec3>) {
     let gpu = TestGpu::shared();
     let mut renderer = SceneRenderer::new(
         gpu.device(),
@@ -58,7 +66,7 @@ fn looking(sky: Sky, forward: Vec3) -> (Vec<u8>, Vec<Vec3>) {
 
     let eye = Vec3::ZERO;
     let view = glam::camera::rh::view::look_to_mat4(eye, forward, Vec3::Z);
-    let fov = 75f32.to_radians();
+    let fov = degrees.to_radians();
     let projection = glam::camera::rh::proj::vulkan::perspective_infinite_reverse(fov, 1.0, 0.05);
     let constants = renderer.frame_constants(view, projection, eye);
     renderer
@@ -112,13 +120,13 @@ fn every_pixel_of_the_sky_is_what_the_scene_crate_says_it_is() {
         // a hash. The test below is what says they are there at all; this one is about the dome.
         let sky = Sky {
             stars: 0.0,
-            ..Sky::at(TimeOfDay::hours(hour))
+            ..Sky::at(WorldTime::hours(hour))
         };
         let to_sun = -sky.sun.direction;
         // Facing across the sun rather than at it, so one edge of the frame is the sunward sky and
         // the other is the sky opposite — the axis the dome varies most along.
         let forward = to_sun.cross(Vec3::Z).normalize();
-        let (pixels, directions) = looking(sky, forward);
+        let (pixels, directions) = looking(sky, forward, WIDE);
 
         let (mut worst, mut worst_at) = (0.0f32, Vec3::ZERO);
         for (index, direction) in directions.iter().enumerate() {
@@ -149,8 +157,9 @@ fn the_stars_come_out_at_night_and_only_at_night() {
     // an empty sky of any brightness has none of.
     let contrast = |hour: f32| {
         let (pixels, _) = looking(
-            Sky::at(TimeOfDay::hours(hour)),
+            Sky::at(WorldTime::hours(hour)),
             Vec3::new(0.3, 0.0, 0.95).normalize(),
+            WIDE,
         );
         let mut values: Vec<f32> = (0..(WIDTH * HEIGHT) as usize)
             .map(|i| at(&pixels, i).max_element())
@@ -180,7 +189,7 @@ fn the_stars_come_out_at_night_and_only_at_night() {
 fn the_sky_is_warm_toward_a_low_sun_and_pale_and_dim_away_from_it() {
     // **What the whole change is for**, and it is worth asserting separately from the cross-check
     // above: that one would still pass if both implementations were a flat colour.
-    let sky = Sky::at(TimeOfDay::hours(17.8));
+    let sky = Sky::at(WorldTime::hours(17.8));
     let to_sun = -sky.sun.direction;
     let flat = |towards: Vec3| Vec3::new(towards.x, towards.y, 0.0).normalize();
     let (sunward, away) = (sky.shape(flat(to_sun)), sky.shape(flat(-to_sun)));
@@ -215,11 +224,109 @@ fn the_sky_is_warm_toward_a_low_sun_and_pale_and_dim_away_from_it() {
 
     // And overhead it is blue at every hour — the thinnest air on the dome.
     for hour in [9.0, 12.0, 17.5] {
-        let overhead = Sky::at(TimeOfDay::hours(hour));
+        let overhead = Sky::at(WorldTime::hours(hour));
         let zenith = overhead.shape(Vec3::Z);
         assert!(
             zenith.z > zenith.x,
             "the zenith is not blue at {hour}: {zenith:?}"
+        );
+    }
+}
+
+#[test]
+fn both_moons_are_the_discs_the_scene_crate_puts_in_the_sky() {
+    // **The second equation written in two languages**, after the dome itself: `Moon::radiance` and
+    // `moon_disc` in `lighting.glsl` are the same lit sphere, and only this stops them drifting.
+    // The sign on the sphere's bulge was wrong once already — it inverts the phase, showing a
+    // gibbous moon as a crescent, which no assertion about brightness or position would have caught.
+    // **Stars off**, as the dome's own cross-check has them: a star landing on a moon's disc is
+    // sixty times the sky's floor added to a pixel this is trying to attribute to the moon, and it
+    // is drawn from a hash `Moon::radiance` knows nothing about.
+    let sky = Sky {
+        stars: 0.0,
+        ..Sky::at(WorldTime::hours(23.0))
+    };
+    for (name, moon) in [("masser", sky.masser), ("secunda", sky.secunda)] {
+        // Straight at it, so the disc is near the middle of the frame where a pixel's direction is
+        // least distorted and the whole of it is in view.
+        let forward = -moon.direction;
+        let (pixels, directions) = looking(sky, forward, NARROW);
+
+        let (mut worst, mut worst_at) = (0.0f32, Vec3::ZERO);
+        let (mut covered, mut lit, mut dark) = (0, 0, 0);
+        for (index, direction) in directions.iter().enumerate() {
+            // Inside the disc is the cone test and nothing else, which is what says how *wide* the
+            // moon is — the lit fraction says nothing about that, and a new moon has none of it.
+            if direction.dot(-moon.direction) <= moon.angular_radius.cos() {
+                continue;
+            }
+            covered += 1;
+            let disc = moon.radiance(*direction, sky.sun.direction);
+            match disc.max_element() > 0.5 * moon.colour.max_element() {
+                true => lit += 1,
+                false => dark += 1,
+            }
+            // Drawn *on top of* the sky rather than instead of it: a moon is behind the air, and
+            // the airglow in front of it adds. So the pixel is both, which is what the shader sums.
+            let wanted = sky.shape(*direction) + Sky::NIGHT_FLOOR + disc;
+            if wanted.max_element() > 0.97 {
+                continue;
+            }
+            let error = (at(&pixels, index) - wanted).abs().max_element();
+            if error > worst {
+                (worst, worst_at) = (error, *direction);
+            }
+        }
+
+        // **The disc is the width the ini says**, measured off the frame rather than off the field
+        // it was computed in: a moon of angular radius `r` seen through a view of half-angle `f`
+        // covers `pi * (r * (WIDTH / 2) / tan(f))^2` pixels, near enough at these angles.
+        let scale = (WIDTH as f32 * 0.5) / (NARROW.to_radians() * 0.5).tan();
+        let expected = std::f32::consts::PI * (moon.angular_radius * scale).powi(2);
+        let ratio = covered as f32 / expected;
+        assert!(
+            (ratio - 1.0).abs() < 0.05,
+            "{name} covered {covered} pixels where the ini's size wants {expected:.0}"
+        );
+        // And a terminator runs across it, or the comparison above would pass just as well against
+        // a flat disc of one colour. A twelfth, because at this hour of the first day Secunda is all
+        // but full and the shadowed part of it is a sliver down one limb.
+        assert!(
+            lit > covered / 12 && dark > covered / 12,
+            "{name} has no terminator: {lit} lit, {dark} dark of {covered}"
+        );
+        // A little over one part in 255, which is what an 8-bit target can carry.
+        assert!(
+            worst < 0.006,
+            "{name}: the shader and `Moon::radiance` disagree by {worst} looking {worst_at:?}"
+        );
+    }
+
+    // And the bigger moon covers the more sky, which is the one thing a per-pixel comparison of two
+    // agreeing implementations cannot tell you — they would agree about a moon of any size.
+    assert!(sky.masser.angular_radius > 2.0 * sky.secunda.angular_radius);
+}
+
+#[test]
+fn a_moon_that_has_set_is_not_drawn_and_the_day_has_none() {
+    // Noon: both moons are the far side of the world, so the sky where they *would* be is empty.
+    let noon = Sky::at(WorldTime::hours(12.0));
+    assert_eq!(noon.masser.colour, Vec3::ZERO, "Masser is up at noon");
+    assert_eq!(noon.secunda.colour, Vec3::ZERO, "Secunda is up at noon");
+
+    // Which is a claim about the picture and not only about the numbers: pointing where a moon
+    // would have stood draws nothing but sky.
+    let forward = -Moon::masser(WorldTime::hours(12.0), noon.sun).direction;
+    let (pixels, directions) = looking(noon, forward, NARROW);
+    for (index, direction) in directions.iter().enumerate() {
+        let wanted = noon.shape(*direction) + Sky::NIGHT_FLOOR;
+        if wanted.max_element() > 0.97 {
+            continue;
+        }
+        let error = (at(&pixels, index) - wanted).abs().max_element();
+        assert!(
+            error < 0.006,
+            "something is drawn at noon looking {direction:?}"
         );
     }
 }

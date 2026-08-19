@@ -2,8 +2,10 @@
 
 use glam::Vec3;
 
+use crate::moon::Moon;
+use crate::srgb::LUMA;
 use crate::sun::Sun;
-use crate::time_of_day::TimeOfDay;
+use crate::world_time::WorldTime;
 
 /// Optical depth of the whole atmosphere looking straight up, per channel.
 ///
@@ -28,8 +30,9 @@ const SKY_STRENGTH: f32 = 1.5786;
 
 /// What the sky radiates once the sun is properly down.
 ///
-/// Not moonlight — Morrowind has two moons and this renderer draws neither yet. It is the floor that
-/// keeps a night exterior legible rather than black, and it is blue because scotopic vision is.
+/// **Not moonlight**, which is [`Moon`]'s and arrives as a direction rather than as a floor. This is
+/// the airglow and the starlight that are there on a moonless night too — what keeps a night
+/// exterior legible rather than black, blue because scotopic vision is.
 ///
 /// **Quartering this to darken the night sky was tried and put back.** The sky and the ground are the
 /// same number here by construction — §8.49 tied the ambient to the dome's own average, which is
@@ -38,9 +41,10 @@ const SKY_STRENGTH: f32 = 1.5786;
 /// that for a linear 0.01 is 0.0094, sixteen times the value, and Seyda Neen went black while the
 /// sky stayed legible.
 ///
-/// Nothing that scales the whole scene can separate the two. What can is a second light source that
-/// falls on surfaces and not on the sky — which is moonlight, and is why the moons are the next thing
-/// to build rather than a smaller number here.
+/// **The second light source that can separate the two now exists**, which is what the moons were
+/// built for: moonlight falls on surfaces and not on the sky, so a lower floor no longer has to take
+/// the ground with it. It is left where it is all the same, because the hours a moon is down are
+/// still lit by this alone and `NIGHT_STOPS` was settled by eye against this number.
 ///
 /// **Added to the daylight term rather than crossfaded with it**, which is not a detail: starlight
 /// is another source and not a replacement for the sun, and a sum of two positive things cannot come
@@ -96,6 +100,13 @@ const AWAY_SHARE: f32 = 0.25;
 pub struct Sky {
     /// Black once the sun is down, which is how a cell with no sun says so.
     pub sun: Sun,
+    /// The larger moon, red and low-contrast, the one this sky is remembered for.
+    ///
+    /// Lit by [`Self::sun`] wherever it stands, so its phase is never told what to be — see
+    /// [`Moon`]. [`Moon::NONE`] for a cell with no sky.
+    pub masser: Moon,
+    /// The smaller one, pale and grey, on an arc that crosses Masser's. Otherwise as above.
+    pub secunda: Moon,
     /// The dome's average radiance, which is what an unshadowed surface receives from all of it.
     ///
     /// Derived from [`Self::shape`] rather than beside it, so the light a surface is given and
@@ -109,7 +120,7 @@ pub struct Sky {
     pub warmth: f32,
     /// What the dome's shape is multiplied by to give radiance.
     pub scale: f32,
-    /// How much of the star field is out, from none to all of it — [`TimeOfDay::starlight`].
+    /// How much of the star field is out, from none to all of it — [`WorldTime::starlight`].
     pub stars: f32,
     /// What the hour multiplies the metered exposure by — a bias on it, never the exposure itself.
     ///
@@ -118,9 +129,6 @@ pub struct Sky {
     /// midnight. Noon is one and the deepest night is `NIGHT_STOPS` below it.
     pub exposure_bias: f32,
 }
-
-/// What the eye makes of a colour, which is the only sense in which a sky has one brightness.
-const LUMA: Vec3 = Vec3::new(0.2126, 0.7152, 0.0722);
 
 /// The dome's luminance at noon, which is the bright end the curve below is fitted against.
 ///
@@ -159,11 +167,12 @@ impl Sky {
     ///
     /// Drawn as well as shaded with, so the sky a surface is lit by is the sky behind it at midnight
     /// too. An associated constant rather than a field, because it is the same for every sky there
-    /// is — it becomes a field the day a moon makes it vary.
+    /// is: the moons vary a night, but they do it as two discs and two directional lights rather
+    /// than by lifting the floor, so this stayed a constant when they arrived.
     pub const NIGHT_FLOOR: Vec3 = NIGHT_SKY;
 
     /// The light above an exterior at `time`.
-    pub fn at(time: TimeOfDay) -> Self {
+    pub fn at(time: WorldTime) -> Self {
         let bare = Sun::at(time.orbit());
         // The sun's direction travels downward, so its climb above the horizon is the negation —
         // and it is signed, because after sunset there is a good deal of sky left to light and how
@@ -189,14 +198,16 @@ impl Sky {
         // the sun out — no separate fade, and nothing that can disagree with where the sun is. By
         // the time it matters the beam has crossed thirty-eight atmospheres and is a deep red
         // already, so this is the last of a light that has nearly gone rather than a cut.
-        let radius = Sun::REAL_ANGULAR_RADIUS;
-        let above = ((climb + radius) / (2.0 * radius)).clamp(0.0, 1.0);
-        let showing = above * above * (3.0 - 2.0 * above);
+        let showing = Self::showing(climb, Sun::REAL_ANGULAR_RADIUS);
         let mut sky = Self {
             sun: Sun {
                 colour: bare.colour * transmitted * showing,
                 ..bare
             },
+            // Lit by the bare sun rather than the attenuated one: what reaches a moon is the beam
+            // before this planet's air, which is the only air in the arithmetic.
+            masser: Moon::masser(time, bare),
+            secunda: Moon::secunda(time, bare),
             ambient: Vec3::ZERO,
             warm,
             warmth,
@@ -291,12 +302,24 @@ impl Sky {
         total / SAMPLES as f32 + Self::NIGHT_FLOOR
     }
 
+    /// How much of a disc of angular radius `radius` has cleared the horizon, `climb` being the
+    /// sine of the elevation of its centre.
+    ///
+    /// **Over its own width rather than at a line**, which is what a body setting actually does and
+    /// what stops one blinking out against a sea horizon. Smoothstepped, so the last of it goes
+    /// without a corner. The sun and both moons take the same answer; they differ only in how wide
+    /// they are, which is the parameter.
+    pub(crate) fn showing(climb: f32, radius: f32) -> f32 {
+        let above = ((climb + radius) / (2.0 * radius)).clamp(0.0, 1.0);
+        above * above * (3.0 - 2.0 * above)
+    }
+
     /// What is left of a beam that crossed the atmosphere to a sun `climb` above the horizon.
     ///
     /// `climb` is the sine of the elevation. The air mass is Kasten and Young's fit rather than the
     /// flat-earth `1/sin`, which is off by 10% at ten degrees and diverges at the horizon where all
     /// of this matters most — theirs stays finite, reaching 38 atmospheres at zero.
-    fn transmittance(climb: f32) -> Vec3 {
+    pub(crate) fn transmittance(climb: f32) -> Vec3 {
         (-ZENITH_DEPTH * Self::air_mass(climb)).exp()
     }
 
@@ -313,7 +336,7 @@ impl Sky {
 
 impl Default for Sky {
     fn default() -> Self {
-        Self::at(TimeOfDay::default())
+        Self::at(WorldTime::default())
     }
 }
 
@@ -323,7 +346,7 @@ mod tests {
 
     /// The sine of the sun's elevation, which is what every claim below is really about.
     fn climb(hour: f32) -> f32 {
-        -Sky::at(TimeOfDay::hours(hour)).sun.direction.z
+        -Sky::at(WorldTime::hours(hour)).sun.direction.z
     }
 
     /// What the eye makes of a colour, which is the only thing a "darker" claim can mean.
@@ -349,12 +372,12 @@ mod tests {
 
     #[test]
     fn the_hour_carries_its_own_exposure_down_to_night() {
-        let bias = |hour: f32| Sky::at(TimeOfDay::hours(hour)).exposure_bias;
+        let bias = |hour: f32| Sky::at(WorldTime::hours(hour)).exposure_bias;
         // **`DAY_LUMINANCE` is a measurement and this is what keeps it one.** The curve is fitted
         // between the dome's own two ends, so a `SKY_STRENGTH` that moved without this moving would
         // leave the bias anchored to a noon that no longer exists — and it would fail silently, as a
         // slightly wrong exposure at every hour rather than as anything visible.
-        let noon = luminance(Sky::at(TimeOfDay::hours(12.0)).ambient);
+        let noon = luminance(Sky::at(WorldTime::hours(12.0)).ambient);
         assert!(
             (noon - DAY_LUMINANCE).abs() < 0.005,
             "the dome measures {noon} at noon, not the {DAY_LUMINANCE} the bias is fitted against"
@@ -401,7 +424,7 @@ mod tests {
         // A line between two endpoints cannot do that, and blue to red passes through grey.
         let mut hour = 0.0;
         while hour < 24.0 {
-            let sky = Sky::at(TimeOfDay::hours(hour)).ambient;
+            let sky = Sky::at(WorldTime::hours(hour)).ambient;
             assert!(
                 sky.y <= sky.x.max(sky.z),
                 "the sky is green at {hour:.2}: {sky:?}"
@@ -417,7 +440,7 @@ mod tests {
         // of the floor. Descending at a steady rate puts it sixty degrees under instead, where there
         // is nothing left to add.
         for hour in [23.0, 0.0, 1.0, 2.0, 3.0] {
-            let night = Sky::at(TimeOfDay::hours(hour)).ambient;
+            let night = Sky::at(WorldTime::hours(hour)).ambient;
             assert!(night.z > night.x, "{hour} is not blue: {night:?}");
             assert!(
                 luminance(night) < 1.1 * luminance(NIGHT_SKY),
@@ -435,7 +458,7 @@ mod tests {
         let floor = luminance(NIGHT_SKY);
         let mut hour = 0.0;
         while hour < 24.0 {
-            let sky = Sky::at(TimeOfDay::hours(hour));
+            let sky = Sky::at(WorldTime::hours(hour));
             assert!(
                 luminance(sky.ambient) >= floor,
                 "{hour:.2} is darker than midnight: {:?} against a floor of {NIGHT_SKY:?}",
@@ -455,7 +478,7 @@ mod tests {
         // light that got into the air and then scattered out of it, which is largest at middling
         // optical depth, and a noon sky is deep blue where blue carries little luminance. The
         // defect was never up there.
-        let at = |hour: f32| luminance(Sky::at(TimeOfDay::hours(hour)).ambient);
+        let at = |hour: f32| luminance(Sky::at(WorldTime::hours(hour)).ambient);
         let mut hour = 0.0;
         while hour < 8.0 {
             let (before, after) = (at(hour), at(hour + 1.0 / 60.0));
@@ -495,21 +518,21 @@ mod tests {
         // Full daylight either side of the horizon by more than the disc is wide, and nothing at all
         // below it: the disc setting is the whole of what puts the sun out, so there is no second
         // fade to disagree with where the sun actually is.
-        assert!(Sky::at(TimeOfDay::hours(6.2)).sun.colour.x > 0.0);
-        assert_eq!(Sky::at(TimeOfDay::hours(5.5)).sun.colour, Vec3::ZERO);
-        assert_eq!(Sky::at(TimeOfDay::hours(18.5)).sun.colour, Vec3::ZERO);
+        assert!(Sky::at(WorldTime::hours(6.2)).sun.colour.x > 0.0);
+        assert_eq!(Sky::at(WorldTime::hours(5.5)).sun.colour, Vec3::ZERO);
+        assert_eq!(Sky::at(WorldTime::hours(18.5)).sun.colour, Vec3::ZERO);
 
         // Half a degree of disc against fourteen hours of day is a minute or so of setting, and the
         // beam has crossed thirty-eight atmospheres by then — so what goes out is already a deep
         // red, and the blue left it long before.
-        let setting = Sky::at(TimeOfDay::hours(18.0)).sun.colour;
+        let setting = Sky::at(WorldTime::hours(18.0)).sun.colour;
         assert!(setting.x > setting.z * 100.0, "{setting:?}");
     }
 
     #[test]
     fn the_sun_reddens_and_dims_as_it_sets() {
-        let noon = Sky::at(TimeOfDay::hours(12.0)).sun.colour;
-        let dusk = Sky::at(TimeOfDay::hours(17.5)).sun.colour;
+        let noon = Sky::at(WorldTime::hours(12.0)).sun.colour;
+        let dusk = Sky::at(WorldTime::hours(17.5)).sun.colour;
 
         // **Hand-computed from the constants above.** At noon the sun stands at 53.1 degrees, which
         // is 1.249 air masses, so `exp(-0.0464 * 1.249)` = 0.944 of the red survives and
@@ -529,7 +552,7 @@ mod tests {
 
     #[test]
     fn the_sky_is_blue_by_day_and_warm_at_dusk_and_gone_at_night() {
-        let noon = Sky::at(TimeOfDay::hours(12.0)).ambient;
+        let noon = Sky::at(WorldTime::hours(12.0)).ambient;
         // Blue above green above red is what Rayleigh scattering means, and the reason the sky has
         // a colour at all.
         assert!(noon.z > noon.y && noon.y > noon.x, "{noon:?}");
@@ -538,7 +561,7 @@ mod tests {
         // lands where the model before it did, so every image made against that one is still
         // comparable. Noon is brighter than mid-morning now, which it should always have been —
         // the old tint fell away at low air mass and took the middle of the day down with it.
-        let default = Sky::at(TimeOfDay::default()).ambient;
+        let default = Sky::at(WorldTime::default()).ambient;
         assert!((luminance(default) - 0.518).abs() < 0.01, "{default:?}");
         assert!(
             luminance(noon) > luminance(default),
@@ -546,12 +569,12 @@ mod tests {
         );
 
         // At dusk the order inverts: the blue never got through the air to be scattered.
-        let dusk = Sky::at(TimeOfDay::hours(17.8)).ambient;
+        let dusk = Sky::at(WorldTime::hours(17.8)).ambient;
         assert!(dusk.x > dusk.z, "{dusk:?}");
         assert!(dusk.length() < noon.length(), "{dusk:?} against {noon:?}");
 
         // And at night there is no sun at all, so nothing casts.
-        let night = Sky::at(TimeOfDay::hours(1.0));
+        let night = Sky::at(WorldTime::hours(1.0));
         assert_eq!(night.sun.colour, Vec3::ZERO);
         // The floor is what is left, plus whatever twilight still reaches an hour past midnight —
         // which is little enough that the night is still blue.

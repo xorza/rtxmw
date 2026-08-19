@@ -9,7 +9,7 @@ use rtxmw_gpu::{
     Validation, image_blit,
 };
 use rtxmw_render::{FrameConstants, OUTPUT_FORMAT, SceneRenderer, TARGET_FORMAT};
-use rtxmw_scene::{CellId, Sky, StaticScene};
+use rtxmw_scene::{CellId, MoonFaces, Sky, StaticScene};
 use rtxmw_texture::Texture;
 
 use crate::cli::Upscaling;
@@ -134,6 +134,15 @@ impl Renderer {
         scene.set_sky(sky);
         if let Err(failed) = upscaler::attach(&memory, &mut scene, upscaler) {
             eprintln!("DLSS did not attach: {failed}");
+        }
+        // **Before any cell, and it need not be** — the array reserves their slots either way. It
+        // is here because this is where the archives are already open once.
+        match MoonFaces::load() {
+            Ok(Some(faces)) => {
+                scene.set_moon_faces(&device, &mut uploader, physical.limits(), &faces)?;
+            }
+            Ok(None) => {}
+            Err(failed) => eprintln!("the moons keep their own colour: {failed}"),
         }
 
         Ok(Self {

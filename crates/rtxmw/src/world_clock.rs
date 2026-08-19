@@ -1,6 +1,6 @@
 //! The clock the world runs on, which is not the wall's.
 
-use rtxmw_scene::TimeOfDay;
+use rtxmw_scene::WorldTime;
 
 /// Game seconds per real second at speed 1.
 ///
@@ -56,18 +56,19 @@ const NUDGE: f32 = 0.5;
 pub(crate) struct WorldClock {
     /// Seconds the world has run, which is what the fog and the water drift against.
     elapsed: f32,
-    /// The hour, in hours from midnight, kept unwrapped so `TimeOfDay` does the wrapping.
-    hour: f32,
+    /// What the world's clock reads, which counts the days as well as the hour — the moons' phase
+    /// is the thing that needs the second half.
+    time: WorldTime,
     speed: f32,
     paused: bool,
 }
 
 impl WorldClock {
     /// A clock started at `time`, running at the game's own rate.
-    pub(crate) fn starting_at(time: TimeOfDay) -> Self {
+    pub(crate) fn starting_at(time: WorldTime) -> Self {
         Self {
             elapsed: 0.0,
-            hour: time.hour(),
+            time,
             speed: SPEED_MIN,
             paused: false,
         }
@@ -80,7 +81,7 @@ impl WorldClock {
         }
         let seconds = dt.min(LONGEST_STEP) * self.speed;
         self.elapsed += seconds;
-        self.hour += seconds * TIMESCALE / 3600.0;
+        self.time = self.time.advanced(seconds * TIMESCALE / 3600.0);
     }
 
     /// Moves the hour by `steps` nudges without moving anything else.
@@ -89,7 +90,7 @@ impl WorldClock {
     /// dusk drags the fog through an hour of wind on the way; this arrives there with the banks
     /// where they were, which is what makes two hours comparable.
     pub(crate) fn nudge(&mut self, steps: f32) {
-        self.hour += steps * NUDGE;
+        self.time = self.time.advanced(steps * NUDGE);
     }
 
     /// Moves the speed by `steps` presses, in either direction.
@@ -109,8 +110,8 @@ impl WorldClock {
         self.elapsed
     }
 
-    pub(crate) fn time(&self) -> TimeOfDay {
-        TimeOfDay::hours(self.hour)
+    pub(crate) fn time(&self) -> WorldTime {
+        self.time
     }
 }
 
@@ -143,7 +144,7 @@ mod tests {
 
     #[test]
     fn the_hour_advances_with_the_clock_and_the_speed_multiplies_both() {
-        let mut clock = WorldClock::starting_at(TimeOfDay::hours(9.5));
+        let mut clock = WorldClock::starting_at(WorldTime::hours(9.5));
         // A real minute at the game's own rate is thirty game minutes, which is half an hour.
         a_minute(&mut clock);
         assert!((clock.time().hour() - 10.0).abs() < 1e-3, "{clock}");
@@ -163,7 +164,7 @@ mod tests {
         // **The case this exists for**: a cell load stalls the better part of a second, and at the
         // top speed that would be thirty-four game hours — the sun past a whole day and back — for
         // a frame in which nothing actually happened.
-        let mut fast = WorldClock::starting_at(TimeOfDay::hours(12.0));
+        let mut fast = WorldClock::starting_at(WorldTime::hours(12.0));
         for _ in 0..6 {
             fast.step_speed(1.0);
         }
@@ -174,14 +175,14 @@ mod tests {
         assert!((fast.time().hour() - 12.0 - 0.1067).abs() < 1e-3, "{fast}");
 
         // And an ordinary frame is carried whole, so the clamp costs nothing when nothing stalled.
-        let mut steady = WorldClock::starting_at(TimeOfDay::hours(12.0));
+        let mut steady = WorldClock::starting_at(WorldTime::hours(12.0));
         steady.advance(LONGEST_STEP * 0.5);
         assert_eq!(steady.seconds(), LONGEST_STEP * 0.5);
     }
 
     #[test]
     fn the_speed_is_clamped_and_pausing_stops_everything_but_a_nudge() {
-        let mut clock = WorldClock::starting_at(TimeOfDay::default());
+        let mut clock = WorldClock::starting_at(WorldTime::default());
         // However hard either end is leaned on, it stops where the constants say.
         for _ in 0..20 {
             clock.step_speed(1.0);
@@ -215,11 +216,11 @@ mod tests {
 
     #[test]
     fn the_clock_reads_as_a_face_and_a_rate_and_wraps_at_midnight() {
-        let face = |hour| WorldClock::starting_at(TimeOfDay::hours(hour)).to_string();
+        let face = |hour| WorldClock::starting_at(WorldTime::hours(hour)).to_string();
         assert_eq!(face(9.5), "09:30 1x");
         assert_eq!(face(0.0), "00:00 1x");
         assert_eq!(face(13.25), "13:15 1x");
-        // Past midnight rather than past twenty-four, which is `TimeOfDay`'s doing.
+        // Past midnight rather than past twenty-four, which is `WorldTime`'s doing.
         assert_eq!(face(25.5), "01:30 1x");
     }
 }

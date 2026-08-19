@@ -12,7 +12,7 @@ use rtxmw_gpu::{
     readback,
 };
 use rtxmw_render::SceneRenderer;
-use rtxmw_scene::{CellId, CellStreamer, LoadedCell, Sky};
+use rtxmw_scene::{CellId, CellStreamer, LoadedCell, MoonFaces, Sky};
 
 use crate::cli::ScreenshotOptions;
 use crate::scene_loader;
@@ -68,6 +68,9 @@ pub(crate) fn screenshot(options: &ScreenshotOptions) -> Result<f32, Box<dyn std
     renderer.set_delight(*delight);
     renderer.set_fog(*fog);
     renderer.set_sky(Sky::at(*time));
+    if let Some(faces) = MoonFaces::load()? {
+        renderer.set_moon_faces(&device, &mut uploader, physical.limits(), &faces)?;
+    }
 
     let cell = LoadedCell::load_at(cell.clone())?
         .ok_or("no game data configured — set MORROWIND_DATA_DIR, or put it in .env")?;

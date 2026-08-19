@@ -4,7 +4,7 @@ use ash::vk;
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec2, Vec3};
 use rtxmw_gpu::{Binding, Buffer, BufferMemory, ComputePipeline, Device, Image, Memory};
-use rtxmw_scene::Sun;
+use rtxmw_scene::{Moon, Sun};
 
 use crate::acceleration_structure::AccelerationStructure;
 use crate::gbuffer::GBuffer;
@@ -45,6 +45,20 @@ pub(crate) struct Lighting {
     pub(crate) sky_stars: f32,
     /// Whether the fog forms banks. Weather does that to a landscape; a room's air is still.
     pub(crate) fog_banked: bool,
+    /// The larger moon. [`Moon::NONE`] for a cell with no sky, which draws and lights nothing
+    /// without a branch anywhere to say so.
+    pub(crate) masser: Moon,
+    /// The smaller one, on the same terms.
+    pub(crate) secunda: Moon,
+    /// Where Masser's vanilla portrait sits in the bindless array.
+    ///
+    /// **Zero is none**, which is the array's own magenta fallback and so the one slot that can
+    /// never hold a real portrait — the shader draws a flat disc of the moon's own colour instead.
+    /// That is what a renderer nobody handed the faces to gets, which is every test that does not
+    /// need them.
+    pub(crate) masser_face: u32,
+    /// Where Secunda's sits, on the same terms.
+    pub(crate) secunda_face: u32,
 }
 
 impl Default for Lighting {
@@ -66,6 +80,40 @@ impl Default for Lighting {
             sky_scale: 0.0,
             sky_floor: Vec3::ZERO,
             sky_stars: 0.0,
+            masser: Moon::NONE,
+            secunda: Moon::NONE,
+            masser_face: 0,
+            secunda_face: 0,
+        }
+    }
+}
+
+/// One moon as the shader reads it — see `struct Moon` in `bindings.glsl`.
+///
+/// Twelve floats packed tightly, which under `scalar` layout is exactly what the shader expects.
+/// `face` is a slot in the bindless array or **zero for none**, which is the array's own fallback
+/// and so the one index that can never name a real portrait.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct GpuMoon {
+    direction: [f32; 3],
+    cos_radius: f32,
+    colour: [f32; 3],
+    face: u32,
+    light: [f32; 3],
+    face_mean: f32,
+}
+
+impl GpuMoon {
+    /// `moon` as the shader reads it, showing the portrait at `face`.
+    fn new(moon: Moon, face: u32) -> Self {
+        Self {
+            direction: moon.direction.to_array(),
+            cos_radius: moon.angular_radius.cos(),
+            colour: moon.colour.to_array(),
+            face,
+            light: moon.light.to_array(),
+            face_mean: moon.face_mean,
         }
     }
 }
@@ -195,6 +243,9 @@ pub struct FrameConstants {
     sky_stars: f32,
     /// One where the fog is an even haze rather than banks, which is what a room wants.
     fog_uniform: f32,
+    /// The two moons — see [`GpuMoon`].
+    masser: GpuMoon,
+    secunda: GpuMoon,
     /// The sinusoids the water surface is summed from — see [`crate::wave_spectrum`].
     ///
     /// Static for the life of a sea state, and carried here rather than in a buffer of its own
@@ -269,6 +320,8 @@ impl FrameConstants {
             sky_floor: lighting.sky_floor.to_array(),
             sky_stars: lighting.sky_stars,
             fog_uniform: if lighting.fog_banked { 0.0 } else { 1.0 },
+            masser: GpuMoon::new(lighting.masser, lighting.masser_face),
+            secunda: GpuMoon::new(lighting.secunda, lighting.secunda_face),
             // Rebuilt each frame rather than cached: it is a few hundred floats of arithmetic once
             // per frame against a million rays that read it, and a cache would need invalidating
             // the moment the sea state becomes something a cell can set.
@@ -658,9 +711,12 @@ mod tests {
         assert_eq!(offset_of!(FrameConstants, sky_floor), 356);
         assert_eq!(offset_of!(FrameConstants, sky_stars), 368);
         assert_eq!(offset_of!(FrameConstants, fog_uniform), 372);
+        // Two moons of twelve tightly packed floats apiece.
+        assert_eq!(offset_of!(FrameConstants, masser), 376);
+        assert_eq!(offset_of!(FrameConstants, secunda), 424);
         // The wave table follows, twenty tightly packed bytes apiece.
-        assert_eq!(offset_of!(FrameConstants, waves), 376);
-        assert_eq!(size_of::<FrameConstants>(), 376 + 20 * WAVE_COUNT);
+        assert_eq!(offset_of!(FrameConstants, waves), 472);
+        assert_eq!(size_of::<FrameConstants>(), 472 + 20 * WAVE_COUNT);
     }
 
     #[test]

@@ -11,7 +11,7 @@ use rtxmw_gpu::{
     Device, Image, Memory, PhysicalDevice, RayTracingLimits, Timestamps, Uploader, image_barrier,
     memory_barrier,
 };
-use rtxmw_scene::{CellId, Sky, StaticScene};
+use rtxmw_scene::{CellId, MoonFaces, Sky, StaticScene};
 use rtxmw_texture::Texture;
 
 use crate::auto_exposure::AutoExposure;
@@ -52,13 +52,24 @@ const DEFAULT_BOUNCE_SAMPLES: u32 = 4;
 /// A/B, and §5.1's warning about over-correction is what that switch is for.
 const DEFAULT_DELIGHT: f32 = 1.0;
 
-/// How long the device spent on each stage of a frame, in milliseconds.
+/// How long the device spent on each stage of a frame, in milliseconds, and at what size.
 ///
 /// Device time, not wall clock: what the GPU was busy for, which is the number `docs/design.md`
 /// §5.3's budget is written in. Every field is zero on a device whose queue cannot write
 /// timestamps.
+///
+/// **The sizes travel with the durations because a duration on its own is not a measurement.** A
+/// trace time means nothing without the resolution it traced at, and that resolution is *not* the
+/// one a caller asked for: `--screenshot 1920x1080` names the output, and an upscaler set to quality
+/// silently traces at 1280x720 — two and a quarter times fewer pixels. A figure copied out of this
+/// line and written down as "at 1920x1080" was wrong by that factor once already, so the line now
+/// carries what it was measured at and there is nothing left to assume.
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
 pub struct FrameTimings {
+    /// What the trace ran at, which is what every duration below is a duration *for*.
+    pub traced: vk::Extent2D,
+    /// What came out, which differs from [`Self::traced`] exactly when an upscaler is attached.
+    pub displayed: vk::Extent2D,
     /// The ray traced pass: primary visibility, shadow rays and the diffuse bounce.
     pub trace: f32,
     /// Every à-trous pass together.
@@ -84,8 +95,14 @@ impl FrameTimings {
     }
 
     /// Reads the durations back in the order [`SceneRenderer::record`] wrote them.
-    fn from_durations(durations: [f32; Self::STAGES]) -> Self {
+    fn from_durations(
+        durations: [f32; Self::STAGES],
+        traced: vk::Extent2D,
+        displayed: vk::Extent2D,
+    ) -> Self {
         Self {
+            traced,
+            displayed,
             trace: durations[0],
             denoise: durations[1],
             composite: durations[2],
@@ -102,17 +119,22 @@ impl std::fmt::Display for FrameTimings {
     /// Here rather than at the caller so that adding a stage does not silently stop being reported:
     /// a new field would otherwise have to be remembered in every place that prints one.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "device time {:.2} ms ", self.total())?;
+        // Both sizes, never one: the mistake this exists to stop is taking the size a caller asked
+        // for as the size the trace ran at, and printing only one of them is what allowed it.
+        match self.traced == self.displayed {
+            true => write!(f, "at {}x{}", self.traced.width, self.traced.height)?,
+            false => write!(
+                f,
+                "tracing {}x{} to {}x{}",
+                self.traced.width, self.traced.height, self.displayed.width, self.displayed.height
+            )?,
+        }
         write!(
             f,
-            "device time {:.2} ms: trace {:.2}, denoise {:.2}, composite {:.2}, upscale {:.2}, \
+            ": trace {:.2}, denoise {:.2}, composite {:.2}, upscale {:.2}, \
              exposure {:.2}, tonemap {:.2}",
-            self.total(),
-            self.trace,
-            self.denoise,
-            self.composite,
-            self.upscale,
-            self.exposure,
-            self.tonemap,
+            self.trace, self.denoise, self.composite, self.upscale, self.exposure, self.tonemap,
         )
     }
 }
@@ -387,24 +409,57 @@ impl SceneRenderer {
         scene: &StaticScene,
         textures: &[Option<Texture>],
     ) -> rtxmw_gpu::Result<()> {
-        let residency = match self.scene.as_mut() {
-            Some(residency) => residency,
-            None => {
-                let residency = self
-                    .scene
-                    .insert(SceneResidency::new(device, uploader, limits)?);
-                // A fresh residency starts under the default sky; this one is standing under
-                // whatever the caller last set.
-                residency.set_sky(self.sky);
-                residency
-            }
-        };
+        let residency = self.residency(device, uploader, limits)?;
         residency.add(device, uploader, limits, id, scene, textures)?;
         assert!(
             residency.textures().len() <= MAX_TEXTURES,
             "cells need {} texture slots but the array is built for {MAX_TEXTURES}",
             residency.textures().len()
         );
+        Ok(())
+    }
+
+    /// The residency, building one if this renderer has never held a cell.
+    ///
+    /// **Lazy because a renderer is useful before it has a scene** — it can be sized, given a sky
+    /// and handed an upscaler — but everything resident shares one set of buffers, so the first
+    /// caller to need them is the one that pays for them. Which caller that is stopped being
+    /// `add_cell` alone when the moons' portraits arrived, and this exists so the two do not each
+    /// carry their own copy of the same three lines.
+    fn residency(
+        &mut self,
+        device: &Device,
+        uploader: &mut Uploader,
+        limits: RayTracingLimits,
+    ) -> rtxmw_gpu::Result<&mut SceneResidency> {
+        if self.scene.is_none() {
+            let residency = self
+                .scene
+                .insert(SceneResidency::new(device, uploader, limits)?);
+            // A fresh residency starts under the default sky; this one is standing under whatever
+            // the caller last set.
+            residency.set_sky(self.sky);
+        }
+        Ok(self.scene.as_mut().expect("just built if it was absent"))
+    }
+
+    /// Hands the moons their vanilla portraits, which every later frame draws them with.
+    ///
+    /// Idempotent and order-free: the two slots exist from the moment a residency does, so this may
+    /// be called before or after any cell. Without it the moons are flat discs of their own
+    /// measured colour, which is what the headless tests draw.
+    ///
+    /// The caller must have waited for device idle.
+    pub fn set_moon_faces(
+        &mut self,
+        device: &Device,
+        uploader: &mut Uploader,
+        limits: RayTracingLimits,
+        faces: &MoonFaces,
+    ) -> rtxmw_gpu::Result<()> {
+        self.residency(device, uploader, limits)?
+            .set_moon_faces(uploader, faces)?;
+        self.bind_scene();
         Ok(())
     }
 
@@ -623,7 +678,11 @@ impl SceneRenderer {
         // A stack array, so asking what a frame cost is not itself something a frame pays for.
         let mut durations = [0.0; FrameTimings::STAGES];
         self.timestamps.read(&mut durations)?;
-        Ok(FrameTimings::from_durations(durations))
+        Ok(FrameTimings::from_durations(
+            durations,
+            self.target.extent(),
+            self.output().extent(),
+        ))
     }
 
     /// Records the trace into `command_buffer`, leaving the target ready to copy from.
@@ -764,22 +823,57 @@ impl SceneRenderer {
 mod tests {
     use super::*;
 
+    /// An extent, as these tests write one.
+    fn extent(width: u32, height: u32) -> vk::Extent2D {
+        vk::Extent2D { width, height }
+    }
+
     #[test]
     fn a_device_that_wrote_no_timestamps_reports_nothing_rather_than_zeroes_it_invented() {
         // `Timestamps::read` returns an empty slice on a queue that cannot time anything, and the
         // caller has to be able to tell that from a frame that genuinely took no time.
+        let nothing = extent(0, 0);
         assert_eq!(
-            FrameTimings::from_durations([0.0; FrameTimings::STAGES]),
+            FrameTimings::from_durations([0.0; FrameTimings::STAGES], nothing, nothing),
             FrameTimings::default()
         );
 
         // In the order `record` writes them. The array's width is the type's guarantee that a
         // caller cannot hand over a stage count that disagrees with the pool's.
-        let timings = FrameTimings::from_durations([1.0, 2.0, 4.0, 8.0, 16.0, 32.0]);
+        let timings = FrameTimings::from_durations(
+            [1.0, 2.0, 4.0, 8.0, 16.0, 32.0],
+            extent(1920, 1080),
+            extent(3840, 2160),
+        );
         assert_eq!(timings.trace, 1.0);
         assert_eq!(timings.denoise, 2.0);
         assert_eq!(timings.upscale, 8.0);
         assert_eq!(timings.tonemap, 32.0);
         assert_eq!(timings.total(), 63.0);
+    }
+
+    #[test]
+    fn a_reported_duration_carries_the_size_it_was_measured_at() {
+        // **The mistake this exists to stop.** A trace time copied out of this line and written down
+        // against the resolution the *caller* asked for was wrong by 2.25x, because `--screenshot
+        // 1920x1080` names the output and an upscaler on quality traces at 1280x720. Both sizes are
+        // in the line, so there is nothing left to assume about which one a number belongs to.
+        let upscaled = FrameTimings::from_durations(
+            [1.0, 0.0, 0.0, 8.0, 0.0, 0.0],
+            extent(1280, 720),
+            extent(1920, 1080),
+        );
+        let line = upscaled.to_string();
+        assert!(line.contains("tracing 1280x720 to 1920x1080"), "{line}");
+        assert!(line.contains("trace 1.00"), "{line}");
+
+        // And where nothing upscales, one size rather than the same one twice.
+        let native = FrameTimings::from_durations(
+            [1.0; FrameTimings::STAGES],
+            extent(1920, 1080),
+            extent(1920, 1080),
+        );
+        assert!(native.to_string().contains("at 1920x1080"), "{native}");
+        assert!(!native.to_string().contains("tracing"), "{native}");
     }
 }

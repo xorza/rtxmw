@@ -145,6 +145,24 @@ struct Wave {
 // waves needed a clock. Scalar layout, so it matches the `repr(C)` struct in `visibility_pass.rs`
 // field for field. The matrices arrive already multiplied — their product is all unprojection
 // needs, and it is one thing to send rather than two to keep consistent.
+// One of Morrowind's two moons: where it is, how wide, what its lit face radiates, and what it
+// delivers to a surface facing it.
+//
+// **A sphere rather than a sprite.** The disc is drawn by reconstructing the sphere's own normal at
+// the pixel and asking whether the sun reaches it, so the terminator is the real one — a crescent
+// points at the sun because nothing else could have drawn it. `face` is the slot in `textures` its
+// vanilla portrait sits at, or zero for a flat disc of `colour` where none was uploaded.
+struct Moon {
+    vec3 direction;
+    float cos_radius;
+    vec3 colour;
+    uint face;
+    vec3 light;
+    // Luminance of the portrait's own mean texel, which is what the portrait is divided by so its
+    // mottling multiplies `colour` as a ratio rather than replacing it with a level.
+    float face_mean;
+};
+
 layout(set = 0, binding = 14, scalar) readonly buffer Frame {
     // Clip coordinates to an offset from the eye, in world axes — *not* the inverse
     // view-projection, which would land a world-space point the shader then has to subtract the
@@ -204,6 +222,10 @@ layout(set = 0, binding = 14, scalar) readonly buffer Frame {
     // One where the fog should be an even haze rather than banks — indoors, where the air is still
     // and a room is smaller than a single bank would be.
     float fog_uniform;
+    // Masser and Secunda, which the sky draws as spheres and the surfaces are lit by — see `Moon`
+    // above and `moon_disc` in `lighting.glsl`. Black and zero-width for a cell with no sky.
+    Moon masser;
+    Moon secunda;
     // The sinusoids the sea is summed from, built on the host from an empirical spectrum rather
     // than a series chosen by eye — see `wave_spectrum.rs`.
     Wave waves[WAVE_COUNT];

@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use ash::vk;
 use clap::{CommandFactory, Parser};
 use rtxmw_render::dlss::Preset;
-use rtxmw_scene::{CellId, TimeOfDay};
+use rtxmw_scene::{CellId, WorldTime};
 
 use crate::scene_loader;
 use crate::scene_loader::ViewpointOverride;
@@ -208,7 +208,7 @@ fn at_least_one(value: &str) -> Result<u32, String> {
 ///
 /// The colon form is the one anybody would reach for and the decimal one is what the clock actually
 /// is, so both are taken. Any hour is legal, including the small ones nobody can see anything in.
-fn hour(value: &str) -> Result<TimeOfDay, String> {
+fn hour(value: &str) -> Result<WorldTime, String> {
     let hours = match value.split_once(':') {
         Some((hours, minutes)) => match (hours.parse::<f32>(), minutes.parse::<f32>()) {
             (Ok(hours), Ok(minutes)) if (0.0..60.0).contains(&minutes) => {
@@ -219,7 +219,7 @@ fn hour(value: &str) -> Result<TimeOfDay, String> {
         None => value.parse::<f32>().map_err(|_| ()),
     };
     match hours {
-        Ok(hours) if hours.is_finite() => Ok(TimeOfDay::hours(hours)),
+        Ok(hours) if hours.is_finite() => Ok(WorldTime::hours(hours)),
         _ => Err(format!(
             "expected an hour of the day like 9.5 or 9:30, got {value:?}"
         )),
@@ -271,9 +271,10 @@ pub(crate) struct WindowOptions {
         allow_negative_numbers = true,
     )]
     pub(crate) fog: f32,
-    /// The hour to light an exterior at: 6 is sunrise, 13 noon, 20 sunset, and anything else night.
+    /// The hour to light an exterior at: 6 is sunrise, 12 noon, 18 sunset, anything else night,
+    /// and past 24 the next day — which is how a still reaches a moon phase other than the first's.
     #[arg(long = "time", value_name = "HOUR", default_value_t, value_parser = hour)]
-    pub(crate) time: TimeOfDay,
+    pub(crate) time: WorldTime,
     /// What DLSS runs at: off, performance, balanced, quality or dlaa.
     #[arg(
         long = "dlss",
@@ -346,9 +347,10 @@ pub(crate) struct ScreenshotOptions {
         allow_negative_numbers = true,
     )]
     pub(crate) fog: f32,
-    /// The hour to light an exterior at: 6 is sunrise, 13 noon, 20 sunset, and anything else night.
+    /// The hour to light an exterior at: 6 is sunrise, 12 noon, 18 sunset, anything else night,
+    /// and past 24 the next day — which is how a still reaches a moon phase other than the first's.
     #[arg(long = "time", value_name = "HOUR", default_value_t, value_parser = hour)]
-    pub(crate) time: TimeOfDay,
+    pub(crate) time: WorldTime,
     /// What DLSS runs at: off, performance, balanced, quality or dlaa.
     #[arg(
         long = "dlss",

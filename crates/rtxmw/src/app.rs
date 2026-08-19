@@ -10,7 +10,7 @@ use winit::event_loop::ActiveEventLoop;
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowId};
 
-use rtxmw_scene::{CellDetail, CellId, CellStreamer, LoadedCell, SceneError, Sky, TimeOfDay};
+use rtxmw_scene::{CellDetail, CellId, CellStreamer, LoadedCell, SceneError, Sky, WorldTime};
 
 use crate::camera::{Camera, Movement};
 use crate::cli::{Upscaling, WindowOptions};
@@ -278,7 +278,7 @@ impl Default for App {
             dlss: Upscaling(None),
             delight: 1.0,
             fog: 1.0,
-            clock: WorldClock::starting_at(TimeOfDay::default()),
+            clock: WorldClock::starting_at(WorldTime::default()),
             renderer: None,
             window: None,
             centre: None,

@@ -16,6 +16,20 @@ vec3 daylight_reaching(vec3 position);
 // too few samples turn that gradient into banding across a whole hillside.
 const uint SUN_SAMPLES = 16u;
 
+// And how many each moon gets.
+//
+// **Half the sun's, and the two of them together still cost more than it does**, because the hours
+// they are up are the hours it is not: a night frame was casting no shadow rays at all before there
+// were moons in it, so every one of these is new work. Traced at 1920x1080, sixteen apiece took a
+// 5.88 ms night trace to 10.47 and eight apiece to 9.12 — so this halves 4.6 ms to 3.2.
+//
+// Eight is enough where sixteen is not for the sun because the two questions are different sizes:
+// Masser subtends five degrees against the sun's half, so its penumbra is spread over ten times the
+// distance, and a gradient resolved in eight steps across a metre is smoother than one resolved in
+// sixteen across a hand's width. The light is a fraction of the sun's besides, so what noise is left
+// is a fraction of a fraction.
+const uint MOON_SAMPLES = 8u;
+
 // How many shadow rays each light gets at the primary hit. A point light needs one and gives a hard
 // edge; a light with real size needs several, and the penumbra is exactly the disagreement between
 // them.
@@ -70,16 +84,21 @@ float lambert(Surface surface, vec3 towards) {
     return max(facing, 0.0);
 }
 
-// The sun's contribution, before the surface's albedo.
+// What one disc in the sky contributes, before the surface's albedo.
 //
-// No attenuation and no distance: the sun is far enough away that its rays are parallel and its
-// brightness is the same everywhere, so the only questions are which way the surface faces and how
-// much of the disc it can see. That second one is the soft shadow — the same visibility fraction a
-// lamp's sphere gives, over a cone rather than a sphere.
-vec3 sun_light(Surface surface, vec3 origin, uvec2 pixel, uint salt, uint samples) {
-    float facing = lambert(surface, -frame.sun_direction);
-    // A black sun is how a cell with no sky says so, and a surface facing away needs no rays.
-    if (facing <= 0.0 || frame.sun_colour == vec3(0.0)) {
+// **The sun and both moons, which are the same problem.** No attenuation and no distance: all three
+// are far enough away that their rays are parallel and their brightness is the same everywhere, so
+// the only questions are which way the surface faces and how much of the disc it can see. That
+// second one is the soft shadow — the same visibility fraction a lamp's sphere gives, over a cone
+// rather than a sphere — and it is why a moon five degrees across throws an edge a metre wide where
+// the sun's half-degree throws one a few centimetres wide.
+//
+// `direction` is the way the light travels, so the direction *to* the disc is its negation.
+vec3 disc_light(Surface surface, vec3 direction, vec3 colour, float cos_radius, vec3 origin,
+                uvec2 pixel, uint salt, uint samples, uint at_primary) {
+    float facing = lambert(surface, -direction);
+    // A black disc is how a sky without one says so, and a surface facing away needs no rays.
+    if (facing <= 0.0 || colour == vec3(0.0)) {
         return vec3(0.0);
     }
 
@@ -87,16 +106,16 @@ vec3 sun_light(Surface surface, vec3 origin, uvec2 pixel, uint salt, uint sample
     // wants one ray, not sixteen, and its penumbra is invisible under an albedo it is about to be
     // averaged with. Scaling by the ratio instead gave a bounce *two*, which the comment here used
     // to claim was one.
-    uint taken = samples >= SHADOW_SAMPLES ? SUN_SAMPLES : samples;
+    uint taken = samples >= SHADOW_SAMPLES ? at_primary : samples;
     float visible = 0.0;
     for (uint s = 0u; s < taken; ++s) {
-        vec2 u = unit_pair(hash(uvec4(sample_stream(pixel), salt + STREAM_SUN, s)));
-        vec3 towards = cone_direction(-frame.sun_direction, frame.sun_cos_radius, u);
+        vec2 u = unit_pair(hash(uvec4(sample_stream(pixel), salt, s)));
+        vec3 towards = cone_direction(-direction, cos_radius, u);
         if (!occluded(origin, towards, RAY_MAX)) {
             visible += 1.0;
         }
     }
-    return frame.sun_colour * facing * (visible / float(taken))
+    return colour * facing * (visible / float(taken))
          * sun_through_water(surface.position, surface.footprint);
 }
 
@@ -133,7 +152,18 @@ uvec2 lights_reaching(vec3 position) {
 // afterwards; a bounce hit, whose albedo belongs to a different surface, multiplies immediately in
 // `shade`.
 vec3 direct_light(Surface surface, uvec2 pixel, uint salt, uint samples) {
-    vec3 total = sun_light(surface, leaving(surface, -frame.sun_direction), pixel, salt, samples);
+    vec3 total = disc_light(surface, frame.sun_direction, frame.sun_colour, frame.sun_cos_radius,
+                            leaving(surface, -frame.sun_direction), pixel, salt + STREAM_SUN,
+                            samples, SUN_SAMPLES);
+    // **And the two moons, on the same terms.** A moonlit night costs no more than a sunlit day:
+    // the sun's rays are skipped where its colour is black, which is every hour the moons are worth
+    // anything, and the moons' where theirs is — which is most of the day.
+    total += disc_light(surface, frame.masser.direction, frame.masser.light,
+                        frame.masser.cos_radius, leaving(surface, -frame.masser.direction), pixel,
+                        salt + STREAM_MASSER, samples, MOON_SAMPLES);
+    total += disc_light(surface, frame.secunda.direction, frame.secunda.light,
+                        frame.secunda.cos_radius, leaving(surface, -frame.secunda.direction), pixel,
+                        salt + STREAM_SECUNDA, samples, MOON_SAMPLES);
     uvec2 near = lights_reaching(surface.position);
     for (uint k = near.x; k < near.y; ++k) {
         uint i = light_grid_indices[k];
@@ -270,13 +300,73 @@ float star_field(vec3 direction, float footprint) {
     return magnitude * (1.0 - smoothstep(0.0, radius, away));
 }
 
+// What a moon adds to the sky along `direction`, which is nothing unless the ray lands on its disc.
+//
+// **A lit sphere, not a sprite.** The disc is the orthographic silhouette of a ball five degrees
+// across, so the surface normal at a pixel is recoverable from where in the disc the pixel fell —
+// and once there is a normal there is a terminator, drawn by asking whether the sun reaches it. That
+// is the whole of the phase: nothing selects one of eight painted textures, nothing schedules a
+// crescent, and a crescent points at the sun because there is no other direction it could point.
+//
+// **Lommel-Seeliger rather than Lambert**, which is the model astronomy uses on airless bodies and
+// is one divide. A Lambertian sphere is brightest at the middle and falls off to its limb, so a full
+// moon would read as a shaded ball; the real one reads as a flat disc, because a rough dusty surface
+// scatters back the way the light came. `mu0 / (mu0 + mu)` is exactly that — at full phase the two
+// cosines are equal everywhere and the disc comes out uniform, which is what the sky actually shows.
+vec3 moon_disc(vec3 direction, Moon moon) {
+    float along = dot(direction, -moon.direction);
+    if (along <= moon.cos_radius || moon.colour == vec3(0.0)) {
+        return vec3(0.0);
+    }
+
+    // Where in the disc the ray landed, in units of its radius: the part of the ray perpendicular to
+    // the moon's centre, over the sine of the angular radius. Unit length at the limb.
+    float sin_radius = sqrt(max(1.0 - moon.cos_radius * moon.cos_radius, 0.0));
+    vec3 offset = (direction + moon.direction * along) / max(sin_radius, 1e-6);
+    float across = dot(offset, offset);
+    if (across >= 1.0) {
+        return vec3(0.0);
+    }
+
+    // The sphere's own normal there: the offset, plus however far the surface bulges toward us. The
+    // moon's light travels *from* it to us, so the way out of the moon toward the eye is
+    // `moon.direction` itself — and at the middle of the disc, where the bulge is all of it, that is
+    // the whole normal.
+    float mu = sqrt(1.0 - across);
+    vec3 normal = offset + moon.direction * mu;
+    float mu0 = max(dot(normal, -frame.sun_direction), 0.0);
+    // Doubled because the operator is a half at opposition, where a full moon has to come out at the
+    // colour it was given rather than at half of it.
+    float shade = 2.0 * mu0 / max(mu0 + mu, 1e-4);
+
+    vec3 face = vec3(1.0);
+    if (moon.face != 0u) {
+        // **The vanilla portrait**, mapped across the disc as the game's own art has it: the texture
+        // is a square with the moon inscribed, so the offset in disc units is the texture coordinate
+        // scaled and centred. Built against the world's up rather than the camera's, so the face
+        // stays the right way round as the camera rolls — a moon does not spin when you tilt your
+        // head.
+        vec3 right = normalize(cross(vec3(0.0, 0.0, 1.0), moon.direction));
+        vec3 up = cross(moon.direction, right);
+        vec2 uv = vec2(dot(offset, right), -dot(offset, up)) * 0.5 + 0.5;
+        // **Divided by the portrait's own mean, not by each texel's own luminance.** The faces were
+        // drawn to be shown rather than lit — Masser's mean texel is a linear 0.033 — so what is
+        // wanted from the picture is each texel's *ratio* to that mean, with `moon.colour` supplying
+        // the level it multiplies. Dividing by the texel instead normalises every part of the disc
+        // to the same brightness and leaves the maria as a hue shift, which is not what a moon looks
+        // like: they are darker, and this is what makes them darker.
+        face = textureLod(textures[moon.face], uv, 0.0).rgb / max(moon.face_mean, 1e-6);
+    }
+    return moon.colour * (shade * face);
+}
+
 // How many atmospheres a beam crosses to something `climb` above the horizon — Kasten and Young.
 float air_mass(float climb) {
     float degrees = degrees(asin(clamp(climb, 0.0, 1.0)));
     return 1.0 / (climb + 0.50572 * pow(degrees + 6.07995, -1.6364));
 }
 
-vec3 sky_seen_through(vec3 direction, float lobe, bool stars) {
+vec3 sky_seen_through(vec3 direction, float lobe, bool looking) {
     // **The sky has a direction, and this is `Sky::shape` drawn per pixel.** Deep blue overhead,
     // pale at the horizon where the air is thick enough to have forgotten what colour it was, and
     // once the sun is low, orange on its side and dim blue on the other. Everything that knows what
@@ -300,16 +390,25 @@ vec3 sky_seen_through(vec3 direction, float lobe, bool stars) {
     // **Behind the fog and under the sun**, which is why they are added here rather than composited
     // later: a star is a thing in the sky, so the fog attenuates it and the dawn drowns it exactly as
     // they do everything else the sky sends. The schedule is Morrowind's own — see
-    // `TimeOfDay::starlight`.
+    // `WorldTime::starlight`.
     //
-    // **Drawn, and lighting nothing**, which is why `stars` is a flag rather than always on. The
+    // **Drawn, and lighting nothing**, which is why `looking` is a flag rather than always on. The
     // brightest here is sixty times the sky's floor, and a bounce ray finds one about once in eight
     // hundred — so with four samples a pixel, one in two hundred would come back with a sixteenfold
     // spike in it and the night would crawl with fireflies. Real starlight is a rounding error on a
     // moonless landscape, so the honest answer and the cheap one agree.
-    if (stars && frame.sky_stars > 0.0) {
+    if (looking && frame.sky_stars > 0.0) {
         colour += vec3(STAR_BRIGHTNESS * frame.sky_stars
                      * star_field(direction, frame.cone_spread + lobe));
+    }
+
+    // **The moons, and for the same reason drawn rather than gathered.** Masser is five degrees
+    // across against the sun's half, so its disc covers a thousand times the solid angle and a
+    // bounce ray finds one about once in a thousand — at three hundred times the night sky's own
+    // floor, which is a firefly every few hundred pixels. The light they actually contribute arrives
+    // as a directional term in `direct_light`, where it is resolved rather than sampled.
+    if (looking) {
+        colour += moon_disc(direction, frame.masser) + moon_disc(direction, frame.secunda);
     }
 
     // **`lobe` is how far a rough surface smears the sun**, in radians. Water too fine to resolve
@@ -333,7 +432,8 @@ vec3 sky(vec3 direction) {
 }
 
 // The same sky as a *source of light* rather than a thing to look at, which is the same sky without
-// its stars — see the note beside them in `sky_seen_through`.
+// the two things in it small enough and bright enough to be fireflies: its stars and its moons. Both
+// are resolved elsewhere — see the notes beside them in `sky_seen_through`.
 vec3 sky_lighting(vec3 direction) {
     return sky_seen_through(direction, 0.0, false);
 }

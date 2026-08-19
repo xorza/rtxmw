@@ -4,10 +4,24 @@ use std::collections::HashMap;
 
 use rtxmw_gpu::{Buffer, Device, RayTracingLimits, Uploader};
 use rtxmw_scene::{
-    Ambient, CellId, Instance, Light, MaterialKind, MaterialTable, Mesh, MeshId, Sky, StaticScene,
-    Sun, TerrainLayers, TextureId,
+    Ambient, CellId, Instance, Light, MaterialKind, MaterialTable, Mesh, MeshId, Moon, MoonFaces,
+    Sky, StaticScene, Sun, TerrainLayers, TextureId,
 };
 use rtxmw_texture::Texture;
+
+/// How many slots the bindless array reserves before any material's, matching `MOON_FACES` in
+/// `surface.glsl` — where they disagree, every texture in the cell shifts, which
+/// `tests/terrain.rs` fails on.
+const MOON_FACES: u32 = 2;
+
+/// Which of those two slots each moon takes.
+///
+/// **Ids rather than descriptor indices**, which differ by one: slot zero of the descriptor array
+/// is the fallback, so `Lighting::masser_face` is this plus one — and zero there means no portrait,
+/// which is why the fallback's own index is the one that can stand for "none".
+const MASSER_FACE: u32 = 0;
+/// Secunda's, immediately after Masser's.
+const SECUNDA_FACE: u32 = 1;
 
 use crate::geometry_buffers::GeometryBuffers;
 use crate::gpu_light::GpuLight;
@@ -119,7 +133,15 @@ impl SceneResidency {
     ) -> rtxmw_gpu::Result<Self> {
         let memory = uploader.memory().clone();
         let geometry = GeometryBuffers::new(&memory)?;
-        let textures = TextureArray::new(device, uploader)?;
+        let mut textures = TextureArray::new(device, uploader)?;
+        // **The moons' two slots, reserved before anything else can take them.** A material's id
+        // addresses a fixed pair of slots — `colour_slot` in `surface.glsl` — so a face inserted
+        // after the first cell had loaded would displace every texture behind it. They hold the
+        // array's own fallback until someone hands over the portraits, which is what `masser_face`
+        // staying zero says.
+        for _ in 0..MOON_FACES {
+            textures.insert(uploader, None)?;
+        }
         let acceleration = SceneAcceleration::new(device, uploader, limits)?;
         let materials = MaterialTable::default();
         let tables = MaterialBuffers::upload(uploader, &geometry, materials.materials())?;
@@ -216,12 +238,14 @@ impl SceneResidency {
         };
         self.lighting.sky_scale = scale;
         self.lighting.sky_floor = floor;
-        // A room has no stars in it however late it is.
-        self.lighting.sky_stars = if self.record.is_some() {
-            0.0
-        } else {
-            self.sky.stars
+        // A room has no stars in it however late it is, and no moons either.
+        let (stars, masser, secunda) = match self.record {
+            Some(_) => (0.0, Moon::NONE, Moon::NONE),
+            None => (self.sky.stars, self.sky.masser, self.sky.secunda),
         };
+        self.lighting.sky_stars = stars;
+        self.lighting.masser = masser;
+        self.lighting.secunda = secunda;
 
         // **Only interiors carry fog in the record**, so a recorded density is what identifies one
         // and settles all three of these together. An exterior's fog belongs to the weather system —
@@ -328,6 +352,29 @@ impl SceneResidency {
         &self.textures
     }
 
+    /// Fills the two reserved slots with the moons' vanilla portraits.
+    ///
+    /// Until this is called the moons are drawn as flat discs of their own colour, which is what a
+    /// renderer nobody handed the faces to gets — every test that does not need them, and any
+    /// session where the files would not decode.
+    ///
+    /// The caller must have waited for device idle.
+    pub(crate) fn set_moon_faces(
+        &mut self,
+        uploader: &mut Uploader,
+        faces: &MoonFaces,
+    ) -> rtxmw_gpu::Result<()> {
+        if let Some(texture) = faces.masser.as_ref() {
+            self.textures.fill(uploader, MASSER_FACE, texture)?;
+            self.lighting.masser_face = MASSER_FACE + 1;
+        }
+        if let Some(texture) = faces.secunda.as_ref() {
+            self.textures.fill(uploader, SECUNDA_FACE, texture)?;
+            self.lighting.secunda_face = SECUNDA_FACE + 1;
+        }
+        Ok(())
+    }
+
     pub(crate) fn acceleration(&self) -> &SceneAcceleration {
         &self.acceleration
     }
@@ -365,7 +412,11 @@ impl SceneResidency {
                 // holds the array's magenta stand-in, which would divide the surface by two.
                 let map = texture.map_or_else(Texture::neutral_shading, Texture::shading_map);
                 let shading = self.textures.insert(uploader, Some(&map))?;
-                assert_eq!(colour, shared * 2, "a texture id addresses its own pair");
+                assert_eq!(
+                    colour,
+                    MOON_FACES + shared * 2,
+                    "a texture id addresses its own pair, behind the moons' reserved slots"
+                );
                 assert_eq!(
                     shading,
                     colour + 1,

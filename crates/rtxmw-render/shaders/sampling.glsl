@@ -34,11 +34,15 @@ const uint STREAM_DIRECT = 0u;
 const uint STREAM_BOUNCE = 1u;
 const uint STREAM_INDIRECT = 2u;
 
-// Added to whichever stream is asking, so the sun's samples never repeat a lamp's.
+// Added to whichever stream is asking, so the sun's samples never repeat a lamp's — and the moons'
+// never repeat the sun's, which matters at dusk when all three are up at once and one pattern
+// across all of them would correlate their penumbrae into a single band.
 const uint STREAM_SUN = 4096u;
 const uint STREAM_WATER_REFLECT = 8192u;
 const uint STREAM_FOG = 12288u;
 const uint STREAM_WATER_REFRACT = 8193u;
+const uint STREAM_MASSER = 16384u;
+const uint STREAM_SECUNDA = 20480u;
 
 // A cheap, stable hash of four integers, for decorrelating one pixel's samples from its
 // neighbours'.

@@ -1,6 +1,11 @@
-//! Decoding the colours Morrowind stores.
+//! Decoding the colours Morrowind stores, and what the eye makes of them once decoded.
 
 use glam::Vec3;
+
+/// What the eye makes of a linear colour, which is the only sense in which one has a brightness.
+///
+/// Rec. 709, matching the primaries every texture in the game is decoded to.
+pub(crate) const LUMA: Vec3 = Vec3::new(0.2126, 0.7152, 0.0722);
 
 /// Converts a packed `0xAABBGGRR` colour to linear RGB.
 ///

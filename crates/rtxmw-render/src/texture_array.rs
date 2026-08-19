@@ -87,6 +87,26 @@ impl TextureArray {
         Ok(id)
     }
 
+    /// Puts `texture` in a slot that already exists, replacing whatever was there.
+    ///
+    /// **What the moons' portraits need and nothing else does.** Their two slots are reserved when
+    /// the array is built, because a material's id addresses a fixed pair of slots after them and an
+    /// id that moved once the faces arrived would be every wall in the cell wearing the wrong
+    /// texture. The faces themselves arrive later, from a caller that had to open the archives
+    /// first.
+    ///
+    /// The caller must have waited for device idle: the image being replaced may be one a queued
+    /// frame is still sampling.
+    pub(crate) fn fill(
+        &mut self,
+        uploader: &mut Uploader,
+        id: u32,
+        texture: &Texture,
+    ) -> rtxmw_gpu::Result<()> {
+        self.slots[id as usize] = Some(upload_one(uploader, texture)?);
+        Ok(())
+    }
+
     /// How many slots the array holds, fallback included.
     pub(crate) fn len(&self) -> u32 {
         self.slots.len() as u32 + 1
