@@ -8,6 +8,7 @@ mod renderer;
 mod scene_loader;
 mod texture_sheet;
 mod upscaler;
+mod world_clock;
 
 use winit::event_loop::{ControlFlow, EventLoop};
 

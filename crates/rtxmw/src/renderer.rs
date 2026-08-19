@@ -202,9 +202,15 @@ impl Renderer {
             .commit(&self.device, &mut self.uploader, self.physical.limits())
     }
 
-    /// Sets the clock the water's waves move against, in seconds since the engine started.
+    /// Sets the clock the water's waves and the fog's drift move against, in seconds since the
+    /// engine started — the world's own seconds, which run faster than the wall's when asked.
     pub(crate) fn set_time(&mut self, seconds: f32) {
         self.scene.set_time(seconds);
+    }
+
+    /// Moves the sky every resident exterior stands under.
+    pub(crate) fn set_sky(&mut self, sky: Sky) {
+        self.scene.set_sky(sky);
     }
 
     /// The frame constants for a camera, filled in with the loaded cell's lighting.

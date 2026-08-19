@@ -2638,3 +2638,43 @@ is a uniform gold wash where it should be orange toward the sun and blue away fr
 `sky_seen_through` needs the same treatment the ground fog got. Night is a floor value and a dark
 frame that auto-exposure lifts to a pale one: Morrowind has two moons and a night sky texture, and
 this renderer draws neither.
+
+### 8.46 A clock to look at the world with
+
+§8.45 made the sky a function of an hour but left the hour fixed for the run, so seeing dusk meant
+restarting with a different `--time` and the fog's drift — a minute of wind to move a bank its own
+width — meant sitting and waiting. Both are now keys on one clock.
+
+**One clock, because both are the same clock.** The fog's drift is a distance the wind has carried
+it and the sun's height is an hour of the day; a `WorldClock` holds the seconds and the hour and
+advances both by the same real delta times one speed, so `[` and `]` carry the two together the way
+a day actually does. At speed 1 it runs at Morrowind's own `timescale` of 30, which makes the
+fourteen-hour day take twenty-eight minutes — right to play at, useless to look at. The step is ×4
+and the ceiling 256, which is five settings in all: at 64 the fog reads, banks forming and pulling
+apart at about one a second, and at 256 a whole day is under seven seconds.
+
+**The timescale is a factor of thirty before the speed touches it, and forgetting that is how the
+ceiling first came out at 4096** — at which the entire day passes in four tenths of a second. What
+caught it was the test written for the stall clamp below: the arithmetic that test needed made the
+number impossible to keep.
+
+**And nudges, which are the useful half.** `,` and `.` move the hour half an hour without moving the
+clock, so they work while paused. Reaching dusk by speeding time up drags the fog through an hour of
+wind on the way, and two frames that differ in the fog as well as the light compare nothing; a nudge
+arrives with every bank where it was. That is the control for judging a change, and the speed is the
+one for watching the world.
+
+**A clock is not a velocity**, which is what a frame's delta usually is here. A camera that missed a
+second simply did not move; a clock that missed one has to decide how much time passed, and a cell
+load stalls the better part of a second — unclamped at the top speed that is two and a half game
+hours for a frame in which nothing happened. `advance` therefore carries at most a twentieth of a
+second, a long frame, and drops whatever a stall added to it.
+
+The keys deliberately act on a key's *repeat* as well as its press, so holding one scrubs — except
+the pause on `\`, which a repeat would flicker on and off thirty times a second. The window's title
+carries the clock face and the rate, and `WorldClock` writes itself into the caller's formatter
+rather than handing back strings, because the title is built twice a second on the frame path.
+
+`SceneRenderer::set_sky` is called every frame now rather than once, which §8.45 built it for:
+`relight()` is a match and a handful of float assignments over state the residency already holds, and
+allocates nothing.

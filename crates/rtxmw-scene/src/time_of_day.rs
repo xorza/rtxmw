@@ -26,6 +26,11 @@ impl TimeOfDay {
         }
     }
 
+    /// The hour itself, wrapped into a day.
+    pub fn hour(self) -> f32 {
+        self.hours
+    }
+
     /// Where the sun stands in its arc: 1 at sunrise, 0 at noon, −1 at sunset.
     ///
     /// **It runs past both ends rather than stopping there**, and that is what carries the night:

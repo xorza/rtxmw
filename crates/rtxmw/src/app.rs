@@ -16,6 +16,17 @@ use crate::camera::{Camera, Movement};
 use crate::cli::{Upscaling, WindowOptions};
 use crate::renderer::Renderer;
 use crate::scene_loader::{self, WantedCell};
+use crate::world_clock::WorldClock;
+
+/// What the keys below do, for whoever is looking at the window rather than at this file.
+///
+/// Here rather than beside the clock they mostly drive, because the bindings are here: a key named
+/// in one file and matched in another rots the moment either moves.
+const KEYS: &str = concat!(
+    "keys: WASD, space and ctrl to fly \u{b7} shift to hurry \u{b7} ",
+    "[ ] time speed \u{b7} \\ pause time \u{b7} , . step the hour by half \u{b7} ",
+    "esc to release the mouse",
+);
 
 /// Starting resolution — the internal render target from the design's performance budget.
 const INITIAL_SIZE: (u32, u32) = (1920, 1080);
@@ -76,8 +87,8 @@ pub(crate) struct App {
     delight: f32,
     /// How much of the cell's fog to apply, held for the renderer built when the window appears.
     fog: f32,
-    /// The hour an exterior is lit at, likewise held until there is a renderer to give it to.
-    time: TimeOfDay,
+    /// How long the world has run and what hour it is there, which the keys below drive.
+    clock: WorldClock,
     /// Which cell to open in, from the command line.
     cell: CellId,
     /// **Before `window`, and that is load-bearing.** Fields drop in declaration order, and the
@@ -112,8 +123,6 @@ pub(crate) struct App {
     /// Mouse look is only applied while the cursor is captured.
     mouse_captured: bool,
     last_frame: Instant,
-    /// When the engine started, which is the clock the water's waves move against.
-    started: Instant,
     last_title_update: Instant,
     frames_since_title: u32,
 }
@@ -254,7 +263,7 @@ impl App {
             dlss: options.dlss,
             delight: options.delight,
             fog: options.fog,
-            time: options.time,
+            clock: WorldClock::starting_at(options.time),
             exit_after: options.exit_after,
             ..Self::default()
         }
@@ -269,7 +278,7 @@ impl Default for App {
             dlss: Upscaling(None),
             delight: 1.0,
             fog: 1.0,
-            time: TimeOfDay::default(),
+            clock: WorldClock::starting_at(TimeOfDay::default()),
             renderer: None,
             window: None,
             centre: None,
@@ -285,7 +294,6 @@ impl Default for App {
             keys: Keys::default(),
             mouse_captured: false,
             last_frame: now,
-            started: now,
             last_title_update: now,
             frames_since_title: 0,
         }
@@ -329,7 +337,8 @@ impl App {
             .map(Renderer::device_name)
             .unwrap_or("no device");
         window.set_title(&format!(
-            "rtxmw — {fps:.0} fps — {:.0}, {:.0}, {:.0} — {:.1} m/s — {} cells — {device}",
+            "rtxmw — {fps:.0} fps — {} — {:.0}, {:.0}, {:.0} — {:.1} m/s — {} cells — {device}",
+            self.clock,
             position.x,
             position.y,
             position.z,
@@ -366,10 +375,11 @@ impl ApplicationHandler for App {
             self.dlss,
             self.delight,
             self.fog,
-            Sky::at(self.time),
+            Sky::at(self.clock.time()),
         ) {
             Ok(renderer) => {
                 println!("{}", renderer.capability_report());
+                println!("{KEYS}");
                 self.renderer = Some(renderer);
             }
             Err(e) => {
@@ -455,6 +465,19 @@ impl ApplicationHandler for App {
                     KeyCode::Space => self.keys.up = pressed,
                     KeyCode::ControlLeft => self.keys.down = pressed,
                     KeyCode::ShiftLeft => self.keys.boost = pressed,
+                    // **Time.** The fog drifts against the same clock the sun climbs on, so one
+                    // speed carries both — and the nudges move the hour alone, which is how two
+                    // times of day are compared without the fog having blown somewhere else in
+                    // between.
+                    //
+                    // These take the key's repeat as well as its press, so holding one scrubs
+                    // rather than stepping — except the pause, which a repeat would flicker on and
+                    // off thirty times a second.
+                    KeyCode::BracketRight if pressed => self.clock.step_speed(1.0),
+                    KeyCode::BracketLeft if pressed => self.clock.step_speed(-1.0),
+                    KeyCode::Backslash if pressed && !event.repeat => self.clock.toggle_pause(),
+                    KeyCode::Period if pressed => self.clock.nudge(1.0),
+                    KeyCode::Comma if pressed => self.clock.nudge(-1.0),
                     KeyCode::Escape if pressed => {
                         if self.mouse_captured {
                             self.set_capture(false);
@@ -473,9 +496,12 @@ impl ApplicationHandler for App {
                 self.camera.fly(self.keys.movement(), dt);
                 self.stream_cells();
 
+                self.clock.advance(dt);
+
                 if let (Some(renderer), Some(window)) = (&mut self.renderer, &self.window) {
                     let size = window.inner_size();
-                    renderer.set_time(self.started.elapsed().as_secs_f32());
+                    renderer.set_time(self.clock.seconds());
+                    renderer.set_sky(Sky::at(self.clock.time()));
                     let constants = renderer.frame_constants(
                         self.camera.view(),
                         self.camera.projection(renderer.aspect_ratio()),
