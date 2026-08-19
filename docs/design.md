@@ -1,7 +1,7 @@
-# rtxmw — renderer design proposal
+# rtxmw — renderer design
 
-Written 2026-08-18. The decisions below are settled; §4 carries what is built and what each
-milestone measured.
+Written 2026-08-18. The decisions here are settled; §4 records what is built and what each milestone
+measured.
 
 Immediate goal: **render static Morrowind locations with a free noclip camera**, with hardware ray
 tracing as the primary rendering mode rather than an effect layered on a rasterizer.
@@ -10,531 +10,257 @@ tracing as the primary rendering mode rather than an effect layered on a rasteri
 
 | Question | Decision | Consequence |
 |---|---|---|
-| Graphics API | **`ash` (raw Vulkan) + GLSL via `glslc`** | wgpu removed. Nothing is a dead end — refit, opacity micromaps, SER and RT pipelines all reachable. Costs 1–2 weeks of plumbing at M0 |
-| License | **MIT OR Apache-2.0** | DLSS Ray Reconstruction is available. M7 becomes an integration rather than writing a denoiser |
-| Material data | **De-light vanilla textures offline** | The most ambitious option; needs its own spike. See §5.1 — de-lighting recovers albedo only |
+| Graphics API | **`ash` (raw Vulkan) + GLSL via `glslc`** | wgpu removed. Refit, opacity micromaps, SER and RT pipelines all stay reachable |
+| License | **MIT OR Apache-2.0** | DLSS Ray Reconstruction is available; M7 is an integration rather than writing a denoiser |
+| Material data | **De-light vanilla textures offline** | Needs its own spike. See §5.1 — de-lighting recovers albedo only |
 | Perf target | **1920×1080 internal → 3840×2160 output @ 60 fps** | ~8–9 ms denoiser, ~7 ms for everything else. 16:9 output, not native ultrawide |
 | First scene | **Interiors through M8; exteriors at M9** | Fastest path to a correct image; terrain and streaming stay unvalidated until late |
 | Windowing | **`winit`** | Gamepad and audio need separate crates when they arrive |
 
 ---
 
-## 1. Graphics API: decided
+## 1. Graphics API: `ash` and GLSL
 
-**`ash` (raw Vulkan) with GLSL shaders compiled by `glslc`. wgpu removed.**
+wgpu 30 was audited against its vendored sources, not its documentation, and removed.
 
-The reasoning is below; §1.3 keeps the counter-case on record, because if this decision is ever
-revisited that is the argument to re-read.
+**It does well:** ray queries from compute with a complete WGSL surface — candidate *and* committed
+intersections, barycentrics, instance and geometry indices, both object↔world matrices, position
+fetch; bindless *including* non-uniform indexing of a `binding_array` by a value read at a hit;
+BLAS/TLAS creation with working async compaction; `as_hal` down to `ash::Device` for SDK interop.
 
-### 1.1 What wgpu 30 can and cannot do
-
-Audited against the vendored crate sources, not documentation.
-
-**Works, and works well:**
-
-- Ray queries from compute/fragment with a complete WGSL surface: candidate *and* committed
-  intersections, `RayIntersection` carrying `t`, barycentrics, instance/geometry/primitive index,
-  `instance_custom_data`, front-face, and both object↔world matrices; AABB
-  `rayQueryGenerateIntersection`; `ray_query<vertex_return>` position fetch.
-- Bindless, **including non-uniform indexing of a `binding_array` by a value read at a ray-query
-  hit** — naga auto-emits the `NonUniform` decoration. This is the capability a bindless material
-  system depends on, and it is present.
-- BLAS/TLAS creation, batched builds, AABB geometry, per-geometry transforms, working async BLAS
-  compaction, TLAS binding arrays.
-- `as_hal` gives `ash::Device`, `vk::Image`, `vk::Buffer`, queue, semaphores — enough for
-  native-SDK interop.
-
-**Cannot do, and these are not edge cases for this project:**
+**It cannot do these, and none of them is an edge case here:**
 
 | Gap | Consequence for a Morrowind engine |
 |---|---|
-| **No BLAS refit.** `ALLOW_UPDATE`/`PreferUpdate` are accepted and silently ignored; wgpu-core hardcodes `Build` and logs *"only rebuild is implemented"* | Every skinned NPC and creature is a **full BLAS rebuild every frame** |
-| **No opacity micromaps** (`VK_EXT_opacity_micromap` is exposed by the target hardware, unreachable through wgpu) | Morrowind is saturated with alpha-tested foliage, grates, lanterns, banners. This is the single biggest RT cost multiplier in the game, and the hardware fix is off the table |
-| **No RT pipelines at the safe API level** — zero mentions in wgpu-core; the draft PR is untouched and will not land in v31. No `as_hal` on `BindGroup`/`PipelineLayout`/`ShaderModule`, so the wgpu-hal implementation is unreachable without a parallel descriptor system | No SBT-driven material dispatch, no intersection or callable shaders |
-| **No shader execution reordering** (the target hardware reports real `REORDER` mode) | Leaves substantial performance unclaimed on divergent hit shading |
-| **TLAS instances are a CPU `Vec`**, serialized and staged on every build; the raw-instance escape hatch was removed in v30 | Measured upstream at ~1 ms per 1,000 instances, with instance marshalling at 98.7% of encode time. Morrowind exteriors are thousands of small statics |
-| No async/second queue for AS builds; no per-instance geometry flags or SBT offset; no buffer device address on ordinary buffers | Assorted, each individually survivable |
+| **No BLAS refit** — `ALLOW_UPDATE`/`PreferUpdate` are accepted and silently ignored | Every skinned actor is a full BLAS rebuild every frame |
+| **No opacity micromaps**, though the hardware exposes `VK_EXT_opacity_micromap` | Morrowind is saturated with alpha-tested foliage, grates and banners — the single biggest RT cost multiplier in the game |
+| **No RT pipelines** at the safe API level, and `as_hal` does not reach `BindGroup`/`PipelineLayout`/`ShaderModule` | No SBT-driven material dispatch, no intersection or callable shaders |
+| **No shader execution reordering**, though the hardware reports real `REORDER` | Substantial performance unclaimed on divergent hit shading |
+| **TLAS instances are a CPU `Vec`**, re-serialized every build | ~1 ms per 1,000 instances upstream, 98.7% of encode time. Exteriors are thousands of small statics |
 
-### 1.2 The decisive evidence
+The corroborating evidence is bevy_solari, wgpu's flagship RT consumer: its tracking issue still
+lists transparent and alpha-masked materials, skinned meshes, point lights, environment lighting,
+LODs and mipmaps as unsupported — approximately the Morrowind feature set — and it has already
+dropped to `wgpu-hal` to escape TLAS-build overhead. wgpu's RT surface has also had breaking changes
+in every release since 23.0.0 and sits behind an `unsafe` token documented as *"inherently bugs in
+our implementation"*.
 
-**bevy_solari** is the flagship wgpu ray-tracing project, written by wgpu's principal RT consumer.
-Its own tracking issue still lists as *not supported*: transparent and alpha-masked materials,
-skinned and morphed meshes, point/spot lights, environment lighting, LODs, mipmaps. **That list is
-approximately the Morrowind feature set.** And it has already dropped to `wgpu-hal` plus a compute
-shader for TLAS building specifically to escape wgpu's overhead.
+**The counter-case, kept because this is the argument to re-read if the decision is revisited.** For
+the stated goal alone wgpu is sufficient: static geometry means BLASes and the TLAS are built once,
+so refit never fires, and ray-queries-in-compute is a mainstream architecture rather than a
+compromise. It would have saved one to two weeks of allocator, descriptor, barrier and SBT plumbing,
+and `dlss_wgpu` pins exactly to wgpu 30. Two things defeat it: the gaps above are certainties rather
+than risks, and the DLSS advantage is illusory — `dlss_wgpu` exists to inject Vulkan extensions
+before device creation, which under `ash` is just calling NGX with a device we own.
 
-Meanwhile wgpu's RT surface has had breaking changes in **every release since 23.0.0**, one release
-required adding a new `enable` directive to every existing shader, the feature is authored almost
-entirely by one person, and using it requires an `unsafe { ExperimentalFeatures::enabled() }` token
-documented as *"inherently bugs in our implementation that we will eventually fix."* There is also a
-live codegen bug in the current release: ray queries hoisted out of loops emit invalid SPIR-V.
-
-Set against that, `ash` 0.38 exposes the full `VK_KHR_acceleration_structure` /
-`ray_tracing_pipeline` / `ray_query` / `ray_tracing_position_fetch` surface plus
-`VK_EXT_opacity_micromap` and invocation reorder, and `glslc` + `spirv-val` were verified compiling
-`.rgen`/`.rchit`/`.rmiss` and ray-query compute against the target hardware.
-
-### 1.3 The honest counter-case
-
-For **the stated immediate goal alone**, wgpu is sufficient. Static geometry means BLASes are built
-once and compacted, and the TLAS is built once — refit and GPU-driven instance updates never fire.
-Ray-queries-in-compute is a mainstream 2026 architecture, not a compromise. wgpu would also save
-perhaps one to two weeks of allocator/descriptor/barrier/SBT plumbing, and `dlss_wgpu` 5.0.0 pins
-exactly to wgpu 30, making DLSS Ray Reconstruction almost free.
-
-Two things defeat that argument:
-
-1. The gaps are **certainties, not risks**. A Morrowind engine has skinned actors, pervasive
-   alpha-tested geometry, and torch point lights. The question is *when* the wall arrives, not *if*.
-2. The DLSS advantage is smaller than it looks. `dlss_wgpu` exists precisely to work around wgpu's
-   abstraction — it has to inject Vulkan extensions via `init_with_callback` before device creation.
-   Under `ash` the `VkDevice` is ours and NGX is called directly, which is *simpler*, not harder.
-
-Trading a bounded backend rewrite later for a Morrowind interior on screen two weeks sooner is a
-defensible choice, and §2's module split is designed so the backend is replaceable either way. But
-"RTX as a first-class feature" should not be designed on an API that cannot reach opacity micromaps,
-refit, or SER.
-
-### 1.4 Shader language
-
-**GLSL**, via `glslc` from `build.rs`, with `spirv-val` in the verification chain.
-
-`GLSL_EXT_ray_tracing` and `GLSL_EXT_ray_query` are complete and frozen-because-done. Critically,
-**almost every readable open-source RT reference is GLSL**: Lumen (MIT, ReSTIR DI+GI+PT, Vulkan,
-Linux), caldera, Q2RTX's A-SVGF, Godot's RT plumbing, NVIDIA's Godot RTX fork, `adrien-ben`'s
-ash-0.38/edition-2024 examples. For a first RT renderer, reference-code availability outweighs
-language quality.
-
-**Slang** is the better language, has the most complete RT surface of any option (all six stages,
-`HitObject`/SER, autodiff), is Apache-2.0 under Khronos governance, and is where new NVIDIA and
-Khronos samples are going — nvpro's ray tracing tutorial has been rewritten Slang-only. It costs an
-AUR install and `slangc` shelled from `build.rs`. Both compile to SPIR-V, so this is **not a
-one-way door**: shaders can migrate individually. Revisit once the renderer's shape is settled.
-
-Rejected: WGSL (wgpu-proprietary RT dialect, no WebGPU RT spec exists, dead end off wgpu); HLSL/DXC
-(hard ceiling — DXC knows only three RT extensions, no position fetch, no micromaps, no SER);
-rust-gpu (zero RT examples, incomplete buffer-device-address, and even kajiya used HLSL for its ray
-tracing).
+**GLSL**, compiled by `glslc` from `build.rs` and validated with `spirv-val`. `GLSL_EXT_ray_tracing`
+and `GLSL_EXT_ray_query` are complete, and almost every readable open-source RT reference is GLSL —
+Lumen, caldera, Q2RTX's A-SVGF, Godot's RT plumbing, `adrien-ben`'s ash-0.38 examples. For a first
+RT renderer, reference availability outweighs language quality. Slang is the better language, has
+the most complete RT surface of any option, and both compile to SPIR-V, so shaders can migrate
+individually; revisit once the renderer's shape is settled. Rejected: WGSL (a wgpu-proprietary
+dialect, dead end off wgpu), HLSL/DXC (knows three RT extensions, no position fetch, micromaps or
+SER), rust-gpu (no RT examples, incomplete buffer device address).
 
 ---
 
 ## 2. Module structure
 
-Workspace crates, in dependency order. Each is a hard boundary; nothing below the line knows about
-Vulkan, nothing above it knows about ESM records.
+Workspace crates, in dependency order. Each is a hard boundary; nothing below `rtxmw-scene` knows
+about Vulkan, nothing above it knows about ESM records.
 
 ```
 crates/
   rtxmw-vfs      path normalization, archive layering, BSA readers
   rtxmw-esm      ESM3 reader, record types, RefId, record store
   rtxmw-nif      NIF block reader → geometry, material, node graph
+  rtxmw-texture  DDS/TGA decode
   rtxmw-scene    format-neutral scene: meshes, materials, instances, lights
   rtxmw-gpu      Vulkan: instance/device/queues/allocator/descriptors/swapchain
   rtxmw-render   acceleration structures, passes, denoise, post
   rtxmw          binary: window, input, noclip camera, wiring
 ```
 
-`rtxmw-scene` is the seam that matters. Everything above it is Morrowind-specific and testable
-headlessly; everything below is a renderer that would work for any scene. It is also what makes the
-API decision in §1 revisable — swapping `rtxmw-gpu` and `rtxmw-render` leaves four crates untouched.
-
-Within crates, the existing style rules apply: directory modules, one major struct per file named
-after it, `impl` blocks only in the struct's own file, no re-exports except `lib.rs`, gated test mods
-at the end of the production file.
+Everything above `rtxmw-scene` is Morrowind-specific and testable headlessly; everything below is a
+renderer that would work for any scene. That seam is also what keeps §1 revisable — swapping
+`rtxmw-gpu` and `rtxmw-render` leaves the format crates untouched.
 
 ---
 
 ## 3. Core data types
 
-Sketches, not final signatures. Flat storage throughout, per the project's collection rules — a
-Morrowind cell is thousands of small objects and `Vec<Vec<_>>` would allocate per instance.
+Flat storage throughout: a Morrowind cell is thousands of small objects and `Vec<Vec<_>>` would
+allocate per instance. `StaticScene` is parallel vectors of meshes, materials, textures, instances
+and lights plus the cell ambient; a mesh is one flat vertex and index buffer with a `submeshes`
+table of index ranges tagged by material.
 
-### Scene (format-neutral, `rtxmw-scene`)
+**A hit resolves through one indexed read.** The TLAS instance's 24-bit custom index carries the
+mesh's `first_submesh`; adding the hit's own `geometry_index` lands directly on a `GpuGeometry`
+entry, which names the material and the vertex/index offsets needed to interpolate attributes at the
+barycentrics. That is the whole reason the submesh table is flat rather than per-mesh.
 
-```rust
-/// One loaded location, ready to hand to the renderer.
-struct StaticScene {
-    meshes: Vec<Mesh>,
-    materials: Vec<Material>,
-    textures: Vec<TextureId>,
-    instances: Vec<Instance>,
-    lights: Vec<Light>,
-    ambient: CellAmbient,
-}
+**Positions get their own tightly packed `Float32x3` stream**, with shading attributes in a parallel
+buffer indexed by the same vertex id. Acceleration structure builds read positions with their own
+stride and ignore everything else; this is what the build API wants, not an optimization.
 
-/// Geometry for one NIF, flattened. Submeshes index into the shared buffers.
-struct Mesh {
-    positions: Vec<[f32; 3]>,
-    normals:   Vec<[f32; 3]>,
-    uvs:       Vec<[f32; 2]>,
-    colors:    Vec<[u8; 4]>,        // empty when the NIF has none
-    indices:   Vec<u32>,
-    submeshes: Vec<SubMesh>,        // small and fixed after load
-}
-
-/// An index range plus the material it draws with. One BLAS geometry each.
-struct SubMesh {
-    indices: Range<u32>,
-    base_vertex: u32,
-    material: MaterialId,
-}
-
-/// A placed reference. `transform` already folds in position, rotation and scale.
-struct Instance {
-    mesh: MeshId,
-    transform: Affine3A,
-    /// Packed into the TLAS instance's 24-bit custom index.
-    geometry_base: u32,
-}
-
-struct Material {
-    base_color: TextureId,
-    /// Only ever populated by replacer texture packs — vanilla NIFs carry none.
-    normal: Option<TextureId>,
-    specular: Option<TextureId>,
-    emissive: [f32; 3],
-    alpha: AlphaMode,               // Opaque | Masked { threshold } | Blended
-    two_sided: bool,
-}
-
-/// From an ESM `LIGH` record plus its placement.
-struct Light {
-    position: Vec3,
-    color: [f32; 3],
-    /// Morrowind units. Needs a physical mapping — see §5.4.
-    radius: f32,
-    flags: LightFlags,              // flicker, pulse, negative, fire
-}
-```
-
-### GPU-side (`rtxmw-render`)
-
-The shading pass is bindless: one storage buffer of geometry descriptors, one of materials, one
-texture `binding_array`. A hit gives `instance_custom_data + geometry_index`, which indexes
-`GeometryRef`, which gives the material and the vertex/index offsets needed to fetch and interpolate
-attributes at the barycentrics.
-
-```rust
-/// One per BLAS geometry, indexed by `instance_custom_data + geometry_index`.
-#[repr(C)]
-struct GeometryRef {
-    index_offset: u32,
-    vertex_offset: u32,
-    material: u32,
-    flags: u32,                     // has_colors, two_sided, alpha_mode
-}
-
-#[repr(C)]
-struct GpuMaterial {
-    base_color: u32,                // index into the bindless texture array
-    normal: u32,                    // sentinel when absent
-    specular: u32,
-    emissive: [f32; 3],
-    alpha_cutoff: f32,
-    flags: u32,
-}
-```
-
-`FrameConstants` should be lifted field-for-field from OpenMW's
-`components/fx/stateupdater.hpp:284-288` — current and previous view/projection and their inverses,
-eye position and vector, fog, ambient, sky and sun colors, sun position and vector, resolution,
-near/far/fov, game hour, water height, underwater and interior flags, simulation time, frame number,
-wind. It is a complete, battle-tested list, and the previous-frame matrices are exactly what a
-denoiser and any temporal pass need.
-
-### Vertex layout for BLAS
-
-Position must be a separate, tightly packed `Float32x3` stream — acceleration structure builds read
-positions with their own stride and ignore everything else. Keep shading attributes (normal, uv,
-color, tangent) in a parallel buffer indexed by the same vertex id. This is not an optimization; it
-is what the build API wants.
+**Frame constants** were lifted field-for-field from OpenMW's `components/fx/stateupdater.hpp` —
+current and previous matrices and their inverses, eye, fog, ambient, sky and sun, resolution,
+near/far/fov, game hour, water height, underwater and interior flags, time, frame number, wind. They
+started in push constants, reached Vulkan's guaranteed 128 bytes exactly, and now live in a storage
+buffer read with `scalar` layout so a `vec3` packs at four-byte alignment and matches the `repr(C)`
+struct field for field.
 
 ---
 
 ## 4. Implementation plan
 
-Ten milestones. Each names a **sub-goal**, a **done-when** that is observable rather than "it
-compiles", and the risk it retires. Milestones 1–2 and 3–4 are independent and can interleave.
+Each milestone names a sub-goal, an observable done-when, and the risk it retires.
 
 ### M0 — Foundations — **done**
 winit window, Vulkan instance/device with the RT extension set, swapchain, a cleared frame,
-validation layers on in debug. Noclip camera with mouse-look and WASD, frame timing in the title bar.
-**Done when:** a cleared window presents at the target resolution with validation silent, and the
-camera reports plausible world coordinates. ✔
-**Retired:** the Vulkan plumbing risk, and the `ash` decision is now confirmed on real hardware —
-position fetch, ray tracing maintenance1 and **opacity micromap** all report available.
-
-Two corrections from building it:
+validation on in debug, noclip camera. **Retired:** the Vulkan plumbing risk. Position fetch, ray
+tracing maintenance1 and opacity micromap all report available on the target hardware.
 
 - **Vulkan 1.3, not 1.4.** `ash` 0.38 ships 1.3.281 headers, so `API_VERSION_1_4` does not exist.
-  1.3 plus the KHR ray tracing extensions covers everything needed; revisit at ash 0.39.
-- **The swapchain cannot be a storage image.** sRGB formats do not expose
-  `VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT`, so no compute or ray tracing shader can write it directly.
-  Ray tracing output must go to an offscreen HDR image and reach the swapchain through the tonemap
-  blit — which is the wanted shape anyway, but it means the offscreen target is required from M3
-  rather than being an M8 concern.
+- **The swapchain cannot be a storage image.** sRGB formats expose no
+  `VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT`, so ray tracing output must go to an offscreen HDR image and
+  reach the swapchain through a blit — which makes the offscreen target an M3 requirement rather
+  than an M8 concern.
 
-Hardware limits worth having recorded: shader group handle size 32, base alignment 64, max ray
-recursion depth 31, max BLAS geometries and TLAS instances both 16,777,215.
-
-The memory allocator (`gpu-allocator`) is wired as a dependency but not yet used — nothing allocates
-device memory until M2 uploads geometry.
+Hardware limits recorded: shader group handle size 32, base alignment 64, max ray recursion depth
+31, max BLAS geometries and TLAS instances both 16,777,215.
 
 ### M1 — Data: VFS + BSA + ESM enumeration — **done**
-`rtxmw-vfs` path normalization and archive layering; the Morrowind BSA reader; enough of `rtxmw-esm`
-to read `CELL`, stream its refs, and resolve `STAT`/`DOOR`/`CONT`/`ACTI`/`LIGH`/`MISC` to model
-paths.
-**Done when:** given an interior cell name, it prints the ref list — refid, model path, position,
-rotation, scale — and the ref count matches `esmtool dump -t CELL` for that cell. ✔
-**Retired:** the format-decode risk.
+Path normalization and archive layering, the Morrowind BSA reader, and enough ESM to read `CELL`,
+stream its refs and resolve them to model paths. **Retired:** the format-decode risk.
 
-`esmtool` is not installed and building it from `.refs/openmw` was not worth it, so the cross-check
-is against the file's **own header record count** instead: walking Morrowind.esm yields exactly the
-48,295 records the header declares. That catches the failure that matters — a mis-sized record
-shifting every subsequent offset — at least as well as an external diff would.
+`esmtool` is not installed, so the cross-check is the file's **own header record count**: walking
+Morrowind.esm yields exactly the 48,295 records the header declares. That catches the failure that
+matters — a mis-sized record shifting every subsequent offset.
 
 Measured: 20,952 VFS paths across the three BSAs plus loose files (7,319 meshes, 6,256 textures);
 1,134 interiors and 1,404 exteriors holding 316,116 references; Seyda Neen's Census and Excise
-Office resolves 261 of its 268 references to meshes, with **zero** model paths missing from the VFS.
+Office resolves 261 of 268 references to meshes, with zero model paths missing from the VFS.
 
 ### M2 — Geometry: NIF — **done**
-`NiNode` graph traversal with accumulated transforms, `NiTriShape`/`NiTriStrips` → indexed
-triangles, `NiTexturingProperty` base slot, `NiMaterialProperty`, `NiAlphaProperty`, marker and
-`RootCollisionNode` filtering.
-**Done when:** every NIF in `Morrowind.bsa` parses without error or panic (a `niftest` equivalent),
-and triangle/vertex counts for a sample of meshes match `niftest`'s. ✔
-**Retired:** the largest single format risk.
+`NiNode` traversal, `NiTriShape`/`NiTriStrips`, the texturing, material and alpha properties, marker
+and `RootCollisionNode` filtering. **Retired:** the largest single format risk.
 
-All **7,319** shipped meshes parse: 4,579,361 triangles and 4,631,142 vertices, with 41,702 geometry
-blocks passing index-bounds validation. As with `esmtool`, `niftest` is unavailable, so the
-cross-check is self-consistency: every triangle index inside its vertex buffer, every UV set and
-normal array matching the vertex count, and the block walk landing exactly on the root list.
+All 7,319 shipped meshes parse: 4,579,361 triangles, 4,631,142 vertices, 41,702 geometry blocks
+passing index-bounds validation. `niftest` is unavailable too, so the cross-check is
+self-consistency: every triangle index inside its vertex buffer, every UV set and normal array
+matching the vertex count, the block walk landing exactly on the root list.
 
-**Carried into M3, deliberately:** node-graph traversal with accumulated transforms, and marker /
-`RootCollisionNode` filtering. Both are listed in the scope above, and both are about *placing*
-geometry rather than decoding it — they belong with scene assembly, not with the reader.
+**Blocks carry no size at version 4.0.0.2**, so a parser off by one byte shifts every subsequent
+block and the failure surfaces far from its cause. Four bugs, three of them the same mistake: `bool`
+is four bytes at this version, but several fields that look like booleans are declared `char` and
+are one. What made them findable was wrapping every block failure in an error carrying the block's
+index and type — "6,601 × read past the end" became "6,601 × NiSourceTexture", which names the bug.
 
-What made this milestone exacting is worth recording: blocks carry no size at version 4.0.0.2, so a
-parser off by one byte shifts every subsequent block and the failure surfaces far from its cause.
-Four bugs, three of them the same mistake — `bool` is four bytes at this version, but several fields
-that look like booleans are declared `char`/`uint8_t` and are one. The thing that made them findable
-was wrapping every block failure in an error carrying the block's index and type; before that the
-report was "6,601 × read past the end", after it was "6,601 × NiSourceTexture", which named the bug.
+### M3 — First light: RT primary visibility — **done**
+One BLAS per mesh, compacted; one TLAS over the cell's instances; a ray-query compute pass into an
+offscreen HDR target. **Retired:** the whole acceleration-structure pipeline.
 
-### M3 — First light: RT primary visibility
-One BLAS per mesh, compacted; one TLAS over the cell's instances; a raygen (or ray-query compute)
-pass writing barycentric or normal-visualized hits.
-**Done when:** an interior cell is recognizable on screen in false color, and the camera flies
-through it.
-**Retires:** the whole acceleration-structure pipeline. **This is the milestone that proves the
-project.**
+**Upload.** Seyda Neen's office uploads 104 distinct meshes — 21,113 vertices, 17,835 triangles —
+into 0.85 MiB across three buffers.
 
-Split into steps, since it is the largest milestone: **M3a** scene assembly ✔, **M3b** the shader
-build and its ray-query pass ✔, **M3c** geometry upload ✔, **M3d** BLAS and TLAS, **M3e** the
-compute pass into an offscreen HDR target and the blit to the swapchain, **M3f** camera into frame
-constants.
-
-**M3c — done.** `Memory`, `Buffer`, `Uploader` in `rtxmw-gpu`; `GeometryBuffers` in `rtxmw-render`.
-Seyda Neen's Census and Excise Office uploads its 104 distinct meshes — 21,113 vertices, 17,835
-triangles — into 0.85 MiB across three buffers. Four things settled here:
-
-- **Positions get their own tightly packed stream** and shading attributes a parallel one, as §3
-  requires. `GeometryBuffers::POSITION_STRIDE` is asserted to be 12, because the stride is a number
-  the build is *told* rather than one it derives: padding the vertex would not fail, it would
-  misplace every triangle.
+- `GeometryBuffers::POSITION_STRIDE` is asserted to be 12, because the stride is a number the build
+  is *told* rather than one it derives: padding the vertex would not fail, it would misplace every
+  triangle.
 - **Indices stay mesh-local**, with `MeshRange::first_vertex` passed to the build as its
-  `firstVertex` and added in the shader before an attribute fetch. Rebasing them into the shared
-  buffer would work equally well today, but it ties a mesh's index data to where it landed, and
-  cells will relocate meshes at M9.
+  `firstVertex`. Rebasing them into the shared buffer ties a mesh's index data to where it landed,
+  and cells relocate meshes at M9.
 - **A mesh that flattened to nothing keeps its slot** as a zero-length range, so a `MeshId` stays a
   direct index.
-- **`gpu-allocator` pads an allocation to the memory requirement's alignment**, so the raw mapped
-  slice is longer than the buffer — an 8-byte buffer maps 16. `Buffer::mapped` trims to the
-  requested size; without that, every readback would return padding as data.
+- **`gpu-allocator` pads an allocation to the memory requirement's alignment**, so an 8-byte buffer
+  maps 16. `Buffer::mapped` trims to the requested size; without it every readback returns padding.
 
-`TestGpu` was rebuilt on the same three types rather than keeping its own allocator and submitter,
-so the upload path the engine uses is the one the tests exercise. The one-shot `Commands` type stays
-`pub(crate)`: uploads and acceleration structure builds happen at load time, where blocking on a
-fence is the simplest correct thing, and nothing outside the crate should reach for that.
-
-**M3d — done.** `AccelerationStructure` and `SceneAcceleration` in `rtxmw-render`. The same interior
-builds **104 BLAS over 17,835 triangles and a 261-instance TLAS**; compaction takes the bottom level
-from **1.31 MiB to 0.58 MiB, a 56% saving**, which is why `ALLOW_COMPACTION` is on by default rather
-than being an option. Top level is 79 KiB.
+**Structures.** 104 BLAS and a 261-instance TLAS; compaction takes the bottom level from 1.31 MiB to
+0.58 MiB, a 56% saving, which is why `ALLOW_COMPACTION` is on by default rather than optional.
 
 - **One `cmd_build_acceleration_structures` call for all 104**, each with its own scratch region cut
-  from a single buffer, and the compaction-size query rides in the same submission behind a barrier.
-  The alternative — one shared scratch plus a barrier between builds — is simpler to write and
-  serialises work that is independent by construction.
-- **Scratch alignment is `minAccelerationStructureScratchOffsetAlignment`, 128 on this device**, and
-  it is *not* satisfied by the buffer's natural memory requirement. `Buffer::with_alignment` raises
-  the requirement and then asserts the resulting address, because raising a requirement is an
-  indirect way to align an address and a heap that satisfies it by luck would stop under
+  from a single buffer, with the compaction-size query in the same submission behind a barrier. One
+  shared scratch plus a barrier between builds serialises work that is independent by construction.
+- **Scratch alignment is `minAccelerationStructureScratchOffsetAlignment`, 128 here**, and is *not*
+  satisfied by the buffer's natural requirement. `Buffer::with_alignment` raises the requirement and
+  then asserts the resulting address, because a heap that satisfies it by luck stops under
   fragmentation.
 - **Instances use `TRIANGLE_FACING_CULL_DISABLE`.** Morrowind authors single-sided planes and relies
   on seeing them from both faces, and winding is inconsistent across the mesh library.
-- **`instance_custom_index` carries the mesh index**, which is what the material lookup at M4 is
-  built on.
-- **Geometry flag is `OPAQUE`, pairing with `gl_RayFlagsOpaqueEXT` in the shader.** Both change
-  together at M4; either one alone is wrong.
 
-What M3d does *not* prove is that the triangles inside a structure are the right ones. The build
-range triple — `first_vertex`, `primitive_offset`, `max_vertex` — could be wrong in a way that still
-builds and still validates, because validation cannot inspect index contents on the device. M3e
-settles it.
-
-**M3e — done.** `Image` and `image_blit` in `rtxmw-gpu`, `VisibilityPass` and `FrameConstants` in
-`rtxmw-render`, and the whole chain wired into `Renderer`. `cargo run` opens Seyda Neen's Census and
-Excise Office and traces it: 1920×1080 offscreen `R16G16B16A16_SFLOAT`, blitted to the swapchain.
-A debug build, whose validation layer aborts on error, runs the frame loop silently.
-
-The milestone's real value is that the pass is verified **headlessly, pixel by pixel**, which
-retires every "silently wrong" risk carried since M3c:
-
-- A wall 100 units ahead covers the centre and misses the corners, with the covered fraction
-  matching what 75° of field of view predicts.
-- Geometry to the **north appears on the left**, geometry **above appears at the top**. That pair
-  pins the whole handedness chain — instance transform, projection convention, Vulkan's Y-down NDC,
-  and the shader's unprojection. A mirror anywhere in it still draws a wall, just in the wrong
-  place, and nothing before M3e could tell.
-- Two meshes in one buffer both render at their own offsets, which is the direct test of the build
-  range triple M3d could not check.
-- An instance behind the camera is not drawn, so instance transforms are applied rather than
-  ignored.
-- The real cell renders with 48% of pixels hitting geometry across 11,854 distinct barycentric
-  shades — structure, not a single wrongly-placed triangle filling the view.
-
-Two things worth recording:
-
-- **`RenderTarget`'s readback used to lock the shared uploader internally**, so a caller holding the
-  guard deadlocked — which is exactly what the first run of the new test did. The methods now take
-  `&mut Uploader`, making it a compile error rather than a hang. The doc comment warning about it,
-  added a milestone earlier, did not prevent it.
-- **Locating the game install is production behaviour**, not a test helper, so `morrowind_data_dir`
-  and friends came out from behind the `internals` feature and `dotenvy` became a normal dependency.
+**Verified headlessly, pixel by pixel**, which is what retires the "silently wrong" risks: a wall
+100 units ahead covers the centre and misses the corners in the fraction 75° of field of view
+predicts; geometry to the **north appears on the left** and **above appears at the top**, which pins
+the whole handedness chain — instance transform, projection convention, Vulkan's Y-down NDC, the
+shader's unprojection — where a mirror anywhere in it still draws a wall in the wrong place; two
+meshes in one buffer both render at their own offsets, the direct test of the build range triple;
+and the real cell renders with 48% of pixels hitting geometry across 11,854 barycentric shades.
 
 The camera's projection uses the *offscreen* aspect ratio, not the window's — the trace happens at a
-fixed internal resolution and is stretched to whatever the window is, so a projection built for the
-window would distort as soon as the two differed.
+fixed internal resolution and is stretched to whatever the window is.
 
-### M4 — Textures and bindless materials
-DDS/TGA decode, bindless texture array, `GeometryRef` and material buffers, attribute interpolation
-at the hit, alpha-test in the candidate loop.
-**Done when:** the cell renders with correct albedo and alpha-tested geometry reads correctly, no
-unbound-descriptor validation errors.
+### M4 — Textures and bindless materials — **done**
+All 6,256 shipped textures decode: 190.8 MiB across 4,181 BC1, 1,971 BC2, 93 uncompressed BGRA8 and
+11 TGA. A survey of the shipped data cut the scope before any of it was written:
 
-**M4a — done.** `rtxmw-texture`, a new crate beside `rtxmw-nif` on the same one-format-one-crate
-rule. All **6,256** shipped textures decode: 190.8 MiB across 4,181 BC1, 1,971 BC2, 93 uncompressed
-BGRA8 and 11 TGA.
-
-A survey of the shipped data cut the scope before any of it was written, and is worth recording
-because the plan above was wrong in three ways:
-
-- **There is no DXT5.** The library is DXT1 and DXT3 only, so BC3 never appears. The corpus test
-  asserts that, because a replacer pack introducing it would otherwise render as noise.
-- **"BCn transcode where needed" was not needed at all.** DXT1 and DXT3 *are* BC1 and BC2, which
-  every target GPU samples natively — decoding is parsing a header and handing the blocks on. The
-  scope item is struck from the milestone above. Likewise "mip generation": the files already carry
-  their chains, up to eleven levels deep.
-- **TGA is 11 files**, all uncompressed 24-bit, against 6,245 DDS. Run-length encoding and colour
-  maps are rejected rather than implemented, since no shipped asset exercises them and untested
-  format code is worse than an error.
-
-Three decisions worth keeping:
-
-- **`TextureFormat` is not a `VkFormat`,** and says nothing about colour space. The same BC1 bytes
-  are sRGB as albedo and UNORM as a replacer pack's normal map, so the consumer chooses and the
-  decoder only reports what the bytes are.
-- **DXT1 maps to BC1 *with* alpha.** Morrowind uses its one-bit alpha for exactly the foliage and
-  grates the alpha test at M4d needs; reading it as RGB-only would discard that.
-- **Mip levels share one buffer with a range table beside it**, never `Vec<Vec<u8>>` — eleven-deep
-  chains across 6,256 textures would be an allocation each, and it is already the shape
+- **There is no DXT5.** The library is DXT1 and DXT3 only. The corpus test asserts that, because a
+  replacer pack introducing BC3 would otherwise render as noise.
+- **No transcode is needed at all.** DXT1 and DXT3 *are* BC1 and BC2, which every target GPU samples
+  natively, and the files already carry mip chains up to eleven levels deep.
+- **TGA is 11 files**, all uncompressed 24-bit. RLE and colour maps are rejected rather than
+  implemented, since no shipped asset exercises them.
+- **`TextureFormat` says nothing about colour space.** The same BC1 bytes are sRGB as albedo and
+  UNORM as a replacer's normal map, so the consumer chooses.
+- **DXT1 maps to BC1 *with* alpha** — that one bit is exactly the foliage and grates the cutout
+  needs.
+- **Mip levels share one buffer with a range table beside it**, which is also the shape
   `vkCmdCopyBufferToImage` wants: one staging buffer, one region per level.
 
-The corpus test initially had a hole worth noting: it checked that the level table tiled the buffer,
-which a decoder that *drops* a level still satisfies. Deleting one mip passed cleanly. It now also
-asserts that header plus data accounts for the whole file, which ties the decode back to its source
-and catches it.
+The corpus test initially checked only that the level table tiled the buffer, which a decoder that
+*drops* a level still satisfies. It now asserts that header plus data accounts for the whole file.
 
-**M4b (host half) — done.** `Material`, `AlphaMode` and `MaterialTable` in `rtxmw-scene`; `Mesh`
-gains `submeshes`. Across the whole library: **7,319 meshes flatten into 26,869 submeshes drawing
-4,593 distinct materials over 4,311 distinct textures**. Seyda Neen's office alone resolves 119
-materials, 118 of them textured, across 309 submeshes.
+**Materials.** 7,319 meshes flatten into 26,869 submeshes drawing 4,593 distinct materials over
+4,311 distinct textures.
 
-- **A model is one mesh but rarely one surface.** A lantern is glass and metal, so flattening now
-  keeps runs of indices tagged by material. Adjacent blocks sharing a material merge; non-adjacent
-  ones do not, because collapsing those would need reordering and the index ranges are what a build
-  reads. Each run becomes a geometry within the model's BLAS, which is how a hit names its material.
+- **A model is one mesh but rarely one surface** — a lantern is glass and metal — so flattening
+  keeps runs of indices tagged by material. Adjacent runs sharing a material merge; non-adjacent
+  ones do not, because collapsing those needs reordering and the index ranges are what a build
+  reads.
 - **NIF properties are inherited**, so resolution carries a property stack down the node graph
-  alongside the transform — a whole building shares one texture property set on its root.
-- **The material table is scene-wide, not per mesh**, because that is the granularity the GPU wants:
-  one bindless array and one material buffer per cell. Meshes intern into it as they are built, so
-  `Submesh::material` is already the index the shader will use.
-- **Two path fixups the original data needs**, both quirks rather than conventions: a texture name is
-  relative to `textures/`, and it routinely claims an extension the shipped file does not have —
-  the art was converted to DDS and the references were never updated.
+  alongside the transform.
+- **The material table is scene-wide**, because that is the granularity the GPU wants: one bindless
+  array and one material buffer per cell.
+- **Two path fixups the original data needs**: a texture name is relative to `textures/`, and it
+  routinely claims an extension the shipped file does not have.
+- **45 of 4,311 texture references resolve to nothing** — dangling in the shipped data, not a
+  decoding error. The corpus test asserts a *rate* under 2% rather than perfection.
 
-**45 of 4,311 texture references resolve to nothing.** They are dangling in the shipped data, not a
-decoding error: `tx_moon`, `tx_lavacrust00` and `tx_hlaalu_wall1_02` exist nowhere in the archives.
-So the upload needs a fallback texture rather than treating a miss as fatal, and the corpus test
-asserts a *rate* (under 2%) instead of perfection — a broken path fixup pushes it far past that,
-which is what the assertion is really for.
+**Device side.** A flat `GpuGeometry` table, a `GpuMaterial` table, UV interpolation at the hit, and
+the cell renders with its own albedo — 118 textures across 3,133 distinct shades.
 
-**M4b (device half) — done**, minus the texture array. One acceleration structure geometry per
-submesh, a flat `GpuGeometry` table and a `GpuMaterial` table, and a shader that resolves a hit to
-its material. The interior renders with surfaces coloured by material identity.
-
-- **`instance_custom_index` carries the mesh's `first_submesh`,** not the mesh index. A hit adds its
-  own `geometry_index` and lands directly on the geometry entry — one indexed read, no per-mesh
-  indirection to chase first. That is the whole reason the submesh table is flat.
-- **Geometry opacity now follows the material.** `OPAQUE` lets traversal commit without invoking a
-  shader, which is right for a wall and catastrophic for a grate; the flag is decided per submesh
-  from its `AlphaMode` rather than set once for everything.
+- **Geometry opacity follows the material.** `OPAQUE` lets traversal commit without invoking a
+  shader, which is right for a wall and catastrophic for a grate.
 - **The shader declares `scalar` block layout.** Under default std430 a `vec3` pads to sixteen bytes
-  and every table entry after the first is misread — the kind of failure that renders as plausible
-  nonsense.
-- **Alpha carries an explicit hit flag.** Tests used to infer "did this ray hit" from brightness,
-  which worked only while the output was barycentric; a material can legitimately be dark, so the
-  shader writes the flag rather than leaving it to be guessed at.
-
-The test that matters is `two_materials_in_one_mesh_shade_differently`: both halves live in the
-*same* mesh, so they share an instance and a custom index and only `geometry_index` separates them.
-Dropping that term from the shader still fills exactly the same pixels — and fails only this test.
-
-**M4 — done.** `TextureArray` in `rtxmw-render`, UV interpolation at the hit, and the cell renders
-with its own albedo. Seyda Neen's office samples **118 textures across 3,133 distinct shades**, with
-none of its references missing.
-
+  and every table entry after the first is misread. `spirv-val` needs `--scalar-block-layout` to
+  agree.
 - **The bindless array is the set's last binding.** Vulkan permits a variable descriptor count only
-  on the final element, which validation caught the moment the array sat at binding 4 with two
-  buffers after it. Adding any binding after it moves it.
-- **Slot zero is a magenta fallback**, and a material's texture id addresses `id + 1`. Missing
-  textures are a normal case — 45 of the library's 4,311 references name files that were removed —
-  so the array absorbs them rather than the caller special-casing a hole.
-- **Every format maps to an sRGB view.** These are all albedo; sampling them as UNORM feeds
-  gamma-encoded values to a linear renderer, which darkens midtones by about half and cannot be
-  tuned out afterwards. Pinned by a test, because it looks merely "a bit dark" rather than wrong.
-- **`textureLod`, never `texture`.** Implicit LOD needs screen-space derivatives, which a compute
-  shader does not have. Level zero aliases at distance; the real fix is ray differentials, which
-  need the pixel footprint carried along the ray.
-- **`spirv-val` needs `--scalar-block-layout`.** The shaders declare scalar layout and the device
-  enables the feature, but the validator defaults to std430 and rejects a `vec3`-carrying struct
-  array for a stride that is correct under the rules actually in force.
-- **Anisotropy is deliberately off.** It is a rasterizer's answer to a footprint problem a ray
-  tracer should solve with differentials, and enabling it would paper over their absence.
+  on the final element.
+- **Slot zero is a magenta fallback** and a material's texture id addresses `id + 1`, so missing
+  textures are absorbed rather than special-cased.
+- **Every format maps to an sRGB view.** Sampling gamma-encoded albedo as UNORM darkens midtones by
+  about half and cannot be tuned out afterwards. Pinned by a test, because it looks merely "a bit
+  dark".
+- **`textureLod`, never `texture`.** Implicit LOD needs derivatives a compute shader does not have.
+  Anisotropy stays off: it is a rasterizer's answer to a footprint problem a ray tracer solves with
+  ray differentials, and enabling it would paper over their absence.
 
-One diagnostic lesson worth keeping: alpha carries the hit flag, and the debug PNG preserved it — so
-every missed ray wrote a transparent pixel that a viewer composited as white. Half the frame looked
-blown out and I went looking for a sampling bug that did not exist. The pixel values were
-`[13, 18, 25, 0]`, the background, all along. The dump now forces alpha opaque.
+The test that matters is `two_materials_in_one_mesh_shade_differently`: both halves share an
+instance and a custom index, so only `geometry_index` separates them. Dropping that term fills
+exactly the same pixels and fails only this test.
 
-**M4d — done.** The alpha cutout runs in the candidate loop. `gl_RayFlagsOpaqueEXT` is gone from the
-ray query, so the per-geometry `OPAQUE` bits the build sets from each material are what decide
-whether traversal asks at all — forcing the flag at the query overrode them and put the rectangles
-back regardless of what the build said.
-
-The survey that shaped this is worth recording, because the obvious reading of the data is wrong.
-Across the 4,593 materials in the shipped library:
+**The alpha cutout runs in the candidate loop**, with `gl_RayFlagsOpaqueEXT` gone from the query so
+the per-geometry bits decide whether traversal asks at all. The survey that shaped it reads the
+opposite of the obvious way:
 
 | mode | count |
 |---|---|
@@ -542,129 +268,101 @@ Across the 4,593 materials in the shipped library:
 | **Blend** | **539** |
 | Mask | 72 |
 
-Only 72 materials are *explicitly* alpha-tested, which looks like the cutout barely matters. It is
-the 539 blended ones that carry Morrowind's foliage, grates and banners: the game draws them with
-`NiAlphaProperty` blending over a texture whose alpha is very nearly binary, not with a threshold.
-Treating blend as opaque — which is faster, and which the flag would honestly describe today —
-renders every tree as a rectangle. So blended materials get a stand-in cutoff of 0.5 and run the
-same cutout path until ordered transparency replaces it. That takes 611 of 4,593 materials off the
-fast path, which is the right shape; marking only the 72 would have looked correct and been wrong.
+Only 72 materials are *explicitly* alpha-tested. It is the 539 blended ones that carry Morrowind's
+foliage, grates and banners — the game draws them with `NiAlphaProperty` over a texture whose alpha
+is very nearly binary. Treating blend as opaque renders every tree as a rectangle, so blended
+materials get a stand-in cutoff of 0.5 and run the same cutout path until ordered transparency
+replaces it. Marking only the 72 would have looked correct and been wrong.
 
-Seyda Neen's office runs the cutout on 14 of its 119 materials. The mask thresholds the data
-actually uses are 100 and 192 out of 255, plus two materials at zero.
+### M5 — Direct lighting — **done**
+`LIGH` point lights with shadow rays and a defensible attenuation model, cell ambient, and the sun.
+Seyda Neen's office places 13 lights, radii 64 to 128 units, under an ambient of `(0.038, 0.026,
+0.026)`. **Retires:** the "does this look like Morrowind or like a tech demo" question — see §5.1.
 
-### M5 — interior direct lighting — **done**
-`LightRecord` in `rtxmw-esm`, `Light`/`Ambient` in `rtxmw-scene`, `LightBuffer` in `rtxmw-render`,
-and shadow rays in the visibility shader. Seyda Neen's office places **13 lights** — warm torch
-orange, radii 64 to 128 units — under an ambient of `(0.038, 0.026, 0.026)`.
-
-- **Both the light colours and the cell ambient are sRGB-encoded** in the file, like everything
-  authored for a fixed-function renderer. Using them unconverted makes every light too bright and
-  too washed out, in exactly the way an unconverted albedo texture does. Decoded on the way in and
-  pinned by tests at mid grey, where the two spaces diverge most.
-- **Morrowind stores no intensity.** A `LIGH` record carries a colour and a radius and nothing else,
-  because the original renderer's fixed attenuation curve supplied brightness. Radiant intensity is
-  therefore derived as `radius² × INTENSITY`, which makes reach the only control the data needs to
-  give and keeps a lamp and a candle differing by their size rather than by an invented number.
+- **Light colours and cell ambient are sRGB-encoded** in the file, like everything authored for a
+  fixed-function renderer. Decoded on the way in and pinned by tests at mid grey, where the two
+  spaces diverge most.
+- **Morrowind stores no intensity** — a `LIGH` record carries a colour and a radius, because the
+  original renderer's fixed attenuation curve supplied brightness. Radiant intensity is derived as
+  `radius² × INTENSITY`, so reach is the only control the data gives and a lamp differs from a
+  candle by its size.
 - **Attenuation is inverse square, windowed to reach exactly zero at the radius.** Morrowind's
-  radius is a hard cutoff, and a clipped inverse square leaves a visible edge where the falloff
-  jumps to nothing.
-- **Carried, negative and off-by-default lights are not placed.** A carried light belongs to whoever
-  holds it; a negative one *subtracts* illumination, which is a trick for a renderer accumulating
-  into a framebuffer and meaningless for one tracing paths.
-- **Shadow rays run the alpha cutout too**, so a grate throws bars rather than a rectangle, and they
-  use `TerminateOnFirstHit` — a shadow ray asks only whether something is in the way.
+  radius is a hard cutoff and a clipped inverse square leaves a visible edge.
+- **Carried, negative and off-by-default lights are not placed.** A negative light *subtracts*
+  illumination, which is a trick for a renderer accumulating into a framebuffer.
+- **Shadow rays run the cutout too**, so a grate throws bars rather than a rectangle, and they use
+  `TerminateOnFirstHit`.
+
+**Soft shadows.** Each light is sampled as a sphere over eight shadow rays, so visibility is the
+fraction of the emitter that can be seen. The emitter size is invented, because Morrowind records
+none: 8% of reach with a 10-unit floor, so a lantern's penumbra stays wider than a candle's while
+the smallest lights do not collapse to points. The sample pattern is a **stable** per-pixel hash
+rather than a per-frame one — without temporal accumulation, reseeding each frame turns the penumbra
+into crawling noise.
+
+The test took two attempts. Counting distinct brightness levels across the shadow boundary *passed
+with a point light*: with no ambient the lit wall already varies row to row through attenuation and
+the cosine term. The measure that isolates visibility is the ratio against the same scene with the
+occluder removed, which cancels the shading — a point emitter gives zero partly-lit rows, an area
+one gives a band.
+
+**The sun.** Direction is Morrowind's own hardcoded `(-400 · orbit, 75, -100)`, with `orbit` running
+1 at sunrise to −1 at dusk — not an astronomical model, and it is the direction light *travels*, so
+the shader negates it. The **angular diameter is ours**: OpenMW's sun is a pure direction with no
+size anywhere in its codebase. Half a degree is the real sun, and it is the only reason a shadow has
+a penumbra; shadow rays sample the cone uniformly over solid angle rather than over the disc.
+
+| | penumbra |
+|---|---|
+| sun with a real half-degree disc | **38 rows** |
+| the same light from a point | **0 rows** |
+
+The fixture is deliberately odd: a real sun's penumbra is about **one pixel wide** when camera and
+blocker are the same distance from the surface, since its angular width is `2·tan(r)·d/D`. Sharp sun
+shadows are the correct answer, and the fixture exists to make the softness measurable.
+
+**The sky comes from the ambient** rather than constants of its own, brighter overhead than at the
+horizon, which ties the two together so they cannot disagree — indoors a missed ray now yields the
+room's own dark fill. The disc is drawn but is **not** energy-consistent with the directional term:
+a real sun's radiance is its irradiance over the solid angle it subtends, some sixty thousand times
+the value used, and reconciling them means making the directional light an area light.
+
+**Cost:** the exterior went from 1.75 ms to 3.5 ms at 1920×1080, nearly all of it in the trace —
+sixteen shadow rays a pixel where most reach the sky unobstructed. That is the first thing to spend
+down if the budget tightens. `Sun::at(orbit)` takes a time of day the engine does not track yet, so
+exteriors use a fixed mid-morning, and the colour is a warm white chosen for its *ratio* to the sky,
+about five to one.
 
 **The interior comes out dark, and that is the honest result rather than a bug.** The ambient is
-0.038 and the lights reach 64–128 units inside a room spanning 1,757 × 2,559. Away from a torch,
-almost nothing is lit. This is §5.1 arriving from the other direction: the original engine leaned on
-pre-lit albedo *and* a flat ambient to carry a room's illumination, so lighting that albedo correctly
-leaves it looking underlit rather than double-lit. `INTENSITY` is tuned by eye and provisional —
-the de-lighting spike is what would make any value here mean something.
+0.038 and the lights reach 64–128 units inside a room spanning 1,757 × 2,559. This is §5.1 from the
+other direction: the original engine leaned on pre-lit albedo *and* a flat ambient to carry a room's
+illumination, so lighting that albedo correctly leaves it underlit. `INTENSITY` is tuned by eye.
 
-**Soft shadows.** The milestone's done-when is a torch casting a *soft* shadow, so each light is
-sampled as a sphere over eight shadow rays rather than as a point over one — visibility becomes the
-fraction of the emitter that can be seen, and that fraction is the penumbra. The emitter size is
-invented, because Morrowind records none: a light there is a point with a falloff curve, and its
-shadows were a decal. It is derived as 8% of reach with a 10-unit floor, so a lantern's penumbra
-stays wider than a candle's while the smallest lights do not collapse back to points.
+### M6 — Indirect lighting — **done**
+One diffuse bounce per pixel, cosine-weighted, with next-event estimation at the bounce hit. `trace`
+owns a ray query and returns a resolved `Surface`, so primary and bounce rays share one traversal;
+`occluded` keeps its own copy because `glslc` rejects `rayQueryEXT` as a parameter.
 
-The sample pattern is a **stable** per-pixel hash rather than a per-frame one. Without temporal
-accumulation, reseeding each frame turns the penumbra into crawling noise; a fixed pattern dithers
-instead, and holds still. That changes at M7, where a denoiser wants the opposite.
+**Ambient became the environment's radiance rather than an unconditional fill.** That is the
+decision the milestone turns on: a bounce ray that escapes returns the cell's ambient, so with zero
+bounce samples every direction escapes by definition, the estimator's mean *is* the ambient, and the
+term collapses exactly to the `albedo * ambient` the renderer applied before. With rays, geometry
+occludes that fill where it should — ambient occlusion is not a separate effect here, it is the same
+integral, sampled. Seyda Neen's office is sealed, so mean frame brightness falls 9% and the loss
+concentrates in corners and under furniture, which is §5.1 again: the albedo already has AO painted
+into it.
 
-The test for this took two attempts, and the first was wrong in an instructive way. Counting distinct
-brightness levels across the shadow boundary *passed with a point light*: with no ambient, the lit
-wall already varies row to row through attenuation and the cosine term, so a hard shadow produces
-plenty of levels too. Only the fault injection showed it. The measure that actually isolates
-visibility is the ratio against the same scene with the occluder removed, which cancels the shading
-and leaves partial occlusion alone — a point emitter gives zero partly-lit rows, an area one gives a
-band.
+- **The Lambertian `1/pi` moved into the shader.** It had been folded into `INTENSITY`, where a
+  single scale on the only lighting term was unobservable; with a second term integrating over the
+  hemisphere the ratio became real. The direct-lit image is unchanged, which the M5 tests passing
+  untouched is the evidence for.
+- **Cosine-weighted by Malley's method** — a uniform sphere point added to the normal, exact rather
+  than an approximation, reusing the sphere sampler the soft shadows already had. The pdf cancels
+  both the cosine and the `1/pi`, so the estimator is albedo times mean radiance and nothing else.
+- **Shadow rays at a bounce hit are cut from eight to one.** A bounce is already being averaged over
+  four directions; resolving *its* penumbra would cost thirteen rays a bounce to change nothing.
 
-### Test harness: the renderer is the thing under test
-
-`Renderer` used to own both the scene and the swapchain, which put it in the binary crate where no
-test could reach it — so `primary_visibility` assembled its own copy of the load-and-trace sequence.
-That replica was a **parallel abstraction**: every assertion was about a reconstruction of the
-engine rather than the engine.
-
-Split along the seam §2 already describes. `rtxmw_render::SceneRenderer` owns the pass, the target
-and the loaded cell; `rtxmw::Renderer` adds surface, swapchain, frame ring and present. The tests
-now drive `SceneRenderer` directly and the replica is gone.
-
-Two things fell out of doing it:
-
-- **The uploader is borrowed, never owned.** Giving each `SceneRenderer` its own made twelve tests
-  submit to one queue concurrently, which Vulkan requires external synchronisation for — every
-  parallel test failed and every serial one passed. An uploader wraps one command pool on one
-  queue, so it is a device-wide resource; the renderer takes `&mut Uploader` everywhere instead.
-- **Image readback moved off `RenderTarget`** and onto `readback::image_to_rgba8`, because the image
-  worth reading back is the renderer's own output, which no test owns.
-
-**`cargo run -- --screenshot <path>`** renders one frame through the same path on a device brought
-up with no surface extensions — no window, works headless, ~0.6 s warm against tens of seconds for
-the windowed binary. Cost of the whole verification loop: **2.9 s of tests plus 0.6 s for a picture**,
-against ~60 s and a window appearing on the user's screen.
-
-### M6 — indirect lighting — **done**
-
-One diffuse bounce per pixel, cosine-weighted, with next-event estimation at the bounce hit. The
-shader was restructured to get it: `trace` now owns a ray query and returns a resolved `Surface`, so
-the primary ray and a bounce ray share one traversal rather than two copies of a candidate loop, and
-`direct_light` is a function both hits call. `occluded` still keeps its own copy — `glslc` rejects
-`rayQueryEXT` as a parameter, so a traversal genuinely cannot be handed around.
-
-**Ambient became the environment's radiance rather than an unconditional fill.** This is the
-decision the milestone turns on, and it is what makes zero bounce samples meaningful rather than
-black: a bounce ray that escapes the geometry returns the cell's ambient, so with no bounce rays
-every direction escapes by definition, the estimator's mean is the ambient itself, and the term
-collapses *exactly* to the `albedo * ambient` the renderer applied before. With rays, geometry
-occludes that fill where it should. Ambient occlusion is therefore not a separate effect here — it
-is the same integral, sampled.
-
-The consequence is that **interiors get darker, and correctly so**. Seyda Neen's office is sealed,
-so almost every bounce ray finds a wall instead of escaping; the mean frame brightness falls 9%
-(8.36 to 7.60 in 8-bit units) and the loss is concentrated in corners and under furniture, which is
-where a flat fill was most obviously wrong. §5.1 again: the albedo already has ambient occlusion
-painted into it, so this is the second one. That is a content problem, not a lighting-model one.
-
-**The Lambertian `1/pi` moved into the shader.** It had been folded into `LightBuffer::INTENSITY`,
-where a single scale on the only lighting term was unobservable. With a second term integrating over
-the hemisphere the ratio between them became real, so the factor went where it belongs and
-`INTENSITY` was multiplied by pi to compensate. The direct-lit image is unchanged, which the M5
-tests passing untouched is the evidence for.
-
-**Sampling.** Cosine-weighted by Malley's method — a uniform sphere point added to the normal, which
-reuses the sphere sampler the soft shadows already had and is exact rather than an approximation.
-Because the pdf cancels both the cosine and the `1/pi`, the estimator is albedo times the mean
-radiance and carries no other factor. Shadow rays at a bounce hit are cut from eight to one: a bounce
-is a fraction of the pixel's radiance and is already being averaged over four directions, so
-resolving *its* penumbra would cost thirteen rays a bounce to change nothing visible. Four bounce
-samples by default rather than the one the frame budget eventually wants, because nothing accumulates
-or denoises yet; that drops to one at M7.
-
-**The variance baseline M7 needs**, measured as RMSE against a 256-sample reference of the same
-frame, over the pixels both renders hit:
+**The variance baseline M7 needs**, RMSE against a 256-sample reference of the same frame:
 
 | samples per pixel | RMSE |
 |---|---|
@@ -672,244 +370,186 @@ frame, over the pixels both renders hit:
 | 4 | 0.0355 |
 | 16 | 0.0174 |
 
-Ratios of 2.01 and 2.04 for each quadrupling — textbook `1/sqrt(N)`, which says the error is Monte
-Carlo noise with no bias underneath it. That is the property the test asserts, and a stuck sample
-index fails it flat (0.0000227 at every count) rather than merely degrading.
+Ratios of 2.01 and 2.04 per quadrupling — textbook `1/sqrt(N)`, which says the error is Monte Carlo
+noise with no bias underneath it. A stuck sample index fails that flat (0.0000227 at every count)
+rather than merely degrading.
 
-The synthetic scenes are worth stating because they are hand-checkable: a white wall with a coloured
-floor at its base, lit by one white light nearly overhead. Every bit of colour on the wall arrived by
-reflection, so the red-minus-blue gap at a pixel *is* the indirect term with no reference render to
-compare against. The predictions were computed before the trace ran and came back within 2% —
-direct 0.188 against 0.188 predicted, indirect 0.151 against 0.156, ambient occlusion 0.323 against
-0.313. Both tests read a 17x17 patch rather than a pixel, because at four samples a pixel holds one
-of five levels and means nothing on its own.
+The synthetic scenes are hand-checkable: a white wall with a coloured floor at its base, lit by one
+white light nearly overhead, so the red-minus-blue gap at a pixel *is* the indirect term with no
+reference render needed. Predictions computed before the trace ran came back within 2% — direct
+0.188 against 0.188, indirect 0.151 against 0.156, AO 0.323 against 0.313. Both tests read a 17×17
+patch rather than a pixel, because at four samples a pixel holds one of five levels.
 
-**Cost is not measured yet.** The bounce work is below run-to-run noise in a single headless frame at
-1280x720, which bounds it usefully at neither end. The renderer has no GPU timers, and adding them
-belongs with M7, where the frame budget stops being background and becomes the milestone's own
-done-when.
-
-**Not done, deliberately:** stratifying the bounce directions (the hash is white noise per pixel, and
-a low-discrepancy sequence would cut the same error for the same cost), and sampling one light rather
-than looping all of them — thirteen is cheap and lower-variance, but it is `O(lights)` per bounce and
-does not survive exteriors. ReSTIR is the answer to the second one when it stops being cheap, and the
-plan is still to escalate only when variance demands it.
+**Not done, deliberately:** stratifying the bounce directions, and sampling one light rather than
+looping all of them — thirteen is cheap and lower-variance but is `O(lights)` per bounce. §8.10 is
+what that became.
 
 ### Spawning: where a cell puts the player
 
 The camera used to start at the cell's geometry centroid, which for Seyda Neen's census office is
-near the ceiling and pointed out through the roof — 47% of primary rays escaped the room. The fix is
-not a better guess, because the game already records the answer.
+near the ceiling pointing out through the roof. The game already records the answer.
 
 **Morrowind stores the arrival point on the door you leave through, not in the cell you enter.** A
 door reference carries `DODT`, a position *in its destination cell*, and `DNAM`, that cell's name.
-Two consequences follow, and they pull in opposite directions:
+So travelling through a door is a local question answered with no search, while arriving without
+walking through anything means finding a door elsewhere that leads there — one pass over all 316,116
+references, about 25 ms. There is no cheaper route, because a cell does not record how it is
+entered.
 
-- **Travelling through a door is a local question.** The reference is already in the cell being
-  played, so `Door::from_ref` answers it with no search. That is the whole mechanism door travel
-  will need.
-- **Arriving in a cell without walking through anything is not.** It means finding a door elsewhere
-  that leads there — `Door::leading_to`, one pass over all 316,116 references in `Morrowind.esm`,
-  about 25 ms. There is no cheaper route, because a cell does not record how it is entered.
+`DNAM` is absent for a door to an exterior, where `CellId::containing` floors the world coordinates
+by the 8,192-unit grid. **Flooring rather than truncating matters**: truncation puts everything
+between −8192 and 8192 in cell zero and mirrors half the map onto the other half.
 
-`DNAM` is absent for a door to an exterior, where the arrival position identifies the cell on its
-own: `CellId::containing` floors the world coordinates by the 8,192-unit grid. Flooring rather than
-truncating matters — truncation puts everything between −8192 and 8192 in cell zero and mirrors the
-western and southern half of the map onto the eastern and northern one.
-
-**Editor markers place no geometry either.** The same six meshes are the original engine's
-placement aids and it never drew them, yet 1,145 references to them are placed across the shipped
-game — one `NorthMarker` in the census office alone, a solid 160-unit arrow standing in the room.
-`StaticScene` now skips them on the way in, which is one line and one integration test comparing the
-cell's meshes against the marker's own vertices rather than against a guess at its shape.
-
-**Editor markers are excluded from the door search too, and finding that out is what made this
-work.** `PrisonMarker` is
-filed as a `DOOR`, carries a destination into the census office, and is the *first* such door in
-file order — so the obvious rule picked it, and the camera started inside the furniture. It is where
-the character-generation script drops the player, not a door in a wall. Morrowind names its
-placement aids `meshes/Marker_*.nif` and ships exactly six: the north arrow, the door and travel
-arrows, the temple and divine intervention targets, and the prison marker. Filtering on that leaves
-four real doors into the cell, and a traveller arriving through any of them stands in the room
-facing into it.
-
-The remaining pieces are conventions worth writing down because neither is guessable:
+**Editor markers place no geometry, and are excluded from the door search too.** Morrowind names its
+placement aids `meshes/Marker_*.nif` and ships exactly six; 1,145 references to them are placed
+across the game, including a solid 160-unit `NorthMarker` standing in the census office.
+`PrisonMarker` is filed as a `DOOR`, carries a destination into that office, and is the *first* such
+door in file order — so the obvious rule picked it and the camera started inside the furniture.
+Filtering on the name leaves four real doors into the cell.
 
 - **Yaw is a compass bearing.** The stored rotation turns about the **negated** Z axis, so zero
-  faces `+Y` (north) and a quarter turn faces `+X` (east) — the opposite handedness to what a maths
-  library gives by default. OpenMW spells the same rotation out at `mwmechanics/combat.cpp:695`.
-- **Only the arrival's horizontal position is authored data. Its height is a hint.** Measured
-  against the floor directly beneath it — sixteen arrivals across twelve interiors — it sits a
-  median of 89 units up and ranges from 22 to 144. The original engine throws the stored height
-  away: `World::adjustPosition` (`mwworld/worldimp.cpp:1207`) raises the actor 20 units, traces
-  down, and takes whichever is lower. So this drops too, through `StaticScene::ground_below`, and
-  stands the traveller on what it finds. That is what makes the camera the same height above the
-  floor in every cell, when the authored heights vary by 120 units across the game.
+  faces +Y (north) and a quarter turn faces +X (east) — the opposite handedness to what a maths
+  library gives by default.
+- **Only the arrival's horizontal position is authored data; its height is a hint.** Measured across
+  sixteen arrivals in twelve interiors it sits a median of 89 units above the floor and ranges from
+  22 to 144. The original engine throws it away, raising the actor 20 units and tracing down, so
+  this does too, through `StaticScene::ground_below`. That walks every placed triangle — 0.3 ms over
+  the office's 46,251, which is nothing once per cell and hopeless per frame — and queries the
+  *visible* geometry, while Morrowind ships separate collision meshes this does not read yet.
+- **Standing eye height is 160 units**: twice the median arrival height, times nine tenths. That
+  lands 83% of the way up a 194-unit door. Two wrong answers came first, and the second is
+  instructive — `MWRender::Camera::mHeight`, 124, is the *third-person* orbit pivot, applied only
+  `if (mMode != Mode::FirstPerson)`, so adding it to a marker that already contained a body height
+  put the camera at 394 in a room whose ceiling is at 420. A constant lifted from a reference
+  implementation without reading the branch it sits in is not a citation.
 
-  `ground_below` walks every placed triangle — 0.3 ms over the census office's 46,251, which is
-  nothing once per cell and hopeless per frame. It also queries the *visible* geometry, while
-  Morrowind ships separate collision meshes this does not read yet. Both are fine for the question
-  it answers and neither survives an actor that has to ask every frame; that wants the collision
-  meshes and an acceleration structure over them.
+### Test harness: the renderer is the thing under test
 
-- **Standing eye height is 160 units.** An actor's height is twice the median arrival height above
-  the floor, since the arrival marks roughly an actor's centre, and eyes sit about nine tenths of
-  the way up — the ratio a human has, close to where OpenMW measures line of sight from
-  (`mwphysics/mtphysics.cpp:767`). That lands 83% of the way up a 194-unit door, which is where a
-  person's eyes are in a doorway.
+`Renderer` used to own both the scene and the swapchain, which put it in the binary crate where no
+test could reach it, so `primary_visibility` assembled its own copy of the load-and-trace sequence —
+a parallel abstraction whose every assertion was about a reconstruction of the engine.
 
-  Two wrong answers came before that one, and the second is the instructive one. The first used the
-  geometry centroid. The second used `MWRender::Camera::mHeight`, 124, on the assumption that the
-  arrival was a standing position — but that constant is the *third-person* orbit pivot, applied at
-  `camera.cpp:97` only `if (mMode != Mode::FirstPerson)`, and adding a body height to a marker that
-  already contained one put the camera at 394 in a room whose ceiling is at 420. A constant lifted
-  from a reference implementation without reading the branch it sits in is not a citation.
+Split along the seam §2 describes: `rtxmw_render::SceneRenderer` owns the pass, the target and the
+loaded cell; `rtxmw::Renderer` adds surface, swapchain, frame ring and present.
 
-**What this exposed:** with the camera inside the room rather than looking out through the roof, the
-frame is nearly black. That is not a regression — it is the §5.1 darkness the old viewpoint was
-hiding behind the miss colour, now unavoidable. The interior renders at roughly 3% of full scale and
-there is no exposure or tone mapping anywhere in the pipeline yet, which is M8.
+- **The uploader is borrowed, never owned.** Giving each `SceneRenderer` its own made twelve tests
+  submit to one queue concurrently — every parallel test failed and every serial one passed. An
+  uploader wraps one command pool on one queue, so it is a device-wide resource.
+- **Image readback moved off `RenderTarget`** onto `readback::image_to_rgba8`, because the image
+  worth reading back is the renderer's own output, which no test owns.
 
-**Not done:** `StaticScene` does not carry the doors a cell places. That is the one line travel
-needs and nothing consumes it yet, so it waits for the thing that activates a door.
+**`cargo run -- --screenshot <path> [WIDTHxHEIGHT] [CELL]`** renders one frame through the same path
+on a device brought up with no surface extensions, ~0.6 s warm against tens of seconds for the
+windowed binary. The whole verification loop is 2.9 s of tests plus 0.6 s for a picture.
 
-### M8 — exposure, tone curve and sRGB — **core done**
+### M8 — Exposure, tone curve and sRGB — **core done**
+Everything before this wrote linear radiance and clamped it to `0..1` on the way out, and an
+interior traces at about three hundredths of mid grey. The frame that finally showed the room is the
+same trace with only the output path fixed.
 
-Everything before this wrote linear radiance and then clamped it to `0..1` on the way out. An
-interior traces at about three hundredths of mid grey, so the whole cell arrived at a display as
-near-black — and the frame that finally showed the room is the same trace, unchanged, with only the
-output path fixed. Nothing about the lighting moved.
-
-**Auto-exposure is measured from a log histogram, not an average.** The scene that makes the case is
-the one being rendered: thirteen candle flames at a luminance above one, in a room sitting at 0.02.
-A linear mean of that is dominated by whichever population has more pixels — for a frame that is
-five sixths dark and one sixth bright, the mean is 1.7 and exposing for it puts the room at 0.002,
-which is zero after encoding. The mean of the *logs* is 2⁻⁴·¹, which exposes the room to something
-visible and lets the flames roll off. Both numbers are asserted in `tests/output.rs`.
+**Auto-exposure is measured from a log histogram, not an average.** Thirteen candle flames above
+luminance 1 in a room at 0.02: a linear mean is dominated by whichever population has more pixels —
+for a frame five sixths dark, the mean is 1.7 and exposing for it puts the room at 0.002, which is
+zero after encoding. The mean of the *logs* is 2⁻⁴·¹.
 
 Two dispatches, because a reduction cannot see every pixel's contribution until every workgroup has
 finished writing it and a dispatch boundary is the only barrier that wide:
 
-- `luminance_histogram.comp` bins log luminance into 256 bins spanning 2⁻¹⁰ to 2⁶. It tallies into
-  shared memory first, so the global buffer sees one atomic per bin per workgroup rather than one
-  per pixel. The buffer is cleared with `vkCmdFillBuffer` rather than by the shader — anything
-  zeroing it from inside the same dispatch would race the accumulation.
-- **Bin zero is reserved for pixels with no light on them at all**, and they are excluded from the
-  divisor as well as the sum. Counting them halves the mean bin, which reads as two stops darker
-  than the truth and opens the exposure until everything lit is white. Measured on a half-black
-  frame: 103 correct, 230 with them counted.
-- `exposure.comp` reduces the bins in one workgroup of exactly 256 threads and divides mid grey by
-  the result.
+- `luminance_histogram.comp` bins log luminance into 256 bins spanning 2⁻¹⁰ to 2⁶, tallying into
+  shared memory first so the global buffer sees one atomic per bin per workgroup. The buffer is
+  cleared with `vkCmdFillBuffer` — anything zeroing it inside the same dispatch would race.
+- **Bin zero is reserved for pixels with no light on them**, excluded from the divisor as well as
+  the sum. Counting them halves the mean bin, two stops darker than the truth: measured on a
+  half-black frame, 103 correct against 230.
+- `exposure.comp` reduces the bins in one workgroup of exactly 256 threads.
 
-**The tone curve is Khronos PBR Neutral**, chosen against the milestone's own done-when rather than
-by taste: the test is that an original Morrowind screenshot and a render of the same viewpoint
-compare without a gamma mismatch, and the original applied no tone curve at all. This one is the
-identity below 0.76 and only rolls off above it, so the midtones the comparison rests on are
-untouched — where a filmic curve like ACES would darken and twist every one of them. Its
-desaturation term is what keeps a torch flame going white instead of clipping channel by channel
-through yellow.
+**The tone curve is Khronos PBR Neutral**, chosen against the milestone's own done-when: the test is
+that an original Morrowind screenshot and a render of the same viewpoint compare without a gamma
+mismatch, and the original applied no tone curve at all. PBR Neutral is the identity below 0.76, so
+the midtones the comparison rests on are untouched where ACES would darken and twist every one. Its
+desaturation term keeps a torch flame going white instead of clipping channel by channel.
 
-**sRGB is encoded in the shader, and the swapchain was changed to `UNORM` to stop it happening
-twice.** sRGB formats expose no storage capability, so a compute shader cannot write one; the
-alternatives were to encode in the shader or to leave a *linear* 8-bit intermediate for the
-presentation engine to encode, which bands badly in exactly the near-black range an interior lives
-in. Encoding here has a second payoff that is worth more than it sounds: **the screenshot is now
-byte-identical to what the window shows**, which matters when the entire verification loop is
-looking at a PNG and believing it.
+**sRGB is encoded in the shader and the swapchain is `UNORM`** to stop it happening twice. sRGB
+formats expose no storage capability; the alternative, a linear 8-bit intermediate for the
+presentation engine to encode, bands badly in exactly the near-black range an interior lives in. The
+payoff is that **the screenshot is byte-identical to what the window shows**.
 
-The whole chain is pinned by one hand-computable number. A flat frame of *any* radiance should reach
-the file at 103: auto-exposure puts it on the 0.18 key, the curve's shadow lift takes 0.04 off it
-leaving 0.14, which is below the compression threshold and passes through, and sRGB-encoding 0.14
-gives 0.404. Measured: 103, and unchanged across a hundredfold change in scene radiance. The same
-assertion catches a missing encode (36), a double one (172) and a missing tone curve (118).
+The chain is pinned by one hand-computable number. A flat frame of *any* radiance reaches the file
+at 103: auto-exposure puts it on the 0.18 key, the curve's shadow lift leaves 0.14, which is below
+the compression threshold, and sRGB-encoding 0.14 gives 0.404 → 103. Unchanged across a hundredfold
+change in scene radiance, and the same assertion catches a missing encode (36), a double one (172)
+and a missing tone curve (118).
 
-`rtxmw-gpu` gained `ComputePipeline` on the way. Three new passes would each have repeated the
-eighty lines of descriptor layout, pool, set, pipeline layout and pipeline that `VisibilityPass`
-already had; that pass keeps its own because its bindless texture array needs a variable descriptor
-count, which is the one thing the helper deliberately does not do.
+`rtxmw-gpu` gained `ComputePipeline` on the way; `VisibilityPass` keeps its own because its bindless
+array needs a variable descriptor count, which is the one thing the helper does not do.
 
-**What it exposed:** with the room visible, the dominant artefact is now unmistakably the indirect
-lighting's noise — the thing M7 exists to remove, and which was invisible while the frame was black.
-That is the argument for having done this first.
-
-**Not done:** bloom, colour grading and sharpening; exposure adaptation over time, which needs a
-frame delta this renderer does not yet plumb through and which is only observable once the camera
-moves between a lit and an unlit space; and HDR output.
+**Not done:** bloom, colour grading, sharpening; exposure adaptation over time, which needs a frame
+delta and is only observable once the camera moves between a lit and an unlit space; HDR output.
 
 ### M7 groundwork — a G-buffer and a denoiser over it
 
-With the frame finally visible, the dominant artefact was the indirect lighting's noise. This is the
-half of M7 that needs no external SDK, and none of it is throwaway: DLSS Ray Reconstruction consumes
-the same G-buffer, so only the filter itself is replaced.
+With the frame visible the dominant artefact was the indirect lighting's noise. None of this is
+throwaway: DLSS Ray Reconstruction consumes the same G-buffer, so only the filter is replaced.
 
 **The trace no longer writes a picture. It writes what a surface is, separately from what light
-reaches it.** That split is the whole idea: all the noise is in the lighting, while the albedo a ray
-reads from a texture is exact. Filtering the lighting alone smooths the noise without touching a
-texel of surface detail, and recombining is one multiply. A filter run on the composed frame cannot
-tell the two apart and blurs both.
+reaches it.** All the noise is in the lighting, while the albedo a ray reads from a texture is
+exact, so filtering the lighting alone smooths the noise without touching a texel of surface detail
+and recombining is one multiply.
 
-- `albedo` — base colour, **half float, not the eight bits a reflectance in `0..1` appears to
-  need.** The error does not stay small: the composite multiplies albedo by unbounded illumination,
-  so a quantisation step is scaled by however bright the light is. Measured against the same frame
-  rendered without the split, eight bits moved the mean pixel by 0.32 of 255 and the worst by 37;
-  half float moves the worst by 1. Exact recombination is what the split rests on.
+- `albedo` — **half float, not the eight bits a reflectance in `0..1` appears to need.** The
+  composite multiplies albedo by unbounded illumination, so a quantisation step is scaled by however
+  bright the light is: eight bits moved the mean pixel by 0.32 of 255 and the worst by 37, half
+  float moves the worst by 1.
 - `normal_depth` — world normal and distance from the eye, together because they are the pair an
   edge-stopping filter tests to decide whether two pixels are the same surface.
 - `illumination` — light arriving, albedo divided out, double-buffered for the ping-pong.
-- Emissive surfaces and the sky stay in the existing target, which the composite adds on top of.
-  They are the one part of the frame that is neither noisy nor demodulated, so they need neither the
-  filter nor an albedo to divide by, and keeping them there costs no image at all.
+- Emissive surfaces and the sky stay in the existing target, which the composite adds on top. They
+  are neither noisy nor demodulated, so they need neither the filter nor an albedo to divide by.
+- A miss writes **zeroes** across the G-buffer rather than being skipped: the filter reads a
+  neighbourhood, and an untouched pixel holds whatever the allocator left there.
 
-A miss now writes **zeroes** across the G-buffer rather than being skipped. Not tidiness: the filter
-reads a neighbourhood, and an untouched pixel holds whatever the allocator left there.
-
-**The filter is an edge-stopping à-trous wavelet**, four passes with the tap spacing doubling each
-time — 5×5 taps reaching sixteen pixels either way, where a direct blur of that radius would need
-nearly a thousand. Weights are a normal term and a *relative* depth term; relative because
-Morrowind's units put a room's walls tens apart and a hillside thousands, and one absolute threshold
-cannot serve both. Two pipelines over one shader, differing only in which way their descriptor sets
-point, because a pass reads a whole image and writes a whole image and cannot work in place.
-
-Measured on a fixture built to hold three different edges at once:
+**The filter is an edge-stopping à-trous wavelet**, four passes with tap spacing doubling each time
+— 5×5 taps reaching sixteen pixels either way, where a direct blur of that radius needs nearly a
+thousand. Weights are a normal term and a *relative* depth term; relative because Morrowind's units
+put a room's walls tens apart and a hillside thousands.
 
 | | unfiltered | filtered |
 |---|---|---|
 | neighbour-to-neighbour roughness on a flat lit surface | 8.8 | 0.07 |
 | width of an albedo step, in columns | 0 | 0 |
 
-A hundredfold drop in noise with the albedo step still one pixel wide. Fault injection covers each
-term separately, and the fixture had to grow twice to earn that: with only a wall and a floor, whose
-normals are perpendicular, deleting the *depth* term changed nothing, so a panel parallel to the
-wall and identically surfaced was added — two surfaces nothing but depth distinguishes. Composing the
-lighting before filtering, the regression this design exists to prevent, spreads the albedo step
-over fifteen columns.
+A hundredfold drop in noise with the albedo step still one pixel wide. The fixture had to grow twice
+to earn that: with only a wall and a floor, whose normals are perpendicular, deleting the *depth*
+term changed nothing, so a panel parallel to the wall and identically surfaced was added — two
+surfaces nothing but depth distinguishes. Composing the lighting before filtering, the regression
+this design exists to prevent, spreads the albedo step over fifteen columns.
 
-**What it cost the test suite:** the M6 convergence test measures the estimator's Monte Carlo error,
-which is precisely what a denoiser removes, so it started failing. Every assertion in
-`primary_visibility.rs` is about what the *trace* computes — hand-worked radiance, `1/sqrt(N)`
-convergence, the fraction of rays that hit — so that file now traces unfiltered, and the denoiser
-has a test file of its own.
+The M6 convergence test measures the estimator's Monte Carlo error, which is precisely what a
+denoiser removes, so `primary_visibility.rs` now traces unfiltered and the denoiser has its own
+file.
 
-**Not built: motion vectors.** They need the previous frame's view-projection, and the frame
-constants are already at 100 of Vulkan's guaranteed 128 push-constant bytes — a second matrix does
-not fit, so they need a small per-frame buffer written with `vkCmdUpdateBuffer`. That is
-straightforward, but nothing reads a motion vector until temporal reuse exists, which is M7 proper.
+### M7 — Denoise and upscale — **not built**
+DLSS Ray Reconstruction via NGX: denoise, antialias and upscale in one pass, 1920×1080 → 3840×2160,
+with no separate TAA — running TAA over a temporally-accumulated denoiser double-blurs and compounds
+ghosting. Needs the full G-buffer including the specular guide. **Done when:** a still frame at 1
+spp is comparable to a 1024-sample reference by a numeric metric, and the frame holds 60 fps at the
+§5.3 target. **Retires:** the biggest performance unknown.
+
+Practical notes: NGX ships real Linux `.so` files and needs specific Vulkan instance and device
+extensions **at creation time**; OTA model updates are broken on Linux, so the baked-in model is the
+one that gets used; Streamline is Windows-only, so call NGX directly.
+
+**Motion vectors are the missing piece.** They need the previous frame's view-projection, which is
+what pushed the frame constants out of push constants into a storage buffer.
 
 ### Frame timing — the first measurement against §5.3
 
-Every performance decision so far had been made blind. There were no GPU timers at all: the only
-number anywhere was a frames-per-second counter in the window title, which requires opening a window
-— and twice during M6 and M8 a question about what something cost had to be answered with "below
-run-to-run noise", because nothing could resolve it.
+A timestamp query pool brackets each stage. **Device time, not wall clock**: a timestamp is written
+when everything recorded before it has completed, so the gap between two is what the GPU spent. It
+means anything only because the stages are already separated by full barriers.
 
-A timestamp query pool now brackets each stage. **Device time, not wall clock**: a timestamp is
-written when everything recorded before it has completed, so the gap between two is what the GPU
-spent, which is what a budget is written in. It means anything only because the stages are already
-separated by full barriers — without them the device would overlap adjacent work and a per-stage
-figure would be a fiction.
-
-Measured on the shipped cell, an RTX 4090 Laptop, with four bounce samples and four à-trous passes.
-Medians of five runs, because single figures are not trustworthy here — see the note on spread below:
+Measured on the shipped cell, RTX 4090 Laptop, four bounce samples, four à-trous passes. Medians of
+five runs:
 
 | internal resolution | total (median) | range | trace | denoise | composite | exposure | tonemap |
 |---|---|---|---|---|---|---|---|
@@ -917,149 +557,65 @@ Medians of five runs, because single figures are not trustworthy here — see th
 | **1920×1080** | **3.43 ms** | 3.31–4.69 | 2.41 | 0.83 | 0.04 | 0.03 | 0.02 |
 | 2560×1440 | 5.96 ms | 4.85–9.35 | 4.35 | 1.62 | 0.09 | 0.04 | 0.04 |
 
-**Against the §5.3 budget there is room, though less than a single lucky run suggests.** The target
-is 1920×1080 internal upscaled to 3840×2160 at 60 fps — 16.7 ms a frame — with 8 to 9 of those
-reserved for DLSS Ray Reconstruction. That leaves roughly 8 ms for everything else, and an interior
-uses about 3.4 of it. The à-trous filter's 0.83 ms is also returned when DLSS-RR replaces it.
+**Against the §5.3 budget there is room.** 16.7 ms a frame with 8–9 reserved for DLSS-RR leaves
+about 8 ms, and an interior uses 3.4 of it; the à-trous filter's 0.83 ms is also returned when
+DLSS-RR replaces it.
 
-**Take the spread seriously; it is the measurement's own caveat.** This is a laptop GPU whose clocks
-move with thermals and recent load. At 720p five runs agree to within 0.02 ms, at 1080p they span
-1.4 ms, and at 1440p nearly two to one. A single run taken straight after the test suite read 5.77
-ms at 1080p — 1.7 times the median — so anything measured cold, or immediately after other GPU work,
-is not comparable to anything else.
+**Take the spread seriously.** This is a laptop GPU whose clocks move with thermals and recent load.
+At 720p five runs agree to within 0.02 ms, at 1440p they span nearly two to one, and a single run
+taken straight after the test suite read 5.77 ms at 1080p — 1.7× the median. Scaling is close to
+linear in pixels but not exactly: 2.25× the pixels from 720p to 1080p cost 2.45× the time. Near
+enough that there is no hidden fixed cost, not so exact that a figure can be extrapolated.
 
-Scaling is close to linear in pixels but not exactly: 2.25 times the pixels from 720p to 1080p cost
-2.45 times the time, and 1.78 times again to 1440p cost 1.74. Near enough that there is no hidden
-fixed cost to grow into, not so exact that a figure can be extrapolated rather than measured.
+And it is an *interior*: 260 instances, 13 lights, every ray terminating on a wall a few metres
+away.
 
-And it is an *interior*: 260 instances and 13 lights, every ray terminating on a wall a few metres
-away. Exteriors are the case this budget will actually be decided by, and M9 is where that is
-tested.
-
-`--screenshot <path> [WIDTHxHEIGHT]` takes a resolution now, because the budget cannot be checked at
-the 720p the flag defaulted to.
-
-What the tests can assert about timings is narrow, and deliberately so: no wall-clock threshold,
-which would be flaky, but that four filter passes are timed at something and zero passes at nothing,
-that the trace outweighs the composite, and — as a pure function, since this machine's queue reports
-all 64 bits valid and so never exercises it — that a duration masks off the bits a queue does not
-promise, including across a wrap.
-
-### M9 — exteriors: the ground under the world
-
-The first half of the milestone: a named exterior cell loads with its terrain and its objects, and
-renders. Streaming, the active grid and distant statics are not built.
+### M9 — Exteriors: terrain and streaming — **done**
+`LAND` decode, terrain as BLAS geometry, texture layer blending, the active cell grid, distant
+statics. **Note:** this is where TLAS instance counts get large — the point at which wgpu's CPU
+marshalling would have become the bottleneck. It did not become one here: the 477 cells resident
+from a hilltop rebuild the top level once a frame without showing up in the budget.
 
 **`LAND` is two encodings that both look plausible when decoded wrongly**, which is what the tests
 are shaped around:
 
-- **`VHGT` stores gradients, not heights.** Each row's first column steps from the row above it and
-  every other column steps from its left-hand neighbour, over a float offset for the whole cell. So
-  one cell is a running total down its western edge and 65 running totals across. Read as absolute
-  values it still produces a surface — just not this one.
+- **`VHGT` stores gradients, not heights.** Each row's first column steps from the row above and
+  every other column from its left-hand neighbour, over a float offset for the whole cell. Read as
+  absolute values it still produces a surface — just not this one.
 - **`VTEX` is sixteen 4×4 blocks, not a 16×16 grid.** Read flat it scrambles the texturing into the
   right textures in the wrong places.
-- **A `VTEX` index is one past its `LTEX` index**, because zero means the region's default rather
-  than the palette's first entry. OpenMW resolves the same way at
-  `components/esmterrain/storage.cpp:376`, and the default is `_land_default.dds`.
+- **A `VTEX` index is one past its `LTEX` index**, because zero means the region's default.
 
-Verified against every `LAND` record in `Morrowind.esm`: 1,292 cells of terrain from −2,152 to
-18,952 units, neighbouring vertices never more than 1,016 apart, 548 cells centred below sea level.
-Those are Vvardenfell's shape — sea level at zero, Red Mountain at eighteen thousand, an island —
-and they are what a corpus catches that a round trip cannot. A further **98 `LAND` records carry no
-terrain at all**, only coordinates and a flag word; they are cells that exist for their objects, and
-treating them as parse failures would discard 7% of the world's records silently.
+Verified against every `LAND` record: 1,292 cells from −2,152 to 18,952 units, neighbouring vertices
+never more than 1,016 apart, 548 centred below sea level. Those are Vvardenfell's shape — sea level
+at zero, Red Mountain at eighteen thousand, an island — and they are what a corpus catches that a
+round trip cannot. A further **98 `LAND` records carry no terrain at all**, only coordinates and a
+flag word; they exist for their objects, and treating them as parse failures would discard 7% of the
+world's records silently.
 
-**Terrain is placed rather than instanced.** A NIF is authored about its own origin and an instance
-transform puts it somewhere; a heightmap belongs to exactly one cell and could never appear
-elsewhere, so `Mesh::from_land` writes world coordinates and the instance carries no transform. Its
-65×65 grid shares its last row and column with the neighbouring cell, which is what makes adjacent
-terrain meet without a seam and why 65 vertices span 64 quads.
+**Terrain is placed rather than instanced.** A heightmap belongs to exactly one cell and could never
+appear elsewhere, so `Mesh::from_land` writes world coordinates and the instance carries no
+transform. Its 65×65 grid shares its last row and column with the neighbouring cell, which is what
+makes adjacent terrain meet without a seam and why 65 vertices span 64 quads. Texture tiles become
+submeshes — the quads of every tile sharing a material emitted together — so Seyda Neen comes out as
+eight submeshes over 84 meshes and 289 instances, loading in 19 ms.
 
-Texture tiles become submeshes: the quads of every tile sharing a material are emitted together, so
-a cell of marsh, sand and rock is a handful of contiguous runs rather than 256 of them. Seyda Neen
-comes out as **eight submeshes over 84 meshes and 289 instances, loading in 19 ms**.
+The test names the eight textures exactly. Asserting they belong to the Bitter Coast was not enough,
+because **the palette is grouped by region**, so dropping the index offset still lands on Bitter
+Coast art: `Tx_BC_rock_01` where `Tx_BC_rock_03` belongs.
 
-The test that matters names the eight textures exactly. Asserting they belong to the Bitter Coast —
-Seyda Neen's region — was not enough, because **the palette turns out to be grouped by region**, so
-dropping the index offset still lands on Bitter Coast art: `Tx_BC_rock_01` where `Tx_BC_rock_03`
-belongs. Every wrong answer looks as plausible as the right one, so the set has to be spelled out.
-
-**A fault-injection harness reported four false negatives** before that was noticed. It treated a
+**A fault-injection harness reported four false negatives** before that was noticed: it treated a
 compile failure as "the test passed", and `mesh.rs`'s unit tests had stopped compiling when
-`from_land` changed signature. It now distinguishes *did not build* from *not caught*, which is the
-second time in this project that a verification step quietly reported success for work it never ran.
+`from_land` changed signature. It now distinguishes *did not build* from *not caught* — the second
+time in this project that a verification step reported success for work it never ran.
 
-**Not built at the time of writing, and each has its own section since:** the active grid and
-streaming, distant terrain and statics (§7.23), blending between neighbouring texture layers
-(§7.22), and **the sun**. An exterior carries no `AMBI`, so out of doors
-there is nothing lighting the world at all — the placeholder is a fixed overcast daylight standing
-in for a sky the weather system will eventually drive.
+**Not done:** the layer blend is bilinear between tile *centres* (§8.8), not the per-vertex blend
+map the original engine used, and distant terrain is one stride rather than a hierarchy (§8.9).
 
-### The sun — M5's last piece, and what an exterior needed
+### M9 — Streaming cells one at a time
 
-An exterior carries no `AMBI`, so until now the outdoors was lit by a flat placeholder ambient with
-no direction and no shadows. The sun closes that, and closes the one part of M5 that was never
-built.
-
-**The direction is Morrowind's own hardcoded constant**, `(-400 · orbit, 75, -100)` from
-`apps/openmw/mwworld/weather.cpp:900`, with `orbit` running 1 at sunrise to −1 at dusk. It is not an
-astronomical model: the sun runs east to west at a fixed angle from overhead and sits to the south.
-It is the direction light *travels*, which is why the shader negates it to point at the disc.
-
-**The angular diameter is ours, not Morrowind's.** OpenMW's sun is a pure direction with no size
-anywhere in its codebase, and its shadows are as sharp as the shadow map. Half a degree across is
-the real sun, and it is the only reason a shadow has a penumbra rather than an edge. Shadow rays
-sample the cone it subtends, uniformly over solid angle rather than over the disc, which keeps the
-gradient even instead of bunching samples at its centre.
-
-Measured on a fixture built to show it:
-
-| | penumbra |
-|---|---|
-| sun with a real half-degree disc | **38 rows** |
-| the same light from a point | **0 rows** |
-
-The fixture is an odd shape for a reason worth writing down: **a real sun's penumbra is about one
-pixel wide** when the camera and the blocker are the same distance from the surface. Its angular
-width is `2·tan(r)·d/D`, so seeing it at all means putting the blocker far and the camera close —
-here fifty times closer, which turns one pixel into about seventy-five. Sharp sun shadows are the
-correct answer, and the fixture exists to make the softness measurable rather than to make it large.
-
-The lit value is the whole chain in one number: albedo 0.5, the Lambertian `1/pi`, a sun of 2.0
-straight on — 0.318, or 81 of 255. Four injections are caught, including the sun's direction not
-being negated.
-
-**The push constant block is now exactly 128 bytes — Vulkan's guarantee, in full.** The field order
-is load-bearing rather than cosmetic: std430 aligns a `vec3` to sixteen bytes, so the sun's radius
-sits *between* its direction and its colour to keep both on a boundary. A unit test reads the actual
-field offsets and asserts each is a multiple of sixteen. Anything further has to move the block into
-a buffer, which is also what motion vectors will need.
-
-**The sky comes from the ambient rather than from constants of its own**, brighter overhead than at
-the horizon. That ties the two together so they cannot disagree, and it removes the hardcoded
-blue-grey a missed ray used to return — indoors it now yields the room's own dark fill, which is
-what a ray escaping through a doorway should find. The disc is drawn but is **not** energy-consistent
-with the directional term: a real sun's radiance is its irradiance over the solid angle it subtends,
-some sixty thousand times the value used, and reconciling them means making the directional light an
-area light.
-
-**Cost:** the exterior went from 1.75 ms to 3.5 ms at 1920×1080, nearly all of it in the trace —
-sixteen shadow rays a pixel across a scene where most of them reach the sky unobstructed. That is
-generous, and the first thing to spend down if the budget tightens; temporal reuse at M7 is what
-makes one sample a frame viable. Against the ~8 ms §5.3 allowance there is still room.
-
-`Sun::at(orbit)` takes the time of day the engine does not yet track, so exteriors use a fixed
-mid-morning. The colour is a warm white scaled by a constant chosen for its *ratio* to the sky —
-about five to one, as on a clear day — and is provisional in exactly the way `INTENSITY` is.
-
-### M9 — streaming cells one at a time
-
-The camera flies across a 7×7 window of exterior cells and the window follows it, a cell at a time,
-without a stall. Getting there meant throwing away the first answer.
-
-**The window is nearly free past 5×5.** Measured at 1920×1080 on the shipped cell, with four bounce
-samples, four à-trous passes and sixteen sun rays:
+**The window is nearly free past 5×5.** Measured at 1920×1080 with four bounce samples, four à-trous
+passes and sixteen sun rays:
 
 | radius | window | cells | instances | frame | trace |
 |---|---|---|---|---|---|
@@ -1069,19 +625,14 @@ samples, four à-trous passes and sixteen sun rays:
 | 3 | 7×7 | 49 | 6,406 | 8.16 ms | 7.30 |
 | 4 | 9×9 | 81 | 10,545 | 8.15 ms | 7.33 |
 
-Tripling the cells from 5×5 to 9×9 — 2.7 times the instances — costs **0.12 ms**. The extra cells are
-beyond anything a ray reaches: the top-level structure dismisses them in log time and the rays that
-would have visited them terminated long before. The expensive step is the *first* neighbour, 1×1 to
-3×3, which nearly doubles the frame — not because of instance count but because rays that used to
-escape to the sky now hit terrain and spawn shadow and bounce rays of their own.
+Tripling the cells from 5×5 to 9×9 costs **0.12 ms** — the extra cells are beyond anything a ray
+reaches, the top level dismisses them in log time, and the rays that would have visited them
+terminated long before. The expensive step is the *first* neighbour, 1×1 to 3×3, and not because of
+instance count: rays that used to escape to the sky now hit terrain and spawn shadow and bounce
+rays. **Draw distance is not what this budget is spent on. Ray termination is.**
 
-So draw distance is not what this budget is spent on. **Ray termination is.** That reframes what to
-tune: sixteen sun samples a pixel, not the size of the world.
-
-#### What the first attempt cost, and why
-
-Streaming began as a *block* reload: cross a boundary, load the 7×7 around the new centre, replace
-everything. It worked and it stalled for a fifth of a second. Broken down, one crossing:
+**The first attempt was a block reload** — cross a boundary, load the 7×7 around the new centre,
+replace everything. It worked and stalled for a fifth of a second:
 
 | | dev | release |
 |---|---|---|
@@ -1093,277 +644,150 @@ everything. It worked and it stalled for a fifth of a second. Broken down, one c
 | upload and build structures | 71.9 | 43.1 |
 | **total** | **195 ms** | **133 ms** |
 
-The shape is what matters, and it is not "loading is slow". **Three passes over the same 79 MB
-file** to find records whose location never changes, and then a re-upload of a scene that is 90%
-identical to the one already resident — 49 neighbouring cells share 378 meshes between them, so the
-block arriving after a one-cell step is almost entirely the block that was already on the device.
+The shape is what matters: **three passes over the same 79 MB file** to find records whose location
+never changes, then a re-upload of a scene 90% identical to the resident one — 49 neighbouring cells
+share 378 meshes.
 
-#### Identity, and two lifetimes
+**Identity, and two lifetimes.** Every mesh carries the path it was loaded from (terrain is keyed by
+its cell, being the one mesh no other cell can share), and on that identity the renderer keeps two
+tiers split by lifetime rather than by kind:
 
-The fix is to stop rebuilding what has not changed, which requires knowing what "the same" means.
-Every mesh carries the path it was loaded from (`StaticScene::mesh_sources`; terrain is keyed by its
-cell, being the one mesh no other cell can share), and textures already carried theirs. On that
-identity the renderer keeps two tiers, split by lifetime rather than by kind:
-
-- **Assets are grow-only** — mesh data, bottom-level structures, textures, materials. Keyed by
-  source, uploaded by the first cell to name them, and kept for the life of the renderer. The
-  ceiling is the shipped library: 4,311 distinct textures against the array's 8,192 slots, and some
-  three thousand meshes. A session that visited every cell in the game would hold all of it, in the
-  region of half a gigabyte — so nothing is freed, no slot is renumbered, and a mesh's
-  `first_submesh`, which is what an instance carries as its custom index, is stable forever.
+- **Assets are grow-only** — mesh data, bottom-level structures, textures, materials — keyed by
+  source, uploaded by the first cell to name them, kept for the life of the renderer. The ceiling is
+  the shipped library: 4,311 distinct textures against the array's 8,192 slots, some three thousand
+  meshes, in the region of half a gigabyte if a session visited every cell. So nothing is freed, no
+  slot is renumbered, and a mesh's `first_submesh` is stable forever. With eviction the arena would
+  fragment and slots would be reused, which means renumbering, which means rewriting the tables that
+  name them. A mod with 2K textures would blow the ceiling; until a refcount exists, the ceiling is
+  asserted rather than assumed.
 - **Cells own placements and nothing else** — instances and lights. Evicting one is dropping two
   lists.
 
 A commit therefore rebuilds only what the resident *set* determines: the geometry and material
-tables (~100 KB together), the lights, the instance buffer and the top level. Everything there is
-proportional to what is placed, not to what is loaded.
+tables (~100 KB), the lights, the instance buffer and the top level — all proportional to what is
+placed, not to what is loaded.
 
-This is why the arena is grow-only rather than free-listed. With eviction the arena would fragment
-and mesh slots would have to be reused, which means renumbering, which means rewriting the tables
-that name them. Bounding the problem by the game's own art removes all of it. A mod with 2K textures
-would blow the ceiling; the path-keyed map is where a refcount and a free list would go, and until
-one exists the ceiling is asserted rather than assumed.
+**One walk, then two reads.** The file is walked once into a `CellIndex`: the offset of every cell's
+`CELL` and `LAND` record, plus the `LTEX` palette. The palette has to live there for the same reason
+the offsets do — `LTEX` records are scattered with no relation to the cells that use them, so a cell
+loaded on its own would resolve its ground against however much of the palette happened to precede
+it. The door search is simply not run for a streamed cell: it was a third of the cost and answers
+"where would someone arriving here appear", which a cell the camera walks into has already answered.
 
-#### One walk, then two reads
+**Hysteresis is two radii.** Cells load within Chebyshev radius 3 and are evicted only past 4, so
+crossing a boundary pushes the far column out of the load window but not out of the kept one and
+stepping back finds it resident. One crossing settles it; no timers, no margin, one mechanism.
 
-The file is walked once, on the streamer's thread, into a `CellIndex`: the offset of every cell's
-`CELL` and `LAND` record, plus the `LTEX` palette. After that, loading a cell is
-`esm.record_at(offset)` twice. The palette has to live there for the same reason the offsets do —
-`LTEX` records are scattered with no relation to the cells that use them, so a cell loaded on its
-own would otherwise resolve its ground against however much of the palette happened to precede it.
-
-The door search is simply not run for a streamed cell. It was a third of the cost and it answers
-"where would someone arriving here appear", which a cell the camera is walking into has already
-answered.
-
-#### Hysteresis is two radii
-
-Cells load within Chebyshev radius 3 and are evicted only past 4. Crossing a boundary pulls in a
-column and pushes the far column *out of the load window but not out of the kept one*, so stepping
-back over the same edge finds it still resident and loads nothing. One crossing settles it; no
-timers, no distance-from-edge margin, and one mechanism rather than two.
-
-#### What it costs now
-
-Per cell, with its neighbours already resident: **0.7–3.7 ms to add, 0.6–2.5 ms to commit.** One
-cell per frame, deliberately — a boundary crossing wants a whole column, and taking them together
-would rebuild the same structure seven times inside one frame. Filling the whole 7×7 window from
-cold is 48 cells in **136 ms**, against 195 ms for the single block reload it replaces.
-
-In the windowed engine at 1920×1080: **81 fps while a cell arrives every frame**, 108–112 fps once
-the window is full. The stall is gone — the frame that takes a cell is a slower frame, not a
-dropped one.
-
-The horizon beyond that window is §7.23, and terrain layer blending is §7.22.
-
-
-### M5 — Direct lighting
-Sun as a directional light with a real angular diameter (so shadows are soft), shadow rays, cell
-ambient, `LIGH` point lights with shadow rays and a defensible attenuation model, emissive surfaces.
-**Done when:** a torch casts a soft shadow that moves correctly, and an interior without lights is
-lit only by its ambient term.
-**Retires:** the "does this look like Morrowind or like a tech demo" question — see §5.1.
-
-### M6 — Indirect lighting
-One-bounce diffuse GI with next-event estimation and cosine-weighted sampling. Escalate to ReSTIR DI
-then GI only if variance demands it; do not start there.
-**Done when:** an interior lit through a doorway shows plausible bounce, and per-pixel variance is
-measured and recorded so M7 has a baseline.
-
-### M7 — Denoise and upscale
-DLSS Ray Reconstruction via NGX — denoise, antialias and upscale in one pass, 1920×1080 → 3840×2160.
-No separate TAA. Requires the full G-buffer from §5.2 including the specular guide, and the NGX
-Vulkan extensions requested back at M0.
-**Done when:** a still frame at 1 sample per pixel is comparable to a 1024-sample reference by a
-numeric metric, and the frame holds 60 fps at the §5.3 target.
-**Retires:** the biggest performance unknown. Worth spiking early against a placeholder scene rather
-than waiting until M7 — the G-buffer requirements reach back into M3.
-
-### M8 — Filters and output
-Exposure/auto-exposure, tonemap, bloom, color grading, sharpening; correct sRGB↔linear discipline
-end to end; optional HDR output.
-**Done when:** a Morrowind screenshot and an rtxmw render of the same viewpoint can be compared
-side by side without gamma mismatch.
-
-### M9 — Exteriors: terrain and streaming — **done**
-`LAND` decode (delta-coded VHGT, transposed VTEX), terrain as BLAS geometry, texture layer blending,
-the active cell grid, distant statics.
-**Done when:** the camera can fly from Seyda Neen to Balmora with the grid streaming and no hitching.
-**Note:** this is where TLAS instance counts get large — the point at which wgpu's CPU marshalling
-would have become the bottleneck. It did not become one here: the 477 cells resident from a hilltop
-rebuild the top level once a frame without showing up in the budget.
-**What was measured:** §7.22 for the layer blending, §7.23 for the horizon.
-**Not done:** the layer blend is bilinear between tile *centres*, which is not what the original
-engine's per-vertex blend map did, and distant terrain is one stride rather than a hierarchy.
+**Cost:** per cell with neighbours resident, **0.7–3.7 ms to add, 0.6–2.5 ms to commit**. Filling
+the whole 7×7 window from cold is 48 cells in **136 ms** against 195 for the block reload. In the
+windowed engine at 1920×1080: **81 fps while a cell arrives every frame**, 108–112 once full. The
+frame that takes a cell is a slower frame, not a dropped one.
 
 ### M10 — Water — **done**
 Per-cell water plane, RT reflection and refraction, absorption and scattering, analytic caustics.
-**Done when:** standing on Seyda Neen's shore, the seabed is visible through moving water, the
-surface reflects the sky and the coast, and the frame still fits §5.3.
-**Proposal, plan and what was measured:** §7.
-**Not done:** foam at the shoreline, and sun shafts underwater.
+Design and findings: §7. **Not done:** foam at the shoreline, and sun shafts underwater.
 
 ---
 
 ## 5. Decisions still open
 
-Ordered by how much damage they do if deferred. The first two outrank the API choice.
-
 ### 5.1 Vanilla Morrowind has no material data, and its albedo is pre-lit
 
-OpenMW's own documentation states it plainly: *"Morrowind format NIF files do not support normal
-maps or specular maps."* Vanilla assets are 256²-era diffuse textures with **lighting, shading and
-ambient occlusion painted into the albedo**, authored for a fixed-function renderer with no
-per-pixel lighting.
+OpenMW states it plainly: *"Morrowind format NIF files do not support normal maps or specular
+maps."* Vanilla assets are 256²-era diffuse textures with **lighting, shading and ambient occlusion
+painted into the albedo**, authored for a fixed-function renderer with no per-pixel lighting.
 
-Physically-based ray tracing on top of pre-lit albedo double-lights everything. Surfaces read flat
-and muddy, ambient occlusion appears twice, and no amount of denoiser tuning fixes it. This is the
-single largest threat to "looks great", and it is an art-pipeline problem that no renderer
-architecture solves.
+Physically-based ray tracing on top of pre-lit albedo double-lights everything: surfaces read flat
+and muddy, ambient occlusion appears twice, and no denoiser tuning fixes it. This is the single
+largest threat to "looks great", and it is an art-pipeline problem no renderer architecture solves.
 
 Four options, not mutually exclusive:
 
-1. **Accept it and tune.** Cheapest. Reduce GI contribution, lean on direct lighting. Will look
-   better than vanilla but will not look like a modern RT title.
-2. **Support replacer texture packs.** Morrowind has a mature ecosystem of HD/PBR replacers, and
-   OpenMW's `_n` / `_nh` / `_spec` filename conventions are the de-facto standard for wiring them
-   in. Cheap to implement, and shifts the quality ceiling onto the pack. **Probably the best
-   value.**
-3. **Synthesize normal and roughness from diffuse.** Classic height-from-luminance is unreliable;
-   a small image model would do better. Medium effort, uncertain payoff.
-4. **De-light the vanilla textures offline** — estimate and divide out baked shading. Research-grade,
-   high effort, but it is the only path that makes *vanilla* assets look physically correct.
+1. **Accept it and tune.** Cheapest. Will beat vanilla, will not look like a modern RT title.
+2. **Support replacer texture packs.** Morrowind has a mature HD/PBR replacer ecosystem and OpenMW's
+   `_n` / `_nh` / `_spec` filename conventions are the de-facto standard. Cheap, and shifts the
+   quality ceiling onto the pack.
+3. **Synthesize normal and roughness from diffuse.** Height-from-luminance is unreliable; a small
+   image model would do better. Medium effort, uncertain payoff.
+4. **De-light the vanilla textures offline** — estimate and divide out baked shading.
+   Research-grade, and the only path that makes *vanilla* assets physically correct.
 
-**Decided: option 4, de-light the vanilla textures offline.**
+**Decided: option 4.** One implication: **de-lighting recovers base colour only.** Normal and
+roughness still need option 2 or 3, and since `Material` carries those slots as first-class either
+way, supporting the filename conventions is nearly free and worth doing alongside.
 
-One implication to plan for: **de-lighting recovers base colour only.** It does nothing about the
-missing normal and roughness maps, which vanilla NIFs simply do not have. So the material pipeline is
-really two problems, and choosing 4 solves the harder half:
-
-- *Albedo* — de-lighting. Estimate and divide out baked shading and AO.
-- *Normal / roughness* — still needs option 2 (replacer packs) or option 3 (synthesis). Since
-  `Material` now carries these slots as first-class either way, supporting the `_n` / `_nh` / `_spec`
-  filename conventions is nearly free and worth doing alongside.
-
-De-lighting deserves its own spike **before M4 commits to a texture format**, run offline against a
-sample of a few dozen textures and judged by eye against the same surfaces under flat lighting. The
-failure mode to watch for is over-correction: flat, washed-out output where the algorithm removed
-genuine painted detail along with the shading. Keep the vanilla textures as a fallback path so a
+The spike should run offline against a few dozen textures, judged by eye against the same surfaces
+under flat lighting. The failure mode to watch is over-correction — flat, washed-out output where
+the algorithm removed genuine painted detail. Keep the vanilla textures as a fallback so a
 regression in the bake is always visible as an A/B.
 
 ### 5.2 Licensing — settled: MIT OR Apache-2.0
 
-**Decided.** The workspace is permissive, so the NVIDIA RTX SDK conflict below does not apply and
-**DLSS Ray Reconstruction is available**. M7 becomes an integration task rather than writing a
-denoiser: DLSS-RR does denoise, antialias and upscale in one pass, which also means **no separate TAA
-pass** — running TAA on top of a temporally-accumulated denoiser double-blurs and compounds ghosting.
+Permissive, so the NVIDIA RTX SDK licence's source-disclosure prohibition does not apply and **DLSS
+Ray Reconstruction is available**. Under GPL-3 the denoiser would have had to be hand-rolled SVGF
+from the BSD-3 references — roughly 700 lines of shader to work, 2,000 to be good.
 
-The cost is a fat G-buffer. DLSS-RR requires diffuse albedo, specular albedo, normals, roughness,
-colour, depth, motion vectors, and a specular guide (hit distance or specular motion vectors), plus
-jitter offset and a reset flag. **Design the G-buffer for this from M3 onward** rather than
-retrofitting it at M7 — the specular guide in particular is easy to forget and awkward to add late.
-
-Practical notes for when M7 arrives: NGX ships real Linux `.so` files (not Proton stubs) and needs
-specific Vulkan instance and device extensions **at creation time**, so M0's device setup must leave
-room for them. OTA model updates are broken on Linux, so the model baked into the shipped library is
-the one that gets used. Streamline is Windows-only — call NGX directly.
-
-The original analysis is kept below, since reversing the licence would reinstate every word of it.
-
-#### Why GPL-3 would have conflicted
-
-Kept for the record: this section describes the position the workspace would have been in under
-`GPL-3.0-or-later`, the licence considered before `MIT OR Apache-2.0` was settled on. NRD, DLSS,
-SHARC and RTXDI all ship under the NVIDIA RTX SDK license, whose §4(e) forbids using the SDK in any
-way that would subject it to a license requiring source disclosure, derivative works, or free
-redistribution — i.e. exactly what GPL-3 requires.
-
-Building and running locally is fine; the obligation triggers on **distribution**. But:
-
-- No OpenMW code is being copied, so **GPL-3 here would be a choice, not an inheritance.** For
-  distributing binaries with DLSS-RR, a permissive license removes the conflict outright.
-- Under GPL-3 with distribution, the denoiser would have to be hand-rolled SVGF from the BSD-3
-  references (Falcor's `SVGFPass`, Schied's A-SVGF, chrismile's Vulkan/GLSL implementation) —
-  roughly 700 lines of shader to work, 2,000 to be good.
-
-(Resolved by going permissive.)
+The cost is a fat G-buffer: DLSS-RR requires diffuse albedo, specular albedo, normals, roughness,
+colour, depth, motion vectors and a specular guide, plus jitter offset and a reset flag. The
+specular guide in particular is easy to forget and awkward to add late.
 
 ### 5.3 Output resolution is the hardest constraint in the project
 
-Denoising scales with *output* pixels, not internal ones. Measured upstream, DLSS Ray Reconstruction
-alone costs ~6.1 ms at 3200×1800 on a 3080. Even scaling generously for Ada, anything above 4K output
-spends 10–14 ms on the denoiser before a single ray is cast — the whole frame, at 60 fps. Driving a
-high-resolution ultrawide at its native mode is therefore off the table.
+Denoising scales with *output* pixels, not internal ones. DLSS-RR alone costs ~6.1 ms at 3200×1800
+on a 3080; even scaling generously for Ada, anything above 4K output spends 10–14 ms on the denoiser
+before a single ray is cast. Driving a high-resolution ultrawide at its native mode is off the
+table.
 
-**Decided: 1920×1080 internal → 3840×2160 output at 60 fps** on Ada-class hardware — DLSS Performance
-mode. That is 8.3 M output pixels, so budget roughly **8–9 ms of denoiser**, leaving about **7 ms of
-a 16.6 ms frame** for acceleration structures, rays, GI and post.
-
-Treat that 7 ms as the real budget from M3 onward and measure against it, rather than discovering at
-M7 that the frame is already full. If the renderer turns out efficient enough, the internal
-resolution moves up to 2560×1440 (Quality mode) at no architectural cost. Ray tracing at native
-ultrawide resolution is not a target; it is a wish.
+**Decided: 1920×1080 internal → 3840×2160 output at 60 fps** — DLSS Performance mode. 8.3 M output
+pixels, so roughly **8–9 ms of denoiser**, leaving about **7 ms of a 16.6 ms frame** for
+acceleration structures, rays, GI and post. If the renderer turns out efficient enough the internal
+resolution moves up to 2560×1440 at no architectural cost.
 
 The good news is Morrowind-shaped: ~1.1 GB of game data, 256² textures, very low-poly meshes. BLAS
-memory and build time will be a non-issue in a 16 GB budget. The pressure is **TLAS instance count**
-and **alpha-tested foliage**, not geometry volume.
+memory and build time are a non-issue in a 16 GB budget. The pressure is **TLAS instance count** and
+**alpha-tested foliage**.
 
 ### 5.4 Smaller decisions — settled by default
 
-These are recorded as chosen rather than left open. Each is cheap to revisit; none warrants blocking.
-
-- **Light units.** Work in physical units throughout, with 69.99125109 units per metre as the single
-  conversion constant. `LIGH` radius maps to an inverse-square falloff with a radius-derived cutoff,
-  not Morrowind's original curve — matching vanilla attenuation exactly would fight the renderer.
-- **Emissive vs analytic.** A Morrowind torch is *both* a `LIGH` record and a glowing mesh. Use the
-  `LIGH` record as an analytic light for direct lighting, and mark the mesh emissive **but excluded
-  from light sampling**, so it appears bright to primary and reflection rays without being counted
-  twice. This is the standard resolution and the double-count is very visible when got wrong.
-- **Sky and environment.** Ambient light needs an environment map. Morrowind's sky is procedural
-  (`WeatherResult` carries the colors); render it to a small cubemap once per frame and sample it.
-- **Color management.** sRGB textures, linear working space, tonemap at the end. Getting this wrong
-  is the most common reason RT renders look washed out, and it is nearly free to get right on day
-  one.
-- **Asset cache.** Re-parsing 500 MB of BSA and every NIF on each launch will dominate iteration
-  time. Plan a converted-asset cache keyed by content hash before it becomes painful.
-- **Debug affordances.** A debug-view selector (albedo / normal / instance id / material id /
-  variance / ray count), shader hot reload, and a headless golden-image mode. All three pay for
-  themselves within a week. `ash` also behaves better than wgpu under RenderDoc and Nsight.
-- **Testing.** Format layers get round-trip and cross-check tests against `esmtool`/`niftest`. The
-  renderer gets golden-image tests via the headless mode. Neither is optional at this scale.
-- **Scope boundary for "static".** M0–M8 render the **bind pose only, no particles, no animation of
-  any kind** — animated doors and activators appear in their rest state, NIF controllers are parsed
-  but not evaluated. Creatures and NPCs are not placed at all. This is a deliberate cut, not an
-  omission to discover later; it is also what keeps the missing-BLAS-refit problem out of scope until
-  after the renderer is proven.
+- **Light units.** Physical units throughout, 69.99125109 units per metre as the single conversion
+  constant. `LIGH` radius maps to inverse-square with a radius-derived cutoff, not Morrowind's
+  original curve — matching vanilla attenuation exactly would fight the renderer.
+- **Emissive vs analytic.** A torch is *both* a `LIGH` record and a glowing mesh. Use the record as
+  an analytic light and mark the mesh emissive **but excluded from light sampling**, so it appears
+  bright to primary and reflection rays without being counted twice.
+- **Sky and environment.** Morrowind's sky is procedural; render it to a small cubemap once per
+  frame and sample it.
+- **Colour management.** sRGB textures, linear working space, tonemap at the end. The most common
+  reason RT renders look washed out, and nearly free to get right on day one.
+- **Asset cache.** Re-parsing 500 MB of BSA and every NIF each launch will dominate iteration time.
+  Plan a converted-asset cache keyed by content hash before it becomes painful.
+- **Debug affordances.** A debug-view selector, shader hot reload, a headless golden-image mode.
+- **Scope boundary for "static".** M0–M8 render the **bind pose only, no particles, no animation** —
+  animated doors appear in their rest state, NIF controllers are parsed but not evaluated, creatures
+  and NPCs are not placed. A deliberate cut, and what keeps the missing-BLAS-refit problem out of
+  scope until the renderer is proven.
 
 ---
 
-## 6. Dependencies this proposal implies
-
-Approved. `wgpu` is removed.
+## 6. Dependencies
 
 | Crate | Purpose | Note |
 |---|---|---|
-| `ash` | Vulkan | 0.38 on crates.io is two years stale but carries the full RT surface plus opacity micromap and invocation reorder. It lacks only cluster/partitioned AS, which this project does not need. 0.39 will be a large breaking rewrite — pin and revisit |
+| `ash` | Vulkan | 0.38 is stale but carries the full RT surface plus opacity micromap and invocation reorder. 0.39 will be a large breaking rewrite — pin and revisit |
 | `gpu-allocator` | device memory | `ash` provides none |
-| `winit` | window + input | Gamepad and audio will need separate crates later |
+| `winit` | window + input | gamepad and audio will need separate crates |
 | `glam` | math | `Affine3A` matches the 3×4 transforms the AS API wants |
 | `bytemuck` | `#[repr(C)]` GPU structs | |
-| build-time: `glslc` | GLSL → SPIR-V | external tool; shelled out to from `build.rs` |
+| `dotenvy` | locating the game install | production behaviour, not a test helper |
+| build-time: `glslc` | GLSL → SPIR-V | external tool, shelled from `build.rs` |
 
-Not yet added, needed later: an NGX binding for DLSS-RR at M7 (hand-written FFI against the C
-header), and an image decoder for DDS/TGA at M4.
+Not yet added: an NGX binding for DLSS-RR at M7, hand-written FFI against the C header.
 
 ---
 
-## 7. M10 water: proposal and plan
-
-Not yet built. This is the design to argue with before any of it is written.
+## 7. Water
 
 ### 7.1 What the data says
-
-Measured over `Morrowind.esm`, because the shape of the water decides the technique:
 
 | | |
 |---|---|
@@ -1373,632 +797,212 @@ Measured over `Morrowind.esm`, because the shape of the water decides the techni
 | land cells whose terrain crosses z = 0 | **533 of 1,292** |
 | lowest terrain vertex in the game | **−2,152 units**, about 31 m |
 
-Four things follow, and they are the whole brief:
-
 1. **Sea level is z = 0 everywhere outdoors.** No per-cell lookup, no interpolation across a
-   boundary, one constant. Vvardenfell is one body of water.
+   boundary. Vvardenfell is one body of water.
 2. **The flag is the gate, not the value.** Every interior carries a water height whether or not it
-   has water, so reading `WHGT` and testing for presence would flood 941 dry rooms. `has_water()`
-   is `(flags & 0x02) || is_exterior()`, matching `loadcell.hpp:164`.
-3. **Water is shallow.** Thirty-one metres at the deepest point in the game, and the Bitter Coast is
-   a fraction of that. The seabed is *visible through the surface almost everywhere*, which is what
-   makes caustics worth having rather than a detail nobody sees.
-4. **The shoreline is the most-seen feature.** 41% of land cells contain one. Whatever happens where
-   water meets sand is on screen more than anything else about the water.
+   has water, so reading `WHGT` and testing for presence would flood 941 dry rooms. `has_water()` is
+   `(flags & 0x02) || is_exterior()` — an exterior has water whatever the record says, which only
+   matters for content that does not set the flag, and that is exactly where trusting it leaves a
+   hole in the sea.
+3. **Water is shallow**, so the seabed is visible through the surface almost everywhere, which is
+   what makes caustics worth having.
+4. **The shoreline is the most-seen feature** — 41% of land cells contain one.
 
-### 7.2 What that rules out
+### 7.2 A sum of trochoidal waves, not an FFT ocean
 
-**Not an FFT ocean.** Tessendorf's spectrum is the right answer for deep water at kilometre scale
-with a horizon: it sums thousands of components for free by doing the sum in frequency space. We
-have coastal shallows and interior pools. It would cost a compute pass and three textures a frame to
-simulate a spectrum whose defining feature — long deep-water swell — does not belong in a swamp.
+Tessendorf's spectrum is the right answer for deep water at kilometre scale with a horizon: it sums
+thousands of components for free by doing the sum in frequency space. We have coastal shallows and
+interior pools, and it would cost a compute pass and three textures a frame to simulate a spectrum
+whose defining feature — long deep-water swell — does not belong in a swamp.
 
-**A sum of trochoidal (Gerstner) waves instead**, four to six of them, plus a procedural detail
-normal. Analytic, stateless, no texture. Critically it is also **differentiable in closed form**,
-which §7.5 needs: caustics come out of the derivative of the surface, so a surface we can
-differentiate on paper is worth more here than one that is merely prettier.
+A direct sum of sinusoids is **differentiable in closed form**, which is what makes the analytic
+caustic possible at all: a closed-form height field can be differentiated twice, and an FFT texture
+cannot without another pass.
 
-### 7.3 The surface, as geometry
+### 7.3 The surface and its shading
 
-One unit quad, instanced once per water cell with the level in its transform. This falls out of the
-residency work: water is the *ideal* shared asset — every cell's water is the same mesh, unlike
-terrain, which is per-cell by nature. One mesh, N instances, keyed `water`.
+One unit quad, instanced per water cell with the level in its transform — water is the *ideal*
+shared asset, unlike terrain, which is per-cell by nature. It goes in the acceleration structure
+rather than being intersected analytically so that reflections, shadows and refraction rays all see
+it without a second code path.
 
-It goes in the acceleration structure rather than being intersected analytically in the shader so
-that reflections, shadows and the refraction ray all see it without a second code path. A ray that
-happens to hit water inside a bounce is then handled by the same branch as a primary hit.
+On a water hit, with `n` the wave normal and `η = 1/1.333`: **Fresnel** (Schlick, `F0 = 0.02`),
+which is most of what reads as "water"; **a reflection ray** and **a refraction ray**, each traced
+and shaded; **Beer–Lambert absorption** along the underwater path with σ from a Jerlov coastal water
+type rather than a hand-picked blue, which is *why* shallow water reads green and deep water blue;
+**single scattering** added back so what the water absorbs it partly returns; and **sun glint**, GGX
+against the wave normal.
 
-### 7.4 Shading it
+**This dodges the denoiser by construction.** The à-trous filter is demodulated by albedo and water
+has none — but a mirror reflection and a refraction are *deterministic*, one ray each, no sampling.
+Water shades into the emissive/sky channel that already bypasses the denoiser. Perfectly specular
+water is not a simplification to be undone later, it is what makes water compose with the filter.
 
-On a water hit, with `n` the wave normal and `η = 1/1.333`:
+### 7.4 Caustics from the Jacobian
 
-- **Fresnel**, Schlick with `F0 = 0.02`. At grazing angles water is a mirror; head-on it is a
-  window. This one term is most of what reads as "water".
-- **A reflection ray**, `reflect(d, n)`, traced and shaded — sky above the horizon, the coast below
-  it.
-- **A refraction ray**, `refract(d, n, η)`, traced to the seabed and shaded, then attenuated.
-- **Beer–Lambert absorption** along the underwater path: `T = exp(−σ · depth)`, with σ from a
-  **Jerlov coastal water type** rather than a hand-picked blue. Water absorbs red within a metre or
-  two and passes green-blue furthest, which is *why* shallow water reads green and deep water blue —
-  falling out of the physics rather than being painted in.
-- **Single scattering** added back as `σs/σ · (1 − T) · L`, so what the water absorbs it partly
-  returns as its own glow.
-- **Sun glint**, GGX against the wave normal, with the sun's real angular radius already in the
-  frame constants from M5.
+Caustics are ray-density change. With an analytic height field the refracted direction is known in
+closed form, so the convergence of the refracted bundle at depth `d` is the determinant of the
+Jacobian of that map and intensity is `1/|det J|` — a few ALU per underwater hit, evaluated where
+the seabed is already being shaded. No photons, no buffer, no filtering. This is the same quantity
+image-space methods (wavefront meshes, caustic maps, photon splats) estimate by splatting; a single
+analytic layer lets it be evaluated pointwise instead.
 
-**Why this dodges the denoiser.** The à-trous filter is demodulated by albedo — it filters light
-arriving at a surface, and water has no albedo. But a mirror reflection and a refraction are
-*deterministic*: one ray each, no sampling, no noise. So water shades into the emissive/sky channel
-that already bypasses the denoiser, and needs no filtering at all. This is the argument for
-perfectly specular water first: it is not a simplification to be undone later, it is the thing that
-makes water compose with the denoiser we have.
+Held in reserve if that ever disappoints: photon-splatted caustic maps, the *Ray Tracing Gems II*
+chapter 30 approach, reported at 0.5–2 ms on RTX hardware.
 
-### 7.5 Caustics, two ways
+### 7.5 Underwater
 
-The seabed is visible nearly everywhere (§7.1), so caustics are not a garnish here.
+The same model inverted: Beer–Lambert on every primary ray rather than on the refraction ray, total
+internal reflection looking up past the critical angle of 48.6° — which is why the surface from
+below is a mirror ringed by a bright disc of sky — and the sun's colour filtered by depth before it
+lights anything.
 
-**First: analytic, from the Jacobian.** Caustics are ray-density change. With an analytic height
-field, the refracted direction at any surface point is known in closed form, so the convergence of
-the refracted bundle at depth `d` is the determinant of the Jacobian of that map, and intensity is
-`1/|det J|`. No photons, no buffer, no filtering — a few ALU per underwater hit, evaluated where the
-seabed is already being shaded. This is the same quantity Evan Wallace's light-front mesh computes
-with `dFdx`/`dFdy`, and the same stationarity condition the optics literature defines caustics by;
-the difference is that a single analytic layer lets it be evaluated pointwise instead of meshed.
+### 7.6 What was built
 
-It is exact for what we have — **one water layer, one sun, a height field we wrote ourselves** — and
-that is precisely the case where the expensive method buys nothing.
+**Stage 1, the flat plane, made the frame faster.** At Seyda Neen's shore over 900 frames under
+sustained load: **134 fps with water against 108–116 without.** A water pixel *replaces* a diffuse
+one, and a diffuse pixel is the expensive kind — sixteen shadow rays and four bounce rays, against
+water's two deterministic rays.
 
-**Second, if that disappoints: photon-splatted caustic maps**, the *Ray Tracing Gems II* chapter 30
-approach as shipped in UE4's RTX branch. Generate photons through the surface toward the light,
-trace them, splat each as a decal sized by photon differentials, filter, composite. Reported at
-0.5–2 ms on RTX hardware, roughly halved at half resolution. Our version would generate photons with
-ray queries rather than rasterising a caustic map, since we already have the structure to trace
-against. Held in reserve: it is the general answer, and generality is exactly what we do not need
-yet.
+**Water must not cast a shadow, and how it is told matters.** The first version put every seabed in
+the shade of its own sea, keeping 3.6% of its sunlight instead of 85%. Building the water non-opaque
+so the any-hit loop can wave shadow rays past *works* and **costs half the frame rate** — 68 fps
+against 134 — because every shadow ray crossing the sea then invokes a shader where traversal alone
+had been enough. Water carries a mask bit instead and `occluded` asks only for solid geometry: free.
 
-### 7.6 Underwater
-
-Below the surface the same model runs inverted: Beer–Lambert on every primary ray rather than on the
-refraction ray, total internal reflection looking up past the critical angle (48.6°, and the reason
-the surface from below is a mirror ringed by a bright disc of sky), and the sun's colour filtered by
-depth before it lights anything. Sun shafts are a later want, not part of this.
-
-### 7.7 Plan
-
-Four stages, each independently verifiable, each leaving the tree green.
-
-**Stage 1 — the plane exists — done.** `has_water` reaches `StaticScene`, one shared quad is
-instanced per water cell, `MaterialKind::Water` selects the model, and the shader branch does
-Fresnel, one reflection ray, one refraction ray and Beer–Lambert into the emissive channel. Flat —
-no waves.
-
-`Cell::has_water` now encodes the format's rule rather than the flag alone: an exterior has water
-whatever the record says. Every shipped exterior sets the flag anyway, so this only matters for
-content that does not — which is exactly the case where trusting the flag leaves a hole in the sea.
-
-**It made the frame faster.** At Seyda Neen's shore, 900 frames under sustained load: **134 fps with
-water against 108–116 without**. Water was expected to cost about double; instead a water pixel
-*replaces* a diffuse one, and a diffuse pixel is the expensive kind — sixteen shadow rays and four
-bounce rays, against water's two deterministic rays and their cheap shading. Screenshot timings are
-useless for this comparison on a desktop that keeps the GPU at its idle 315 MHz: five runs of the
-same frame spanned 6.2 to 11.0 ms, which is why the number above comes from a sustained run.
-
-**Water must not cast a shadow**, and the way it is told not to matters. A surface in the
-acceleration structure blocks shadow rays, so the first version of this put every seabed in the
-shade of its own sea — measured, the bottom kept 3.6% of its sunlight instead of 85%. Building the
-water non-opaque so the any-hit loop could wave shadow rays past *works* and **costs half the frame
-rate**: 68 fps against 134, because every shadow ray crossing the sea then invokes a shader where
-traversal alone had been enough. Water carries a mask bit of its own instead, and `occluded` asks
-only for solid geometry — free, and back to 134 fps. The light is not attenuated on the way *down*
-either, which the caustics stage replaces rather than a claim about water.
-
-Verified by four headless tests, each catching one thing a plausible implementation gets wrong —
-proven by injection: collapsing the extinction to one channel, dropping the angle from Fresnel,
-shading water as an ordinary surface, and letting water occlude each fail exactly one test and no
-others.
-
-**Stage 2 — waves — done.** Five trochoidal components, wavelengths 390 down to 57 units,
-amplitudes under a tenth of a metre. Real dispersion — `sqrt(gk)` with Morrowind's own gravity — so
+**Waves.** Trochoidal components with real dispersion, `sqrt(gk)` with Morrowind's own gravity, so
 the long waves outrun the short ones and the pattern never sets into one rigid shape. The quad stays
 flat and only the normal moves: displacing two triangles buys nothing a normal does not, and the
-silhouette against a shore comes from the terrain behind it.
-
-**The frame constants moved out of push constants into a storage buffer**, which the block reaching
-exactly 128 bytes had made unavoidable — M7's motion vectors would have forced the same move. Read
-with `scalar` layout, which packs a `vec3` at four-byte alignment and so matches the `repr(C)` struct
-field for field; a test pins every offset, and earned its place immediately by catching `time`
-inserted on the wrong side of `bounce_samples`, where the shader would have read each as the other.
-
-**A wave shorter than the pixel looking at it is averaged away rather than drawn.** This is
-mip-mapping applied to a normal, using the ray cone footprint already carried for choosing texture
-levels: a cone a wavelength wide covers a crest and a trough whose slopes cancel, and picking one of
-them instead is what makes distant water a field of crawling white sparks.
-
-**Which side of the surface a ray is on is a question about the plane, not about a wave.** Taking it
-from the wave normal — as the first version did — reads a facet tilted away at a glancing angle as
-"the camera is underwater", sends the reflection down into the seabed, and turns the far water
-white. A facet that still faces away after that is tilted back toward the plane, standing in for the
-self-occlusion a height field does not model.
-
-**Waves cost nothing measurable.** Flattening the surface and running the same two thousand frames
-gives 131–134 fps; the waves give 131–133. An earlier reading of 97 fps, and the story about ray
-incoherence built on it, came from a run whose tail had not settled — this machine idles the GPU at
-315 MHz and a short run measures the ramp rather than the frame. Nothing about that story survives
-the A/B, and the lesson is the measurement protocol rather than the shader.
-
-*Tests:* the surface varies across a row where a mirror would not, and moves when the clock does —
-which is also the only end-to-end proof that `time` survives the trip through the new buffer.
-Injection confirms both: flattening the surface and freezing the clock each fail exactly that test.
-
-**Stage 3 — caustics — done.** The seabed's sunlight is multiplied by `1/|det J|`, with
-`J = I - bend * depth * H` and `H` the Hessian of the same five sinusoids the normals come from —
-written out, not sampled, splatted or filtered. Sunlight is also absorbed on the way *down* now,
-which stage 1 had left out; the two together are the whole of what the surface does to the sun.
-
-**The finding that made it work was not about caustics at all.** `water_ray` traced the reflection
-and the refraction at `BOUNCE_SPREAD`, one unit of cone width per unit travelled — the rate a
-*diffuse* bounce widens at, where a coarse mip is the correct answer. A reflection and a refraction
-are specular and carry the pixel's own cone. At the bounce rate a seabed a hundred units down was
-being sampled with a hundred-unit footprint: every texture at its top mip, and every wave averaged
-out of the caustics that the same footprint governs. Measured, the caustic term was varying by 25%
-on its own and arriving at the frame as 4%. Fixing the cone is what turned the pattern on, and it
-sharpened every reflection in the game as a side effect.
-
-**Where the model stops.** `q = p - bend * grad(h)` holds while the refracted bundle has not yet
-crossed itself. Past the first focus the rays have folded and one Jacobian cannot describe what is
-there — and because the term is evaluated at the seabed rather than at the surface it came from, it
-starts *making* light: measured, three quarters more of it at four hundred units. The depth fed to
-the lens is therefore capped at 140 units, which holds the error to **under 6% at every depth** and
-says something true anyway, that caustics are sharp in a shallow pool and washed out in deep water.
-
-*Tests:* the pattern moves while the mean light does not — energy conservation, the property that
-catches a wrong derivative — and contrast grows with depth, which pins the `depth` term rather than
-merely the curvature. Injection confirms both, plus a third for the downward absorption: a constant
-caustic, a lens with no throw, and unabsorbed sunlight each fail exactly the test that covers them.
-
-**Free, as far as the frame can tell**: 131–133 fps against 131–134 with the water flat.
-
-**Stage 4 — shore and underwater — done.** The waterline fades over the last thirty-five units of
-depth, and a camera below the surface fogs every primary ray rather than only what it sees past a
-refraction. Total internal reflection came free at stage 1, out of `refract` returning zero past the
-critical angle.
-
-**The seam is a grazing-angle artefact**, which is what makes it worth fixing and what nearly made
-the test worthless. Looked at from above, three units of water is almost invisible whatever the
-shader does — the first version of the test compared views straight down, passed, and went on
-passing with the fade deleted entirely. Edge-on, Fresnel turns that same water into a mirror, so
-the pixel where the ground all but touches the surface reflects sky while the shore beside it shows
-sand. That step is the line a water plane draws across two cells in five, and the test now measures
-it from the angle where it exists.
-
-Underwater, the *albedo* is dimmed rather than the lighting: the filter divides the lighting by the
-albedo and dimming both would put the water straight back, and what the depth took is a property of
-the path rather than of the light that travelled it.
-
-**A ribbon of flat colour along every waterline**, found by looking at a screenshot rather than at
-a test. The refraction ray was offset to the *far* side of the plane, so wherever the bed sat nearer
-the surface than the 1.5-unit offset itself, the ray began under the ground, travelled down through
-open air and reported water of unbounded depth — which shades as pure scattering colour. On a gentle
-shore that band is metres wide. Both water rays now leave from the viewer's side and are traced
-against solid geometry only, which is what makes that legal: culling water from its own reflection
-and refraction removes the self-intersection the offset existed to avoid, and removes the
-"water behind water" case with it.
-
-The lesson is where the bug was found. Every test passed throughout: the waterline test used three
-units of water, twice the offset, and the artefact lives below it. It now checks both sides of that
-number.
-
-**The waves were woven, and the fix was the spectrum.** Six components with hand-picked directions
-interfere into a quasi-periodic pattern that reads as fabric — visible across a whole bay. Nine
-octaves, each turned by the **golden angle** and each 0.618 of the last in wavelength and 0.55 in
-height, never come back into alignment; that product being below one is what keeps steepness falling
-as the detail gets finer, which is the opposite of what makes a distant sea sparkle. The spectrum is
-now a rule rather than a table, and the compiler folds all of it away when it unrolls the loop.
-
-**What a ray cone cannot resolve is not gone, it is rough.** Averaging a crest and a trough into a
-flat facet throws away real slope, and a surface that lost its slope reflects like polished plastic —
-which is what distant water looked like. The variance of the discarded octaves is kept and comes back
-as a widened specular lobe: *LEAN mapping*'s argument, in the one dimension it needs. Its most
-visible consequence is the sun. A mirror shows one hard dot; a mile of ruffled water shows a
-shimmering road, because the glitter path **is** the wave-slope distribution made visible — which is
-how Cox and Munk measured sea roughness from photographs in 1954. The disc is widened by the lobe
-and dimmed by the same factor, so a rougher sea spreads the sun without adding any light to the
-scene.
-
-**Deep water was a milky sheet, and the cause was the scattering albedo rather than the colour.**
-Absorption takes light out of the scene; scattering hands it back, so a channel whose scattering
-albedo approaches one settles at a bright colour however deep it gets. Clear tropical water really
-does behave that way — molecular scattering dominates its blue — but a tannin-stained coastal swamp
-does not, and Vvardenfell is the second. Halving the albedo is what makes the deep go dark while
-lowering the extinction keeps the shallows transparent: the two complaints pull on different terms.
-
-The in-scattering integral was wrong as well, in the direction that made it worse. Light scattered
-toward the eye had to reach the point it scattered from, and only the return leg was being
-attenuated. Integrating both replaces `1 - T` with `(1 - T^2) / 2`: identical in the shallows, half
-as bright where it settles, and markedly less red, because squaring the transmittance costs red
-twice over.
-
-**The sun was attenuated on its way down and the sky was not.** An underwater surface was lit by a
-dimmed sun alongside a full-strength sky — brighter than either would allow, inconsistent between
-them, and flat with depth, since the larger of the two terms outdoors did not know how deep it was.
-It is the same `exp(-sigma * depth)` now for both.
-
-That was found by measuring an invariant rather than by looking: the same column of water seen from
-ten units above the surface and ten below has to agree, because the only difference is those twenty
-units. It does, to 3%. At a *slant* the two legitimately differ by 11% and the reason is refraction —
-entering at 53 degrees a ray is bent to 37 and reaches a floor 200 units down in 250 units of water,
-where the same look from below costs 317. **Water really is clearer from a boat than from under it**,
-and that asymmetry is now pinned by a test rather than mistaken for a bug.
-
-The extinction and scattering coefficients are art direction resting on physics, and were tuned by
-eye across several passes. The tests derive every expectation from a single `EXTINCTION` constant so
-that a tuning pass is one line rather than five pieces of arithmetic that quietly stop describing the
-shader.
-
-**M10 is done.** Standing on Seyda Neen's shore: the seabed is visible through moving water, the
-surface reflects the sky and the coast, caustics play on the bottom, and the frame is inside §5.3.
-**No absolute frame rate from this machine is worth quoting.** Measurements across the session
-ranged from 116 to 382 fps for the same scene, and the reason turned out to be the GPU's own clock:
-it idles at 315 MHz here and only ramps to 2,280 under sustained load, so a short run measures the
-ramp. Back-to-back A/B pairs — flat against wavy, guard on against off — are the only comparisons
-that survived, and they are the only kind worth making here.
-
-### 7.9 Shadow acne on Morrowind's geometry
-
-Found from screenshots rather than from a test, and not really a water problem at all — but it was
-water's ray offsets that led to it. Rugs sparkled along their edges, smooth-shaded rocks came out
-under salt-and-pepper, and **the noise changed strength from triangle to triangle**, which is what
-made the diagnosis: every ray leaving a surface was offset along the *interpolated* normal.
-
-That normal comes from the vertices and is what a surface should be shaded by, but on geometry this
-coarse it can point tens of degrees away from the triangle it belongs to. Offsetting along it puts
-the ray origin under the surface on some triangles and over it on others, and a shadow ray that
-starts underneath is stopped by the surface it started from.
-
-Rays now leave along the **triangle's own plane**, from the cross product of its edges. The subtlety
-is which way that plane should face, and getting it wrong blacked out half an interior: turned
-toward the *ray*, a shadow ray leaving the back of a tapestry sets off for the sun, meets the
-tapestry, and reports shadow. Morrowind hangs single-sided planes everywhere — every tapestry, sail
-and leaf card — and draws them from both sides, so the plane has to face the side the surface is
-*lit* from, which is the side its shading normal points at. False-colouring the two against each
-other showed how common that case is: every leaf on every tree is a back-facing hit.
-
-A test now pins it — a single-sided plane seen from behind still shows the light on its front — and
-turning the offset back toward the ray fails it and nothing else. Nothing in the suite had noticed
-those surfaces going black.
-
-### 7.10 Sheets are lit from both sides
-
-The remainder of §7.9's artefact was not acne. A handful of the boat sail's polygons shaded as though
-their normals were inverted — flat, noise-free patches, lit while the cloth around them was not — and
-the tapestries kept a coloured speckle after the offsets were fixed. Both come from the same gap:
-**Morrowind hangs single layers of triangles and the renderer treated every one of them as the skin
-of a solid.** A layer has no inside. Lit from the far side it should glow; shaded as a solid it goes
-black, and a triangle the artist wound backwards takes its whole neighbourhood with it.
-
-A run now carries a `thin` bit into `GpuGeometry`, and the shading term for one is
-`max(N·L, 0) + T·max(−N·L, 0)` with `T = 0.5` — a Lambertian sheet, view-independent, lit from
-whichever side the light is on. The indirect gather takes the hemisphere the ray came from rather
-than the one the normal names, so an inside-out triangle no longer gathers the inside of the hull it
-is nailed to.
-
-**Deciding which runs are sheets is the whole difficulty, and two plausible tests each fail on real
-data.** Asking what a run encloses works for a flat rug and fails for a curved sail, because an open
-surface encloses the cone it subtends from wherever it is measured. Asking whether it has a border —
-an edge with one triangle on it — is exact for closedness but cannot be asked of a *run*: a run is a
-material boundary, so a wine bottle with three textures arrives as three open patches. Measured that
-way, **268 of the Census Office's 308 runs classified as cloth**, chests and bottles included.
-
-The test that holds asks both, at the level each is meaningful: the border of the whole mesh, the
-enclosed volume of the run. That leaves 47 of 308 — the tapestries, the rugs, the flat slabs of the
-wall shells. A room's shell is open at the ends where it meets the next section but wraps the room's
-air, so it stays solid and a lamp next door does not shine through the wall: the wall's brightness
-moves by 0.02% while the tapestries' speckle drops by a quarter.
-
-Edges are keyed by quantised *position*, not by vertex index. Morrowind splits vertices at every
-texture seam, so two triangles sharing an edge routinely name four different vertices for it —
-counted by index, every seam reads as a border and every solid as cloth.
-
-### 7.11 The shading normal faces the ray
-
-The dark dust over every tree, the speckle on the interior tapestries and the sparkle along a rug's
-edge were one defect, and it was neither the denoiser nor the alpha cutout that the shape of it kept
-suggesting. **The shading normal was whichever way the vertices were authored, so a surface hit from
-its far side reported the light landing on its near one** — lit through its own body. Morrowind's
-foliage is thousands of single cards packed below a pixel apiece, wound every which way; neighbouring
-pixels landing on cards facing opposite ways came back at opposite brightnesses, and that is the
-dust.
-
-The normal now faces the ray, which is what `gl_FrontFacing` does for every rasteriser. It could not
-be done before §7.9: while ray offsets were taken along the shading normal, turning it toward the
-viewer sent shadow rays out from under the surface and blacked out `Seyda Neen, Census and Excise
-Office` — nine distinct shades where there were hundreds. With offsets on the triangle's own plane
-and chosen per ray direction, the two are independent and the interior keeps its forty thousand.
-
-**Which side the ray met is decided by the triangle's plane, not by the normal being turned.** Doing
-it the other way is the obvious reading and it is wrong: an interpolated normal near a silhouette can
-point away from a face the camera is looking straight at, so the test flips part of a surface and not
-the rest, along a seam that slides across the floor as the camera moves. A rug seen from across a
-room grew a hard dark band down the middle of it. A plane cannot disagree with itself that way —
-either the ray met the front of the triangle or it met the back.
-
-That rests on the winding agreeing with the authored normals, which nothing in the format enforces,
-so it is measured rather than assumed: **77 of 60,215 triangles** across a furnished interior and a
-stretch of shore are wound against their own normals, a fifth of a percent. Three of this repo's own
-*fixtures* were, though — quads written normals-first with the indices copied from a neighbour — and
-they had never been wrong before, because nothing consulted a winding until now.
-
-Getting there cost five wrong answers, each cheap to test and each ruled out by one render:
-
-| suspected | measured |
-|---|---|
-| alpha cutout coin-flipping per pixel | cutoff swept 0.15/0.5/0.85: 17.8 / 19.0 / 17.1 — real but a tenth of it |
-| the mip level the cutout is tested at | +3 levels of bias: 19.0 → 17.3, and visually unchanged |
-| alpha coverage drifting across mip levels | corrected to hold at 44%: 19.0 → 19.8, *worse* |
-| the indirect gather being under-sampled | 4 → 64 bounce samples: dust unchanged, so not stochastic at all |
-| shadow rays through the canopy | sun forced fully visible: dust unchanged |
-
-The one that mattered was rendering **albedo alone**, which came back clean: whatever it was lived in
-the lighting, not the surface. From there the sun could be ruled out, and what remained was the
-cosine.
-
-Two things found along the way and deliberately not acted on. Morrowind's cutout art is black
-wherever it is transparent — in the canopy texture, 1,449 of the 1,635 fully transparent blocks
-against one of the 955 opaque ones — so a filtering sampler mixes black into every leaf edge;
-dividing it back out by the alpha changed nothing measurable and was dropped. And `NiStencilProperty`
-would have named which surfaces are two-sided outright, except that the three shipped archives
-contain **no** stencil property at all, so there is no authored answer to read.
-
-### 7.12 The alpha mode says which surfaces are sheets
-
-§7.10's shape test finds a rug and a sail and cannot find a tree. A canopy is hundreds of leaf cards
-joined at the branches, and the cupped cluster they make wraps as much air as a shell around a room
-does — `Flora_BC_Tree_02` scores 0.031 against a cube's 0.068, on the solid side of any threshold
-that keeps a room solid. Splitting the run into connected pieces does not help, because the cards
-really are connected. Measured as geometry, a tree is a solid, and every card facing away from the
-sun is in shade.
-
-**The material knows.** A run whose alpha is anything but opaque is a cutout, and Morrowind has no
-solid cutouts: the mode is set on foliage, thatch, banners, grates and glass, every one of them a
-single layer with nothing behind it. It is authored rather than inferred, it costs a lookup, and it
-is the only signal that catches a canopy. The shape test stays for the opaque sheets — a rug, a
-tapestry, a sail — that carry no alpha to be read.
-
-Together they mark 47 of the shore's 419 runs and 50 of the Census Office's 308. The tree comes out
-3 runs of 5, the other two being the trunk and boughs, which hold most of its triangles. Backlit
-foliage is 27% brighter with no measurable change in noise.
-
-### 7.13 A model's outermost node transform is discarded
-
-Seyda Neen's fireplace presented its back to the room, with the fire the cell places burning behind
-the stack. Every other object around it was right, which is what made it hard: a wrong *convention*
-would have turned the whole room, so whatever was wrong had to be per-model.
-
-It was. `in_nord_fireplace_01.nif` carries a half turn about Z on its outermost node, and **the
-original engine ignores that transform**. OpenMW discards it while reading
-(`components/nif/node.cpp:182`, whose own comment calls it a stopgap in the wrong layer), for block
-zero only, only when that block is a node, and never for one named `bip01`. 455 of the 7,317 shipped
-models carry a turn there and 423 a translation or scale; 259 are rooted at `bip01`, 255 of those
-with a real transform — so the exception is as load-bearing as the rule, since discarding a rig's
-animation root would flatten every piece of armour in the game.
-
-What broke it open was finding an anchor that needed no screenshot: **a hearth and the fire inside
-it are placed as separate references**, so the fire says which way the stack faces. Measured from the
-fireplace's own origin, the hearth slab pointed at −0.99 against the fire — almost exactly opposite —
-and at +0.99 once the rule was in. That is the regression test.
-
-Two variants were tried and rejected on the way: taking the reference's axes unnegated fixes the
-fireplace and breaks the room, and skipping whichever node the walk starts from would discard the 423
-roots that legitimately translate.
-
-### 7.14 A reference's Euler angles apply Z first
-
-The other half of the same report — a book standing through the side of the cupboard it is in, a rock
-lying at an angle no one placed it at — was the composition order, and it took a wrong turn worth
-recording.
-
-OpenMW composes the reference's rotation as `Quat(z, -Z) * Quat(y, -Y) * Quat(x, -X)`
-(`components/misc/convert.hpp:50`), which reads as X-first and was transcribed that way. It is not.
-**OSG writes its quaternion product in the opposite order to everyone else**, so that expression
-means Z first and X last. The tell is a page away in OpenMW's own source: `Misc::toEulerAnglesZYX`
-recovers the angles `makeOsgQuat` was given, and it only inverts it under the reversed reading —
-transcribed both ways and run over four thousand random angles, reversed round-trips to zero and the
-ordinary reading is out by up to two units of a unit vector.
-
-The argument that delayed this was a bad one and is worth naming so it is not made again: OpenMW
-writes the *same* order for Bullet a few lines below, Bullet's product is the ordinary one, and the
-two were assumed to agree because physics ought to match graphics. They do not agree — that is a
-latent inconsistency in OpenMW, not evidence about OSG.
-
-It moves only the references that turn about more than one axis, 22 of one interior's 268, which is
-why a room looks broadly right either way. Worse, the obvious measurements are blind to it: a plate's
-tilt out of horizontal is *identical* under both orders whenever the Y angle is zero, and only the
-azimuth differs. What separates them is that things stop resting where they were put — the book's
-base sits 8 units below the board its cups stand on, which is the test.
-
-### 7.15 Caustics tile when the spectrum is spaced too widely
-
-The light on the seabed came out as a lattice — a tiling of near-identical cells, regular enough to
-read as a texture rather than as water. The waves themselves do not look like that, and the reason is
-in the derivative.
-
-**Curvature weights an octave by `A k²`**, a ratio of `WAVE_GAIN / WAVE_LACUNARITY²`. At the original
-0.55 and 0.618 that is **1.44 — above one**, so however many octaves are summed, the finest one or
-two dominate the Hessian entirely. Two plane waves crossing is a grid, and that grid was the caustics.
-The surface escaped it because slope weights an octave by `A k`, a ratio of 0.89, so every octave
-contributes there and the sum looks irregular.
-
-Two changes, and both earn their place — the second alone still leaves a visible grain:
-
-- **The octaves are spaced closely**: 14 of them at a lacunarity of 0.74 rather than 9 at 0.618,
-  holding `WAVE_GAIN / WAVE_LACUNARITY` at 0.89 so the total slope is unchanged and the surface keeps
-  its character. Five or six components now land at comparable short scales pointing in different
-  directions, which is what a real short-wave spectrum is — broad in direction where the swell is
-  narrow. The curvature ratio falls from 1.44 to 1.21.
-- **The ripples are carried by the swell.** A low-frequency displacement field, two long crossing
-  waves at angles the octave sequence never takes, is applied to the sample position before the
-  waves are evaluated. Physically this is short waves riding on the orbital motion of long ones; in
-  practice it bends the crests so the pattern wanders instead of tiling. Thirteen units of drift is
-  most of a wavelength to the shortest waves and a rounding error to the longest, so one field does
-  the whole job.
-
-The Hessian is taken with respect to the drifted position, which drops the chain rule's contribution
-from the drift itself — that field turns over six hundred units against a curvature set by ten, so
-its Jacobian is within a fifth of the identity, and the omission shows up as a slow variation in
-caustic strength that is indistinguishable from what real water does.
-
-Measured: no change in trace time that this machine can resolve (4.48–5.20 ms against 4.70–5.41 over
-interleaved runs), and distant water is slightly calmer rather than sparklier — pixel-to-pixel
-variation 17.1 down to 14.0 — because the ray cone filters more of a finer-spaced spectrum away.
-
-### 7.17 Choppiness is right, and at this sea state it is invisible
-
-§7.16 stage 1. Gerstner's horizontal displacement is in, carried into the caustic Jacobian, and the
-honest result is that **it changes almost nothing to look at** — 788 pixels of a shore by at most a
-twentieth of their value, contrast 18.07 to 18.28. The arithmetic is worth keeping and the
-expectation was worth correcting.
-
-**Why it is small.** The displacement's Jacobian contributes the steepness `A k`, which sums to 0.28
-across the spectrum. The refraction term contributes `bend·depth·A k²`, which at a few metres of
-water is ten times that. Choppiness would matter on a surface steep enough to fold; these waves
-cannot reach the trochoid limit at any choppiness.
-
-**One thing it does buy outright.** With displacement the map from world surface to seabed is a
-*ratio* of determinants — a patch covers `det(I + dD)` of surface and lands on
-`det(I + dD − bend·H)` of bottom. Written as one determinant, a choppy surface would brighten the
-bottom of a puddle that has no depth for light to converge over. The ratio is 1 at zero depth by
-construction.
-
-#### Why the caustics are soft, with numbers
-
-Chasing the stage-1 expectation turned up the real answer, and it is not any of the things it looked
-like. Focus needs the Jacobian to approach zero, which needs `bend·depth·A k² ≈ 1`. Summed over the
-whole spectrum, with every octave aligned in phase and direction — which never happens — that reaches
-**1.21 at the deepest water the term is allowed**, and a fraction of it in practice. The determinant
-stays near one. **This surface does not focus light; it modulates it by tens of percent.** Soft cells
-are the correct answer for a 15° sea over a coastal shelf.
-
-Three plausible culprits were measured and cleared:
-
-| suspected | measured |
-|---|---|
-| the brightness ceiling clipping cusps | raised from 3 to 8: pixel-identical, so nothing was reaching it |
-| the denoiser blurring the filaments | rendered with filtering off: pixel-identical |
-| too little curvature in the spectrum | 14 octaves to 18, shortest wave 8.4 units to 2.5: finer and noisier, not bolder |
-
-That last one is the useful negative. Curvature grows with wavenumber, so adding short waves adds
-curvature — but the cells it focuses are the size of those waves, so the pattern gets *finer* rather
-than sharper, and below a pixel it is noise.
-
-#### What would actually do it
-
-Bold caustics need focusing at a cell size the eye reads as a pattern — call it a metre, 15 units,
-where the spectrum currently carries an amplitude of 0.026 units. Focusing there needs `A k² ≈ 0.04`,
-which is an amplitude of about 0.24 — **roughly nine times the energy** a Phillips-shaped falloff puts
-in that band. A real swimming pool has exactly that: centimetre ripples over a metre of water, which
-is a far higher wavenumber *relative to depth* than a sheltered bay.
-
-So the lever is a wind-chop bump on the metre scale, over the swell, and it is a deliberate departure
-from the physical spectrum in exchange for the look. Worth doing knowingly, and worth not doing by
-accident while tuning something else.
-
-### 7.18 The wind-chop band works and costs too much
-
-§7.17 worked out what bold caustics would need — roughly nine times the energy a swell-shaped
-spectrum puts in the metre band — and said it was a knowing departure to make or not. It was made,
-measured, and **reverted**, and the measurements are the reason to write it down rather than try it
-again.
-
-The change was a second peak in the spectrum at the scale of local wind chop, a log-normal bump over
-the swell's falling series. That is not a fudge — a bimodal sea of swell plus locally raised wind
-waves is ordinary oceanography, and it is the second peak that has a wavenumber high enough, against
-a few metres of water, to actually focus light.
-
-**It does what it was supposed to.** The determinant reaches zero, and the seabed gets bright
-filaments with loops and cusps in place of soft cells. Contrast over a shore patch rose from 20.0 to
-24.2 with a narrow band, and to 27.7 with a wide one.
-
-**It costs more than that is worth**, on three counts, each measured:
-
-| cost | measured |
-|---|---|
-| the whole sea roughens | distant water's pixel-to-pixel variation 14.0 to 23.1, and that is the failure mode `WAVE_TALLEST` is written to avoid |
-| caustics alias where they sharpen | stipple 9.1 to 21.9 with a wide band; a narrow one held it to 9.8 |
-| **the water stops obeying Beer-Lambert** | looking up through it from below, transmission fell to 0.649 of the near view where the analytic answer is 0.807 |
-
-The third is the one that settled it. A surface rough enough to focus light that hard refracts the
-view through it far enough that straight-line attenuation no longer describes what comes out, and the
-rest of the water model — absorption, scattering, the sun's path to the seabed — is built on that
-attenuation. Buying caustics by breaking it is not a trade worth making for one close-up view.
-
-A band-limit was tried against the aliasing, on the argument that a sharpening function of a
-band-limited field carries detail above the band and so needs the ray cone widened for the curvature
-specifically. That argument holds and the filter works — stipple below baseline at a widening of
-three and a half — but it is too blunt: the same widening that cleans a close view erases the pattern
-at a middling one, to the point that `caustics_gather_the_sunlight_without_creating_any` stops seeing
-the caustics move at all. Something that widened with the *sharpness* rather than with the distance
-would be the right shape, and was not worth building for a feature about to be reverted.
-
-**What stands.** Vvardenfell's water is a sheltered coastal shelf, and a sheltered coastal shelf does
-not throw pool caustics. Soft cells are the honest answer; §7.15's respacing and drift are what make
-them look like water rather than a lattice.
-
-### 7.19 The spectrum is empirical now, and its short end is a time limit
-
-§7.16 stages 3 and 4. Dispersion is in and measures at nothing; the spectrum rework is in and is the
-substantial change.
-
-#### Chromatic dispersion, kept and worth almost nothing
-
-Water's index is not one number — Cauchy's fit gives 1.3326, 1.3342 and 1.3392 at 600, 550 and 450
-nanometres, so the three colours are focused by bends a part in seventy apart and a caustic ought to
-have coloured edges. Three determinants over a Hessian that does not depend on the channel, which is
-two extra multiply-adds of numbers already in registers.
-
-**Twelve pixels in ninety thousand differ by more than one level, and none by more than two.** It is
-kept because it is right and free, not because it shows. If the sea ever gets steep enough for the
-determinant to approach zero, this is the term that puts prism edges on the cusps.
-
-#### TMA and Donelan-Banner, replacing a series chosen by eye
-
-`WAVE_TALLEST`, `WAVE_GAIN` and `WAVE_LACUNARITY` are gone. The surface is now summed from a table
-the host builds from the **TMA** spectrum — JONSWAP under Kitaigorodskii's shallow-water attenuation
-— spread over directions by **Donelan-Banner**, which is Horvath's pairing and the one the real-time
+silhouette against a shore comes from the terrain behind it. **Waves cost nothing measurable** —
+flattening the surface over two thousand frames gives 131–134 fps against 131–133 with them.
+
+- **A wave shorter than the pixel looking at it is averaged away rather than drawn**, using the ray
+  cone footprint already carried for texture LOD. A cone a wavelength wide covers a crest and a
+  trough whose slopes cancel; picking one of them instead is what makes distant water a field of
+  crawling white sparks.
+- **What a ray cone cannot resolve is not gone, it is rough.** A surface that lost its slope
+  reflects like polished plastic. The variance of the discarded octaves comes back as a widened
+  specular lobe — LEAN mapping's argument in the one dimension it needs. Its most visible
+  consequence is the sun: a mirror shows one hard dot, a mile of ruffled water shows a shimmering
+  road, because the glitter path **is** the wave-slope distribution made visible. The disc is
+  widened by the lobe and dimmed by the same factor, so a rougher sea spreads the sun without adding
+  light.
+- **Which side of the surface a ray is on is a question about the plane, not about a wave.** Taking
+  it from the wave normal reads a facet tilted away at a glancing angle as "the camera is
+  underwater", sends the reflection into the seabed, and turns the far water white. A facet still
+  facing away after that is standing in for self-occlusion a height field does not model.
+
+**Caustics.** `J = I - bend·depth·H` with `H` the Hessian of the same sinusoids the normals come
+from — written out, not sampled or splatted. The finding that made it work was not about caustics:
+`water_ray` traced reflection and refraction at the *bounce* cone spread, one unit of width per unit
+travelled, where a coarse mip is correct for a diffuse bounce. A reflection and a refraction are
+specular and carry the pixel's own cone; at the bounce rate a seabed a hundred units down was
+sampled with a hundred-unit footprint — every texture at its top mip and every wave averaged out of
+the caustics the same footprint governs. The caustic term was varying by 25% on its own and arriving
+at the frame as 4%. Fixing the cone turned the pattern on and sharpened every reflection in the
+game.
+
+**Where the model stops.** `q = p - bend·grad(h)` holds while the refracted bundle has not crossed
+itself. Past the first focus the rays have folded, and because the term is evaluated at the seabed
+rather than at the surface it came from it starts *making* light — three quarters more at four
+hundred units. The depth fed to the lens is capped at 140 units, which holds the error under 6% at
+every depth and says something true anyway: caustics are sharp in a shallow pool and washed out in
+deep water.
+
+**Chromatic dispersion is kept and worth almost nothing.** Cauchy's fit gives 1.3326, 1.3342 and
+1.3392 at 600, 550 and 450 nm, so three determinants over a Hessian that does not depend on the
+channel — two extra multiply-adds of numbers already in registers. **Twelve pixels in ninety
+thousand differ by more than one level, none by more than two.** Kept because it is right and free;
+if the sea ever gets steep enough for the determinant to approach zero, this is what puts prism
+edges on cusps.
+
+**Shore and underwater.** The waterline fades over the last thirty-five units of depth, and a camera
+below the surface fogs every primary ray. Total internal reflection came free out of `refract`
+returning zero past the critical angle.
+
+- **The seam is a grazing-angle artefact.** From above, three units of water is almost invisible
+  whatever the shader does — the first test compared views straight down, passed, and went on
+  passing with the fade deleted entirely. Edge-on, Fresnel turns that same water into a mirror, so
+  the pixel where the ground all but touches the surface reflects sky while the shore beside it
+  shows sand.
+- **Underwater the *albedo* is dimmed, not the lighting.** The filter divides lighting by albedo, so
+  dimming both would put the water straight back, and what the depth took is a property of the path.
+- **A ribbon of flat colour along every waterline**, found from a screenshot rather than a test. The
+  refraction ray was offset to the *far* side of the plane, so wherever the bed sat nearer the
+  surface than the 1.5-unit offset, the ray began under the ground, travelled down through open air
+  and reported water of unbounded depth — pure scattering colour, metres wide on a gentle shore.
+  Both water rays now leave from the viewer's side and trace against solid geometry only; culling
+  water from its own reflection and refraction removes the self-intersection the offset existed to
+  avoid. Every test passed throughout, because the waterline test used three units of water, twice
+  the offset, and the artefact lives below it.
+- **Deep water was a milky sheet, and the cause was the scattering albedo rather than the colour.**
+  Absorption takes light out of the scene; scattering hands it back, so a channel whose scattering
+  albedo approaches one settles at a bright colour however deep it gets. Clear tropical water does
+  behave that way; a tannin-stained coastal swamp does not. Halving the albedo makes the deep go
+  dark while lowering the extinction keeps the shallows transparent — the two complaints pull on
+  different terms.
+- **The in-scattering integral was wrong in the direction that made it worse.** Light scattered
+  toward the eye has to reach the point it scattered from, and only the return leg was attenuated.
+  Integrating both replaces `1 - T` with `(1 - T²) / 2`: identical in the shallows, half as bright
+  where it settles, and markedly less red, because squaring the transmittance costs red twice.
+- **The sun was attenuated on its way down and the sky was not**, so an underwater surface was lit
+  by a dimmed sun alongside a full-strength sky — inconsistent, and flat with depth. Found by
+  measuring an invariant rather than by looking: the same column of water seen from ten units above
+  and ten below has to agree, and does, to 3%. At a *slant* they legitimately differ by 11% —
+  entering at 53° a ray bends to 37° and reaches a floor 200 units down in 250 units of water, where
+  the same look from below costs 317. **Water really is clearer from a boat than from under it**,
+  and that asymmetry is now pinned by a test rather than mistaken for a bug.
+
+The extinction and scattering coefficients are art direction resting on physics. The tests derive
+every expectation from a single `EXTINCTION` constant so a tuning pass is one line rather than five
+pieces of arithmetic that quietly stop describing the shader.
+
+### 7.7 The spectrum is empirical, and its short end is a limit in time
+
+**Caustics tiled when the octaves were spaced too widely.** The light on the seabed came out as a
+lattice of near-identical cells while the surface itself looked fine, and the reason is in the
+derivative: **curvature weights an octave by `A k²`** where slope weights it by `A k`. A hand-tuned
+geometric series with gain 0.55 and lacunarity 0.618 gives a curvature ratio of **1.44 — above one**
+— so however many octaves are summed the finest one or two own the Hessian entirely, and two plane
+waves crossing is a grid. Slope's ratio was 0.89, so every octave contributed there.
+
+Two fixes, and the second alone still leaves a visible grain:
+
+- **Space the octaves closely** so five or six components land at comparable short scales pointing
+  in different directions — broad in direction where the swell is narrow.
+- **Carry the ripples on the swell.** A low-frequency displacement field applied to the sample
+  position before the waves are evaluated: physically, short waves riding the orbital motion of long
+  ones; in practice it bends the crests so the pattern wanders instead of tiling. Thirteen units of
+  drift is most of a wavelength to the shortest waves and a rounding error to the longest. The
+  Hessian is taken with respect to the drifted position, dropping the chain rule's contribution from
+  the drift itself — that field turns over six hundred units against a curvature set by ten, so its
+  Jacobian is within a fifth of the identity and the omission shows up as a slow variation in
+  caustic strength indistinguishable from what real water does.
+
+**The series is now the TMA spectrum** — JONSWAP under Kitaigorodskii's shallow-water attenuation —
+spread over directions by **Donelan-Banner**, which is Horvath's pairing and the one the real-time
 literature follows. Thirty-two components: eight wavenumber bands, four directions each, sampled by
 *quantile* of the directional spread so every component carries the same energy and the spread's
 shape is exact however few are taken.
 
-Three things fall out that the old series could not have:
-
 - **The depth term is the coastal correction this game needs.** A six-metre swell over half a metre
   of water travels at two thirds of its open-sea speed; over three metres it travels at full speed.
-  That is a shore behaving like a shore, and it is why this is TMA rather than JONSWAP.
-- **The spread is frequency-dependent by construction** — the lowest band fans across 68 degrees and
-  the highest past 120 — which is the empirical form of what §7.15 arrived at from a symptom.
+  That is why this is TMA rather than JONSWAP.
+- **The spread is frequency-dependent by construction** — the lowest band fans across 68° and the
+  highest past 120° — which is the empirical form of what the tiling symptom pointed at.
 - **The maths is testable in Rust**, where the old constants were three numbers in a shader with
-  nothing to check them against. Six tests now cover the attenuation's three parts and the continuity
-  between them, the spread's narrowing at the peak, the significant height the table is scaled to,
-  the dispersion relation each component obeys, and the layout the shader reads.
+  nothing to check them against.
+- `alpha` never appears: it is a constant multiplier on the whole spectrum, so it cancels, and the
+  table is scaled instead to a **significant wave height** — the one number about a sea a person can
+  picture.
 
-`alpha` never appears: it is a constant multiplier on the whole spectrum, so it cancels, and the
-table is scaled instead to a **significant wave height** — the one number about a sea that a person
-can picture.
-
-#### The short end is a limit in time, not in space
-
-The first cut carried waves down to four units and the seabed came out as dense per-pixel noise.
-TMA's tail is the Phillips saturation range, where steepness is *constant* with wavenumber — so
-`A k^2` climbs without bound and the finest waves own the curvature completely. Root-mean-square
-curvature came out seven times the old series'.
-
-Raising the cut to eighteen units fixed the aliasing and produced the best caustics this renderer has
-drawn — bright filaments with loops and cusps. It also made them **tear**: the pattern changed by
-73% of its own contrast every twelfth of a second, against 49% before, which reads as stripes ripping
-across the bottom rather than as water.
-
-That is not a bug to fix but a trade to choose, and it cannot be had both ways: **a wave's period
-falls with its length, so the waves that focus hardest are the ones that move fastest.** They are the
-same waves.
+**The short cutoff is a limit in time, not in space.** Carrying waves down to four units produced
+dense per-pixel noise: TMA's tail is the Phillips saturation range, where steepness is *constant*
+with wavenumber, so `A k²` climbs without bound. Raising the cut to eighteen units produced the best
+caustics this renderer has drawn — and made them **tear**, changing by 73% of their own contrast
+every twelfth of a second, which reads as stripes ripping across the bottom rather than as water.
+That is a trade to choose, not a bug to fix: **a wave's period falls with its length, so the waves
+that focus hardest are the ones that move fastest. They are the same waves.**
 
 | shortest wave | caustic contrast | change per twelfth of a second |
 |---|---|---|
@@ -2007,95 +1011,427 @@ same waves.
 | **32 units** | **18.5** | **51%** |
 | 50 units | 16.5 | 33% |
 
-Thirty-two is where the motion is what it was before anyone objected to it, and the light on the
-seabed is a little stronger than the series it replaced. The spectrum is now honest about *why* it
-stops where it does: not because half a metre is too small to see, but because anything shorter
-reshuffles faster than the eye reads as water.
+**Choppiness is in and changes almost nothing to look at** — 788 pixels of a shore by at most a
+twentieth of their value, contrast 18.07 to 18.28. The displacement's Jacobian contributes the
+steepness `A k`, which sums to 0.28 across the spectrum, while the refraction term contributes
+`bend·depth·A k²`, ten times that at a few metres of water. Choppiness would matter on a surface
+steep enough to fold, and these waves cannot reach the trochoid limit at any choppiness. One thing
+it buys outright: with displacement the map from surface to seabed is a *ratio* of determinants — a
+patch covers `det(I + dD)` of surface and lands on `det(I + dD − bend·H)` of bottom — which is 1 at
+zero depth by construction, where a single determinant would brighten the bottom of a depthless
+puddle.
 
-### 7.16 Proposal: what the literature says would make this water beautiful
+**This surface does not focus light; it modulates it by tens of percent**, and soft cells are the
+correct answer for a 15° sea over a coastal shelf. Focus needs `bend·depth·A k² ≈ 1`; summed over
+the whole spectrum with every octave aligned in phase and direction, which never happens, that
+reaches 1.21 at the deepest water the term is allowed. Three plausible culprits were cleared:
 
-Research, not a record of work done. §7.15 stopped the caustics tiling; this is what the field says
-about going from "not wrong" to good, and what of it applies to a sum-of-sinusoids surface with
-analytic caustics.
+| suspected | measured |
+|---|---|
+| the brightness ceiling clipping cusps | raised from 3 to 8: pixel-identical |
+| the denoiser blurring the filaments | filtering off: pixel-identical |
+| too little curvature in the spectrum | 14 octaves to 18, shortest wave 8.4 units to 2.5: finer and noisier, not bolder |
 
-**Where this implementation sits.** Almost every published real-time ocean is FFT-based — a spectrum
-sampled on a grid, inverse-transformed to a height field, tiled across the water. Ours is a direct
-sum of a dozen-odd sinusoids evaluated per sample, which is unusual and is what makes the analytic
-caustic possible at all: a closed-form height field can be differentiated twice, and an FFT texture
-cannot without another pass. The published caustic methods are all image-space — wavefront meshes
-whose triangle areas give ray density, caustic maps, photon splats. **The Jacobian this renderer
-already evaluates is the same quantity those methods estimate**, arrived at exactly instead of by
-splatting, so the improvements below are about what goes *into* it.
+That last is the useful negative: curvature grows with wavenumber, but the cells it focuses are the
+size of those waves, so the pattern gets *finer* rather than sharper, and below a pixel it is noise.
 
-#### The spectrum is ad-hoc where the field has an empirical answer
+**A wind-chop band was built, measured and reverted.** Bold caustics need roughly nine times the
+energy a swell-shaped spectrum puts in the metre band, and a second log-normal peak at the scale of
+local wind chop supplies it — a bimodal sea of swell plus locally raised wind waves is ordinary
+oceanography, not a fudge. **It does what it was supposed to**: the determinant reaches zero and the
+seabed gets bright filaments with loops and cusps, contrast over a shore patch rising from 20.0 to
+24.2 with a narrow band and 27.7 with a wide one. It costs more than that is worth:
 
-`WAVE_TALLEST`, `WAVE_GAIN` and `WAVE_LACUNARITY` are a geometric series picked by eye. The
-literature's answer is the **TMA spectrum** — JONSWAP with the Kitaigorodskii depth attenuation —
-and Horvath's *Empirical Directional Wave Spectra for Computer Graphics* (DigiPro 2015) is the
-canonical adaptation of it, with an open implementation in EncinoWaves. Two things recommend it here
-beyond accuracy:
+| cost | measured |
+|---|---|
+| the whole sea roughens | distant water's pixel-to-pixel variation 14.0 → 23.1, the exact failure mode the ray-cone filtering exists to avoid |
+| caustics alias where they sharpen | stipple 9.1 → 21.9 wide, 9.8 narrow |
+| **the water stops obeying Beer–Lambert** | looking up from below, transmission fell to 0.649 of the near view where the analytic answer is 0.807 |
 
-- **TMA is the shallow-water correction**, and Vvardenfell's water is a coastal shelf a few metres
-  deep. The depth attenuation is not a detail for this game; it is the regime the game is in.
-- Horvath adds a normalised **`swell` parameter** that elongates waves into parallel trains as a
-  function of wavelength, which is the knob for "sheltered bay" against "open sea" that
-  `WAVE_LONGEST` currently stands in for.
+The third settled it. A surface rough enough to focus light that hard refracts the view through it
+far enough that straight-line attenuation no longer describes what comes out — and absorption,
+scattering and the sun's path to the seabed are all built on that attenuation. A band-limited
+widening of the curvature cone was tried against the aliasing and works (stipple below baseline at
+3.5×) but is too blunt: the same widening that cleans a close view erases the pattern at a middling
+one. Something that widened with the *sharpness* rather than the distance would be the right shape.
 
-Directional spreading should be **frequency-dependent** — Donelan-Banner is the current
-recommendation, cosine-2s and Mitsuyasu the older ones. That is the empirical form of the thing
-§7.15 arrived at from the symptom: swell is narrow in direction, chop is broad.
+**Vvardenfell's water is a sheltered coastal shelf, and a sheltered coastal shelf does not throw
+pool caustics.** Soft cells are the honest answer.
 
-#### Choppiness is the biggest single lever, and it lands in the Jacobian
+### 7.8 Not built
 
-Every ocean renderer applies **horizontal** displacement as well as vertical — Gerstner's circular
-particle motion — which pinches crests to points and flattens troughs. This matters twice over:
+Foam at the shoreline and sun shafts underwater. Foam has a natural source already computed: the
+Jacobian determinant's **sign** detects surface self-intersection, and where a surface folds is
+exactly where whitecaps belong — the shader currently takes its absolute value.
 
-- The surface stops looking like a sum of sines, which no amount of spectrum tuning fixes.
-- **Sharp crests are why real caustics are sharp.** A sinusoidal surface focuses light into soft
-  cells, which is what this renderer draws; a surface with pinched crests and flat troughs focuses it
-  into bright filaments with cusps. The caustic map is `q = p - bend·depth·grad(h)`; under
-  displacement it becomes `q = p + D(p) - bend·depth·grad(h)`, so the choppiness enters the same
-  determinant already being computed. Sharper caustics come out of the arithmetic rather than
-  needing a new stage.
+**No absolute frame rate from this machine is worth quoting.** Measurements across the water work
+ranged from 116 to 382 fps for the same scene, because the GPU idles at 315 MHz and only ramps to
+2,280 under sustained load, so a short run measures the ramp. Back-to-back A/B pairs — flat against
+wavy, guard on against off — are the only comparisons that survived.
 
-The published caution is that choppiness above a threshold makes the surface self-intersect. That
-inversion is detected by the **sign of the Jacobian determinant** — and where it folds is exactly
-where whitecap foam belongs, which is how every FFT ocean generates foam. This renderer computes that
-determinant already and currently takes its absolute value.
+---
 
-#### Caustics have colour
+## 8. Findings
 
-Water's refractive index runs from about **1.3457 in violet to 1.3333 in red**, so `1 - 1/n` spans
-0.2569 to 0.2500 — a 2.8% spread in the bend. Evaluating the determinant per channel with those three
-constants separates the pattern slightly by wavelength: negligible across the flat parts, visible as
-prism fringing exactly on the cusps where the gradient is steepest. This is what the shader articles
-call the thing that "moderates the hotspots", and it costs two more determinants of numbers already
-in registers.
+Things that were wrong, or were measured and turned out not to be worth it. Each is here because the
+mistake was not visible from the code and something else would have made it again.
 
-#### Tiling
+### 8.1 Ray offsets follow the triangle's plane, not the shading normal
 
-The FFT literature's remedy is **cascades whose lengthscales share no common factor**, chosen by a
-golden-ratio relation. This renderer has no tile to repeat, and already turns each octave by the
-golden angle, so the lesson is one it applies in the other axis — worth keeping in mind if wavelengths
-are ever regenerated from a spectrum rather than a fixed ratio.
+Rugs sparkled along their edges and smooth-shaded rocks came out under salt-and-pepper, and **the
+noise changed strength from triangle to triangle**, which is what made the diagnosis. Every ray left
+a surface offset along the *interpolated* normal, which on geometry this coarse can point tens of
+degrees away from the triangle it belongs to — so the ray origin lands under the surface on some
+triangles and over it on others, and a shadow ray that starts underneath is stopped by the surface
+it started from.
 
-#### Suggested order
+Rays now leave along the triangle's own plane, from the cross product of its edges. **Which way that
+plane faces is the subtlety, and getting it wrong blacks out half an interior:** turned toward the
+*ray*, a shadow ray leaving the back of a tapestry sets off for the sun, meets the tapestry, and
+reports shadow. Morrowind hangs single-sided planes everywhere, so the plane has to face the side
+the surface is *lit* from — the side its shading normal points at. Every leaf on every tree is a
+back-facing hit.
 
-1. **Choppiness**, with the displacement carried into the caustic Jacobian. Biggest visual change per
-   line, sharpens waves and caustics together, and needs no new data.
-2. **Foam** from the folded determinant, which stage 1 makes available for free.
-3. **Chromatic dispersion** in the caustic — small, cheap, distinctive.
-4. **TMA plus Donelan-Banner** replacing the geometric series, which is the correctness rework and
-   the one that would want its own before-and-after.
+### 8.2 The shading normal faces the ray
 
-### 7.20 The visibility shader is six files
+Dark dust over every tree, speckle on interior tapestries, sparkle along a rug's edge: one defect,
+and neither the denoiser nor the alpha cutout the shape of it kept suggesting. **The shading normal
+was whichever way the vertices were authored, so a surface hit from its far side reported the light
+landing on its near one** — lit through its own body. Morrowind's foliage is thousands of single
+cards packed below a pixel apiece, wound every which way, so neighbouring pixels landing on cards
+facing opposite ways came back at opposite brightnesses.
+
+The normal now faces the ray, which is what `gl_FrontFacing` does for every rasteriser. It could not
+be done before §8.1: while offsets were taken along the shading normal, turning it toward the viewer
+sent shadow rays out from under the surface and blacked out the census office — nine distinct shades
+where there were hundreds.
+
+**Which side the ray met is decided by the triangle's plane, not by the normal being turned.** The
+obvious reading is wrong: an interpolated normal near a silhouette can point away from a face the
+camera is looking straight at, so the test flips part of a surface and not the rest, along a seam
+that slides across the floor as the camera moves. A plane cannot disagree with itself that way.
+
+That rests on the winding agreeing with the authored normals, which nothing in the format enforces,
+so it was measured: **77 of 60,215 triangles** across a furnished interior and a stretch of shore
+are wound against their own normals, a fifth of a percent. Three of this repo's own *fixtures* were
+— quads written normals-first with the indices copied from a neighbour — and had never been wrong
+before, because nothing consulted a winding until now.
+
+Five suspects were ruled out first, each by one render:
+
+| suspected | measured |
+|---|---|
+| alpha cutout coin-flipping per pixel | cutoff swept 0.15/0.5/0.85: 17.8 / 19.0 / 17.1 — real but a tenth of it |
+| the mip level the cutout is tested at | +3 levels of bias: 19.0 → 17.3, visually unchanged |
+| alpha coverage drifting across mip levels | corrected to hold at 44%: 19.0 → 19.8, *worse* |
+| the indirect gather under-sampled | 4 → 64 bounce samples: dust unchanged, so not stochastic at all |
+| shadow rays through the canopy | sun forced fully visible: dust unchanged |
+
+Rendering **albedo alone** came back clean, which put it in the lighting rather than the surface.
+
+Two things found along the way and deliberately not acted on: Morrowind's cutout art is black
+wherever it is transparent — 1,449 of the canopy texture's 1,635 fully transparent blocks against
+one of its 955 opaque ones — so a filtering sampler mixes black into every leaf edge, and dividing
+it back out by the alpha changed nothing measurable. And `NiStencilProperty` would name two-sided
+surfaces outright, except that the three shipped archives contain **no** stencil property at all.
+
+### 8.3 Sheets are lit from both sides
+
+**Morrowind hangs single layers of triangles and the renderer treated every one as the skin of a
+solid.** A layer has no inside: lit from the far side it should glow, and shaded as a solid it goes
+black, taking its whole neighbourhood with it wherever a triangle is wound backwards. A run carries
+a `thin` bit into `GpuGeometry`, and the shading term for one is `max(N·L, 0) + T·max(−N·L, 0)` with
+`T = 0.5` — a Lambertian sheet, view-independent. The indirect gather takes the hemisphere the ray
+came from rather than the one the normal names, so an inside-out triangle no longer gathers the
+inside of the hull it is nailed to.
+
+**Deciding which runs are sheets is the whole difficulty, and two plausible tests each fail on real
+data.** Asking what a run *encloses* works for a flat rug and fails for a curved sail, because an
+open surface encloses the cone it subtends. Asking whether it has a *border* — an edge with one
+triangle on it — is exact for closedness but cannot be asked of a run: a run is a material boundary,
+so a wine bottle with three textures arrives as three open patches. Measured that way, 268 of the
+census office's 308 runs classified as cloth, chests and bottles included.
+
+The test that holds asks both, at the level each is meaningful: the border of the whole *mesh*, the
+enclosed volume of the *run*. Edges are keyed by quantised **position**, not by vertex index —
+Morrowind splits vertices at every texture seam, so two triangles sharing an edge routinely name
+four different vertices for it, and counted by index every seam reads as a border and every solid as
+cloth. A room's shell is open at the ends where it meets the next section but wraps the room's air,
+so it stays solid and a lamp next door does not shine through the wall: the wall's brightness moves
+by 0.02% while the tapestries' speckle drops by a quarter.
+
+**The shape test finds a rug and a sail and cannot find a tree.** A canopy is hundreds of leaf cards
+joined at the branches, and the cupped cluster wraps as much air as a shell around a room —
+`Flora_BC_Tree_02` scores 0.031 against a cube's 0.068, on the solid side of any threshold that
+keeps a room solid, and splitting the run into connected pieces does not help because the cards
+really are connected. **The material knows.** A run whose alpha is anything but opaque is a cutout,
+and Morrowind has no solid cutouts: the mode is set on foliage, thatch, banners, grates and glass,
+every one a single layer with nothing behind it. Together the two signals mark 47 of a shore's 419
+runs and 50 of the office's 308; the tree comes out 3 runs of 5, the other two being trunk and
+boughs. Backlit foliage is 27% brighter with no measurable change in noise.
+
+### 8.4 A model's outermost node transform is discarded
+
+Seyda Neen's fireplace presented its back to the room with the fire burning behind the stack, while
+every other object around it was right — which is what made it hard, since a wrong *convention*
+would have turned the whole room.
+
+`in_nord_fireplace_01.nif` carries a half turn about Z on its outermost node, and **the original
+engine ignores that transform** — for block zero only, only when that block is a node, and never for
+one named `bip01`. 455 of the 7,317 shipped models carry a turn there and 423 a translation or
+scale; 259 are rooted at `bip01`, 255 of those with a real transform, so the exception is as
+load-bearing as the rule: discarding a rig's animation root would flatten every piece of armour in
+the game.
+
+The anchor that needed no screenshot: **a hearth and the fire inside it are placed as separate
+references**, so the fire says which way the stack faces. Measured from the fireplace's own origin
+the hearth slab pointed at −0.99 against the fire, and at +0.99 once the rule was in.
+
+### 8.5 A reference's Euler angles apply Z first
+
+A book standing through the side of its cupboard, a rock lying at an angle no one placed it at.
+OpenMW composes the rotation as `Quat(z, -Z) * Quat(y, -Y) * Quat(x, -X)`, which reads as X-first
+and was transcribed that way. It is not: **OSG writes its quaternion product in the opposite order
+to everyone else**, so that expression means Z first and X last. The tell is a page away in OpenMW's
+own source — `Misc::toEulerAnglesZYX` recovers the angles `makeOsgQuat` was given, and only inverts
+it under the reversed reading. Transcribed both ways over four thousand random angles, reversed
+round-trips to zero and the ordinary reading is out by up to two units of a unit vector.
+
+The argument that delayed this is worth naming so it is not made again: OpenMW writes the *same*
+order for Bullet a few lines below, Bullet's product is the ordinary one, and the two were assumed
+to agree because physics ought to match graphics. They do not agree — that is a latent inconsistency
+in OpenMW, not evidence about OSG.
+
+It moves only references that turn about more than one axis, 22 of one interior's 268, which is why
+a room looks broadly right either way, and the obvious measurements are blind to it: a plate's tilt
+out of horizontal is *identical* under both orders whenever the Y angle is zero. What separates them
+is that things stop resting where they were put — the book's base sits 8 units below the board its
+cups stand on, which is the test.
+
+### 8.6 `NiStencilProperty` was five bytes short, and nothing could have noticed
+
+It read flags, a versioned `bool` and five words. The format is flags, a **one-byte** enabled flag —
+a `char`, not the four-byte `bool` this NIF version uses elsewhere — and seven words. Twenty-six
+bytes read against thirty-one.
+
+**Blocks in this version carry no size**, so a property that reads one field too few leaves the file
+pointing into its own tail and everything after it decodes as garbage, silently. No shipped mesh
+could catch it — **0 of 7,319 name the block** — which is exactly why the corpus test passed and why
+this needed pinning per block rather than by parsing more files. Every fixed-size property now has
+its byte count asserted directly: a synthetic block of exactly the documented length must be
+consumed whole, and one byte shorter must fail rather than quietly stop. The same mistake in the
+other direction is annotated three blocks away at `NiSourceTexture`, where a `char` read as a `bool`
+over-consumed by three.
+
+### 8.7 The unprojection lost the world, and it looked like jitter
+
+Reported as the camera shaking when it moved, everywhere except near the world origin. That last
+detail is the whole diagnosis. The shader turned a pixel into a ray like this:
+
+```glsl
+vec4 target = frame.inverse_view_projection * vec4(ndc, 1.0, 1.0);
+vec3 direction = normalize(target.xyz / target.w - frame.camera_position);
+```
+
+The unprojection lands a **world-space point on the near plane**, 0.05 units from the eye, and the
+subtraction recovers the direction. Both operands are the size of the world; their difference is
+0.05. At Seyda Neen's 75,000 units the gap between representable `f32` values is 0.024, so the
+answer had two or three bits left in it.
+
+| camera | aim error |
+|---|---|
+| the world origin | 0.00 px |
+| 1,000 units out | 2.1 px |
+| Seyda Neen | **127 px** |
+| the far corner of Vvardenfell | **377 px** |
+
+It read as jitter rather than as a broken projection because the error is a *smooth* field — a still
+frame looks like a slightly wrong field of view, and only when the camera moves does the field move
+with it.
+
+**The fix is not more bits.** Sending the matrix as `f64` would buy an order of magnitude and leave
+the same subtraction in place. The subtraction is what should not exist: **the eye is removed from
+the view before the inverse is taken**, so the unprojection lands in a space centred on the camera
+and hands back an offset directly.
+
+```rust
+let mut rotation = view;
+rotation.w_axis = glam::Vec4::W;   // a look-at view is rotation * translate(-eye)
+(projection * rotation).inverse()
+```
+
+Nothing then cancels, the aim is **0.00013 pixels wrong wherever the camera stands**, and the matrix
+is far better conditioned since no entry is the size of the world any more.
+
+**Why nothing caught it.** The unprojection had a test, and it was a round trip — correct, and blind
+to this, because it ran with the camera at `(1, 2, 3)`. **A precision fault that vanishes at the
+origin needs a test that leaves it**, so the assertion is now made at four camera positions out to
+the far corner of the map, and the same scene rendered at the origin and at 200,000 units has to
+produce the same picture. The old unprojection fails the second on pixel coverage alone.
+
+**What is still `f32`, and why that is fine.** Hit positions quantise to 0.024 units out there, but
+the shadow ray bias is 1.5 units, a terrain blend weight moves by 5e-5 of a tile, and a wave phase
+by 0.005 radians. Terrain vertices are baked in world space and carry the same 0.024, but that is a
+static property of the geometry rather than something that moves when the camera does.
+
+### 8.8 Terrain blends four tile centres, and the quadrant is what carries them
+
+A cell's `VTEX` names one texture per 512-unit tile, 16×16 of them and nothing in between, so ground
+met its neighbours along a straight edge and Seyda Neen's shore was a staircase running diagonally
+across the slope. The fix is bilinear blending between the four nearest tile *centres*; the design
+question is where the four ids live.
+
+**Not a splat map.** The obvious shape is a per-cell weight texture and a second binding, and it is
+not worth it: the weights are a fixed function of world position and need no storage. What needs
+storing is *which four* textures a point blends, and that is constant over a region.
+
+**The quadrant.** Split each tile into 2×2 quads — 32×32 quadrants per cell — and give each the 2×2
+block of tile centres it falls inside. The four ids pack as 4×u16 into the two words `GpuMaterial`
+already had spare, so **no new binding, no new buffer, and 48 bytes stays 48 bytes.** They intern
+like any other material: a cell has 1,024 quadrants and about 78 distinct tuples (worst measured
+121), because most quadrants sit inside a run of tiles naming the same texture.
+
+A cell origin is a whole number of tiles, so it cancels and the weights are
+
+```glsl
+vec2 weight = fract(world.xy / 512.0 - 0.5);
+```
+
+0 at the lower-left centre, approaching 1 at the upper-right, wrapping exactly where the quadrant's
+own tuple shifts by one tile so the ramp is continuous across the boundary.
+
+**Cost:** three extra texture taps on ground pixels — **6.60 ms against 5.95 ms** of trace at
+1920×1080 on a view that is almost entirely terrain, and less than that with a horizon in frame. An
+early-out for the case where all four ids agree, most of a cell, measured at **6.60 ms, no change at
+all**: the taps are not serialised on anything a branch can skip, and the branch is not coherent
+across a warp. Reverted.
+
+**Proof.** `tests/terrain.rs` renders a plane through the real `SceneRenderer` with the four layers
+set to red, green, blue and white, so green *is* the x weight and blue *is* the y weight, and
+predicts every pixel to within two levels of 8-bit quantisation.
+
+### 8.9 A horizon costs 1.5 ms, and the lights would have more than tripled it
+
+Before this the world ended at the streaming window, about 410 m, and from anywhere with a view the
+land stopped mid-slope against the sky. Vvardenfell is only some 36 cells across, so the fix is not
+a level-of-detail hierarchy but a second tier: `CellDetail::Distant` out to twelve rings, terrain
+and objects, at a sixteenth of the triangles.
+
+**Decimating is enough, and stitching is not needed.** `Mesh::from_land` takes a stride; at 4 a cell
+is 17×17 vertices and 512 triangles rather than 65×65 and 8,192. Because the stride divides the 64
+quads a cell spans and the shared last row is kept whatever it is, **two cells at the same stride
+still meet vertex for vertex** — asserted exactly, not to a tolerance. Only the one ring where the
+detailed window meets the distant tier can crack, and over five real cells the coarse chord parts
+from the fine surface by at most **64 units, half a vertex spacing** — under three pixels at 1080p,
+at a boundary never closer than three cells. Skirts and stitching were designed and not built.
+
+**Cost at 1920×1080 from a hilltop over the whole island**, the worst case there is since every
+pixel is horizon:
+
+| | trace | window load |
+|---|---|---|
+| the 7×7 window alone | 4.77 ms | 208 ms |
+| + distant terrain, 12 rings | 5.40 ms | 511 ms |
+| + the objects on it | **6.29 ms** | 1,155 ms |
+| + the lights those objects carry | 9.85 ms | — |
+
+**That last row is the finding.** Distant objects — 21,772 instances over 428 cells — cost 0.89 ms.
+The 229 `LIGH` references among them cost **3.8 ms more**. A lamp a kilometre away with a radius of
+a few hundred units reaches nothing on screen, so a distant cell places its lamps and drops their
+lights, and the image is unchanged. Peak GPU memory with the whole visible world resident is 620 MB.
+
+**Residency and detail are separate questions, and keeping them separate is what stops a hole.** The
+first shape evicted a cell whose tier no longer matched where it was — and a camera crossing one
+boundary demotes a whole column at ring 3, so every crossing deleted seven cells of good coarse
+terrain and showed sky until the detailed copies loaded. Now `still_resident` is blind to the tier
+and only asks whether a cell has left the world's edge, while `rebuild_as` asks whether to *request*
+the other tier, so the swap happens in the frame the replacement lands rather than the frame the
+camera moved. The hysteresis lives in `rebuild_as`: a cell earns a rebuild only a whole ring past
+the boundary.
+
+**Cells arrive sixteen a frame, and "arrive" has to include the misses.** Of the 625 squares the
+horizon asks for only 428 exist — the rest are open sea with no record — and a loop that stops as
+soon as a cell fails to place still drains one sea square a frame:
+
+| | frame 50 | frame 100 | full |
+|---|---|---|---|
+| stopping on a miss | 163 cells | 268 | ~250 frames |
+| taking sixteen either way | 234 cells | 429 | ~100 frames |
+
+What made one-at-a-time the rule for the near window was the top-level rebuild, and that happens
+once per frame however many cells landed in it.
+
+### 8.10 Lights are binned into a world grid
+
+The shader walked every light in the scene for every shading point, primary and bounce alike, with
+no bound on count or distance: **0.031 ms per light per frame at 1920×1080** whether or not it
+contributes. Three filters were tried on the *geometry* before the lights were suspected, and their
+failure is what pointed at them — removing 99% of the instances saved 0.9 ms while removing the
+lights saved 3.8. **A cost that does not move when the geometry does is not the geometry's.**
+
+**A uniform grid over the lights, in world space** rather than screen space, because a bounce hit is
+not on screen and a screen-space cluster list could not answer for it. Cell `i` owns
+`indices[offsets[i]..offsets[i + 1]]` — a prefix sum with a trailing sentinel, so the whole
+structure is two buffers however many cells it has, built by a counting sort at the same commit that
+rebuilds the top level. The cell size starts at one terrain tile and **doubles until the grid fits
+two budgets**: 65,536 cells and 262,144 index entries. The second is not redundant — a wide world
+overruns the first, and one light with an enormous reach overruns the second while the grid is
+small.
+
+Vivec is the worst light density in the game: 173 lights in one 7×7 window, against 53 in Balmora
+and 20 in a typical interior.
+
+| lights | with the grid | walking them all |
+|---|---|---|
+| 173, as shipped | **4.78 ms** | 6.91 ms |
+| +500 | 5.06 ms | 19.03 ms |
+| +2,000 | 5.05 ms | 66.00 ms |
+
+Flat where the old loop was linear, and 1.8 ms — a quarter of the trace — on the real scene. Below
+about fifty lights the two are within noise, which is the honest bound: **this buys a town, not a
+room.**
+
+**The output is bit-identical.** Forcing the grid to a single cell reproduces the old walk through
+the same code path and the two renders differ in 0 of 2,073,600 pixels. The grid may offer a light
+that turns out not to reach — it bins by bounding box and the shader's distance test settles it —
+but it must never withhold one that does, and that one-sidedness is asserted against the brute-force
+answer over a sweep of probes. Binning by a light's centre instead of its reach fails it.
+
+### 8.11 Cell frustum culling buys nothing, and the reason generalises
+
+Built, measured, reverted; kept because someone will otherwise propose it again. Six planes from the
+view-projection, each resident cell's world bounds tested against them, the top level rebuilt over
+what survived, plus the ring around the camera kept whatever the frustum said because the sun does
+not care which way the camera faces.
+
+Out of 6,455 instances across a 48-cell window it removed 4,124 looking along the ground and 1,709
+looking at the sky — a 74% cut, as selective as this can ever get:
+
+| | median | min | max |
+|---|---|---|---|
+| culled | 1.91 ms | 1.91 | 1.94 |
+| everything resident | 1.88 ms | 1.85 | 2.10 |
+
+**Nothing. Not a small win inside the noise — zero, at three quarters of the scene removed.**
+
+The premise is what is wrong, and it applies to any culling scheme proposed above the acceleration
+structure: **a bounding volume hierarchy already culls, spatially, and does it per ray rather than
+per frame.** A ray that never travels toward a cell never descends the subtree holding it, so
+removing that subtree removes work nobody was doing. Frustum culling is a rasteriser's idea — it
+exists because a rasteriser must *submit* geometry before it can reject it, and a ray tracer never
+submits anything. Against that, the costs are real: 1.1 ms and a device-idle stall each time a turn
+brings a cell across a frustum edge, and the image changes by 3,066 pixels of two million because
+bounce and shadow rays that reached a culled cell now escape to the sky.
+
+If the top level ever does become the cost, the thing to reach for is fewer *instances* rather than
+fewer cells — merging a cell's static clutter into one structure shrinks what the hierarchy has to
+describe rather than hiding part of it.
+
+### 8.12 The visibility shader is six files
 
 `primary_visibility.comp` had reached 1,243 lines and was more than half water. It is now 78 — a
-header, six includes and `main` — with the rest in `.glsl` modules beside it. The build already
-excluded `.glsl` from compilation and already rebuilt on any change under `shaders/`, so the
-machinery for this existed and had simply never been used.
-
-The split is not by topic but by **dependency order**, which is the only order GLSL allows:
+header, six includes and `main` — with the rest in `.glsl` modules beside it. The split is not by
+topic but by **dependency order**, which is the only order GLSL allows:
 
 | | |
 |---|---|
@@ -2108,285 +1444,5 @@ The split is not by topic but by **dependency order**, which is the only order G
 
 **One forward declaration in the whole file set.** Lighting needs the sun dimmed on its way down
 through water and water needs a surface shaded, which is a cycle; declaring `sun_through_water` and
-`daylight_reaching` at the top of `lighting.glsl` breaks it and everything else falls in a line.
-Putting water first instead would have cost three.
-
-Two Rust files crossed the threshold this repository sets for splitting tests out — `wave_spectrum`
-at 176 lines and 43%, `geometry_buffers` at 180 — and are now `{mod.rs, tests.rs}` directories.
-
-The whole refactor is **pixel-identical**, which is the only claim worth making about it.
-
-### 7.21 Cell frustum culling buys nothing, and the reason generalises
-
-Built, measured, reverted. The patch is kept because the *measurement* is the useful part and
-someone will otherwise propose this again.
-
-**What it did.** Six planes from the view-projection matrix, each resident cell's world bounds tested
-against them, and the top level rebuilt over what survived — plus the ring of cells around the camera
-kept whatever the frustum said, because the sun does not care which way the camera faces and a cell
-behind it shadows the ground in front.
-
-**What it saved.** Out of 6,455 instances across a 48-cell window: 4,124 looking along the ground,
-and **1,709 looking at the sky**, which is as selective as this can ever get — a 74% cut.
-
-**What it cost in trace time, at that 74%:**
-
-| | median | min | max |
-|---|---|---|---|
-| culled | 1.91 ms | 1.91 | 1.94 |
-| everything resident | 1.88 ms | 1.85 | 2.10 |
-
-**Nothing. Not a small win inside the noise — zero, at three quarters of the scene removed.**
-
-The premise is what is wrong, and it is worth stating because it applies to any culling scheme
-proposed above the acceleration structure: **a bounding volume hierarchy already culls, spatially,
-and does it per ray rather than per frame.** A ray that never travels toward a cell never descends
-the subtree holding it, so removing that subtree removes work nobody was doing. Frustum culling is a
-rasteriser's idea — it exists because a rasteriser must *submit* geometry before it can reject it,
-and a ray tracer never submits anything.
-
-Against that, the costs are real: 1.1 ms and a device-idle stall each time the visible set moves,
-which is every time a turn brings a cell across a frustum edge; and the image changes by 3,066 pixels
-of two million, because bounce and shadow rays that reached a culled cell now escape to the sky.
-
-Worth reaching for instead, if the top level ever does become the cost: fewer *instances* rather than
-fewer cells — merging the static clutter of a cell into one structure — which shrinks what the
-hierarchy has to describe rather than hiding part of it.
-
-### 7.22 Terrain blends four tile centres, and the quadrant is what carries them
-
-A cell's `VTEX` names **one texture per 512-unit tile**, 16×16 of them, and nothing in between. Ground
-that sampled the tile it stood on met its neighbours along a straight edge, and Seyda Neen's shore
-was a staircase of them running diagonally across the slope. The fix is the standard one — bilinear
-blending between the four nearest tile *centres* — and the whole design question is where the four
-ids live.
-
-**Not a splat map.** The obvious shape is a per-cell weight texture and a second descriptor binding,
-and it is not worth it: the weights are a fixed function of world position and need no storage at
-all. What does need storing is *which four* textures a point blends, and that is constant over a
-region.
-
-**The quadrant.** Split each tile into 2×2 quads — 32×32 quadrants per cell — and give each one the
-2×2 block of tile centres it falls inside. The four ids pack as 4×u16 into the two words
-`GpuMaterial` already had spare, so **no new binding, no new buffer, and 48 bytes stays 48 bytes.**
-They intern like any other material: a cell has 1,024 quadrants and about **78 distinct tuples**
-(worst measured 121), because most quadrants sit inside a run of tiles that all named the same
-texture.
-
-**The weights cost nothing to derive.** A cell origin is a whole number of tiles, so it cancels, and
-the position within the square of centres is
-
-```glsl
-vec2 weight = fract(world.xy / 512.0 - 0.5);
-```
-
-which is 0 at the lower-left centre and approaches 1 at the upper-right — wrapping exactly where the
-quadrant's own tuple shifts by one tile, so the ramp is continuous across the boundary.
-
-**What it costs.** Three extra texture taps on ground pixels: **6.60 ms against 5.95 ms** of trace at
-1920×1080 on a view that is almost entirely terrain, so 0.65 ms, and less than that on anything with
-a horizon in it. An early-out for the case where all four ids agree — most of a cell — was written
-and measured at **6.60 ms, no change at all**, on that view and on an inland one; the taps are not
-serialised on anything a branch can skip, and the branch is not coherent across a warp where it would
-matter. Reverted.
-
-**Proof.** `crates/rtxmw-render/tests/terrain.rs` renders a plane through the real `SceneRenderer`
-with the four layers set to red, green, blue and white, so each channel reads back a known sum of
-weights — green *is* the x weight and blue *is* the y weight — and predicts every pixel of the frame
-to within two levels of 8-bit quantisation. Transposing the weights in the shader fails it; dropping
-one of the four fails it and the flat-ground test beside it.
-
-### 7.23 A horizon costs 1.5 ms, and the lights would have more than tripled it
-
-Before this the world ended at the streaming window — 7×7 cells, about 410 m — and from anywhere
-with a view the land stopped mid-slope against the sky. Vvardenfell is only some 36 cells across, so
-the fix is not a level-of-detail hierarchy but a second tier: **[`CellDetail::Distant`] out to twelve
-rings, terrain and objects, at a sixteenth of the triangles.**
-
-**Decimating is enough, and stitching is not needed.** `Mesh::from_land` takes a stride; at 4 a cell
-is 17×17 vertices and 512 triangles rather than 65×65 and 8,192. Because the stride divides the 64
-quads a cell spans and the shared last row is kept whatever it is, **two cells at the same stride
-still meet vertex for vertex** — asserted exactly, not to a tolerance. Only the one ring where the
-detailed window meets the distant tier can crack, and measured over five real cells the coarse chord
-parts from the fine surface by at most **64 units, half a vertex spacing** — under three pixels at
-1080p, at a boundary that is never closer than three cells. Skirts and stitching were designed and
-not built; the measurement is why.
-
-**The cost, at 1920×1080 from a hilltop over the whole island** — the worst case there is, since
-every pixel is horizon:
-
-| | trace | window load |
-|---|---|---|
-| the 7×7 window alone | 4.77 ms | 208 ms |
-| + distant terrain, 12 rings | 5.40 ms | 511 ms |
-| + the objects on it | **6.29 ms** | 1,155 ms |
-| + the lights those objects carry | 9.85 ms | — |
-
-**That last row is the finding.** Distant objects — 21,772 instances over 428 cells — cost 0.89 ms.
-The 229 `LIGH` references among them cost **3.8 ms more**, because the shader walks every light in
-the scene for every pixel with no bound on count or distance. A lamp a kilometre away with a radius
-of a few hundred units reaches nothing on screen, so a distant cell places its lamps and drops their
-lights, and the image is unchanged.
-
-Three filters were tried before the lights were suspected, and their failure is what pointed at
-them: keeping only opaque meshes saved 0.8 ms, only meshes over 400 units saved nothing, and
-**removing 99% of the instances — 21,772 down to 220 — saved 0.9 ms.** A cost that does not move
-when the geometry does is not the geometry's.
-
-**Peak GPU memory with the whole visible world resident is 620 MB.** Nothing here is near a limit.
-
-**Residency and detail are separate questions, and keeping them separate is what stops a hole.** The
-first shape of this evicted a cell whose tier no longer matched where it was — and a camera crossing
-one cell boundary demotes a whole column at ring 3, so every crossing deleted seven cells of good
-coarse terrain and showed sky until the detailed copies loaded. Now `still_resident` is blind to the
-tier and only asks whether a cell has left the world's edge, while `rebuild_as` asks whether to
-*request* the other tier; the swap happens in the frame the replacement lands, not the frame the
-camera moved. **The hysteresis lives in `rebuild_as`** — a cell earns a rebuild only a whole ring
-past the boundary, so walking back and forth over one rebuilds nothing.
-
-**Cells arrive sixteen a frame rather than one, and "arrive" has to include the misses.** One at a
-time was right for a 49-cell window. Of the 625 squares the horizon asks for, only 428 exist — the
-rest are open sea with no record — and a loop that stops as soon as a cell fails to place still
-drains one sea square a frame. Measured from a cold start at Seyda Neen, frames until the world is
-fully resident:
-
-| | frame 50 | frame 100 | full |
-|---|---|---|---|
-| stopping on a miss | 163 cells | 268 | ~250 frames |
-| taking sixteen either way | 234 cells | 429 | ~100 frames |
-
-What made one a time the rule was the top-level rebuild, and that happens once per frame however many
-cells landed in it.
-
-### 7.24 The lights were walked one at a time, and that was most of a town's frame
-
-Two things were wrong with point lights, and only the second was visible as a number at first.
-
-**A distant cell's lamps reach nothing and cost everything.** §7.23 has the measurement: the 229
-`LIGH` references in the cells beyond the streaming window cost 3.8 ms of a 5–6 ms trace, because
-the shader walked every light in the scene for every shading point — primary and bounce alike — with
-no bound on count or distance. Distant cells now place their lamps and drop their lights.
-
-**That left the shape of the problem, which is that the loop is linear in the whole world.** Even a
-light nowhere near the point costs a fetch and a distance test: **0.031 ms per light per frame at
-1920×1080**, whether or not it contributes. Three filters were tried on the geometry before the
-lights were suspected, and their failure is what pointed at them — removing 99% of the *instances*
-saved 0.9 ms while removing the lights saved 3.8.
-
-**The fix is a uniform grid over the lights**, in world space rather than screen space, because a
-bounce hit is not on screen and a screen-space cluster list could not answer for it. Cell `i` owns
-`indices[offsets[i]..offsets[i + 1]]` — a prefix sum with a trailing sentinel, so the whole structure
-is two buffers however many cells it has, built by a counting sort at the same commit that rebuilds
-the top level. The cell size starts at one terrain tile and **doubles until the grid fits two
-budgets**: 65,536 cells, and 262,144 index entries. The second is not redundant — a wide world
-overruns the first, and one light with an enormous reach overruns the second while the grid is still
-small.
-
-**What it is worth.** Vivec is the worst light density that exists in the game: 173 lights in one
-7×7 window, against 53 in Balmora and 20 in a typical interior. At 1920×1080, extra lights scattered
-over the loaded window:
-
-| lights | with the grid | walking them all |
-|---|---|---|
-| 173, as shipped | **4.78 ms** | 6.91 ms |
-| +500 | 5.06 ms | 19.03 ms |
-| +2,000 | 5.05 ms | 66.00 ms |
-
-Flat where the old loop was linear, and 1.8 ms — a quarter of the trace — on the real scene. Below
-about fifty lights the two are within noise, which is the honest bound on it: this buys a town, not
-a room.
-
-**The output is bit-identical.** Forcing the grid to a single cell reproduces the old walk through
-the same code path, and the two renders differ in 0 of 2,073,600 pixels. The grid may offer a light
-that turns out not to reach — it bins by bounding box and the shader's distance test settles it —
-but it must never withhold one that does, and that one-sidedness is asserted against the brute-force
-answer over a sweep of probes rather than assumed. Binning by a light's centre instead of its reach
-fails it.
-
-### 7.25 A stencil property was five bytes short, and nothing could have noticed
-
-`NiStencilProperty` read flags, a versioned `bool` and five words. The format is flags, a **one-byte**
-enabled flag — a `char`, not the four-byte `bool` this NIF version uses elsewhere — and seven words:
-test function, reference, mask, the fail, z-fail and pass actions, and the draw mode. Twenty-six
-bytes read against thirty-one.
-
-**Blocks in this version carry no size**, so the next block's type comes from a table in the header
-rather than from the stream: a property that reads one field too few leaves the file pointing into
-its own tail and everything after it decodes as garbage, silently. No shipped mesh could catch it —
-**0 of 7,319 name the block** — which is exactly why the corpus test passed and why this needed
-pinning per block rather than by parsing more files.
-
-Every fixed-size property now has its byte count asserted directly: a synthetic block of exactly the
-documented length must be consumed whole, and one byte shorter must fail rather than quietly stop.
-The old reading fails it with "left 5 of its 31 tail bytes unread". The same mistake in the other
-direction is already annotated three blocks away at `NiSourceTexture`, where a `char` read as a
-`bool` over-consumed by three.
-
-### 7.26 The unprojection lost the world, and it looked like jitter
-
-Reported as the camera shaking when it moved, everywhere except near the world origin. That last
-detail is the whole diagnosis: the error was proportional to how far the camera stood from `(0, 0)`.
-
-**What it was.** The shader turned a pixel into a ray like this:
-
-```glsl
-vec4 target = frame.inverse_view_projection * vec4(ndc, 1.0, 1.0);
-vec3 direction = normalize(target.xyz / target.w - frame.camera_position);
-```
-
-The unprojection lands a **world-space point on the near plane** — 0.05 units from the eye — and the
-subtraction recovers the direction. Both operands are the size of the world; their difference is
-0.05. At Seyda Neen's 75,000 units the gap between representable `f32` values is 0.024, so the
-answer had two or three bits left in it. Measured against the same unprojection carried out in
-double precision:
-
-| camera | aim error |
-|---|---|
-| the world origin | 0.00 px |
-| 1,000 units out | 2.1 px |
-| Seyda Neen | **127 px** |
-| the far corner of Vvardenfell | **377 px** |
-
-It read as jitter rather than as a broken projection because the error is a *smooth* field — a still
-frame looks like a slightly wrong field of view, and it is only when the camera moves that the field
-moves with it.
-
-**The fix is not more bits.** Sending the matrix as `f64`, or the camera position as two floats,
-would buy an order of magnitude and leave the same subtraction in place. The subtraction is what
-should not exist: **the eye is removed from the view before the inverse is taken**, so the
-unprojection lands in a space centred on the camera and hands back an offset directly.
-
-```rust
-let mut rotation = view;
-rotation.w_axis = glam::Vec4::W;   // a look-at view is rotation * translate(-eye)
-(projection * rotation).inverse()
-```
-
-Nothing then cancels, and the aim is **0.00013 pixels wrong wherever the camera stands** — the
-number no longer depends on position at all. It also leaves a far better conditioned matrix to
-invert, since no entry is the size of the world any more. The camera's position is still sent, and
-still used as a ray origin; it is simply never differenced against anything.
-
-**Why nothing caught it.** The unprojection had a test, and it was a round trip: project a world
-point, unproject it, check it comes back. Correct, and blind to this — the round trip was run with
-the camera at `(1, 2, 3)`. **A precision fault that vanishes at the origin needs a test that leaves
-it**, so the assertion is now made at four camera positions out to the far corner of the map, and
-the same scene rendered at the origin and at 200,000 units has to produce the same picture. The old
-unprojection fails the second one on pixel coverage alone — whole surfaces leave the frame.
-
-**What is still `f32`, and why that is fine.** Hit positions are `origin + direction * t`, so they
-quantise to 0.024 units out there; the shadow ray bias is 1.5 units, a terrain blend weight moves by
-5e-5 of a tile, and a wave phase by 0.005 radians. Terrain vertices are baked in world space and
-carry the same 0.024, but that is a static property of the geometry rather than something that moves
-when the camera does. None of it is a jitter, which is what the ray direction was.
-
-### 7.8 Costs and risks
-
-- **Water pixels cost roughly twice.** Two rays instead of one, each spawning its own shadow rays.
-  On a coastal view perhaps 30% of the frame is water, so budget 1–2 ms and measure before tuning
-  anything else. The 16-sun-sample count identified in M9 is the lever if it overruns.
-- **No new dependency.** Everything here is shader work plus one mesh.
-- **The 128-byte block is a hard stop for stage 2**, and nothing before it.
-- **The largest unknown is the shoreline**, not the deep water: 533 cells have one, and a hard
-  intersection line between a water plane and terrain is the classic tell. Depth-fading the
-  absorption toward zero at the intersection is the standard answer and is stage 4 for that reason.
+`daylight_reaching` at the top of `lighting.glsl` breaks it. Putting water first instead would have
+cost three. The refactor is pixel-identical, which is the only claim worth making about it.
