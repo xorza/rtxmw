@@ -2133,3 +2133,38 @@ what it is. Chasing it further would be optimising a diagnostic.
 block before binning does not fix it — the gap flips to −0.77% and the filtered frame's own exposure
 moves with it, because a block average changes which samples fall under the histogram's black cutoff
 as well as how noisy they are. The concavity is the dominant term but not the only one.
+
+### 8.34 A test for the thing no test could see
+
+§8.30's sign error survived a feature that built, evaluated, returned success and passed the
+validation layer, and every quality number taken from it — because all of them came from a *single*
+frame. `tests/upscaler_stability.rs` renders ten and compares the last two with the camera held
+still, which is the one thing an inverted jitter cannot fake.
+
+**Its own test binary, and so its own process.** NGX is global per device and the SDK does not
+promise to survive concurrent initialisation, which the unit test in `dlss/mod.rs` already depends
+on; two NGX users in one binary would be racing. DLAA rather than an upscaling preset, so what is
+measured is the temporal resolve alone rather than reconstruction error folded in beside it.
+
+**The fixture had to be real content, and finding that out took two tries.** A synthetic wall with
+nine bars each way passed with *every* sign combination — a bar was fifty pixels wide, so the frame
+had thirty-six edges in it and a misaligned history had almost nothing to disagree about. Bars two
+pixels wide separated the populations by 1.5×, still too thin to assert on. Only a real cell, whose
+every surface carries texture detail at pixel scale, gives a misaligned history something to show:
+
+| `Jitter.Offset` | frame-to-frame RMS, colour |
+|---|---|
+| **`-x, -y`** (correct) | **0.00090** |
+| `+x, -y` | 0.00371 |
+| `-x, +y` | 0.00485 |
+| `+x, +y` | 0.00731 |
+
+The bound is 0.0018 — the geometric mean of the correct value and the nearest failure, so each side
+has a factor of two. It fails on **either** axis inverted, not only on both.
+
+**A machine without the game skips**, rather than falling back to the synthetic grid. The grid was
+kept as a fallback at first and that was a mistake twice over: it measured 0.0054 with the signs
+*correct*, so it failed a bound calibrated on real content, and it could not have caught the fault
+anyway. A check that cannot fail on the thing it exists for is worse than an honest skip.
+
+A stable black frame would also pass, so the test asserts the frame is lit as well.
