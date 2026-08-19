@@ -257,17 +257,23 @@ impl StaticScene {
         if let Some(offset) = offsets.land
             && let Some(land) = LandRecord::parse(&esm.record_at(offset)?)?
         {
+            let neighbourhood = Neighbourhood::around(esm, index, &land);
             let tile_materials =
-                terrain_materials(&land, index.land_textures(), &mut scene.materials);
+                terrain_materials(&neighbourhood, index.land_textures(), &mut scene.materials);
             let mesh = MeshId(scene.meshes.len() as u32);
             scene
                 .meshes
                 .push(Mesh::from_land(&land, &tile_materials, detail.stride()));
             // Keyed by the cell rather than by a file, because a heightmap belongs to exactly one
-            // and is the one mesh no other cell can share.
-            scene
-                .mesh_sources
-                .push(format!("land:{},{}", land.grid_x, land.grid_y));
+            // and is the one mesh no other cell can share — **and by the stride it was built at**,
+            // because a cell has one of these per level of detail and a renderer caching meshes by
+            // this key would otherwise hand a promoted cell the coarse terrain it already had.
+            scene.mesh_sources.push(format!(
+                "land:{},{}@{}",
+                land.grid_x,
+                land.grid_y,
+                detail.stride()
+            ));
             // No transform: `Mesh::from_land` places its vertices in the world already.
             scene.instances.push(Instance {
                 mesh,
@@ -497,6 +503,110 @@ fn height_at(a: Vec3, b: Vec3, c: Vec3, at: Vec2) -> Option<f32> {
     Some(a.z + u * (b.z - a.z) + v * (c.z - a.z))
 }
 
+/// The `VTEX` of a cell and the eight around it, as one grid three cells on a side.
+///
+/// **Ground blends across a cell boundary, so one cell's `VTEX` is not enough to build it.** The
+/// transition straddles the boundary: the outermost half-tile of a cell blends with tiles that
+/// belong to its neighbour. Reading only its own and clamping at the edge makes that half-tile blend
+/// with itself, so two cells meet in a 512-unit band of flat ground with a razor seam down the
+/// middle — which is what the ground did.
+#[derive(Debug)]
+struct Neighbourhood {
+    /// Row-major over three cells squared, the middle one being the cell under construction.
+    indices: Vec<u16>,
+}
+
+/// Tiles a side a cell's quadrants can name: its own, and a border of one.
+///
+/// The outermost quadrant blends with the row of tiles past the cell's edge, and no quadrant reaches
+/// further — the four it names are the corners of the square of tile centres it sits inside.
+const BORDERED: usize = TEXTURE_GRID + 2;
+
+/// Cells a side in a [`Neighbourhood`], and so the offset from its coordinates to the grid's.
+const NEIGHBOURS: usize = 3;
+
+impl Neighbourhood {
+    /// The centre cell's own tiles, with each neighbour's read from the file if it has any.
+    ///
+    /// A neighbour that is open sea has no `LAND` record at all, and the grid keeps the centre
+    /// cell's edge tile there — the clamping this exists to remove, but only where there is genuinely
+    /// nothing to blend with rather than everywhere.
+    fn around(esm: &EsmReader<'_>, index: &CellIndex, centre: &LandRecord) -> Self {
+        let side = NEIGHBOURS * TEXTURE_GRID;
+        let own = |x: i32, y: i32| {
+            let x = x.clamp(0, TEXTURE_GRID as i32 - 1) as usize;
+            let y = y.clamp(0, TEXTURE_GRID as i32 - 1) as usize;
+            centre
+                .textures
+                .get(y * TEXTURE_GRID + x)
+                .copied()
+                .unwrap_or(0)
+        };
+        // Clamped from the centre everywhere first, so a neighbour that is missing needs no case of
+        // its own — it simply never overwrites what is already there.
+        let mut indices = Vec::with_capacity(side * side);
+        for row in 0..side {
+            for column in 0..side {
+                indices.push(own(
+                    column as i32 - TEXTURE_GRID as i32,
+                    row as i32 - TEXTURE_GRID as i32,
+                ));
+            }
+        }
+
+        for dy in -1..=1i32 {
+            for dx in -1..=1i32 {
+                if (dx, dy) == (0, 0) {
+                    continue;
+                }
+                let id = CellId::Exterior {
+                    x: centre.grid_x + dx,
+                    y: centre.grid_y + dy,
+                };
+                let Some(offset) = index.cell(&id).and_then(|offsets| offsets.land) else {
+                    continue;
+                };
+                let Ok(record) = esm.record_at(offset) else {
+                    continue;
+                };
+                let Ok(tiles) = LandRecord::textures_of(&record) else {
+                    continue;
+                };
+                if tiles.len() < TEXTURE_GRID * TEXTURE_GRID {
+                    continue;
+                }
+                let (base_x, base_y) = (
+                    (dx + 1) as usize * TEXTURE_GRID,
+                    (dy + 1) as usize * TEXTURE_GRID,
+                );
+                for row in 0..TEXTURE_GRID {
+                    for column in 0..TEXTURE_GRID {
+                        indices[(base_y + row) * side + base_x + column] =
+                            tiles[row * TEXTURE_GRID + column];
+                    }
+                }
+            }
+        }
+        Self { indices }
+    }
+
+    /// The tile at `(x, y)` in the centre cell's coordinates, which may name a neighbour's.
+    ///
+    /// A whole cell either side, which is far more than a quadrant can ask for — see [`BORDERED`].
+    /// The assert is the contract rather than a guard against data: the coordinates are computed
+    /// from a quadrant index, so one outside this is a bug in the arithmetic and not a cell.
+    fn at(&self, x: i32, y: i32) -> u16 {
+        let side = (NEIGHBOURS * TEXTURE_GRID) as i32;
+        let shift = TEXTURE_GRID as i32;
+        let (column, row) = (x + shift, y + shift);
+        debug_assert!(
+            (0..side).contains(&column) && (0..side).contains(&row),
+            "tile ({x}, {y}) is outside the cell and the eight around it"
+        );
+        self.indices[(row * side + column) as usize]
+    }
+}
+
 /// One material per *quadrant* of a cell's texture grid, naming the four tiles it blends.
 ///
 /// **A quadrant is the largest patch of ground whose blend never changes which tiles it draws
@@ -512,13 +622,18 @@ fn height_at(a: Vec3, b: Vec3, c: Vec3, at: Vec2) -> Option<f32> {
 /// the same numbering textures the whole world one slot out, and plausibly, because the palette is
 /// grouped by region and the neighbouring entry is usually more of the same terrain.
 fn terrain_materials(
-    land: &LandRecord,
+    neighbourhood: &Neighbourhood,
     palette: &[String],
     materials: &mut MaterialTable,
 ) -> Vec<u32> {
-    let tiles: Vec<TextureId> = (0..TEXTURE_GRID * TEXTURE_GRID)
+    // The cell's own tiles and a border of one, which is everything a quadrant can name: the
+    // outermost blend with the row beyond the cell and nothing reaches past it. Interning the whole
+    // neighbourhood instead is nine times the tiles and three string allocations apiece — measured
+    // at 1,426 ms against 1,387 for a 428-cell window, so worth having and not where the time goes.
+    let side = BORDERED as i32;
+    let tiles: Vec<TextureId> = (0..side * side)
         .map(|tile| {
-            let name = match land.textures.get(tile).copied().unwrap_or(0) {
+            let name = match neighbourhood.at(tile % side - 1, tile / side - 1) {
                 0 => DEFAULT_TERRAIN_TEXTURE,
                 index => palette
                     .get(index as usize - 1)
@@ -532,15 +647,7 @@ fn terrain_materials(
         })
         .collect();
 
-    // Clamped at the cell's edge, which is where this stops short of the whole answer: the tiles it
-    // should blend with there belong to the next cell, and a cell is loaded without them. So the
-    // outermost half-tile blends with itself and a seam can survive at a cell boundary — one every
-    // 8,192 units rather than one every 512.
-    let tile_at = |x: i32, y: i32| {
-        let x = x.clamp(0, TEXTURE_GRID as i32 - 1) as usize;
-        let y = y.clamp(0, TEXTURE_GRID as i32 - 1) as usize;
-        tiles[y * TEXTURE_GRID + x]
-    };
+    let tile_at = |x: i32, y: i32| tiles[((y + 1) * side + x + 1) as usize];
 
     (0..TERRAIN_QUADRANTS * TERRAIN_QUADRANTS)
         .map(|quadrant| {
@@ -661,6 +768,26 @@ mod tests {
         }
     }
 
+    /// A neighbourhood with nothing around the cell, so the fixtures below read as they always did:
+    /// every lookup past the edge clamps back into the one cell that exists.
+    fn alone(land: &LandRecord) -> Neighbourhood {
+        let side = NEIGHBOURS * TEXTURE_GRID;
+        let mut indices = Vec::with_capacity(side * side);
+        for row in 0..side {
+            for column in 0..side {
+                let x = (column as i32 - TEXTURE_GRID as i32).clamp(0, TEXTURE_GRID as i32 - 1);
+                let y = (row as i32 - TEXTURE_GRID as i32).clamp(0, TEXTURE_GRID as i32 - 1);
+                indices.push(
+                    land.textures
+                        .get(y as usize * TEXTURE_GRID + x as usize)
+                        .copied()
+                        .unwrap_or(0),
+                );
+            }
+        }
+        Neighbourhood { indices }
+    }
+
     /// The texture a patch of ground blends *from* — the first of its four, which is the tile whose
     /// centre the patch straddles and so the one it draws at full weight.
     fn tile_texture(materials: &MaterialTable, patch_material: u32) -> &str {
@@ -677,7 +804,7 @@ mod tests {
         // Index 1 is the *first* palette entry, not the second; index 0 is not an entry at all.
         let land = land_with(vec![0, 1, 2]);
         let mut materials = MaterialTable::default();
-        let patches = terrain_materials(&land, &palette, &mut materials);
+        let patches = terrain_materials(&alone(&land), &palette, &mut materials);
 
         assert_eq!(patches.len(), TERRAIN_QUADRANTS * TERRAIN_QUADRANTS);
         // Read through the blend: the patch at the far corner of a tile draws that tile alone,
@@ -715,7 +842,7 @@ mod tests {
         let palette = ["sand.tga".to_owned(), String::new(), "rock.tga".to_owned()];
         let land = land_with(vec![2, 3]);
         let mut materials = MaterialTable::default();
-        let patches = terrain_materials(&land, &palette, &mut materials);
+        let patches = terrain_materials(&alone(&land), &palette, &mut materials);
 
         assert_eq!(
             tile_texture(&materials, patches[0]),

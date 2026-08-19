@@ -151,3 +151,55 @@ fn a_mesh_two_cells_name_is_uploaded_once_and_survives_either_leaving() {
     drop(uploader);
     gpu.assert_no_validation_errors();
 }
+
+#[test]
+fn a_cell_reloaded_at_another_detail_gets_the_mesh_that_detail_names() {
+    // **Mesh slots are grow-only and keyed by source**, which is what makes a neighbouring cell
+    // nearly free — and what makes a cell that comes back *different* a trap. Terrain has one
+    // heightmap per level of detail, so a cell promoted out of the distant ring must bring its own
+    // mesh rather than the coarse one already sitting under its old name.
+    let gpu = TestGpu::shared();
+    let mut uploader = gpu.uploader();
+    let limits = gpu.physical().limits();
+    let mut renderer =
+        SceneRenderer::new(gpu.device(), gpu.physical(), gpu.memory(), EXTENT).expect("renderer");
+
+    let shore = CellId::Exterior { x: 2, y: -9 };
+    renderer
+        .load_scene(
+            gpu.device(),
+            &mut uploader,
+            limits,
+            shore.clone(),
+            &cell_of("land:2,-9@4", 1),
+            &[],
+        )
+        .expect("the coarse cell loads");
+    let coarse = renderer.resident_meshes();
+
+    // The same cell again, at the detail the window wants now.
+    renderer
+        .add_cell(
+            gpu.device(),
+            &mut uploader,
+            limits,
+            shore.clone(),
+            &cell_of("land:2,-9@1", 1),
+            &[],
+        )
+        .expect("the detailed cell loads");
+    renderer
+        .commit(gpu.device(), &mut uploader, limits)
+        .expect("commit");
+
+    assert_eq!(
+        renderer.resident_meshes(),
+        coarse + 1,
+        "the cell came back at another detail and was handed the mesh it had before, so near \
+         terrain is drawn with the distant tier's geometry and materials"
+    );
+    // One cell, one placement: the old copy went with the old cell rather than accumulating.
+    assert_eq!(renderer.resident_instances(), 1);
+    drop(uploader);
+    gpu.assert_no_validation_errors();
+}

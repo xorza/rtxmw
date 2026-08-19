@@ -141,11 +141,16 @@ fn trace(layers: [u32; 4]) -> Vec<u8> {
 /// The blend weights at the pixel `(column, row)`, worked out from the camera rather than the
 /// shader: at 90° from `HEIGHT` up, the frame spans `TILE` units, so a pixel centre is a known
 /// fraction of the way between the two tile centres on each axis.
+///
+/// **Flat, then across, then flat**, rather than a ramp over the whole tile — see `ground_colour`.
+/// The fraction is where the point sits between two tile centres; the weight is zero over the first
+/// quarter of that, one over the last, and interpolates over the middle half, which puts the whole
+/// transition in the 256 units straddling the tile boundary.
 fn weights_at(column: u32, row: u32) -> Vec2 {
     let across = (column as f32 + 0.5) / SIZE as f32;
     // Row zero is the top of the image and world +Y is up, so the row index runs against +Y.
     let up = 1.0 - (row as f32 + 0.5) / SIZE as f32;
-    Vec2::new(across, up)
+    (Vec2::new(across, up) * 2.0 - 0.5).clamp(Vec2::ZERO, Vec2::ONE)
 }
 
 fn pixel(pixels: &[u8], column: u32, row: u32) -> Vec3 {
@@ -158,7 +163,7 @@ fn pixel(pixels: &[u8], column: u32, row: u32) -> Vec3 {
 }
 
 #[test]
-fn the_ground_is_a_bilinear_blend_of_the_four_tile_centres_around_it() {
+fn the_ground_blends_its_four_tiles_across_their_boundaries_and_nowhere_else() {
     let pixels = trace([0, 1, 2, 3]);
 
     // Red is layer 0, green layer 1, blue layer 2 and layer 3 is all three at once, so each channel
@@ -183,7 +188,19 @@ fn the_ground_is_a_bilinear_blend_of_the_four_tile_centres_around_it() {
     println!("worst channel error across the frame: {:.4}", worst);
     assert!(
         worst < 2.5 / 255.0,
-        "the ground is not the bilinear blend of its four tiles; worst channel is off by {worst}"
+        "the ground is not blending its four tiles as the profile says; worst channel is off by \
+         {worst}"
+    );
+
+    // **The property the first version of this got wrong.** A ramp from one tile centre to the next
+    // leaves nowhere on the map drawing a single texture: every point is a mix of four, and a tile
+    // reads as a translucent square laid over its neighbours rather than as ground. The middle half
+    // of a tile has to be that tile alone.
+    let inside = pixel(&pixels, SIZE / 8, SIZE - 1 - SIZE / 8);
+    println!("well inside the first tile: {inside:?}");
+    assert!(
+        (inside - Vec3::X).length() < 2.5 / 255.0,
+        "a point well inside one tile drew {inside:?} rather than that tile — layer 0 — alone"
     );
 
     // The corners, spelled out, so a failure says which texture went where rather than only that

@@ -121,7 +121,17 @@ uint[4] terrain_layers(Material material) {
 // what makes that cheap.
 vec3 ground_colour(Material material, vec2 world, vec2 uv, float lod) {
     uint layers[4] = terrain_layers(material);
-    vec2 weight = fract(world / TERRAIN_TILE - 0.5);
+    // **Not a ramp across the whole tile.** Interpolating centre to centre leaves no point on the
+    // map drawing a single texture — every one is a mix of four, and a tile reads as a translucent
+    // square laid over its neighbours rather than as ground. The original engine blends through a
+    // map of two texels per tile, each tile's own pair at full weight, so bilinear filtering
+    // confines the transition to the 256 units straddling the tile boundary and leaves the middle
+    // half of every tile pure. `components/esmterrain/storage.cpp:497` is where OpenMW says so —
+    // "upscale the blendmap 2x with nearest neighbor sampling to look like Vanilla".
+    //
+    // The ramp is that transition, written directly: flat for the first quarter, across over the
+    // middle half, flat again for the last quarter.
+    vec2 weight = clamp(fract(world / TERRAIN_TILE - 0.5) * 2.0 - 0.5, 0.0, 1.0);
     vec4 across = vec4((1.0 - weight.x) * (1.0 - weight.y), weight.x * (1.0 - weight.y),
                        (1.0 - weight.x) * weight.y, weight.x * weight.y);
     vec3 colour = vec3(0.0);

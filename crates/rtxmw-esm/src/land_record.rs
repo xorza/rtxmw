@@ -84,6 +84,22 @@ impl LandRecord {
         }))
     }
 
+    /// The texture indices of a `LAND` record, reading nothing else.
+    ///
+    /// Ground blends across cell boundaries, so building one cell's terrain needs the `VTEX` of the
+    /// eight around it — and [`LandRecord::parse`] would undo eight delta-coded heightmaps and
+    /// eight normal fields to answer a question one subrecord settles. Empty for a record that
+    /// names no textures, which is legal and means the region's default everywhere.
+    pub fn textures_of(record: &Record<'_>) -> Result<Vec<u16>> {
+        for sub in record.subrecords() {
+            let sub = sub?;
+            if &sub.name().0 == b"VTEX" {
+                return Ok(decode_textures(sub.data()));
+            }
+        }
+        Ok(Vec::new())
+    }
+
     /// Which cell a `LAND` record belongs to, reading its coordinates and nothing else.
     ///
     /// Indexing a file means touching every `LAND` in it, and [`LandRecord::parse`] would undo a

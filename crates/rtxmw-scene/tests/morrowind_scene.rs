@@ -503,6 +503,11 @@ fn an_exterior_cell_carries_its_terrain_as_well_as_its_objects() {
     // only naming them works. The content file never changes, which is what makes that reasonable.
     // Deduplicated: the ground names four textures per patch and most patches share most of them,
     // so the raw list is a thousand entries of a handful of names.
+    //
+    // **The set is wider than this cell's own `VTEX`**, and has to be: ground blends across a cell
+    // boundary, so the outermost half-tile draws its neighbours' textures. Asserted below rather
+    // than left as a remark, because reverting to a cell that reads only its own `VTEX` would still
+    // produce a plausible list of Bitter Coast art — just with a razor seam every 8,192 units.
     let mut sorted = names.clone();
     sorted.sort_unstable();
     sorted.dedup();
@@ -515,6 +520,7 @@ fn an_exterior_cell_carries_its_terrain_as_well_as_its_objects() {
             "textures/Tx_BC_muck_01.dds",
             "textures/Tx_BC_mud.dds",
             "textures/Tx_BC_rock_03.dds",
+            "textures/Tx_BC_rockyscrub.dds",
             "textures/Tx_BC_undergrowth.dds",
             "textures/Tx_RM_grayrock_01.dds",
         ],
@@ -544,6 +550,40 @@ fn terrain(scene: &StaticScene) -> &Mesh {
         .position(|source| source.starts_with("land:"))
         .expect("an exterior with a heightmap has terrain");
     &scene.meshes[index]
+}
+
+#[test]
+fn a_cells_terrain_is_named_by_the_detail_it_was_built_at() {
+    let Some(bytes) = game_bytes() else { return };
+    let content = Content::open(&bytes);
+
+    // **A renderer caches meshes by this string**, and it is grow-only: whatever a source names
+    // first is what every later cell naming it gets back. A cell has one heightmap per level of
+    // detail, so keying on the cell alone hands a cell promoted into the detailed window the coarse
+    // terrain it was carrying a moment ago — 512-unit quads with one quadrant's four textures over
+    // all of them, up close, which reads as hard-edged rectangles of the wrong ground.
+    let named = |detail| {
+        let scene = content.cell_at(&SHORE, detail);
+        scene
+            .mesh_sources
+            .iter()
+            .find(|source| source.starts_with("land:"))
+            .expect("an exterior with a heightmap has terrain")
+            .clone()
+    };
+    let near = named(CellDetail::Full);
+    let far = named(CellDetail::Distant);
+    println!("{SHORE} terrain is {near:?} near and {far:?} far");
+    assert_ne!(
+        near, far,
+        "the same name covers both of a cell's heightmaps, so whichever loads first is the one it \
+         keeps"
+    );
+
+    // Both still say which cell they are, which is what keeps two cells from sharing one.
+    for name in [&near, &far] {
+        assert!(name.starts_with("land:-2,-9"), "{name:?}");
+    }
 }
 
 #[test]
@@ -608,6 +648,97 @@ fn distant_terrain_meets_its_own_kind_and_reports_what_it_costs_at_the_seam() {
         "a chord across four vertices parted from the surface by {worst} units, which is more \
          relief than a cell has"
     );
+}
+
+/// Every texture the cell's own `VTEX` names, by the palette the file indexes into.
+///
+/// Index zero is the region's default rather than a palette entry, and everything real is one past
+/// its index — see `terrain_materials`.
+fn own_textures(content: &Content<'_>, id: &CellId) -> Vec<String> {
+    let offsets = content.index.cell(id).expect("the cell exists");
+    let record = content
+        .esm
+        .record_at(offsets.land.expect("the cell has terrain"))
+        .expect("its terrain reads");
+    let tiles = rtxmw_esm::LandRecord::textures_of(&record).expect("its textures read");
+    let palette = content.index.land_textures();
+    let mut named: Vec<String> = tiles
+        .iter()
+        .filter(|&&index| index != 0)
+        .filter_map(|&index| palette.get(index as usize - 1))
+        .map(|name| {
+            let stem = name.rsplit(['/', '\\']).next().unwrap_or(name);
+            let stem = stem.rsplit_once('.').map_or(stem, |(base, _)| base);
+            format!("textures/{stem}.dds")
+        })
+        .collect();
+    named.sort_unstable();
+    named.dedup();
+    named
+}
+
+#[test]
+fn a_cells_ground_blends_with_the_tiles_of_the_cell_next_to_it() {
+    let Some(bytes) = game_bytes() else { return };
+    let content = Content::open(&bytes);
+
+    // The shore, and what its own `VTEX` names against what its ground actually draws. The gap is
+    // the neighbours' — a cell's outermost half-tile is where the transition across the boundary
+    // happens, so the tiles it blends there belong to the cell over the line.
+    let scene = content.cell(&SHORE);
+    let mut drawn: Vec<String> = terrain(&scene)
+        .submeshes
+        .iter()
+        .flat_map(|submesh| {
+            let MaterialKind::Terrain(layers) =
+                scene.materials.materials()[submesh.material as usize].kind
+            else {
+                panic!("ground blends between named textures")
+            };
+            layers
+                .0
+                .into_iter()
+                .map(|texture| scene.materials.textures()[texture.0 as usize].clone())
+        })
+        .collect();
+    drawn.sort_unstable();
+    drawn.dedup();
+
+    let own = own_textures(&content, &SHORE);
+    let borrowed: Vec<&String> = drawn.iter().filter(|name| !own.contains(name)).collect();
+    println!(
+        "{SHORE} draws {borrowed:?} from its neighbours, on top of its own {}",
+        own.len()
+    );
+    assert!(
+        !borrowed.is_empty(),
+        "the ground draws only this cell's own {} textures, so nothing is blending across the \
+         boundary and two cells meet in a seam",
+        own.len()
+    );
+
+    // And what it borrows has to actually be next door, rather than anything at all.
+    let neighbours: Vec<String> = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+        .iter()
+        .flat_map(|(dx, dy)| {
+            let CellId::Exterior { x, y } = SHORE else {
+                unreachable!()
+            };
+            own_textures(
+                &content,
+                &CellId::Exterior {
+                    x: x + dx,
+                    y: y + dy,
+                },
+            )
+        })
+        .collect();
+    for name in borrowed {
+        assert!(
+            neighbours.contains(name),
+            "the ground draws {name:?}, which belongs to neither this cell nor any beside it"
+        );
+    }
 }
 
 #[test]

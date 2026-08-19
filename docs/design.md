@@ -1291,14 +1291,12 @@ already had spare, so **no new binding, no new buffer, and 48 bytes stays 48 byt
 like any other material: a cell has 1,024 quadrants and about 78 distinct tuples (worst measured
 121), because most quadrants sit inside a run of tiles naming the same texture.
 
-A cell origin is a whole number of tiles, so it cancels and the weights are
+A cell origin is a whole number of tiles, so it cancels and the weights are a function of world
+position alone, 0 at the lower-left centre and 1 at the upper-right, wrapping exactly where the
+quadrant's own tuple shifts by one tile so the ramp stays continuous.
 
-```glsl
-vec2 weight = fract(world.xy / 512.0 - 0.5);
-```
-
-0 at the lower-left centre, approaching 1 at the upper-right, wrapping exactly where the quadrant's
-own tuple shifts by one tile so the ramp is continuous across the boundary.
+**The first version of that ramp was wrong in two ways, and §8.14 is what it should have been.** It
+ran linearly from one tile centre to the next, and it stopped at the cell boundary.
 
 **Cost:** three extra texture taps on ground pixels — **6.60 ms against 5.95 ms** of trace at
 1920×1080 on a view that is almost entirely terrain, and less than that with a horizon in frame. An
@@ -1514,3 +1512,77 @@ is left of where it is now, and a vector pointing the other way smears history b
 this frame and the previous one alike. They have to agree — the position must be the point the view
 looks from — and passed as three arguments nothing said so; a frame whose rays start somewhere its
 matrices do not would render a plausible picture of the wrong place.
+
+### 8.14 The ground was blended everywhere and nowhere
+
+Reported from a screenshot: terrain reading as overlapping translucent squares, and elsewhere a
+razor-straight seam with no blend at all. Two faults in §8.8, and they pull in opposite directions.
+
+**A tile has to read as itself somewhere.** The ramp ran the whole 512 units from one tile centre to
+the next, so *no point on the map drew a single texture* — every one was a mix of four, and a tile
+came out as a translucent square laid over its neighbours rather than as ground. The original engine
+does not do that. It blends through a map of **two texels per tile**, each tile's own pair at full
+weight, and lets bilinear filtering do the rest — `components/esmterrain/storage.cpp:497`, where the
+comment is *"We need to upscale the blendmap 2x with nearest neighbor sampling to look like
+Vanilla"*. That confines the transition to the 256 units straddling the boundary and leaves the
+middle half of every tile pure. Written directly, it is the same one line with a clamp:
+
+```glsl
+vec2 weight = clamp(fract(world.xy / 512.0 - 0.5) * 2.0 - 0.5, 0.0, 1.0);
+```
+
+**And the blend stopped at the cell boundary.** `terrain_materials` read one cell's `VTEX` and
+clamped past its edge, so a cell's outermost quadrant blended a tile *with itself*. Two cells
+therefore met in a 512-unit band of flat ground — 256 from each — with a hard seam down the middle,
+every 8,192 units. The reported coordinates landed on tile row 15.67 of 16, which is exactly that
+band; the arithmetic said so before the render did.
+
+The fix is to read the eight neighbours' `VTEX` as well, as one grid three cells on a side. A
+neighbour that is open sea has no `LAND` record at all and keeps the old clamped value — which is
+the right answer where there is genuinely nothing to blend with, rather than everywhere.
+
+**Cost: 230 ms across a 428-cell window**, 1,387 against 1,155, or about half a millisecond a cell.
+That is why `LandRecord::textures_of` exists: eight full `LandRecord::parse` calls per cell would
+have undone eight delta-coded heightmaps and eight normal fields to read one subrecord. Interning
+only the tiles a quadrant can reach — the cell and a border of one, rather than the whole
+neighbourhood — is a further 40 ms; it was worth having and it is *not* where the time goes, which
+the first guess at it had backwards.
+
+**What is asserted.** The render test now predicts every pixel of the new profile exactly, *and*
+that a point well inside a tile draws that tile alone — the property the first version had no way to
+fail. On real data, Seyda Neen's ground must draw at least one texture its own `VTEX` never names,
+and every such texture must belong to a cell beside it: reverting to the clamped version fails it
+with "the ground draws only this cell's own 8 textures", while still producing a perfectly plausible
+list of Bitter Coast art. That was the trap in the original test, which pinned the *names* and so
+could not see a missing blend at all.
+
+### 8.15 A promoted cell kept the terrain it had when it was far away
+
+Reported as hard-edged rectangles of the wrong ground, a few hundred units across, on terrain right
+under the camera — and only after flying. A fresh screenshot of the same coordinates never showed it,
+which is the whole clue: the cell had to have been somewhere else first.
+
+**Mesh slots are grow-only and keyed by source path.** That is what makes a neighbouring cell nearly
+free (§8.9) — the second cell to name a rock gets the one already uploaded. Terrain is keyed by its
+cell, `land:x,y`, because a heightmap belongs to exactly one and no other cell can share it.
+
+The distant tier (§8.9) broke that premise without changing the key. **A cell has one heightmap per
+level of detail**, and both were called `land:x,y`. So a cell that arrived in the distant ring at
+stride 4 and was later promoted into the detailed window found its name already taken and was handed
+back the coarse mesh — geometry *and* the material indices baked into its submeshes at upload. Near
+terrain then drew 512-unit quads each carrying a single quadrant's four textures, which under the
+clamped ramp of §8.14 saturate into exactly the reported rectangles. Before that clamp the same fault
+was there and merely looked like a smear.
+
+The key is now `land:x,y@stride`. Two meshes per cell instead of one, in a table the design already
+keeps for the life of the renderer.
+
+**Why the tests missed it.** Every one loaded a cell once. `cell_residency.rs` covered the sharing
+this depends on — two cells naming one mesh upload it once — and nothing covered a cell coming back
+*different*, which is the case the second tier introduced. There are now two: the scene names its
+terrain by detail, and the renderer, handed the same cell at another detail, uploads a mesh rather
+than reusing the one under the old name.
+
+**Out of scope, noted:** anything else a cell can name that changes with its detail would have the
+same problem. Nothing does today — objects are keyed by file path and are the same mesh at any tier —
+but the key is the invariant, not the terrain.
