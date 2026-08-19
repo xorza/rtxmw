@@ -238,7 +238,7 @@ vec3 absorbed_by_water(vec3 radiance, float path) {
 // The normal is flipped to face the ray so one path serves both sides of the surface; `eta` is what
 // distinguishes them, and total internal reflection then falls out of `refract` returning zero
 // rather than needing the critical angle spelled out.
-vec3 water_shade(Surface surface, vec3 incident, uvec2 pixel) {
+vec3 water_shade(Surface surface, vec3 incident, uvec2 pixel, out Guides guides) {
     // Which side of the water the ray is on is a question about the *plane*, not about a wave:
     // at a glancing angle a facet can tilt far enough to face away from the ray, and reading that
     // as "the camera is underwater" sends the reflection down into the seabed and turns the far
@@ -273,8 +273,13 @@ vec3 water_shade(Surface surface, vec3 incident, uvec2 pixel) {
     float cosine = clamp(dot(-incident, n), 0.0, 1.0);
     float fresnel = WATER_F0 + (1.0 - WATER_F0) * pow(1.0 - cosine, 5.0);
 
-    // Only the refraction needs to know how far its ray went; nothing is absorbed above the
-    // surface, so the reflection's distance is discarded.
+    // Water is the whole of this world's specular response. The lobe is the spread the waves too
+    // small to resolve leave behind, which is exactly what roughness means; the reflection's
+    // distance is filled in below, once the ray has been cast.
+    guides = Guides(vec3(fresnel), clamp(lobe, 0.0, 1.0), 0.0);
+
+    // The refraction's distance drives absorption, and the reflection's is the specular guide — it
+    // was discarded here until an upscaler needed to know how fast the reflection moves.
     // Offset along the *plane*, not the facet: what a ray has to clear to avoid finding this
     // surface again is the quad, and only the plane's normal is guaranteed to take it off that.
     // **Absorption follows whichever ray went into the water, and that flips with the side.** Seen
@@ -284,6 +289,7 @@ vec3 water_shade(Surface surface, vec3 incident, uvec2 pixel) {
     float mirrored;
     vec3 reflected = water_ray(surface.position + flat_normal * SHADOW_BIAS, reflect(incident, n),
                                surface.footprint, lobe, pixel, STREAM_WATER_REFLECT, mirrored);
+    guides.specular_distance = mirrored;
     if (from_below) {
         reflected = absorbed_by_water(reflected, mirrored);
     }

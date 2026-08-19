@@ -20,6 +20,12 @@ const NORMAL_DEPTH_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 /// Light arriving at a surface, with its own albedo divided out. Unbounded, so half float.
 const ILLUMINATION_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 
+/// The mirror-like part of a surface's response in `rgb`, how sharp it is in `a`.
+///
+/// Half float like the rest: both are fractions, and neither is a quantity a step of a thousandth
+/// could be wrong about.
+const MATERIAL_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
+
 /// Where each pixel's surface was on the previous frame's screen, in pixels.
 ///
 /// **Full floats, unlike everything else here.** A motion vector spans the frame — up to a couple of
@@ -44,6 +50,7 @@ pub(crate) struct GBuffer {
     /// The one the trace writes and the composite reads. The filter swaps which is which.
     illumination: [Image; 2],
     motion: Image,
+    material: Image,
 }
 
 impl GBuffer {
@@ -67,6 +74,11 @@ impl GBuffer {
                 MOTION_FORMAT,
                 storage | vk::ImageUsageFlags::TRANSFER_SRC,
             )?,
+            material: image(
+                "gbuffer material",
+                MATERIAL_FORMAT,
+                storage | vk::ImageUsageFlags::TRANSFER_SRC,
+            )?,
         })
     }
 
@@ -83,6 +95,11 @@ impl GBuffer {
         &self.motion
     }
 
+    /// Specular albedo and roughness, which an upscaler reads alongside the colour.
+    pub(crate) fn material(&self) -> &Image {
+        &self.material
+    }
+
     /// The image the trace writes its lighting into, and the one a filter reads first.
     pub(crate) fn illumination(&self) -> &Image {
         &self.illumination[0]
@@ -94,13 +111,14 @@ impl GBuffer {
     }
 
     /// Every image, for a caller transitioning them together.
-    pub(crate) fn images(&self) -> [&Image; 5] {
+    pub(crate) fn images(&self) -> [&Image; 6] {
         [
             &self.albedo,
             &self.normal_depth,
             &self.illumination[0],
             &self.illumination[1],
             &self.motion,
+            &self.material,
         ]
     }
 }

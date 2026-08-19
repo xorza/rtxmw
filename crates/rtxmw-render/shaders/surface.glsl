@@ -141,6 +141,32 @@ vec3 ground_colour(Material material, vec2 world, vec2 uv, float lod) {
     return colour;
 }
 
+// What an upscaler needs about a surface beyond its colour.
+//
+// Separate from `Surface` because it is a different question: `Surface` is what the geometry and the
+// material say, and this is what a temporal filter needs in order to know how a *reflection* on that
+// surface moves — which is not the same as how the surface itself moves. DLSS Ray Reconstruction
+// wants all three; §5.2 records that the guide is easy to forget and awkward to add late, which is
+// why it is written now, before there is anything reading it.
+struct Guides {
+    // The mirror-like part of the surface's response. Zero across vanilla Morrowind, whose materials
+    // carry no specular at all — `NiSpecularProperty` is force-disabled at this NIF version — so
+    // water is the only thing in the world that fills this in.
+    vec3 specular_albedo;
+    // How sharp that part is: one for a surface that reflects nothing coherently, toward zero for a
+    // mirror.
+    float roughness;
+    // How far the specular ray travelled. **This is the guide proper**: a reflection moves across
+    // the screen at a rate set by the distance to what is reflected rather than to the surface, so a
+    // filter given only depth reprojects every mirror wrongly. Zero where nothing was reflected.
+    float specular_distance;
+};
+
+// What every surface in a diffuse world says: nothing reflects, and nothing is reflected.
+Guides matte() {
+    return Guides(vec3(0.0), 1.0, 0.0);
+}
+
 // Whether a candidate intersection survives its material's alpha cutout.
 //
 // Only non-opaque geometry reaches this: the build marks a run `OPAQUE` when its material is, and

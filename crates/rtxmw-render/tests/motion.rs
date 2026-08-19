@@ -60,7 +60,16 @@ fn steps() -> StaticScene {
 ///
 /// One renderer across both, because the previous frame is state it keeps: handing each frame its
 /// own would make every frame the first one, which is exactly the case that reports no motion.
-fn motion_after(eyes: &[Vec3]) -> Vec<f32> {
+fn motion_after(eyes: &[Vec3], jitter: bool) -> Vec<f32> {
+    motion_with(eyes, jitter, |_| {})
+}
+
+/// As [`motion_after`], calling `between` on the renderer after every frame but the last.
+fn motion_with(
+    eyes: &[Vec3],
+    jitter: bool,
+    mut between: impl FnMut(&mut SceneRenderer),
+) -> Vec<f32> {
     let gpu = TestGpu::shared();
     let mut renderer = SceneRenderer::new(
         gpu.device(),
@@ -74,6 +83,7 @@ fn motion_after(eyes: &[Vec3]) -> Vec<f32> {
     .expect("renderer should build");
     renderer.set_bounce_samples(0);
     renderer.set_denoise_passes(0);
+    renderer.set_jitter(jitter);
 
     let mut uploader = gpu.uploader();
     renderer
@@ -89,12 +99,15 @@ fn motion_after(eyes: &[Vec3]) -> Vec<f32> {
 
     let projection =
         glam::camera::rh::proj::vulkan::perspective_infinite_reverse(90f32.to_radians(), 1.0, 0.05);
-    for eye in eyes {
+    for (index, eye) in eyes.iter().enumerate() {
         let view = glam::camera::rh::view::look_to_mat4(*eye, Vec3::X, Vec3::Z);
         let constants = renderer.frame_constants(view, projection, *eye);
         renderer
             .render_once(&mut uploader, &constants)
             .expect("frame should render");
+        if index + 1 < eyes.len() {
+            between(&mut renderer);
+        }
     }
 
     let motion = readback::image_to_f32(&mut uploader, renderer.motion(), vk::ImageLayout::GENERAL)
@@ -111,11 +124,81 @@ fn at(motion: &[f32], x: u32, y: u32) -> Vec2 {
 }
 
 #[test]
+fn forgetting_the_history_makes_the_next_frame_a_first_frame() {
+    // **The reset an upscaler needs**, and the case motion vectors cannot describe: the camera has
+    // not moved *through* the world, it has arrived somewhere else — walking a door, or a cell
+    // changing under it. Every vector into the previous frame is then a lie about a surface that
+    // was not on screen, and a filter that believes them smears the old place over the new one.
+    let step = [Vec3::ZERO, Vec3::new(0.0, 4.0, 0.0)];
+
+    // The same two frames, once remembering and once not.
+    let remembered = motion_after(&step, false);
+    let forgotten = motion_with(&step, false, |renderer| {
+        assert!(
+            renderer.has_history(),
+            "a frame that has been rendered leaves history behind"
+        );
+        renderer.forget_history();
+        assert!(
+            !renderer.has_history(),
+            "the history survived being forgotten"
+        );
+    });
+
+    let moved = at(&remembered, SIZE / 4, SIZE / 2);
+    let reset = at(&forgotten, SIZE / 4, SIZE / 2);
+    println!("stepping reports {moved:?} remembering and {reset:?} after a reset");
+    assert!(
+        moved.length() > 0.5,
+        "the fixture reports no motion to forget: {moved:?}"
+    );
+    assert!(
+        reset.length() < 1.0e-3,
+        "a frame whose history was dropped still reported {reset:?}; it has to reproject onto \
+         itself, which is what zero means"
+    );
+}
+
+#[test]
+fn jitter_moves_the_ray_and_leaves_the_motion_vector_alone() {
+    // **The convention this pins.** The jitter is applied to the pixel's coordinate rather than to
+    // the projection, so the hit it produces projects back through that same matrix to exactly that
+    // coordinate — a motion vector measured against it therefore carries no jitter, and a camera
+    // that did not move reports nothing however far inside its pixel the ray went.
+    //
+    // Measuring against the pixel *centre* instead is the plausible alternative, and it is wrong in
+    // a way only this shows: it reports the frame's own jitter as motion, up to half a pixel of
+    // history fetched from the wrong place every frame the camera is still.
+    let still = motion_after(&[Vec3::ZERO, Vec3::ZERO], true);
+    let worst = (0..SIZE * SIZE)
+        .map(|i| at(&still, i % SIZE, i / SIZE).length())
+        .fold(0.0f32, f32::max);
+    println!("a still camera with jitter on reports {worst} pixels of motion");
+    assert!(
+        worst < 1.0e-3,
+        "a still camera reported {worst} pixels of motion with jitter on; the jitter is leaking \
+         into the vector"
+    );
+
+    // And the jitter is genuinely on, or the assertion above is about nothing: two frames of it
+    // must trace different sub-pixel points and so land on different depths at a slope.
+    let stepped = motion_after(&[Vec3::ZERO, Vec3::new(0.0, 4.0, 0.0)], true);
+    let plain = motion_after(&[Vec3::ZERO, Vec3::new(0.0, 4.0, 0.0)], false);
+    let moved = at(&stepped, SIZE / 4, SIZE / 2);
+    let unmoved = at(&plain, SIZE / 4, SIZE / 2);
+    println!("stepping reports {moved:?} jittered and {unmoved:?} not");
+    assert!(
+        (moved - unmoved).length() < 0.05,
+        "jitter changed a real motion vector from {unmoved:?} to {moved:?}"
+    );
+}
+
+#[test]
 fn a_still_camera_reports_no_motion_and_a_stepping_one_reports_it_by_depth() {
     // The first frame has no history at all, and neither does a frame whose camera did not move;
     // both have to come back as zero rather than as whatever the allocator left in the image.
-    let first = motion_after(&[Vec3::ZERO]);
-    let still = motion_after(&[Vec3::ZERO, Vec3::ZERO]);
+    let first = motion_after(&[Vec3::ZERO], false);
+    let still = motion_after(&[Vec3::ZERO, Vec3::ZERO], false);
     for (name, frame) in [("the first frame", &first), ("a still camera", &still)] {
         let worst = (0..SIZE * SIZE)
             .map(|i| at(frame, i % SIZE, i / SIZE).length())
@@ -127,7 +210,7 @@ fn a_still_camera_reports_no_motion_and_a_stepping_one_reports_it_by_depth() {
     // a fixed surface therefore sits further *right* than it did. The vector points back to the
     // history, so it is negative — this is the sign a temporal filter adds to a pixel coordinate to
     // find last frame's sample, and getting it backwards smears the image the wrong way.
-    let stepped = motion_after(&[Vec3::ZERO, Vec3::new(0.0, 4.0, 0.0)]);
+    let stepped = motion_after(&[Vec3::ZERO, Vec3::new(0.0, 4.0, 0.0)], false);
 
     // The near wall fills the left of the image — north is screen-left — and the far one the right.
     let near = at(&stepped, SIZE / 4, SIZE / 2);

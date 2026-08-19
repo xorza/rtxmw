@@ -137,6 +137,28 @@ fn centre_radiance(scene: &StaticScene, eye: Vec3, forward: Vec3) -> Vec3 {
 
 /// Traces `scene` from `eye` toward `forward` with the clock at `time`, and returns the frame.
 fn frame_at(scene: &StaticScene, eye: Vec3, forward: Vec3, time: f32) -> Vec<u8> {
+    rendered(scene, eye, forward, time, |uploader, renderer| {
+        readback::image_to_rgba8(
+            uploader,
+            renderer.target(),
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+        )
+        .expect("readback should succeed")
+    })
+}
+
+/// Renders one frame of `scene` and hands the finished renderer to `read`.
+///
+/// Which image a test wants back is the only thing that varies — the trace's own radiance for the
+/// numbers most of these assert, the material target for the guides — so the setup lives here once
+/// rather than beside each.
+fn rendered<T>(
+    scene: &StaticScene,
+    eye: Vec3,
+    forward: Vec3,
+    time: f32,
+    read: impl FnOnce(&mut rtxmw_gpu::Uploader, &SceneRenderer) -> T,
+) -> T {
     let gpu = TestGpu::shared();
     let mut renderer = SceneRenderer::new(
         gpu.device(),
@@ -185,16 +207,61 @@ fn frame_at(scene: &StaticScene, eye: Vec3, forward: Vec3, time: f32) -> Vec<u8>
         .render_once(&mut uploader, &constants)
         .expect("frame should render");
 
-    let pixels = readback::image_to_rgba8(
-        &mut uploader,
-        renderer.target(),
-        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-    )
-    .expect("readback should succeed");
+    let read = read(&mut uploader, &renderer);
     drop(uploader);
     gpu.assert_no_validation_errors();
+    read
+}
 
-    pixels
+/// The specular guide the trace wrote for the middle pixel: albedo in `rgb`, roughness in `a`.
+fn guides_at(scene: &StaticScene, eye: Vec3, forward: Vec3) -> glam::Vec4 {
+    let channels = rendered(scene, eye, forward, 0.0, |uploader, renderer| {
+        readback::image_to_f32(uploader, renderer.material(), vk::ImageLayout::GENERAL)
+            .expect("readback should succeed")
+    });
+    let index = ((HEIGHT / 2) * WIDTH + WIDTH / 2) as usize * 4;
+    glam::Vec4::from_slice(&channels[index..index + 4])
+}
+
+#[test]
+fn water_is_the_only_thing_that_reflects_and_it_says_so_in_the_guide() {
+    // **What DLSS Ray Reconstruction reads to reproject a reflection.** A mirror does not move
+    // across the screen the way the surface carrying it does — it moves with whatever is reflected —
+    // so a filter given only depth smears every reflection. §5.2 records that this is easy to forget
+    // and awkward to add late, which is why it is written before anything reads it.
+    //
+    // Vanilla Morrowind has no specular at all: `NiSpecularProperty` is force-disabled at this NIF
+    // version, so every material in the world is matte and water is the single exception.
+    // Under the surface looking *down*, so the floor is what the ray finds and no water is crossed
+    // on the way — pointing up from here would hit the surface, which is the one thing that is not
+    // matte.
+    let seabed = guides_at(&pool(400.0), Vec3::new(0.0, 0.0, -100.0), Vec3::NEG_Z);
+    println!("a matte floor reports {seabed:?}");
+    assert_eq!(
+        seabed.truncate(),
+        Vec3::ZERO,
+        "something other than water claimed a specular response"
+    );
+    assert_eq!(seabed.w, 1.0, "a matte surface is not fully rough");
+
+    // Straight down onto water: the reflection is weakest head-on, so this is Fresnel at its floor
+    // — a few per cent — and the surface is nearly a mirror.
+    let above = guides_at(&pool(400.0), Vec3::new(0.0, 0.0, 200.0), Vec3::NEG_Z);
+    println!("water from overhead reports {above:?}");
+    assert!(
+        above.x > 0.0 && above.x < 0.2,
+        "water's specular albedo head-on is {}, not the few per cent Fresnel gives",
+        above.x
+    );
+    assert!(
+        above.w < 0.5,
+        "water came out rougher than a matte floor at {}",
+        above.w
+    );
+    // Grey: the surface reflects every wavelength alike, and a tint here would mean the Fresnel
+    // term had picked up the water's colour.
+    assert_eq!(above.x, above.y);
+    assert_eq!(above.y, above.z);
 }
 
 #[test]

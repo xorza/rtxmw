@@ -62,7 +62,13 @@ void main() {
     // The projection is reverse-Z, so the near plane is depth 1 and the far plane is depth 0. The
     // far plane is also at infinity, where w collapses to zero — so the near plane is the only one
     // that can be unprojected at all.
-    vec2 ndc = ((vec2(pixel) + 0.5) / vec2(size)) * 2.0 - 1.0;
+    // The jitter moves the point inside the pixel that the ray goes through, so successive frames
+    // sample different places in it. **It does not need taking back out for the motion vector**: the
+    // jitter is applied to the coordinate and not to the matrix, so projecting the hit back through
+    // that same matrix returns this exact `ndc`, and a vector measured against it is the surface's
+    // own screen motion with the jitter already cancelled. Measuring against the pixel centre
+    // instead would report the jitter itself as motion every time the camera stood still.
+    vec2 ndc = ((vec2(pixel) + 0.5 + frame.jitter) / vec2(size)) * 2.0 - 1.0;
     vec4 near_point = frame.ndc_to_world_offset * vec4(ndc, 1.0, 1.0);
     vec3 direction = normalize(near_point.xyz / near_point.w);
 
@@ -74,10 +80,12 @@ void main() {
     // since a real hit is always at least `RAY_MIN` away.
     vec3 emitted = sky(direction);
     vec3 lighting = vec3(0.0);
+    // Nothing in vanilla Morrowind is specular but its water, so this is the answer everywhere else.
+    Guides guides = matte();
     if (surface.water) {
         // Written whole to the output rather than through the G-buffer: there is no albedo to
         // demodulate by, and nothing noisy for the filter to improve.
-        emitted = water_shade(surface, direction, pixel);
+        emitted = water_shade(surface, direction, pixel, guides);
     } else if (surface.hit) {
         emitted = surface.emissive;
         lighting = gather_indirect(surface, pixel)
@@ -96,7 +104,11 @@ void main() {
 
     imageStore(motion_target, ivec2(pixel), vec4(motion_vector(surface, direction, ndc, size), 0.0, 0.0));
 
-    imageStore(albedo_target, ivec2(pixel), vec4(albedo, 1.0));
+    // The specular distance rides in the alpha, which the composite does not read and which the
+    // normal target already sets the precedent for by carrying depth in its own fourth channel.
+    imageStore(albedo_target, ivec2(pixel), vec4(albedo, guides.specular_distance));
+    imageStore(
+        material_target, ivec2(pixel), vec4(guides.specular_albedo, guides.roughness));
     imageStore(normal_depth_target, ivec2(pixel), vec4(surface.normal, surface.t));
     imageStore(illumination_target, ivec2(pixel), vec4(lighting, 1.0));
     // Alpha carries whether anything was hit at all. Inferring it from the colour worked while the

@@ -115,6 +115,10 @@ pub struct SceneRenderer {
     /// Where the camera stood when [`Self::frame_constants`] was last asked, or `None` before the
     /// first frame. What this frame's motion vectors are measured against.
     previous_view: Option<Viewpoint>,
+    /// Whether to offset each frame's rays inside their pixel. Off until an upscaler asks.
+    jitter: bool,
+    /// Frames asked for so far, which is what indexes the jitter sequence.
+    frames: u32,
     timestamps: Timestamps,
 }
 
@@ -162,6 +166,8 @@ impl SceneRenderer {
             denoise_passes: DEFAULT_PASSES,
             time: 0.0,
             previous_view: None,
+            jitter: false,
+            frames: 0,
             // One more than the stages, since a duration needs a timestamp either side of it.
             timestamps: Timestamps::new(device, physical, FrameTimings::STAGES as u32 + 1)?,
         };
@@ -349,6 +355,39 @@ impl SceneRenderer {
         &self.target
     }
 
+    /// Whether each frame's rays are offset inside their pixel, and whether this frame has history.
+    ///
+    /// **Off by default, because on its own jitter is only shimmer.** It pays for itself when
+    /// something accumulates across frames and can resolve detail no single frame holds; until then
+    /// it moves every edge a fraction of a pixel a frame and resolves nothing. DLSS Ray
+    /// Reconstruction is what turns it on.
+    pub fn set_jitter(&mut self, enabled: bool) {
+        self.jitter = enabled;
+    }
+
+    /// Whether the next frame has a previous one to reuse, or is starting from nothing.
+    ///
+    /// False before the first frame and after [`SceneRenderer::forget_history`] — the reset an
+    /// upscaler needs when the camera has jumped somewhere its motion vectors cannot describe, such
+    /// as a walk through a door.
+    pub fn has_history(&self) -> bool {
+        self.previous_view.is_some()
+    }
+
+    /// Declares the previous frame unusable, so the next one reprojects onto itself.
+    pub fn forget_history(&mut self) {
+        self.previous_view = None;
+    }
+
+    /// The specular albedo and roughness of each pixel's surface, in `rgb` and `a`.
+    ///
+    /// In `GENERAL` once [`SceneRenderer::record`] has run. The specular *distance* that goes with
+    /// them rides in the alpha of [`SceneRenderer::target`]'s companion albedo image, which the
+    /// composite does not read.
+    pub fn material(&self) -> &Image {
+        self.gbuffer.material()
+    }
+
     /// Where each pixel's surface was on the previous frame's screen, as a displacement in pixels.
     ///
     /// In `GENERAL` once [`SceneRenderer::record`] has run. Written every frame and read by nothing
@@ -400,10 +439,19 @@ impl SceneRenderer {
         // themselves and every motion vector is zero, which is what a temporal filter with no
         // history should be told.
         let previous = self.previous_view.replace(now).unwrap_or(now);
+        // Zero unless something is accumulating over frames, which nothing is until DLSS Ray
+        // Reconstruction arrives — see `FrameConstants::jitter`.
+        let jitter = if self.jitter {
+            FrameConstants::jitter_at(self.frames)
+        } else {
+            glam::Vec2::ZERO
+        };
+        self.frames = self.frames.wrapping_add(1);
         FrameConstants::new(
             now,
             previous,
             lighting,
+            jitter,
             // From the renderer's own target height, so the mip a surface samples follows the
             // resolution it is being traced at.
             FrameConstants::cone_spread_from(projection, self.target.extent().height),

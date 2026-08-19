@@ -1586,3 +1586,44 @@ than reusing the one under the old name.
 **Out of scope, noted:** anything else a cell can name that changes with its detail would have the
 same problem. Nothing does today — objects are keyed by file path and are the same mesh at any tier —
 but the key is the invariant, not the terrain.
+
+### 8.16 The guides an upscaler reads, written before there is one
+
+§5.2 lists what DLSS Ray Reconstruction wants and warns that the specular guide is *"easy to forget
+and awkward to add late"*. The awkwardness is real and specific: the guide is a quantity the **trace**
+has to record at the hit, so retrofitting it means going back into the shader rather than adding a
+pass. It is written now, with nothing reading it.
+
+**Specular albedo, roughness, and the specular hit distance.** A reflection does not move across the
+screen the way the surface carrying it does — it moves with whatever is reflected — so a temporal
+filter given only depth reprojects every mirror wrongly. The distance to the reflected hit is what
+fixes that, and `water_ray` was already returning it and throwing it away: *"the reflection's distance
+is discarded"*.
+
+Vanilla Morrowind is matte. `NiSpecularProperty` is force-disabled at this NIF version, so **water is
+the only thing in the world with a specular response** — its Fresnel term is the albedo and the lobe
+left by waves too small to resolve is the roughness, both already computed. Everything else reports
+`Guides(vec3(0), 1, 0)`.
+
+**One new image, not three.** Specular albedo and roughness share an `rgba16f`; the distance rides in
+the **albedo target's alpha**, which the composite does not read and which was a constant 1.0 — the
+same idiom the normal target already uses for depth.
+
+**Jitter, off by default.** Sub-pixel offsets let successive frames resolve detail no single frame
+holds; on their own they are shimmer, so nothing turns them on until something accumulates. Halton in
+bases 2 and 3 rather than a random offset, and the test asserts the property that distinguishes them:
+16 frames must touch all four quadrants of the pixel and 64 must touch all sixteen sixteenths, which
+a random sequence fails by clumping.
+
+**The convention I got wrong, and how.** The obvious reading of "motion vectors must exclude jitter"
+is to measure against the pixel centre, and that is what I wrote. The fault injection did not fire,
+which was the tell: working out why showed the change was backwards. The jitter is applied to the
+*coordinate*, not the matrix, so a hit produced by a jittered ray projects back through that same
+matrix to exactly the jittered coordinate — measuring against it cancels the jitter, and measuring
+against the centre *introduces* it. With the centre version a still camera reports **0.30 pixels** of
+motion that is purely its own jitter, which is history fetched from the wrong place every frame. The
+original line was right; the test that now pins it did not exist, and both existing motion tests pass
+either way with jitter off.
+
+**Cost:** one more `imageStore` per pixel and an image at 1080p. The visible output is unchanged —
+0 of 921,600 pixels differ, jitter being off.

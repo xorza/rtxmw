@@ -2,7 +2,7 @@
 
 use ash::vk;
 use bytemuck::{Pod, Zeroable};
-use glam::{Mat4, Vec3};
+use glam::{Mat4, Vec2, Vec3};
 use rtxmw_gpu::{Binding, Buffer, BufferMemory, ComputePipeline, Device, Image, Memory};
 use rtxmw_scene::Sun;
 
@@ -66,6 +66,14 @@ pub struct FrameConstants {
     /// its clip coordinates. See [`FrameConstants::motion`].
     previous_clip_from_offset: [f32; 16],
     camera_position: [f32; 3],
+    /// Sub-pixel offset added to the pixel centre this frame, in pixels.
+    ///
+    /// **Zero unless an upscaler asked for it.** Jitter exists so that successive frames sample
+    /// different points inside a pixel and a temporal filter can resolve detail no single frame
+    /// holds; on its own it is just shimmer, so nothing turns it on until something is accumulating.
+    /// It moves the ray and needs no unpicking afterwards: applied to the coordinate rather than to
+    /// the matrix, it cancels out of a motion vector measured against that same coordinate.
+    jitter: [f32; 2],
     /// How far the eye moved since the previous frame, `now - before`.
     ///
     /// A difference of two positions the size of the world, and exact all the same: subtracting two
@@ -131,6 +139,7 @@ impl FrameConstants {
         now: Viewpoint,
         previous: Viewpoint,
         lighting: Lighting,
+        jitter: Vec2,
         cone_spread: f32,
         bounce_samples: u32,
         time: f32,
@@ -146,6 +155,7 @@ impl FrameConstants {
             ndc_to_world_offset: now.clip_from_offset().inverse().to_cols_array(),
             previous_clip_from_offset: previous.clip_from_offset().to_cols_array(),
             camera_position: now.position.to_array(),
+            jitter: jitter.to_array(),
             camera_motion: (now.position - previous.position).to_array(),
             light_grid_scale: lighting.light_grid.scale,
             light_grid_origin: lighting.light_grid.origin.to_array(),
@@ -163,6 +173,31 @@ impl FrameConstants {
             // the moment the sea state becomes something a cell can set.
             waves: SeaState::default().waves(),
         }
+    }
+
+    /// The `index`th term of the Halton sequence in `base`, on `-0.5..0.5`.
+    ///
+    /// **A low-discrepancy sequence rather than a random one**, which is the whole point: over any
+    /// prefix of it the samples are spread evenly inside the pixel, where random offsets clump and
+    /// leave gaps that a temporal filter resolves as neither. Bases 2 and 3 are the usual pair, and
+    /// are coprime so the two axes do not walk in step.
+    fn halton(mut index: u32, base: u32) -> f32 {
+        let mut result = 0.0;
+        let mut fraction = 1.0 / base as f32;
+        while index > 0 {
+            result += (index % base) as f32 * fraction;
+            index /= base;
+            fraction /= base as f32;
+        }
+        result - 0.5
+    }
+
+    /// Where inside its pixel frame `index` samples, in pixels.
+    ///
+    /// One-based, because Halton's zeroth term is zero on every axis and a first frame that sampled
+    /// the exact pixel centre would repeat whatever an un-jittered frame already had.
+    pub(crate) fn jitter_at(index: u32) -> Vec2 {
+        Vec2::new(Self::halton(index + 1, 2), Self::halton(index + 1, 3))
     }
 
     /// How wide one pixel's ray cone grows per unit of distance.
@@ -283,17 +318,18 @@ impl VisibilityPass {
                     Binding::storage_image(9),
                     Binding::storage_image(10),
                     Binding::storage_image(11),
+                    Binding::storage_image(12),
                     // The frame's own constants. They were push constants until waves needed a
                     // clock and the block was already exactly the 128 bytes Vulkan guarantees —
                     // see `FrameConstants`. Motion vectors at M7 would have forced the same move.
-                    Binding::storage_buffer(12),
-                    // The light grid: prefix offsets, then the light indices they address.
                     Binding::storage_buffer(13),
+                    // The light grid: prefix offsets, then the light indices they address.
                     Binding::storage_buffer(14),
+                    Binding::storage_buffer(15),
                     // Last, because Vulkan allows a variable descriptor count only on a set's final
                     // binding. Adding anything after this one moves it — validation rejects the set
                     // outright, which is how this was caught.
-                    Binding::variable_samplers(15, max_textures),
+                    Binding::variable_samplers(16, max_textures),
                 ],
                 0,
                 shaders::primary_visibility(),
@@ -325,7 +361,7 @@ impl VisibilityPass {
             .range(vk::WHOLE_SIZE)];
         let frame_write = vk::WriteDescriptorSet::default()
             .dst_set(self.pipeline.set())
-            .dst_binding(12)
+            .dst_binding(13)
             .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
             .buffer_info(&frame_info);
 
@@ -350,7 +386,7 @@ impl VisibilityPass {
         let texture_infos = scene.textures.descriptors();
         let texture_write = vk::WriteDescriptorSet::default()
             .dst_set(self.pipeline.set())
-            .dst_binding(15)
+            .dst_binding(16)
             .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
             .image_info(&texture_infos);
 
@@ -364,6 +400,7 @@ impl VisibilityPass {
                 gbuffer.normal_depth(),
                 gbuffer.illumination(),
                 gbuffer.motion(),
+                gbuffer.material(),
             ],
         );
 
@@ -390,7 +427,7 @@ impl VisibilityPass {
             .range(vk::WHOLE_SIZE)];
         let grid_offset_write = vk::WriteDescriptorSet::default()
             .dst_set(self.pipeline.set())
-            .dst_binding(13)
+            .dst_binding(14)
             .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
             .buffer_info(&grid_offset_info);
 
@@ -399,7 +436,7 @@ impl VisibilityPass {
             .range(vk::WHOLE_SIZE)];
         let grid_index_write = vk::WriteDescriptorSet::default()
             .dst_set(self.pipeline.set())
-            .dst_binding(14)
+            .dst_binding(15)
             .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
             .buffer_info(&grid_index_info);
 
@@ -493,21 +530,22 @@ mod tests {
         assert_eq!(offset_of!(FrameConstants, ndc_to_world_offset), 0);
         assert_eq!(offset_of!(FrameConstants, previous_clip_from_offset), 64);
         assert_eq!(offset_of!(FrameConstants, camera_position), 128);
-        assert_eq!(offset_of!(FrameConstants, camera_motion), 140);
-        assert_eq!(offset_of!(FrameConstants, light_grid_scale), 152);
-        assert_eq!(offset_of!(FrameConstants, light_grid_origin), 156);
-        assert_eq!(offset_of!(FrameConstants, light_grid_dimensions), 168);
-        assert_eq!(offset_of!(FrameConstants, ambient), 180);
-        assert_eq!(offset_of!(FrameConstants, cone_spread), 192);
-        assert_eq!(offset_of!(FrameConstants, sun_direction), 196);
-        assert_eq!(offset_of!(FrameConstants, sun_cos_radius), 208);
-        assert_eq!(offset_of!(FrameConstants, sun_colour), 212);
-        assert_eq!(offset_of!(FrameConstants, bounce_samples), 224);
-        assert_eq!(offset_of!(FrameConstants, water_level), 228);
-        assert_eq!(offset_of!(FrameConstants, time), 232);
+        assert_eq!(offset_of!(FrameConstants, jitter), 140);
+        assert_eq!(offset_of!(FrameConstants, camera_motion), 148);
+        assert_eq!(offset_of!(FrameConstants, light_grid_scale), 160);
+        assert_eq!(offset_of!(FrameConstants, light_grid_origin), 164);
+        assert_eq!(offset_of!(FrameConstants, light_grid_dimensions), 176);
+        assert_eq!(offset_of!(FrameConstants, ambient), 188);
+        assert_eq!(offset_of!(FrameConstants, cone_spread), 200);
+        assert_eq!(offset_of!(FrameConstants, sun_direction), 204);
+        assert_eq!(offset_of!(FrameConstants, sun_cos_radius), 216);
+        assert_eq!(offset_of!(FrameConstants, sun_colour), 220);
+        assert_eq!(offset_of!(FrameConstants, bounce_samples), 232);
+        assert_eq!(offset_of!(FrameConstants, water_level), 236);
+        assert_eq!(offset_of!(FrameConstants, time), 240);
         // The wave table follows, twenty tightly packed bytes apiece.
-        assert_eq!(offset_of!(FrameConstants, waves), 236);
-        assert_eq!(size_of::<FrameConstants>(), 236 + 20 * WAVE_COUNT);
+        assert_eq!(offset_of!(FrameConstants, waves), 244);
+        assert_eq!(size_of::<FrameConstants>(), 244 + 20 * WAVE_COUNT);
     }
 
     #[test]
@@ -565,6 +603,7 @@ mod tests {
                 sun: None,
                 water_level: None,
             },
+            Vec2::ZERO,
             0.0,
             0,
             0.0,
@@ -804,6 +843,53 @@ mod tests {
         assert!(
             moved[0] > moved[1] * 5.0 && moved[1] > moved[2] * 5.0,
             "parallax did not fall off with depth: {moved:?}"
+        );
+    }
+
+    #[test]
+    fn the_jitter_covers_the_pixel_evenly_and_never_repeats_a_place() {
+        // **The property a random offset would not have.** Jitter earns its cost by letting
+        // successive frames resolve detail no single frame holds, and that needs the samples spread
+        // across the pixel rather than merely unpredictable: random offsets clump, leaving parts of
+        // the pixel unvisited for runs of frames and others visited twice over.
+        let samples: Vec<Vec2> = (0..64).map(FrameConstants::jitter_at).collect();
+
+        // Inside the pixel, and centred on it: a sequence biased to one side would drag every edge
+        // in the frame that way.
+        for (index, sample) in samples.iter().enumerate() {
+            assert!(
+                sample.x.abs() <= 0.5 && sample.y.abs() <= 0.5,
+                "sample {index} is at {sample:?}, outside its own pixel"
+            );
+        }
+        let mean = samples.iter().sum::<Vec2>() / samples.len() as f32;
+        assert!(mean.length() < 0.02, "the sequence leans toward {mean:?}");
+
+        // **Evenly spread, checked as coverage rather than as a mean** — which a sequence that
+        // alternated between two opposite corners would also pass. Sixteen frames must touch every
+        // quadrant of the pixel, and sixty-four must touch all sixteen sixteenths.
+        let cell = |sample: &Vec2, side: f32| {
+            let at = |v: f32| ((v + 0.5) * side).floor().min(side - 1.0) as u32;
+            (at(sample.y) * side as u32) + at(sample.x)
+        };
+        for (frames, side) in [(16usize, 2.0f32), (64, 4.0)] {
+            let mut seen: Vec<u32> = samples[..frames].iter().map(|s| cell(s, side)).collect();
+            seen.sort_unstable();
+            seen.dedup();
+            assert_eq!(
+                seen.len(),
+                (side * side) as usize,
+                "{frames} frames reached {} of the pixel's {} parts",
+                seen.len(),
+                side * side
+            );
+        }
+
+        // And the first frame is not the pixel centre, which an un-jittered frame already sampled.
+        assert!(
+            samples[0].length() > 0.1,
+            "the first sample is {:?}",
+            samples[0]
         );
     }
 
