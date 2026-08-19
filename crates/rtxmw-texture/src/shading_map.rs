@@ -122,6 +122,15 @@ fn coarse_luminance(texture: &Texture) -> Vec<f32> {
         .collect()
 }
 
+/// What one byte of a shading map means, as the multiplier to divide a texel by.
+///
+/// **The sampler's arithmetic, for something doing it on the processor.** A texture sheet has to
+/// show what a frame would draw, and the only way it can is by asking rather than by repeating the
+/// transfer function and the scale in a second place.
+pub(crate) fn multiplier(encoded: u8) -> f32 {
+    to_linear(f32::from(encoded) / 255.0) * RANGE.end()
+}
+
 /// A map that changes nothing, for a material whose texture is missing.
 ///
 /// **Not the array's fallback.** An absent shading map would leave the slot holding the magenta
@@ -142,8 +151,7 @@ fn to_srgb(linear: f32) -> f32 {
     }
 }
 
-/// Its inverse, which is what the sampler applies. Here for the tests that read a map back.
-#[cfg(test)]
+/// Its inverse, which is what the sampler applies.
 fn to_linear(encoded: f32) -> f32 {
     if encoded <= 0.040_45 {
         encoded / 12.92
@@ -241,7 +249,7 @@ mod tests {
     fn shading(map: &Texture) -> Vec<f32> {
         map.data()
             .chunks_exact(4)
-            .map(|texel| to_linear(f32::from(texel[0]) / 255.0) * RANGE.end())
+            .map(|texel| multiplier(texel[0]))
             .collect()
     }
 

@@ -1,6 +1,7 @@
 //! A decoded texture: pixel data plus the shape needed to upload it.
 
 use crate::error::{Result, TextureError};
+use crate::rgba8;
 use crate::shading_map;
 use crate::{dds, tga};
 
@@ -154,6 +155,22 @@ impl Texture {
     /// own.
     pub fn shading_map(&self) -> Texture {
         shading_map::estimate(self)
+    }
+
+    /// The top level as `RGBA8`, whatever this is stored as.
+    ///
+    /// **For inspection, not for rendering.** Every target samples BC natively, so a frame never
+    /// wants this — what does is a tool that has to draw a texture into an image of its own.
+    pub fn to_rgba8(&self) -> Vec<u8> {
+        rgba8::expand(self)
+    }
+
+    /// What one byte of a [`Texture::shading_map`] means, as the multiplier to divide a texel by.
+    ///
+    /// Exposed because a tool that draws the correction has to do it the way the sampler does; see
+    /// `SHADING_SCALE` in `surface.glsl` for the shader's own copy of the same number.
+    pub fn shading_multiplier(encoded: u8) -> f32 {
+        shading_map::multiplier(encoded)
     }
 
     /// A shading map that changes nothing, for a material whose texture never loaded.

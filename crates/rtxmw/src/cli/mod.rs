@@ -22,6 +22,7 @@ mod tests;
 pub(crate) enum Command {
     Window(WindowOptions),
     Screenshot(ScreenshotOptions),
+    TextureSheet(TextureSheetOptions),
 }
 
 impl Command {
@@ -34,41 +35,53 @@ impl Command {
     /// Exits the process on a bad argument or on `--help`, which is what clap's own `parse_from`
     /// does and what a command line is expected to do.
     pub(crate) fn parse_from(arguments: &[String]) -> Self {
-        if !names_screenshot(arguments) {
+        if names(arguments, SHEET_FLAG) {
+            return Self::TextureSheet(command_or_help::<TextureSheetOptions>(arguments));
+        }
+        if !names(arguments, SCREENSHOT_FLAG) {
             return Self::Window(WindowOptions::parse_from(arguments));
         }
-        match ScreenshotOptions::try_parse_from(arguments) {
-            Ok(options) => Self::Screenshot(options),
-            // **`--screenshot` takes a value, so clap meets a `--help` beside it by reporting the
-            // value missing.** Technically correct and useless: there is nothing else the two
-            // together could mean.
-            //
-            // Behind a failure rather than in front of the parse, so that this crate never
-            // adjudicates an argument clap was willing to read. The two happen to agree on what
-            // `-h` is today; only one of them is the authority on it.
-            Err(_) if names_help(arguments) => {
-                ScreenshotOptions::command()
-                    .print_long_help()
-                    .expect("the help text should reach stdout");
-                std::process::exit(0);
-            }
-            Err(failed) => failed.exit(),
-        }
+        Self::Screenshot(command_or_help::<ScreenshotOptions>(arguments))
     }
 }
 
-/// Whether the arguments name the offscreen command.
+/// Parses `arguments` as `T`, printing `T`'s help where that is what they asked for.
 ///
-/// **Anywhere among them, not first.** Requiring this one flag to lead was a rule with nothing
-/// behind it once a parser read the rest, so `--frames 8 --screenshot out.png` now works.
+/// **`--screenshot` and `--textures` take a value, so clap meets a `--help` beside one by reporting
+/// the value missing.** Technically correct and useless: there is nothing else the two together
+/// could mean. Behind a failure rather than in front of the parse, so that this crate never
+/// adjudicates an argument clap was willing to read.
+fn command_or_help<T: Parser + CommandFactory>(arguments: &[String]) -> T {
+    match T::try_parse_from(arguments) {
+        Ok(options) => options,
+        Err(_) if names_help(arguments) => {
+            T::command()
+                .print_long_help()
+                .expect("the help text should reach stdout");
+            std::process::exit(0);
+        }
+        Err(failed) => failed.exit(),
+    }
+}
+
+/// The flag that selects the offscreen render, and the one that selects the texture sheet.
+const SCREENSHOT_FLAG: &str = "--screenshot";
+const SHEET_FLAG: &str = "--textures";
+
+/// Whether the arguments name `flag`, in either the spaced or the `=` spelling.
 ///
-/// A *positional* before it still binds by the offscreen grammar, where the first one is the size —
-/// `-2,-9 --screenshot out.png` is a size that will not parse, not a cell. Nothing can fix that: the
-/// two commands disagree about what the first positional means, which is why they are two.
+/// **Anywhere among them, not first.** Requiring a command's flag to lead was a rule with nothing
+/// behind it once a parser read the rest, so `--frames 8 --screenshot out.png` works.
 ///
-fn names_screenshot(arguments: &[String]) -> bool {
-    options(arguments)
-        .any(|argument| argument == "--screenshot" || argument.starts_with("--screenshot="))
+/// A *positional* before it still binds by that command's own grammar, where the first one is the
+/// size — `-2,-9 --screenshot out.png` is a size that will not parse, not a cell. Nothing can fix
+/// that: the commands disagree about what the first positional means, which is why they are
+/// separate.
+///
+/// Scanning stops at a bare `--`, which ends option parsing: past it the same word is a value.
+fn names(arguments: &[String], flag: &str) -> bool {
+    let equals = format!("{flag}=");
+    options(arguments).any(|argument| argument == flag || argument.starts_with(&equals))
 }
 
 /// Whether the arguments ask for help, in either of the two spellings clap accepts.
@@ -196,8 +209,9 @@ fn at_least_one(value: &str) -> Result<u32, String> {
 #[command(
     about = "A raytraced Morrowind engine.",
     after_help = concat!(
-        "Add --screenshot <PATH> to render offscreen and exit, opening no window.\n",
-        "Its own arguments are at `rtxmw --screenshot --help`.",
+        "Add --screenshot <PATH> to render offscreen and exit, opening no window,\n",
+        "or --textures <PATH> to write a contact sheet of a cell's textures.\n",
+        "Their own arguments are at `rtxmw --screenshot --help` and `rtxmw --textures --help`.",
     )
 )]
 pub(crate) struct WindowOptions {
@@ -298,4 +312,22 @@ pub(crate) struct ScreenshotOptions {
         value_parser = upscaling,
     )]
     pub(crate) dlss: Upscaling,
+}
+
+/// What a texture sheet was asked for.
+#[derive(Parser, Debug, Clone, PartialEq)]
+#[command(about = "Writes a contact sheet of a cell's textures and exits.")]
+pub(crate) struct TextureSheetOptions {
+    /// Write the sheet to this PNG: every texture the cell uses, vanilla left, de-lit right.
+    #[arg(long = "textures", value_name = "PATH")]
+    pub(crate) path: PathBuf,
+    /// Whose textures: a coordinate pair like -2,-9 is an exterior, anything else names an
+    /// interior.
+    #[arg(
+        value_name = "CELL",
+        default_value = scene_loader::DEFAULT_CELL,
+        value_parser = cell,
+        allow_hyphen_values = true,
+    )]
+    pub(crate) cell: CellId,
 }

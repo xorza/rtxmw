@@ -7,8 +7,8 @@ use rtxmw_render::dlss::Preset;
 use rtxmw_scene::CellId;
 
 use crate::cli::{
-    SCREENSHOT_SIZE, ScreenshotOptions, UPSCALING_DEFAULT, Upscaling, WindowOptions, names_help,
-    names_screenshot, size, upscaling,
+    SCREENSHOT_FLAG, SCREENSHOT_SIZE, SHEET_FLAG, ScreenshotOptions, UPSCALING_DEFAULT, Upscaling,
+    WindowOptions, names, names_help, size, upscaling,
 };
 use crate::scene_loader;
 use crate::scene_loader::ViewpointOverride;
@@ -66,7 +66,7 @@ fn the_offscreen_command_is_named_wherever_the_flag_falls() {
         vec!["--samples", "1", "--screenshot=out.png", "1920x1080"],
     ] {
         assert!(
-            names_screenshot(&argv(&arguments)),
+            names(&argv(&arguments), SCREENSHOT_FLAG),
             "{arguments:?} names the offscreen command"
         );
     }
@@ -81,10 +81,22 @@ fn the_offscreen_command_is_named_wherever_the_flag_falls() {
         vec!["--", "--screenshot"],
     ] {
         assert!(
-            !names_screenshot(&argv(&arguments)),
+            !names(&argv(&arguments), SCREENSHOT_FLAG),
             "{arguments:?} does not name the offscreen command"
         );
     }
+}
+
+#[test]
+fn the_sheet_and_the_screenshot_are_told_apart() {
+    // Two commands selected the same way, so neither may answer for the other — and the sheet is
+    // checked first, since asking for both is a contradiction rather than a render.
+    assert!(names(&argv(&["--textures", "sheet.png"]), SHEET_FLAG));
+    assert!(!names(&argv(&["--textures", "sheet.png"]), SCREENSHOT_FLAG));
+    assert!(!names(&argv(&["--screenshot", "out.png"]), SHEET_FLAG));
+    // A near miss must not count: this is a cell whose name begins the same way.
+    assert!(!names(&argv(&["--texturesque"]), SHEET_FLAG));
+    assert!(names(&argv(&["--textures=sheet.png"]), SHEET_FLAG));
 }
 
 #[test]

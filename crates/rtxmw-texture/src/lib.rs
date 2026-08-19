@@ -1,10 +1,13 @@
 //! Decoding the texture formats Morrowind ships.
 //!
-//! The compressed formats are not decompressed: DXT1 and DXT3 are BC1 and BC2, which every target
-//! GPU samples natively, so decoding means parsing a header and handing the blocks on untouched.
+//! The compressed formats are not decompressed on the way to the GPU: DXT1 and DXT3 are BC1 and BC2,
+//! which every target samples natively, so decoding means parsing a header and handing the blocks on
+//! untouched. [`Texture::to_rgba8`] exists beside that for something that has to *look* at a
+//! texture rather than sample it, and is not on any path a frame takes.
 
 mod dds;
 mod error;
+mod rgba8;
 mod shading_map;
 mod texture;
 mod tga;

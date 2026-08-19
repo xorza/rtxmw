@@ -2259,3 +2259,29 @@ left the sky added on top of every surface in the scene. The tell was the scale:
 cell's 181 materials emissive, nothing about emissive could touch every pixel, and the difference map
 was every pixel. Zeroing `emitted` explicitly is the other half of the change, and with it the frame
 moves by 0.007 RMS with its mean luminance unchanged to six figures.
+
+### 8.37 A contact sheet, so de-lighting can be judged rather than argued about
+
+§5.1 says the correction is judged by eye against the same surfaces, and names over-correction as the
+failure to watch for. That is not something a metric sees: an estimate that removes painted detail
+and one that removes painted light move the numbers the same way. `--textures <PATH> [CELL]` writes
+every texture a cell uses, vanilla beside de-lit, as one image.
+
+```
+rtxmw --textures sheet.png -1,-9
+```
+
+**It needed a decompressor, which this crate had deliberately never had.** BC1 and BC2 go straight to
+the GPU, so nothing on a frame's path wants texels — but something that has to *draw* a texture into
+an image of its own does. `Texture::to_rgba8` is that, and the module note now says which of the two
+it is rather than claiming the crate never decompresses at all. Its tests are hand-computed against
+BC1's palettes, both the four-colour one and the three-colour mode whose fourth entry is transparent.
+
+**The correction on the sheet is the shader's arithmetic**, at the same strength and against the same
+map, so what it shows is what a frame would draw rather than a second opinion about it. Thumbnails
+are nearest-neighbour on purpose: a smoothed one would hide exactly the loss of detail this exists to
+find.
+
+Dispatch generalised while adding it: the scan that told the offscreen command from the windowed one
+now takes the flag as an argument, since there are three commands and two of them are selected the
+same way.
