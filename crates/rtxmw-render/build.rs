@@ -111,39 +111,31 @@ fn validate(module: &Path) {
 /// it.
 #[cfg(feature = "dlss")]
 fn link_ngx() {
-    println!("cargo:rustc-check-cfg=cfg(ngx)");
     println!("cargo:rerun-if-env-changed=DLSS_SDK_DIR");
-    let named = std::env::var_os("DLSS_SDK_DIR").map(PathBuf::from);
-    let sdk = named.clone().unwrap_or_else(|| {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .join(".refs/dlss")
-    });
+    let sdk = std::env::var_os("DLSS_SDK_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../..")
+                .join(".refs/dlss")
+        });
     let lib = sdk.join("lib/Linux_x86_64");
 
-    if !lib.join("libnvsdk_ngx.a").is_file() {
-        // **Missing is not an error unless it was asked for by name.** `--all-features` is the
-        // documented verification chain, so a fresh clone has to build with it; the SDK is NVIDIA's
-        // and cannot be in this repository, and a build that fails without it would make the chain
-        // undocumentable. Absent, the feature compiles to nothing and its tests are not there to
-        // skip — the same shape as a machine without the game.
-        assert!(
-            named.is_none(),
-            "DLSS_SDK_DIR names {}, and there is no libnvsdk_ngx.a under it",
-            sdk.display()
-        );
-        println!(
-            "cargo:warning=no NGX SDK at {}, so DLSS is compiled out. Fetch it with `git clone \
-             --depth 1 https://github.com/NVIDIA/DLSS.git .refs/dlss`, or set DLSS_SDK_DIR.",
-            sdk.display()
-        );
-        return;
-    }
+    // **A hard error, not a quiet disable.** The first version warned and compiled the feature out,
+    // so that `--all-features` would build on a machine without the SDK — and that put the "is it
+    // really here" answer in a `cfg` only this crate can see, which the binary then had to gate on
+    // and could not. Requiring it is one rule instead of two, and the message says what to do.
+    assert!(
+        lib.join("libnvsdk_ngx.a").is_file(),
+        "the `dlss` feature needs NVIDIA's NGX SDK, and there is none at {}.\n\
+         Fetch it with `git clone --depth 1 https://github.com/NVIDIA/DLSS.git .refs/dlss`, or set \
+         DLSS_SDK_DIR to where it already is.",
+        lib.display()
+    );
 
-    println!("cargo:rustc-cfg=ngx");
-    // Where NGX must be told to look for its feature libraries: the default search is the
-    // application folder alone, and these are not beside the binary. Handed down rather than
-    // rebuilt, so `DLSS_SDK_DIR` is honoured everywhere the SDK is named and not only here.
+    // Where NGX must be told to look for its feature libraries: its default search is the
+    // application folder alone, and these are not beside the binary. Handed down rather than rebuilt
+    // so `DLSS_SDK_DIR` is honoured wherever the SDK is named.
     println!(
         "cargo:rustc-env=NGX_FEATURE_DIR={}",
         lib.join("rel").display()

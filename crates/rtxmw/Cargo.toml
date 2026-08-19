@@ -7,6 +7,10 @@ license.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Forwards to the renderer's, which needs NVIDIA's NGX SDK on disk. Off by default.
+dlss = ["rtxmw-render/dlss"]
+
 [dependencies]
 rtxmw-gpu.workspace = true
 rtxmw-render.workspace = true

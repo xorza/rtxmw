@@ -796,9 +796,11 @@ git clone --depth 1 https://github.com/NVIDIA/DLSS.git .refs/dlss
 `DLSS_SDK_DIR` overrides the location. The binding is hand-written FFI against the C header — no
 generator and no crate — and the whole path sits behind the `dlss` feature.
 
-**Absent, it compiles out rather than failing.** `--all-features` is the documented verification
-chain, so a fresh clone has to build with it; `build.rs` warns and disables instead. Naming a wrong
-`DLSS_SDK_DIR` is still an error, because that is a mistake rather than an absence.
+**The feature requires the SDK**, and `build.rs` fails with the command to fetch it if it is absent.
+The first version warned and compiled the feature out so that `--all-features` would build without
+it — and that put "is it really here" in a `cfg` only `rtxmw-render` can see, which the binary then
+had to gate on and could not. `--all-features` therefore needs the SDK fetched, the way the tests
+need the game installed.
 
 ---
 
@@ -1819,3 +1821,69 @@ resolution, and neither NGX nor the validation layer can tell one from the other
 an empty allocation, so there is no picture to check either. What this establishes is the resource
 wrapper, the parameter names and the call sequence; whether the right image reaches the right name is
 a question only a real frame can answer, and that is the next step rather than a gap in this one.
+
+### 8.23 Ray Reconstruction is wired into the frame, and produces black
+
+The frame path now reorders around it — trace, composite, **DLSS**, exposure, tone curve — with the
+à-trous filter set to zero, the tone curve moved to the upscaled size and jitter turned on. On a real
+cell it reports `1920x1080 to 3840x2160` and takes about 4 ms. **And the picture is black.**
+
+**What is established.** Read back directly, the upscaled image has peak 1.0 with exactly 8,294,400
+non-zero channels — one per pixel of a 3840×2160 frame, which is the alpha. So DLSS runs, writes its
+output, and writes nothing but alpha. Its colour input is a real frame: 7.6 of 8.3 million channels
+above zero. Nothing errors, and the validation layer is silent.
+
+**Two real bugs found on the way there**, both mine and both fixed: no barrier between the composite
+writing the colour and DLSS reading it, and the tone curve dispatched over the *render* extent while
+writing a 4K image — which left three quarters of the frame as the allocator had it.
+
+**What was ruled out.** Reverse-Z clip depth with `DepthInverted` and `Use.HW.Depth`, against linear
+world distance with neither: black both ways. The parameter names are the RR-specific ones, checked
+against the header — `DLSS.Input.DiffuseAlbedo`, `DLSS.Input.SpecularAlbedo`, `GBuffer.Normals`,
+which the helper sets twice and the second one wins.
+
+**Still to try**, in the order I would: the normal encoding, since nothing has confirmed DLSS reads
+world-space `[-1, 1]` rather than packed `[0, 1]`; the subrect base parameters, which the SDK's helper
+sets for every input and this does not; and feeding a constant colour to separate "DLSS ignores its
+input" from "DLSS rejects its guides".
+
+**Superseded by §8.24**, which found the cause. Everything ruled out above stayed ruled out.
+
+**It is opt-in twice over** until that is understood: `--features dlss` to compile it, and
+`RTXMW_DLSS=1` to attach it. Building with the feature and not setting the variable is **pixel-for-
+pixel identical to the default build** — checked, 0 of 921,600 — so nothing already working is
+standing on this.
+
+### 8.24 The black frame was a missing usage flag
+
+**DLSS samples its inputs.** Every image handed to Ray Reconstruction has to be created with
+`VK_IMAGE_USAGE_SAMPLED_BIT`, and ours were `STORAGE | TRANSFER_SRC` — which is everything the
+renderer's own passes need and one bit short of what NGX needs. An image it cannot sample reads as
+zero. NGX returns success, the validation layer says nothing, and the network resolves a black field
+to a uniform 2⁻²³ — the second-smallest half-float subnormal, its floor rather than a real value.
+
+Adding the bit to the G-buffer, the trace target and the upscaled output turned 640×360 into a clean
+1280×720 in one change.
+
+**What found it was varying an input and watching nothing happen.** Constant colours of 0.25, 1.0 and
+100.0 produced bit-identical output, which says DLSS never read that image — and the output image was
+being written through the same wrapper, so the wrapper, the struct layout, the `SetVoidPointer` path
+and the parameter name were all fine by construction. That narrowed it to a property of the image
+rather than of the code around it.
+
+**Two things ruled out on the way, both now reverted.** The `AutoExposure` creation flag and the
+`DLSS.Pre.Exposure` / `DLSS.Exposure.Scale` scalars the SDK's helper substitutes 1.0 into: measured
+bit-identical with and without, and §3.7 of the RR integration guide says exposure is not supported by
+Ray Reconstruction at all. The SDK helper setting them is DLSS-SR heritage.
+
+**The test now asserts a picture.** A constant frame is the one input whose correct output is
+arithmetic rather than a reimplementation of the network — a flat field can only upscale to itself —
+so `[0.25, 0.5, 0.75]` in has to come back as itself, per channel, and does to within 0.15%. Three
+different values rather than one, because a grey would pass a single-channel check while proving
+nothing about which channel was read. Removing the usage bit fails it with the 2⁻²³ floor in the
+message.
+
+**The upscale got its own timing stage** on the way out. It had been recorded inside the composite's
+window, which reported a 0.65 ms upscale as 0.65 ms of compositing — the composite's real cost is
+0.01 ms. A stage that is the most expensive thing in the frame cannot be measured as part of the
+cheapest.

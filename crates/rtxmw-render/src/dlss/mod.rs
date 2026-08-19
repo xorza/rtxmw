@@ -17,8 +17,10 @@
 
 use std::ffi::{CStr, c_char, c_int, c_uint, c_void};
 
-use rtxmw_gpu::{Device, Image, Instance, PhysicalDevice};
+use ash::vk;
+use rtxmw_gpu::{Device, Image, Instance, PhysicalDevice, Uploader};
 
+pub mod error;
 mod ffi;
 
 /// How much NGX says about what it is doing, from `RTXMW_NGX_LOG`.
@@ -52,6 +54,10 @@ const FEATURE_RAY_RECONSTRUCTION: c_int = 13;
 /// low — render — resolution, which §8.13 writes them at. Reasoning it the other way round and
 /// leaving it out is what Ray Reconstruction rejects with "Low resolution Motion Vectors required",
 /// a message reachable only from NGX's own log.
+///
+/// **`AutoExposure` is deliberately absent**, and so are `DLSS.Pre.Exposure` and
+/// `DLSS.Exposure.Scale` beside it: Ray Reconstruction does not support exposure at all, as its
+/// integration guide says in §3.7 and as setting them measures — bit-identical either way.
 const CREATE_FLAGS: c_int = (1 << 0) | (1 << 1) | (1 << 3);
 
 /// Extensions NGX names that Vulkan 1.2 provides itself, and which must therefore not be enabled.
@@ -65,9 +71,9 @@ const SUPERSEDED_BY_CORE: &[&CStr] = &[c"VK_EXT_buffer_device_address"];
 /// changed between versions. It takes no Vulkan objects, so it can be asked before either exists —
 /// which is the only order that works, since they have to be created with the answer.
 #[derive(Debug)]
-struct Requirements {
-    instance: Vec<&'static CStr>,
-    device: Vec<&'static CStr>,
+pub struct Requirements {
+    pub instance: Vec<&'static CStr>,
+    pub device: Vec<&'static CStr>,
 }
 
 impl Requirements {
@@ -75,7 +81,7 @@ impl Requirements {
     ///
     /// The lists belong to the SDK and live as long as it is loaded, which is the whole process —
     /// hence `'static`, and hence nothing is copied out of them.
-    fn query() -> Result<Self, Status> {
+    pub fn query() -> Result<Self, Status> {
         let mut instance_count: c_uint = 0;
         let mut instance: *const *const c_char = std::ptr::null();
         let mut device_count: c_uint = 0;
@@ -197,7 +203,7 @@ unsafe fn names(array: *const *const c_char, count: c_uint) -> Vec<&'static CStr
 /// this needs to *report* them faithfully far more than it needs to match on them. The SDK names
 /// them all, including ones it has not been told about, so `Display` asks rather than guessing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Status(u32);
+pub struct Status(u32);
 
 impl Status {
     const SUCCESS: u32 = 1;
@@ -206,7 +212,7 @@ impl Status {
     const OUT_OF_DATE: Self = Self(0xBAD0_0000 | 12);
 
     /// Whether the call succeeded.
-    fn is_ok(self) -> bool {
+    pub fn is_ok(self) -> bool {
         self.0 == Self::SUCCESS
     }
 
@@ -465,6 +471,146 @@ impl Ngx {
         status.is_ok().then_some(value)
     }
 }
+
+/// DLSS Ray Reconstruction, ready to upscale a frame.
+///
+/// **Constructed by whoever owns the Vulkan instance**, which the renderer does not — NGX is brought
+/// up on an instance, a physical device and a device together, and handing the finished thing over
+/// keeps `SceneRenderer::new` from growing a parameter that ten tests would have to satisfy for a
+/// feature they do not use.
+///
+/// Field order is the drop order: the feature is released before NGX is shut down, and the image
+/// outlives neither.
+#[derive(Debug)]
+pub struct Upscaler {
+    feature: Feature,
+    ngx: Ngx,
+    output: Image,
+    render: vk::Extent2D,
+}
+
+impl Upscaler {
+    /// Brings NGX up and builds Ray Reconstruction to take `render` and produce `output`.
+    ///
+    /// Records the feature's weight upload through `uploader`, which it waits on — this is a
+    /// once-per-resolution cost, not a per-frame one.
+    ///
+    /// `data` is a directory NGX may write to, and `feature_libraries` is where its own `.so` files
+    /// are; a release ships them beside the binary.
+    ///
+    /// The render size is DLSS's own answer for `output`, asked once here rather than through a
+    /// second NGX brought up and shut down to answer it — which is what a caller needing the size
+    /// before the renderer exists otherwise leads to.
+    pub fn new(
+        instance: &Instance,
+        physical: &PhysicalDevice,
+        device: &Device,
+        uploader: &mut Uploader,
+        output: vk::Extent2D,
+        paths: Paths<'_>,
+    ) -> Result<Self, crate::dlss::error::UpscalerError> {
+        let ngx = Ngx::new(
+            instance,
+            physical,
+            device,
+            paths.data,
+            paths.feature_libraries,
+        )?;
+        let settings = ngx.optimal_settings((output.width, output.height), Preset::Performance)?;
+        let render = vk::Extent2D {
+            width: settings.render.0,
+            height: settings.render.1,
+        };
+        let target = Image::new(
+            uploader.memory(),
+            "dlss output",
+            output,
+            OUTPUT_FORMAT,
+            vk::ImageUsageFlags::STORAGE
+                | vk::ImageUsageFlags::SAMPLED
+                | vk::ImageUsageFlags::TRANSFER_SRC,
+        )?;
+
+        let mut built = None;
+        uploader.submit_and_wait(|_, cmd| {
+            built = Some(ngx.build(
+                cmd,
+                settings.render,
+                (output.width, output.height),
+                Preset::Performance,
+            ));
+        })?;
+        let feature = built.expect("the recording ran")?;
+
+        Ok(Self {
+            feature,
+            ngx,
+            output: target,
+            render,
+        })
+    }
+
+    /// The upscaled frame, in `GENERAL` once the renderer has recorded one.
+    pub fn output(&self) -> &Image {
+        &self.output
+    }
+
+    /// The resolution the frame feeding this must be traced at.
+    pub fn render_size(&self) -> vk::Extent2D {
+        self.render
+    }
+
+    /// Records one upscale of the frame `gbuffer` and `colour` hold.
+    ///
+    /// # Safety
+    /// `cmd` must be recording, and every image must be in `GENERAL` and hold this frame.
+    pub(crate) unsafe fn record(
+        &self,
+        cmd: vk::CommandBuffer,
+        colour: &Image,
+        gbuffer: &crate::gbuffer::GBuffer,
+        jitter: glam::Vec2,
+        reset: bool,
+    ) -> Result<(), Status> {
+        self.feature.evaluate(
+            cmd,
+            Inputs {
+                colour,
+                // The albedo target's `rgb`; DLSS reads three channels and ignores the fourth, which
+                // carries the specular hit distance.
+                diffuse_albedo: gbuffer.albedo(),
+                specular_albedo: gbuffer.material(),
+                normal_roughness: gbuffer.normal_roughness(),
+                depth: gbuffer.depth(),
+                motion: gbuffer.motion(),
+                output: &self.output,
+                jitter,
+                reset,
+            },
+        )
+    }
+}
+
+/// Where NGX may write, and where its feature libraries are.
+///
+/// Both are the caller's to choose: a release ships the libraries beside the binary, and a test
+/// points at wherever the SDK was fetched.
+#[derive(Debug, Clone, Copy)]
+pub struct Paths<'a> {
+    pub data: &'a std::path::Path,
+    pub feature_libraries: &'a std::path::Path,
+}
+
+/// Where `build.rs` found the SDK's feature libraries.
+///
+/// Published because a build script's environment reaches only its own crate, and the binary needs
+/// to tell NGX where to look — deriving the path again there would miss `DLSS_SDK_DIR`. A release
+/// ships them beside the executable and points here instead.
+pub const FEATURE_LIBRARIES: &str = env!("NGX_FEATURE_DIR");
+
+/// What the upscaled frame is written as. Half float, because it is still scene-referred radiance —
+/// exposure and the tone curve come after.
+const OUTPUT_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 
 /// A built DLSS Ray Reconstruction feature, and the parameter map it was built from.
 ///
@@ -830,10 +976,10 @@ mod tests {
             "the build reported success and produced no feature"
         );
 
-        // **And it runs.** Every input is a real image of the right size and format, in `GENERAL`,
-        // and the output is the 4K one DLSS was built to fill. What this proves is the resource
-        // wrapper and the parameter names — the picture is the *next* thing, once the renderer's own
-        // frame feeds this instead of a set of empty targets.
+        // **And it produces a picture.** Every input is a real image of the right size and format
+        // filled with a constant, which is the one frame whose correct output is known without
+        // reimplementing the network: a flat field can only upscale to itself. Asserting only that
+        // `evaluate` returned success would pass on a black frame, which is what it did.
         let image = |name: &str, size: (u32, u32), format: ash::vk::Format| {
             Image::new(
                 &memory,
@@ -843,7 +989,10 @@ mod tests {
                     height: size.1,
                 },
                 format,
-                ash::vk::ImageUsageFlags::STORAGE,
+                ash::vk::ImageUsageFlags::STORAGE
+                    | ash::vk::ImageUsageFlags::SAMPLED
+                    | ash::vk::ImageUsageFlags::TRANSFER_DST
+                    | ash::vk::ImageUsageFlags::TRANSFER_SRC,
             )
             .expect("an image should allocate")
         };
@@ -857,14 +1006,60 @@ mod tests {
         let motion = image("motion", settings.render, ash::vk::Format::R32G32_SFLOAT);
         let output = image("output", OUTPUT, half);
 
+        // A frame with nothing in it to resolve: uniform radiance over a flat wall one unit deep,
+        // facing the camera, stationary. Roughness 1 in the normal's `w` is fully diffuse, and the
+        // depth's second channel is the world distance §8.20 puts there.
+        let filled: [(&Image, [f32; 4]); 6] = [
+            (&colour, [0.25, 0.5, 0.75, 1.0]),
+            (&diffuse, [0.5, 0.5, 0.5, 1.0]),
+            (&specular, [0.04, 0.04, 0.04, 1.0]),
+            (&normals, [0.0, 0.0, 1.0, 1.0]),
+            (&depth, [0.5, 100.0, 0.0, 0.0]),
+            (&motion, [0.0, 0.0, 0.0, 0.0]),
+        ];
+        for (target, value) in filled {
+            uploader
+                .submit_and_wait(|device, cmd| {
+                    // SAFETY: the command buffer is recording and the image is alive.
+                    unsafe {
+                        rtxmw_gpu::image_barrier::transition(
+                            device,
+                            cmd,
+                            target.raw(),
+                            ash::vk::ImageLayout::UNDEFINED,
+                            ash::vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        );
+                        device.cmd_clear_color_image(
+                            cmd,
+                            target.raw(),
+                            ash::vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                            &ash::vk::ClearColorValue { float32: value },
+                            &[ash::vk::ImageSubresourceRange {
+                                aspect_mask: ash::vk::ImageAspectFlags::COLOR,
+                                level_count: 1,
+                                layer_count: 1,
+                                ..Default::default()
+                            }],
+                        );
+                        rtxmw_gpu::image_barrier::transition(
+                            device,
+                            cmd,
+                            target.raw(),
+                            ash::vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                            ash::vk::ImageLayout::GENERAL,
+                        );
+                    }
+                })
+                .expect("the fill should submit");
+        }
+
         let mut ran = None;
         uploader
             .submit_and_wait(|device, cmd| {
                 // DLSS reads and writes them as storage images, which is the layout the renderer's
-                // own frame leaves the G-buffer in.
-                for target in [
-                    &colour, &diffuse, &specular, &normals, &depth, &motion, &output,
-                ] {
+                // own frame leaves the G-buffer in. The inputs are already there; only the output
+                // still has to come out of `UNDEFINED`.
+                for target in [&output] {
                     // SAFETY: the command buffer is recording and every image is alive.
                     unsafe {
                         rtxmw_gpu::image_barrier::transition(
@@ -899,6 +1094,40 @@ mod tests {
             "evaluated {:?} to {:?}",
             settings.render,
             (output.extent().width, output.extent().height)
+        );
+
+        let pixels = rtxmw_gpu::readback::image_to_f32(
+            &mut uploader,
+            &output,
+            ash::vk::ImageLayout::GENERAL,
+        )
+        .expect("the output should read back");
+        // Away from the border, where the network has no neighbourhood and rolls off.
+        let at = |x: usize, y: usize| {
+            let i = (y * output.extent().width as usize + x) * 4;
+            [pixels[i], pixels[i + 1], pixels[i + 2]]
+        };
+        let centre = at(1920, 1080);
+        println!(
+            "input [0.25, 0.5, 0.75] resolved to {centre:?}, corner {:?}",
+            at(8, 8)
+        );
+        // **A constant frame is the one input whose correct output is arithmetic**: upscaling a
+        // flat field can only produce the same flat field, so each channel has to come back as
+        // itself. Three separate values rather than one, because a grey would pass a single-channel
+        // check while proving nothing about which channel was read.
+        for (channel, expected) in centre.iter().zip([0.25, 0.5, 0.75]) {
+            assert!(
+                (channel - expected).abs() < expected * 0.05,
+                "a flat {expected:?} field resolved to {channel:?}, which is not that field — \
+                 {centre:?} against [0.25, 0.5, 0.75]"
+            );
+        }
+        // The floor a rejected input reads back as, and the reason this assertion exists: an image
+        // DLSS cannot sample is not an error anywhere, it is 2^-23 everywhere.
+        assert!(
+            centre[0] > 1e-6,
+            "the output is at the epsilon floor, so DLSS resolved an input it never read"
         );
 
         // **DLSS records its own commands into that buffer**, and a status of success says only

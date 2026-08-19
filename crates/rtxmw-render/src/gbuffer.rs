@@ -69,9 +69,12 @@ impl GBuffer {
     /// Allocates every image at `extent`.
     pub(crate) fn new(memory: &Memory, extent: vk::Extent2D) -> rtxmw_gpu::Result<Self> {
         // Every one is written by a compute shader and read by another, so all of them are storage
-        // images. Three are also copied: what they carry goes to an upscaler that has not arrived
-        // yet, so reading them back is the only way to assert on what the shader wrote.
-        let storage = vk::ImageUsageFlags::STORAGE;
+        // images. Three are also copied, which is how a test asserts on what the shader wrote.
+        //
+        // **`SAMPLED` is what the upscaler needs**, not this crate: DLSS reads its guides through a
+        // sampler, and a view without that usage reads as zero with no error from NGX and none from
+        // the validation layers — which is a black frame and nothing to say why.
+        let storage = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED;
         let readable = storage | vk::ImageUsageFlags::TRANSFER_SRC;
         let image = |name: &str, format, usage| Image::new(memory, name, extent, format, usage);
         Ok(Self {

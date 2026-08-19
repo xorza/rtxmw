@@ -52,6 +52,10 @@ pub struct FrameTimings {
     /// Every à-trous pass together.
     pub denoise: f32,
     pub composite: f32,
+    /// The upscaler, where one is attached; an empty window otherwise. Its own stage rather than
+    /// part of the composite because it is the most expensive thing in a frame that has one, and
+    /// measuring it as part of the cheapest reported 0.65 ms of compositing that cost 0.01.
+    pub upscale: f32,
     /// Histogram and the reduction over it.
     pub exposure: f32,
     /// Tone curve and sRGB encoding.
@@ -60,11 +64,11 @@ pub struct FrameTimings {
 
 impl FrameTimings {
     /// How many stages a frame is measured in, and so how many timestamps it writes.
-    const STAGES: usize = 5;
+    const STAGES: usize = 6;
 
     /// Everything the device spent on the frame.
     pub fn total(&self) -> f32 {
-        self.trace + self.denoise + self.composite + self.exposure + self.tonemap
+        self.trace + self.denoise + self.composite + self.upscale + self.exposure + self.tonemap
     }
 
     /// Reads the durations back in the order [`SceneRenderer::record`] wrote them.
@@ -73,8 +77,9 @@ impl FrameTimings {
             trace: durations[0],
             denoise: durations[1],
             composite: durations[2],
-            exposure: durations[3],
-            tonemap: durations[4],
+            upscale: durations[3],
+            exposure: durations[4],
+            tonemap: durations[5],
         }
     }
 }
@@ -87,12 +92,13 @@ impl std::fmt::Display for FrameTimings {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "device time {:.2} ms: trace {:.2}, denoise {:.2}, composite {:.2}, exposure {:.2}, \
-             tonemap {:.2}",
+            "device time {:.2} ms: trace {:.2}, denoise {:.2}, composite {:.2}, upscale {:.2}, \
+             exposure {:.2}, tonemap {:.2}",
             self.total(),
             self.trace,
             self.denoise,
             self.composite,
+            self.upscale,
             self.exposure,
             self.tonemap,
         )
@@ -117,8 +123,18 @@ pub struct SceneRenderer {
     previous_view: Option<Viewpoint>,
     /// Whether to offset each frame's rays inside their pixel. Off until an upscaler asks.
     jitter: bool,
+    /// The upscaler, when one was handed over. Absent, the denoiser and the render-resolution tone
+    /// curve carry the frame as they always have.
+    #[cfg(feature = "dlss")]
+    upscaler: Option<crate::dlss::Upscaler>,
     /// Frames asked for so far, which is what indexes the jitter sequence.
     frames: u32,
+    /// This frame's jitter and whether it had a previous frame, kept because the upscaler is told
+    /// them at *record* time while they are decided when the constants are built.
+    #[cfg(feature = "dlss")]
+    last_jitter: glam::Vec2,
+    #[cfg(feature = "dlss")]
+    had_history: bool,
     timestamps: Timestamps,
 }
 
@@ -132,13 +148,18 @@ impl std::fmt::Debug for SceneRenderer {
 }
 
 /// The image the trace writes its radiance into.
+///
+/// `SAMPLED` because this is the colour an upscaler reads, and DLSS reads through a sampler — see
+/// [`crate::gbuffer::GBuffer::new`] for what its absence costs.
 fn target_image(memory: &Memory, extent: vk::Extent2D) -> rtxmw_gpu::Result<Image> {
     Image::new(
         memory,
         "primary visibility target",
         extent,
         TARGET_FORMAT,
-        vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC,
+        vk::ImageUsageFlags::STORAGE
+            | vk::ImageUsageFlags::SAMPLED
+            | vk::ImageUsageFlags::TRANSFER_SRC,
     )
 }
 
@@ -167,7 +188,13 @@ impl SceneRenderer {
             time: 0.0,
             previous_view: None,
             jitter: false,
+            #[cfg(feature = "dlss")]
+            upscaler: None,
             frames: 0,
+            #[cfg(feature = "dlss")]
+            last_jitter: glam::Vec2::ZERO,
+            #[cfg(feature = "dlss")]
+            had_history: false,
             // One more than the stages, since a duration needs a timestamp either side of it.
             timestamps: Timestamps::new(device, physical, FrameTimings::STAGES as u32 + 1)?,
         };
@@ -180,10 +207,45 @@ impl SceneRenderer {
     /// Separate from [`SceneRenderer::bind_scene`] because the two go stale for different reasons:
     /// these follow the images, which only a resize replaces, and that one follows the cell.
     fn bind_targets(&mut self) {
+        // Exposure reads the *render*-resolution frame whether or not it is upscaled afterwards: it
+        // wants an average, and averaging four times the pixels for the same answer is waste.
         self.exposure.bind(&self.target);
-        self.tonemap.bind(&self.target, self.exposure.buffer());
         self.denoiser.bind(&self.gbuffer);
         self.composite.bind(&self.target, &self.gbuffer);
+        // Read as fields rather than through a method: `tonemap` is borrowed mutably here, and
+        // asking `self` for the source would borrow the whole of it.
+        #[cfg(feature = "dlss")]
+        let source = self
+            .upscaler
+            .as_ref()
+            .map_or(&self.target, crate::dlss::Upscaler::output);
+        #[cfg(not(feature = "dlss"))]
+        let source = &self.target;
+        self.tonemap.bind(source, self.exposure.buffer());
+    }
+
+    /// Hands this renderer an upscaler, which replaces the denoiser and moves the tone curve to the
+    /// upscaled resolution.
+    ///
+    /// **Built by the caller**, because NGX comes up on a Vulkan instance and this does not own one.
+    /// Passing one also turns jitter on: DLSS resolves detail across frames and cannot do that if
+    /// every frame samples the same point inside its pixel.
+    #[cfg(feature = "dlss")]
+    pub fn set_upscaler(
+        &mut self,
+        memory: &Memory,
+        upscaler: Option<crate::dlss::Upscaler>,
+    ) -> rtxmw_gpu::Result<()> {
+        let output = match &upscaler {
+            Some(upscaler) => upscaler.output().extent(),
+            None => self.target.extent(),
+        };
+        self.jitter = upscaler.is_some();
+        self.upscaler = upscaler;
+        // The tone curve now runs at the upscaled size, so its own output follows.
+        self.tonemap.resize(memory, output)?;
+        self.bind_targets();
+        Ok(())
     }
 
     /// Sets how many à-trous passes smooth the lighting. Zero leaves it as traced.
@@ -445,6 +507,8 @@ impl SceneRenderer {
         // The first frame has no previous one, and is its own: the surfaces then reproject onto
         // themselves and every motion vector is zero, which is what a temporal filter with no
         // history should be told.
+        #[cfg(feature = "dlss")]
+        let had_history = self.previous_view.is_some();
         let previous = self.previous_view.replace(now).unwrap_or(now);
         // Zero unless something is accumulating over frames, which nothing is until DLSS Ray
         // Reconstruction arrives — see `FrameConstants::jitter`.
@@ -454,6 +518,11 @@ impl SceneRenderer {
             glam::Vec2::ZERO
         };
         self.frames = self.frames.wrapping_add(1);
+        #[cfg(feature = "dlss")]
+        {
+            self.last_jitter = jitter;
+            self.had_history = had_history;
+        }
         FrameConstants::new(
             now,
             previous,
@@ -500,10 +569,15 @@ impl SceneRenderer {
             // Every image a frame writes starts from `UNDEFINED`, which discards whatever the last
             // one left there. That is wanted rather than tolerated: each is rewritten in full, so
             // preserving the old contents would cost a transition and buy nothing.
+            #[cfg(feature = "dlss")]
+            let upscaled = self.upscaler.as_ref().map(crate::dlss::Upscaler::output);
+            #[cfg(not(feature = "dlss"))]
+            let upscaled: Option<&Image> = None;
             for image in [&self.target]
                 .into_iter()
                 .chain(self.gbuffer.images())
                 .chain([self.tonemap.output()])
+                .chain(upscaled)
             {
                 image_barrier::transition(
                     device,
@@ -531,17 +605,42 @@ impl SceneRenderer {
             self.timestamps.write(command_buffer, 2);
 
             self.composite.record(command_buffer, extent);
+            // The composed frame is what the upscaler reads, so it has to have been written.
             memory_barrier::full(device, command_buffer);
             self.timestamps.write(command_buffer, 3);
+
+            // **Ray Reconstruction stands in for the filter, not beside it** — it denoises,
+            // antialiases and upscales in one pass, so the à-trous passes above are set to zero by
+            // whoever turned it on, and what it reads is the composed frame as traced.
+            #[cfg(feature = "dlss")]
+            if let Some(upscaler) = &self.upscaler
+                && let Err(failed) = upscaler.record(
+                    command_buffer,
+                    &self.target,
+                    &self.gbuffer,
+                    self.last_jitter,
+                    !self.had_history,
+                )
+            {
+                // Reported rather than propagated: the frame is already half recorded, and a caller
+                // that cannot draw one has nothing better to do with the news than this.
+                eprintln!("DLSS did not run: {failed}");
+            }
+            memory_barrier::full(device, command_buffer);
+            self.timestamps.write(command_buffer, 4);
 
             // Exposure is measured on the composed frame, so it has to follow the composite rather
             // than run alongside the trace.
             self.exposure.record(device, command_buffer, extent);
-            self.timestamps.write(command_buffer, 4);
-
-            self.tonemap.record(command_buffer, extent);
-            memory_barrier::full(device, command_buffer);
             self.timestamps.write(command_buffer, 5);
+
+            // Over the tone curve's *own* size, which is the upscaled one where there is an
+            // upscaler — dispatching over the render size would leave three quarters of a 4K frame
+            // as the allocator left it.
+            self.tonemap
+                .record(command_buffer, self.tonemap.output().extent());
+            memory_barrier::full(device, command_buffer);
+            self.timestamps.write(command_buffer, 6);
 
             for image in [self.target.raw(), self.tonemap.output().raw()] {
                 image_barrier::transition(
@@ -583,10 +682,11 @@ mod tests {
 
         // In the order `record` writes them. The array's width is the type's guarantee that a
         // caller cannot hand over a stage count that disagrees with the pool's.
-        let timings = FrameTimings::from_durations([1.0, 2.0, 4.0, 8.0, 16.0]);
+        let timings = FrameTimings::from_durations([1.0, 2.0, 4.0, 8.0, 16.0, 32.0]);
         assert_eq!(timings.trace, 1.0);
         assert_eq!(timings.denoise, 2.0);
-        assert_eq!(timings.tonemap, 16.0);
-        assert_eq!(timings.total(), 31.0);
+        assert_eq!(timings.upscale, 8.0);
+        assert_eq!(timings.tonemap, 32.0);
+        assert_eq!(timings.total(), 63.0);
     }
 }
