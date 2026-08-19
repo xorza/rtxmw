@@ -13,17 +13,28 @@ use rtxmw_gpu::{Image, Memory};
 /// and eight megabytes at 1080p is not the constraint.
 const ALBEDO_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 
-/// World normal in `xyz`, distance from the eye in `w`. Half floats because the depth is a world
-/// distance in Morrowind units, which reach tens of thousands outdoors.
-const NORMAL_DEPTH_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
+/// World normal in `xyz`, roughness in `w`.
+///
+/// **Roughness sits in `w` because that is where DLSS Ray Reconstruction reads it from** — its
+/// `Roughness_Mode_Packed`, which is one fewer image to bind and one fewer to write. Both are
+/// fractions, so half floats are ample.
+const NORMAL_ROUGHNESS_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
+
+/// Clip-space depth in `r` for the upscaler, distance from the eye in `g` for the filter.
+///
+/// **Full floats, and that is a fix rather than a preference.** The distance used to ride in the
+/// normal target's `w` at half precision, where the largest value is 65,504 — fine when the world
+/// ended at the streaming window, and not since §8.9 pushed the horizon past 100,000 units. Every
+/// pixel beyond that stored infinity, and the filter's depth test divides one distance by another.
+const DEPTH_FORMAT: vk::Format = vk::Format::R32G32_SFLOAT;
 
 /// Light arriving at a surface, with its own albedo divided out. Unbounded, so half float.
 const ILLUMINATION_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 
-/// The mirror-like part of a surface's response in `rgb`, how sharp it is in `a`.
+/// The mirror-like part of a surface's response, in `rgb`.
 ///
-/// Half float like the rest: both are fractions, and neither is a quantity a step of a thousandth
-/// could be wrong about.
+/// How *sharp* that response is lives in the normal target's `w` instead, which is where DLSS Ray
+/// Reconstruction reads it from — so this carries the albedo alone and its fourth channel is spare.
 const MATERIAL_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 
 /// Where each pixel's surface was on the previous frame's screen, in pixels.
@@ -46,7 +57,8 @@ const MOTION_FORMAT: vk::Format = vk::Format::R32G32_SFLOAT;
 #[derive(Debug)]
 pub(crate) struct GBuffer {
     albedo: Image,
-    normal_depth: Image,
+    normal_roughness: Image,
+    depth: Image,
     /// The one the trace writes and the composite reads. The filter swaps which is which.
     illumination: [Image; 2],
     motion: Image,
@@ -57,28 +69,25 @@ impl GBuffer {
     /// Allocates every image at `extent`.
     pub(crate) fn new(memory: &Memory, extent: vk::Extent2D) -> rtxmw_gpu::Result<Self> {
         // Every one is written by a compute shader and read by another, so all of them are storage
-        // images; the motion target is also the one thing here that leaves the device.
+        // images. Three are also copied: what they carry goes to an upscaler that has not arrived
+        // yet, so reading them back is the only way to assert on what the shader wrote.
         let storage = vk::ImageUsageFlags::STORAGE;
+        let readable = storage | vk::ImageUsageFlags::TRANSFER_SRC;
         let image = |name: &str, format, usage| Image::new(memory, name, extent, format, usage);
         Ok(Self {
             albedo: image("gbuffer albedo", ALBEDO_FORMAT, storage)?,
-            normal_depth: image("gbuffer normal and depth", NORMAL_DEPTH_FORMAT, storage)?,
+            normal_roughness: image(
+                "gbuffer normal and roughness",
+                NORMAL_ROUGHNESS_FORMAT,
+                readable,
+            )?,
+            depth: image("gbuffer depth", DEPTH_FORMAT, storage)?,
             illumination: [
                 image("illumination", ILLUMINATION_FORMAT, storage)?,
                 image("illumination scratch", ILLUMINATION_FORMAT, storage)?,
             ],
-            // Copied as well as stored: it goes to an upscaler that has not arrived yet, so reading
-            // it back is the only way to assert on what the shader wrote.
-            motion: image(
-                "gbuffer motion",
-                MOTION_FORMAT,
-                storage | vk::ImageUsageFlags::TRANSFER_SRC,
-            )?,
-            material: image(
-                "gbuffer material",
-                MATERIAL_FORMAT,
-                storage | vk::ImageUsageFlags::TRANSFER_SRC,
-            )?,
+            motion: image("gbuffer motion", MOTION_FORMAT, readable)?,
+            material: image("gbuffer material", MATERIAL_FORMAT, readable)?,
         })
     }
 
@@ -86,8 +95,13 @@ impl GBuffer {
         &self.albedo
     }
 
-    pub(crate) fn normal_depth(&self) -> &Image {
-        &self.normal_depth
+    pub(crate) fn normal_roughness(&self) -> &Image {
+        &self.normal_roughness
+    }
+
+    /// Clip depth for the upscaler, and the distance from the eye that the filter stops edges on.
+    pub(crate) fn depth(&self) -> &Image {
+        &self.depth
     }
 
     /// Where each pixel's surface was last frame, as a displacement in pixels.
@@ -111,10 +125,11 @@ impl GBuffer {
     }
 
     /// Every image, for a caller transitioning them together.
-    pub(crate) fn images(&self) -> [&Image; 6] {
+    pub(crate) fn images(&self) -> [&Image; 7] {
         [
             &self.albedo,
-            &self.normal_depth,
+            &self.normal_roughness,
+            &self.depth,
             &self.illumination[0],
             &self.illumination[1],
             &self.motion,

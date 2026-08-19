@@ -12,7 +12,10 @@
 
 layout(local_size_x = 8, local_size_y = 8) in;
 
-layout(set = 0, binding = 0, rgba16f) uniform readonly image2D normal_depth;
+layout(set = 0, binding = 0, rgba16f) uniform readonly image2D normal_roughness;
+// Distance from the eye in `g`. Read at full precision from its own target rather than from the
+// normal's fourth channel, where anything past 65,504 units — most of the horizon — was infinity.
+layout(set = 0, binding = 3, rg32f) uniform readonly image2D depth;
 layout(set = 0, binding = 1, rgba16f) uniform readonly image2D source;
 layout(set = 0, binding = 2, rgba16f) uniform writeonly image2D target;
 
@@ -48,6 +51,15 @@ float tap_weight(vec4 centre, vec4 neighbour) {
     return pow(facing, NORMAL_SHARPNESS) * exp(-depth);
 }
 
+// What the edge test compares: the normal a tap sits on, and how far away it is.
+//
+// The two arrive from different targets — the normal shares its image with roughness, and the
+// distance shares one with the clip depth an upscaler wants — so this is where they become the one
+// thing `tap_weight` asks about.
+vec4 surface_at(ivec2 at) {
+    return vec4(imageLoad(normal_roughness, at).xyz, imageLoad(depth, at).y);
+}
+
 void main() {
     ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
     ivec2 size = imageSize(source);
@@ -55,7 +67,7 @@ void main() {
         return;
     }
 
-    vec4 centre = imageLoad(normal_depth, pixel);
+    vec4 centre = surface_at(pixel);
     if (centre.w <= 0.0) {
         // Nothing was hit here, so there is nothing to filter and nothing that will read it.
         imageStore(target, pixel, imageLoad(source, pixel));
@@ -71,7 +83,7 @@ void main() {
                 continue;
             }
             float kernel = KERNEL[abs(x)] * KERNEL[abs(y)];
-            float weight = kernel * tap_weight(centre, imageLoad(normal_depth, at));
+            float weight = kernel * tap_weight(centre, surface_at(at));
             total += imageLoad(source, at).rgb * weight;
             weight_total += weight;
         }

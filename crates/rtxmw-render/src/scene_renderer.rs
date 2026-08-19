@@ -388,6 +388,13 @@ impl SceneRenderer {
         self.gbuffer.material()
     }
 
+    /// World normal in `rgb`, roughness in `a` — the layout DLSS Ray Reconstruction reads.
+    ///
+    /// In `GENERAL` once [`SceneRenderer::record`] has run.
+    pub fn normal_roughness(&self) -> &Image {
+        self.gbuffer.normal_roughness()
+    }
+
     /// Where each pixel's surface was on the previous frame's screen, as a displacement in pixels.
     ///
     /// In `GENERAL` once [`SceneRenderer::record`] has run. Written every frame and read by nothing

@@ -213,14 +213,24 @@ fn rendered<T>(
     read
 }
 
-/// The specular guide the trace wrote for the middle pixel: albedo in `rgb`, roughness in `a`.
+/// The specular guide the trace wrote for the middle pixel: albedo in `xyz`, roughness in `w`.
+///
+/// **Read from the two places the upscaler reads them**, not from one convenient image: the albedo
+/// is the material target's `rgb` and the roughness is the *normal* target's `w`, which is where
+/// DLSS Ray Reconstruction's packed mode looks for it. A test reading both from one image would
+/// keep passing if they were written to the wrong one.
 fn guides_at(scene: &StaticScene, eye: Vec3, forward: Vec3) -> glam::Vec4 {
-    let channels = rendered(scene, eye, forward, 0.0, |uploader, renderer| {
-        readback::image_to_f32(uploader, renderer.material(), vk::ImageLayout::GENERAL)
-            .expect("readback should succeed")
-    });
-    let index = ((HEIGHT / 2) * WIDTH + WIDTH / 2) as usize * 4;
-    glam::Vec4::from_slice(&channels[index..index + 4])
+    let middle = ((HEIGHT / 2) * WIDTH + WIDTH / 2) as usize * 4;
+    let read = |image: &rtxmw_gpu::Image, uploader: &mut rtxmw_gpu::Uploader| {
+        let channels = readback::image_to_f32(uploader, image, vk::ImageLayout::GENERAL)
+            .expect("readback should succeed");
+        glam::Vec4::from_slice(&channels[middle..middle + 4])
+    };
+    rendered(scene, eye, forward, 0.0, |uploader, renderer| {
+        let albedo = read(renderer.material(), uploader);
+        let roughness = read(renderer.normal_roughness(), uploader).w;
+        albedo.truncate().extend(roughness)
+    })
 }
 
 #[test]

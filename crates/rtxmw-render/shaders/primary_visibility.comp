@@ -107,9 +107,19 @@ void main() {
     // The specular distance rides in the alpha, which the composite does not read and which the
     // normal target already sets the precedent for by carrying depth in its own fourth channel.
     imageStore(albedo_target, ivec2(pixel), vec4(albedo, guides.specular_distance));
+    // Roughness is not here: it rides in the normal target's fourth channel, which is where the
+    // upscaler reads it from and so the only copy worth keeping.
+    imageStore(material_target, ivec2(pixel), vec4(guides.specular_albedo, 0.0));
     imageStore(
-        material_target, ivec2(pixel), vec4(guides.specular_albedo, guides.roughness));
-    imageStore(normal_depth_target, ivec2(pixel), vec4(surface.normal, surface.t));
+        normal_roughness_target, ivec2(pixel), vec4(surface.normal, guides.roughness));
+    // Clip depth for the upscaler, and the distance from the eye the filter stops edges on. A miss
+    // has neither, and zero is what the filter reads as "nothing here".
+    float clip_depth = 0.0;
+    if (surface.hit) {
+        vec4 clipped = frame.clip_from_offset * vec4(direction * surface.t, 1.0);
+        clip_depth = clipped.w > 0.0 ? clipped.z / clipped.w : 0.0;
+    }
+    imageStore(depth_target, ivec2(pixel), vec4(clip_depth, surface.t, 0.0, 0.0));
     imageStore(illumination_target, ivec2(pixel), vec4(lighting, 1.0));
     // Alpha carries whether anything was hit at all. Inferring it from the colour worked while the
     // output was barycentric and every hit was bright, but a material can legitimately be dark —

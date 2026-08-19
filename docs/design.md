@@ -1732,3 +1732,33 @@ than the name suggests and the one §8.18 spent a while on.
 ignored the quality value would return 1920×1080 for all three and pass a test that only checked
 Performance. Each is also required to sit inside the dynamic range it reports, which is what a
 renderer varying resolution would be handed.
+
+### 8.20 The G-buffer moves to the layout DLSS reads, and depth stops being a half float
+
+DLSS Ray Reconstruction wants diffuse albedo, specular albedo, normals, roughness, depth, colour and
+motion vectors. §8.16 produced all of them — but not in the arrangement it reads them from, and the
+repack turned up a bug that had nothing to do with DLSS.
+
+**Roughness moves into the normal target's `w`.** That is `Roughness_Mode_Packed`, which is one fewer
+resource to bind and one fewer image to write. It was in the material target's alpha, which is now
+spare, and the material target carries specular albedo alone.
+
+**Depth becomes its own target, at full precision.** It used to ride in the normal target's `w`, in
+an `rgba16f` — where the largest representable value is **65,504**. That was fine when the world
+ended at the streaming window and stopped being fine when §8.9 pushed the horizon past 100,000 units:
+every pixel beyond that stored infinity, and the à-trous filter's edge test divides one distance by
+another. Under the ceiling it was merely coarse — eleven bits of mantissa puts the step at about
+eight units by ten thousand, and sixty-four by sixty thousand.
+
+The new target is `rg32f`: **clip depth in `r`** for the upscaler, **distance from the eye in `g`**
+for the filter. Two different questions that were being answered by one number — the upscaler
+reprojects with clip depth and the filter stops edges on world distance, and a reverse-Z clip value
+would have made the filter's tolerance mean something different at every distance.
+
+**Measured effect: 7 pixels of 921,600 move by 2 levels**, scattered rather than banded — the filter
+seeing exact distances where it had quantised ones. Small, and in the direction of correct.
+
+**What the tests had to learn.** `water.rs` read specular albedo and roughness from one image, which
+would have kept passing had roughness been written to the wrong target. It now reads each from where
+DLSS reads it: the albedo from the material target's `rgb`, the roughness from the *normal* target's
+`w`.

@@ -95,28 +95,30 @@ layout(set = 0, binding = 7, scalar) readonly buffer Positions {
 // Depth rides in the normal's fourth channel because the two are always wanted together — they are
 // the pair an edge-stopping filter tests to decide whether two pixels are the same surface.
 layout(set = 0, binding = 8, rgba16f) uniform writeonly image2D albedo_target;
-layout(set = 0, binding = 9, rgba16f) uniform writeonly image2D normal_depth_target;
+layout(set = 0, binding = 9, rgba16f) uniform writeonly image2D normal_roughness_target;
 layout(set = 0, binding = 10, rgba16f) uniform writeonly image2D illumination_target;
 // Where each pixel's surface was on the previous frame's screen, as a displacement in pixels.
 layout(set = 0, binding = 11, rg32f) uniform writeonly image2D motion_target;
 // The mirror-like part of a surface's response and how sharp it is — see `Guides` in `surface.glsl`.
 // The specular *distance* rides in the albedo target's alpha, which is otherwise a constant.
 layout(set = 0, binding = 12, rgba16f) uniform writeonly image2D material_target;
+// Clip depth in `r` for the upscaler, distance from the eye in `g` for the filter.
+layout(set = 0, binding = 13, rg32f) uniform writeonly image2D depth_target;
 
 // Last binding, and the only runtime-sized one: Vulkan allows a variable descriptor count only on
 // the final element of a set. Slot zero is the fallback, so a material's texture id addresses
 // `id + 1`.
 // The light grid: cell `i` owns `light_grid_indices[light_grid_offsets[i] .. [i + 1]]`, which is
 // why the offsets carry a trailing sentinel. Built in `light_grid.rs`.
-layout(set = 0, binding = 14, scalar) readonly buffer LightGridOffsets {
+layout(set = 0, binding = 15, scalar) readonly buffer LightGridOffsets {
     uint light_grid_offsets[];
 };
 
-layout(set = 0, binding = 15, scalar) readonly buffer LightGridIndices {
+layout(set = 0, binding = 16, scalar) readonly buffer LightGridIndices {
     uint light_grid_indices[];
 };
 
-layout(set = 0, binding = 16) uniform sampler2D textures[];
+layout(set = 0, binding = 17) uniform sampler2D textures[];
 
 // Stands in for a material with no base colour texture. Declared as `NO_TEXTURE` in
 // `material_buffers.rs` too, and pinned there by a test, because a shader cannot see a Rust
@@ -143,7 +145,7 @@ struct Wave {
 // waves needed a clock. Scalar layout, so it matches the `repr(C)` struct in `visibility_pass.rs`
 // field for field. The matrices arrive already multiplied — their product is all unprojection
 // needs, and it is one thing to send rather than two to keep consistent.
-layout(set = 0, binding = 13, scalar) readonly buffer Frame {
+layout(set = 0, binding = 14, scalar) readonly buffer Frame {
     // Clip coordinates to an offset from the eye, in world axes — *not* the inverse
     // view-projection, which would land a world-space point the shader then has to subtract the
     // camera position from. See `ndc_to_world_offset` in `visibility_pass.rs` for what that cost.
@@ -151,6 +153,9 @@ layout(set = 0, binding = 13, scalar) readonly buffer Frame {
     // The previous frame's `projection * rotation`: an offset from *that* frame's eye, to its clip
     // coordinates. Built in `visibility_pass.rs`.
     mat4 previous_clip_from_offset;
+    // This frame's, for the clip depth an upscaler reprojects with. The inverse above turns a pixel
+    // into a ray; this turns the hit back into the depth the pixel would have had.
+    mat4 clip_from_offset;
     vec3 camera_position;
     // Sub-pixel offset added to the pixel centre, in pixels. Zero unless an upscaler asked for it,
     // and never part of a motion vector — see `visibility_pass.rs`.

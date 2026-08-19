@@ -45,6 +45,7 @@ impl Denoiser {
                     Binding::storage_image(0),
                     Binding::storage_image(1),
                     Binding::storage_image(2),
+                    Binding::storage_image(3),
                 ],
                 size_of::<PassConstants>() as u32,
                 shaders::denoise(),
@@ -62,7 +63,8 @@ impl Denoiser {
             (&self.forward, gbuffer.illumination(), gbuffer.scratch()),
             (&self.backward, gbuffer.scratch(), gbuffer.illumination()),
         ] {
-            pipeline.bind_storage_images(0, &[gbuffer.normal_depth(), source, target]);
+            pipeline.bind_storage_images(0, &[gbuffer.normal_roughness(), source, target]);
+            pipeline.bind_storage_images(3, &[gbuffer.depth()]);
         }
     }
 

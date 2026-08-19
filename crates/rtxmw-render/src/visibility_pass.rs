@@ -63,8 +63,10 @@ pub struct FrameConstants {
     /// never differenced against anything.
     ndc_to_world_offset: [f32; 16],
     /// The previous frame's `projection * rotation`, taking an offset from *that* frame's eye to
-    /// its clip coordinates. See [`FrameConstants::motion`].
+    /// its clip coordinates. See [`Viewpoint::clip_from_offset`].
     previous_clip_from_offset: [f32; 16],
+    /// This frame's, for the clip depth an upscaler reprojects with.
+    clip_from_offset: [f32; 16],
     camera_position: [f32; 3],
     /// Sub-pixel offset added to the pixel centre this frame, in pixels.
     ///
@@ -154,6 +156,7 @@ impl FrameConstants {
         Self {
             ndc_to_world_offset: now.clip_from_offset().inverse().to_cols_array(),
             previous_clip_from_offset: previous.clip_from_offset().to_cols_array(),
+            clip_from_offset: now.clip_from_offset().to_cols_array(),
             camera_position: now.position.to_array(),
             jitter: jitter.to_array(),
             camera_motion: (now.position - previous.position).to_array(),
@@ -319,17 +322,18 @@ impl VisibilityPass {
                     Binding::storage_image(10),
                     Binding::storage_image(11),
                     Binding::storage_image(12),
+                    Binding::storage_image(13),
                     // The frame's own constants. They were push constants until waves needed a
                     // clock and the block was already exactly the 128 bytes Vulkan guarantees —
                     // see `FrameConstants`. Motion vectors at M7 would have forced the same move.
-                    Binding::storage_buffer(13),
-                    // The light grid: prefix offsets, then the light indices they address.
                     Binding::storage_buffer(14),
+                    // The light grid: prefix offsets, then the light indices they address.
                     Binding::storage_buffer(15),
+                    Binding::storage_buffer(16),
                     // Last, because Vulkan allows a variable descriptor count only on a set's final
                     // binding. Adding anything after this one moves it — validation rejects the set
                     // outright, which is how this was caught.
-                    Binding::variable_samplers(16, max_textures),
+                    Binding::variable_samplers(17, max_textures),
                 ],
                 0,
                 shaders::primary_visibility(),
@@ -361,7 +365,7 @@ impl VisibilityPass {
             .range(vk::WHOLE_SIZE)];
         let frame_write = vk::WriteDescriptorSet::default()
             .dst_set(self.pipeline.set())
-            .dst_binding(13)
+            .dst_binding(14)
             .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
             .buffer_info(&frame_info);
 
@@ -386,7 +390,7 @@ impl VisibilityPass {
         let texture_infos = scene.textures.descriptors();
         let texture_write = vk::WriteDescriptorSet::default()
             .dst_set(self.pipeline.set())
-            .dst_binding(16)
+            .dst_binding(17)
             .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
             .image_info(&texture_infos);
 
@@ -397,10 +401,11 @@ impl VisibilityPass {
             8,
             &[
                 gbuffer.albedo(),
-                gbuffer.normal_depth(),
+                gbuffer.normal_roughness(),
                 gbuffer.illumination(),
                 gbuffer.motion(),
                 gbuffer.material(),
+                gbuffer.depth(),
             ],
         );
 
@@ -427,7 +432,7 @@ impl VisibilityPass {
             .range(vk::WHOLE_SIZE)];
         let grid_offset_write = vk::WriteDescriptorSet::default()
             .dst_set(self.pipeline.set())
-            .dst_binding(14)
+            .dst_binding(15)
             .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
             .buffer_info(&grid_offset_info);
 
@@ -436,7 +441,7 @@ impl VisibilityPass {
             .range(vk::WHOLE_SIZE)];
         let grid_index_write = vk::WriteDescriptorSet::default()
             .dst_set(self.pipeline.set())
-            .dst_binding(15)
+            .dst_binding(16)
             .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
             .buffer_info(&grid_index_info);
 
@@ -529,23 +534,24 @@ mod tests {
         // everything after it and the shader reads the whole frame displaced.
         assert_eq!(offset_of!(FrameConstants, ndc_to_world_offset), 0);
         assert_eq!(offset_of!(FrameConstants, previous_clip_from_offset), 64);
-        assert_eq!(offset_of!(FrameConstants, camera_position), 128);
-        assert_eq!(offset_of!(FrameConstants, jitter), 140);
-        assert_eq!(offset_of!(FrameConstants, camera_motion), 148);
-        assert_eq!(offset_of!(FrameConstants, light_grid_scale), 160);
-        assert_eq!(offset_of!(FrameConstants, light_grid_origin), 164);
-        assert_eq!(offset_of!(FrameConstants, light_grid_dimensions), 176);
-        assert_eq!(offset_of!(FrameConstants, ambient), 188);
-        assert_eq!(offset_of!(FrameConstants, cone_spread), 200);
-        assert_eq!(offset_of!(FrameConstants, sun_direction), 204);
-        assert_eq!(offset_of!(FrameConstants, sun_cos_radius), 216);
-        assert_eq!(offset_of!(FrameConstants, sun_colour), 220);
-        assert_eq!(offset_of!(FrameConstants, bounce_samples), 232);
-        assert_eq!(offset_of!(FrameConstants, water_level), 236);
-        assert_eq!(offset_of!(FrameConstants, time), 240);
+        assert_eq!(offset_of!(FrameConstants, clip_from_offset), 128);
+        assert_eq!(offset_of!(FrameConstants, camera_position), 192);
+        assert_eq!(offset_of!(FrameConstants, jitter), 204);
+        assert_eq!(offset_of!(FrameConstants, camera_motion), 212);
+        assert_eq!(offset_of!(FrameConstants, light_grid_scale), 224);
+        assert_eq!(offset_of!(FrameConstants, light_grid_origin), 228);
+        assert_eq!(offset_of!(FrameConstants, light_grid_dimensions), 240);
+        assert_eq!(offset_of!(FrameConstants, ambient), 252);
+        assert_eq!(offset_of!(FrameConstants, cone_spread), 264);
+        assert_eq!(offset_of!(FrameConstants, sun_direction), 268);
+        assert_eq!(offset_of!(FrameConstants, sun_cos_radius), 280);
+        assert_eq!(offset_of!(FrameConstants, sun_colour), 284);
+        assert_eq!(offset_of!(FrameConstants, bounce_samples), 296);
+        assert_eq!(offset_of!(FrameConstants, water_level), 300);
+        assert_eq!(offset_of!(FrameConstants, time), 304);
         // The wave table follows, twenty tightly packed bytes apiece.
-        assert_eq!(offset_of!(FrameConstants, waves), 244);
-        assert_eq!(size_of::<FrameConstants>(), 244 + 20 * WAVE_COUNT);
+        assert_eq!(offset_of!(FrameConstants, waves), 308);
+        assert_eq!(size_of::<FrameConstants>(), 308 + 20 * WAVE_COUNT);
     }
 
     #[test]
