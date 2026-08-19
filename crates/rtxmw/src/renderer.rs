@@ -81,6 +81,7 @@ impl Renderer {
         width: u32,
         height: u32,
         dlss: Upscaling,
+        delight: f32,
     ) -> rtxmw_gpu::Result<Self>
     where
         W: HasDisplayHandle + HasWindowHandle,
@@ -126,6 +127,7 @@ impl Renderer {
             &memory,
             upscaler::render_size(upscaler.as_ref(), internal_extent(display)),
         )?;
+        scene.set_delight(delight);
         if let Err(failed) = upscaler::attach(&memory, &mut scene, upscaler) {
             eprintln!("DLSS did not attach: {failed}");
         }

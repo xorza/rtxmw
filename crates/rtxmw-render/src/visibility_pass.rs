@@ -130,6 +130,12 @@ pub struct FrameConstants {
     /// noise every frame — the estimator's error becomes a fixed pattern rather than something
     /// averaging away. A spatial filter hides that; a temporal one reads it as detail and keeps it.
     sequence: u32,
+    /// How much of the lighting painted into a texture to divide back out.
+    ///
+    /// **Zero is the texture as Bethesda shipped it**, and one the whole estimate. Vanilla assets
+    /// have shading and ambient occlusion painted into their albedo for a renderer with no lighting
+    /// of its own, so tracing over them lights everything twice — `docs/design.md` §5.1.
+    delight: f32,
     /// The sinusoids the water surface is summed from — see [`crate::wave_spectrum`].
     ///
     /// Static for the life of a sea state, and carried here rather than in a buffer of its own
@@ -147,6 +153,8 @@ pub(crate) struct Sampling {
     /// Sub-pixel offset from the pixel centre, in pixels. Zero unless an upscaler asked for it.
     pub(crate) jitter: Vec2,
     pub(crate) bounce_samples: u32,
+    /// How much of the baked lighting to divide out of every texture.
+    pub(crate) delight: f32,
     /// Which frame this is, counted from the renderer's first.
     pub(crate) sequence: u32,
 }
@@ -190,6 +198,7 @@ impl FrameConstants {
             water_level: lighting.water_level.unwrap_or(f32::NEG_INFINITY),
             time,
             sequence: sampling.sequence,
+            delight: sampling.delight,
             // Rebuilt each frame rather than cached: it is a few hundred floats of arithmetic once
             // per frame against a million rays that read it, and a cache would need invalidating
             // the moment the sea state becomes something a cell can set.
@@ -569,9 +578,10 @@ mod tests {
         assert_eq!(offset_of!(FrameConstants, water_level), 300);
         assert_eq!(offset_of!(FrameConstants, time), 304);
         assert_eq!(offset_of!(FrameConstants, sequence), 308);
+        assert_eq!(offset_of!(FrameConstants, delight), 312);
         // The wave table follows, twenty tightly packed bytes apiece.
-        assert_eq!(offset_of!(FrameConstants, waves), 312);
-        assert_eq!(size_of::<FrameConstants>(), 312 + 20 * WAVE_COUNT);
+        assert_eq!(offset_of!(FrameConstants, waves), 316);
+        assert_eq!(size_of::<FrameConstants>(), 316 + 20 * WAVE_COUNT);
     }
 
     #[test]

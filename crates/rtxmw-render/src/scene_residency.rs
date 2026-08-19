@@ -265,8 +265,22 @@ impl SceneResidency {
             // Interning hands out ids in order, so one past what has been uploaded is one this
             // renderer has never seen — and the only case where the file has to be read.
             if shared >= self.uploaded_textures {
-                let id = self.textures.insert(uploader, textures[local].as_ref())?;
-                assert_eq!(id, shared, "texture ids and array slots must stay in step");
+                // **Each texture is followed by the shading map estimated from it**, so a material's
+                // id addresses a pair rather than a slot. One array rather than two because Vulkan
+                // allows a variable descriptor count only on a set's final binding, and there is
+                // therefore no second one to put the maps in — `surface.glsl` does the arithmetic.
+                let texture = textures[local].as_ref();
+                let colour = self.textures.insert(uploader, texture)?;
+                // A neutral map rather than nothing where the texture is missing: an empty slot
+                // holds the array's magenta stand-in, which would divide the surface by two.
+                let map = texture.map_or_else(Texture::neutral_shading, Texture::shading_map);
+                let shading = self.textures.insert(uploader, Some(&map))?;
+                assert_eq!(colour, shared * 2, "a texture id addresses its own pair");
+                assert_eq!(
+                    shading,
+                    colour + 1,
+                    "a shading map follows the texture it is of"
+                );
                 self.uploaded_textures = shared + 1;
             }
             remap.push(shared);

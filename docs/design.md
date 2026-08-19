@@ -2168,3 +2168,66 @@ kept as a fallback at first and that was a mistake twice over: it measured 0.005
 anyway. A check that cannot fail on the thing it exists for is worse than an honest skip.
 
 A stable black frame would also pass, so the test asserts the frame is lit as well.
+
+### 8.35 De-lighting, as an estimate divided out at sample time
+
+§5.1 chose option 4 — de-light the vanilla textures — and this is the first working form of it. Three
+findings changed the shape of it along the way, and each is worth more than the code.
+
+**A Morrowind plugin cannot override a texture.** Only `LTEX` names a texture path in the record
+stream, and that covers the ~100 land textures; every other reference is `NiSourceTexture::mFilename`
+inside a NIF, which no ESM record reaches. What replacer packs actually use is the VFS — later
+archives win and loose files beat BSAs — so the override belongs there, and this engine has its own
+VFS and need not touch the install at all.
+
+**A cache is not needed.** Estimating a shading map for the *entire* shipped library — 4,783
+textures, 148.7 MB — takes **162 ms**, against 50 ms to decode them. A cell's 118 textures is well
+under a millisecond, so the maps are computed on load and thrown away with the cell. The cache
+directory this was going to need does not exist.
+
+**Rewriting the texels was the wrong mechanism.** `rtxmw-texture` deliberately never decompresses:
+BC1 and BC2 go straight to the GPU. De-lighting the pixels would need a decoder *and* either an
+encoder — re-compressing all 4,851 through a hand-rolled one, trading Bethesda's compression quality
+for this — or storing them uncompressed, four times the VRAM. What is actually being removed is
+low-frequency by nature, so a 32×32 map per texture holds it, and BC1 gives block averages from its
+endpoint pairs without decompressing anything.
+
+**The estimate**, in `shading_map.rs`: mean luminance over a 32-square grid, three box blurs,
+normalised to a mean of one and clamped to `0.5..=2.0`. Normalising is what makes it a
+redistribution rather than a brightness change — dividing by it leaves a texture's average colour
+where it was. It is written through the sRGB transfer, because the bindless array binds these as an
+sRGB format and the sampler decodes every fetch.
+
+**It rides in the existing array, interleaved.** Vulkan allows a variable descriptor count only on a
+set's final binding, so there cannot be a second bindless array; a texture id now addresses a pair,
+`1 + 2n` for the colour and `2 + 2n` for its map. Terrain gets the correction for free, because it
+blends four texture *ids* and each one carries its own.
+
+**The default is on**, and `--delight 0` is the A/B. Leaving the painted lighting in is the wrong
+default for a renderer whose whole point is that it lights things; §5.1's warning about
+over-correction is what the switch is for. At full strength on the census office the frame moves by
+0.020 RMS, which is the scale a normalised, clamped, heavily blurred estimate should move things.
+
+**Three bugs, all found by review or by an existing test rather than by looking at the picture.**
+
+`cone_lod` measures texel density with `textureSize` on an array *slot*, and all three of its call
+sites still passed the pre-interleave index — so every mip selection in the renderer was reading a
+32×32 shading map's dimensions instead of the texture's. It costs nothing visible on a still frame
+and everything on a grazing one.
+
+A texture smaller than the grid lands in a handful of cells and leaves the rest empty. Reading those
+as black made the estimate a spike on a floor, and normalising by its mean drove the correction to
+the clamps — a flat one-texel texture came out divided by two in one corner and doubled everywhere
+else. Empty cells now take the average of the sampled ones, which makes such a texture neutral: too
+few texels to resolve shading is the same as having none. The terrain test caught this, because its
+fixture is one texel per tile deliberately.
+
+A material whose texture never loaded got no map, which left the array's magenta stand-in in the
+slot — and magenta's red channel decodes to the top of the range, so every untextured surface was
+divided by two. Missing textures now get an explicit neutral map.
+
+Four tests carry the algorithm, and the third is the one that matters: a flat texture must come back
+neutral to within 0.01, a painted 3:1 ramp must be recovered (0.575 to 1.431, mean 1.000), **a
+checkerboard must be left alone** — detail alternating every texel is not lighting, and following it
+is exactly the over-correction that flattens a texture — and a BC1 block's mean must match the
+hand-computed average of its palette.

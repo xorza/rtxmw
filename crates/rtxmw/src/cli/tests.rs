@@ -120,6 +120,7 @@ fn the_cell_and_the_frame_limit_go_in_either_order() {
         Ok(WindowOptions {
             cell: default.clone(),
             exit_after: None,
+            delight: 1.0,
             dlss: Upscaling(None),
         })
     );
@@ -130,6 +131,7 @@ fn the_cell_and_the_frame_limit_go_in_either_order() {
         Ok(WindowOptions {
             cell: default,
             exit_after: Some(3),
+            delight: 1.0,
             dlss: Upscaling(None),
         })
     );
@@ -137,6 +139,7 @@ fn the_cell_and_the_frame_limit_go_in_either_order() {
     let outdoors = WindowOptions {
         cell: CellId::Exterior { x: -2, y: -9 },
         exit_after: Some(3),
+        delight: 1.0,
         dlss: Upscaling(None),
     };
     assert_eq!(parse(&["-2,-9", "--frames", "3"]), Ok(outdoors.clone()));
@@ -178,6 +181,7 @@ fn a_screenshot_can_be_told_where_to_stand_and_which_way_to_look() {
             frames: 1,
             samples: None,
             denoise: None,
+            delight: 1.0,
             dlss: Upscaling(None),
         })
     );
@@ -226,6 +230,7 @@ fn a_screenshot_takes_a_path_then_a_size_then_a_cell() {
             frames: 1,
             samples: None,
             denoise: None,
+            delight: 1.0,
             dlss: Upscaling(None),
         })
     );
@@ -242,6 +247,7 @@ fn a_screenshot_takes_a_path_then_a_size_then_a_cell() {
             frames: 1,
             samples: None,
             denoise: None,
+            delight: 1.0,
             dlss: Upscaling(None),
         })
     );
@@ -269,6 +275,7 @@ fn a_screenshot_takes_a_path_then_a_size_then_a_cell() {
             frames: 64,
             samples: Some(1024),
             denoise: Some(0),
+            delight: 1.0,
             dlss: Upscaling(None),
         })
     );
@@ -336,4 +343,29 @@ fn the_upscaler_defaults_to_on_and_can_be_turned_off() {
         failed.contains("off") && failed.contains("quality"),
         "it should list what does work: {failed}"
     );
+}
+
+#[test]
+fn de_lighting_strength_is_a_fraction_or_it_is_refused() {
+    // **On by default**: leaving the painted lighting in is the wrong answer for a renderer that
+    // lights things itself, so the switch exists to turn the correction *off* for an A/B.
+    assert_eq!(screenshot_options(&["out.png"]).unwrap().delight, 1.0);
+    for (given, expected) in [("0", 0.0), ("0.5", 0.5), ("1", 1.0)] {
+        assert_eq!(
+            screenshot_options(&["out.png", "--delight", given])
+                .unwrap()
+                .delight,
+            expected
+        );
+    }
+    // **Refused rather than clamped.** Two is not a stronger wish, it is a misreading of what the
+    // number is — dividing by the square of an estimate is not on the scale at all.
+    for wrong in ["2", "-0.5", "lots"] {
+        let failed = screenshot_options(&["out.png", "--delight", wrong])
+            .expect_err("{wrong} is not a strength");
+        assert!(
+            failed.contains("0 to 1"),
+            "{wrong:?} was refused without saying the range: {failed}"
+        );
+    }
 }

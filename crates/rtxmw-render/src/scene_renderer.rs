@@ -31,9 +31,12 @@ pub const TARGET_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 
 /// Ceiling on the bindless array, fixed because the descriptor set layout is.
 ///
-/// A cell uses far fewer — Seyda Neen's office needs 118 — and the whole shipped library holds
-/// 4,311 distinct textures, so this leaves room for a cell far larger than any interior.
-const MAX_TEXTURES: u32 = 8192;
+/// **Slots, not textures**, and each texture takes two of them: the array interleaves every texture
+/// with the shading map estimated from it, because Vulkan allows a variable descriptor count only
+/// on a set's final binding and there is therefore no second array to put the maps in. A cell uses
+/// far fewer — Seyda Neen's office needs 118 textures — and the whole shipped library holds 4,311
+/// distinct ones, which is 8,622 slots.
+const MAX_TEXTURES: u32 = 16384;
 
 /// Diffuse bounce rays per pixel unless a caller says otherwise.
 ///
@@ -41,6 +44,14 @@ const MAX_TEXTURES: u32 = 8192;
 /// denoises yet: at one sample the indirect term is a dither pattern rather than an image. It drops
 /// to one at M7, where the denoiser is what turns a single sample into a smooth field.
 const DEFAULT_BOUNCE_SAMPLES: u32 = 4;
+
+/// How much baked lighting a frame divides out unless a caller says otherwise.
+///
+/// **The whole estimate.** Vanilla albedo has shading painted into it for a renderer with no
+/// lighting of its own, and tracing over that lights every surface twice — leaving it in is the
+/// wrong default for a renderer whose whole point is that it lights things. `--delight 0` is the
+/// A/B, and §5.1's warning about over-correction is what that switch is for.
+const DEFAULT_DELIGHT: f32 = 1.0;
 
 /// How long the device spent on each stage of a frame, in milliseconds.
 ///
@@ -125,6 +136,9 @@ pub struct SceneRenderer {
     previous_view: Option<Viewpoint>,
     /// Whether to offset each frame's rays inside their pixel. Off until an upscaler asks.
     jitter: bool,
+    /// How much of the lighting painted into a texture to divide back out. See
+    /// [`SceneRenderer::set_delight`].
+    delight: f32,
     /// The upscaler, when one was handed over. Absent, the denoiser and the render-resolution tone
     /// curve carry the frame as they always have.
     #[cfg(feature = "dlss")]
@@ -190,6 +204,7 @@ impl SceneRenderer {
             time: 0.0,
             previous_view: None,
             jitter: false,
+            delight: DEFAULT_DELIGHT,
             #[cfg(feature = "dlss")]
             upscaler: None,
             frames: 0,
@@ -262,6 +277,19 @@ impl SceneRenderer {
         self.tonemap.resize(memory, output)?;
         self.bind_targets();
         Ok(())
+    }
+
+    /// Sets how much of the lighting painted into a texture is divided back out.
+    ///
+    /// Zero is the texture as shipped and one the whole estimate; anything between fades between
+    /// them, which is what makes the A/B `docs/design.md` §5.1 asks for a slider rather than a
+    /// rebuild.
+    pub fn set_delight(&mut self, strength: f32) {
+        assert!(
+            (0.0..=1.0).contains(&strength),
+            "de-lighting runs from none to the whole estimate, not {strength}"
+        );
+        self.delight = strength;
     }
 
     /// Sets how many à-trous passes smooth the lighting. Zero leaves it as traced.
@@ -547,6 +575,7 @@ impl SceneRenderer {
                 jitter,
                 bounce_samples: self.bounce_samples,
                 sequence: self.frames,
+                delight: self.delight,
             },
             // From the renderer's own target height, so the mip a surface samples follows the
             // resolution it is being traced at.

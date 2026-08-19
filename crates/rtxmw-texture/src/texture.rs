@@ -1,6 +1,7 @@
 //! A decoded texture: pixel data plus the shape needed to upload it.
 
 use crate::error::{Result, TextureError};
+use crate::shading_map;
 use crate::{dds, tga};
 
 /// How a texture's bytes are encoded.
@@ -139,6 +140,25 @@ impl Texture {
     /// Every mip level, largest first.
     pub fn levels(&self) -> &[MipLevel] {
         &self.levels
+    }
+
+    /// The lighting this texture appears to have been painted with, at low resolution.
+    ///
+    /// **Normalised, so the correction is a redistribution rather than a brightness change.**
+    /// Dividing a texture by this leaves its average colour where it was and flattens only the
+    /// variation across it, which is what separates baked shading from base colour — see
+    /// `docs/design.md` §5.1 for why vanilla assets need it at all.
+    ///
+    /// Returned as a texture because that is how it reaches the GPU: the bindless array already
+    /// takes one of these per entry, so a map needs no binding, no format and no upload path of its
+    /// own.
+    pub fn shading_map(&self) -> Texture {
+        shading_map::estimate(self)
+    }
+
+    /// A shading map that changes nothing, for a material whose texture never loaded.
+    pub fn neutral_shading() -> Texture {
+        shading_map::neutral()
     }
 
     /// The whole chain's bytes, which the level table indexes into.

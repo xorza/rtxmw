@@ -5,6 +5,7 @@
 
 mod dds;
 mod error;
+mod shading_map;
 mod texture;
 mod tga;
 

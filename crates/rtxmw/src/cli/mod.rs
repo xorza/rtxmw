@@ -170,6 +170,17 @@ fn upscaling_default() -> &'static str {
     })
 }
 
+/// Reads a de-lighting strength on `0..=1`.
+///
+/// Refused outside that rather than clamped: 2 is not a stronger wish, it is a misunderstanding of
+/// what the number means, and dividing a texture by the square of an estimate is not on the scale.
+fn strength(value: &str) -> Result<f32, String> {
+    match value.parse::<f32>() {
+        Ok(strength) if (0.0..=1.0).contains(&strength) => Ok(strength),
+        _ => Err(format!("expected a strength from 0 to 1, got {value:?}")),
+    }
+}
+
 /// Reads a frame count, rejecting zero.
 ///
 /// Zero can only be a mistake, and rendering one frame for it would answer a question nobody asked.
@@ -204,6 +215,17 @@ pub(crate) struct WindowOptions {
     /// Draw this many frames, then exit through the ordinary shutdown path.
     #[arg(long = "frames", value_name = "N", value_parser = at_least_one)]
     pub(crate) exit_after: Option<u32>,
+    /// How much of the lighting painted into each texture to divide back out, from 0 to 1.
+    // A negative strength is nonsense, but it should be refused for saying so rather than for
+    // looking like a flag — which is what clap does with a leading minus unless told otherwise.
+    #[arg(
+        long,
+        value_name = "STRENGTH",
+        default_value_t = 1.0,
+        value_parser = strength,
+        allow_negative_numbers = true,
+    )]
+    pub(crate) delight: f32,
     /// What DLSS runs at: off, performance, balanced, quality or dlaa.
     #[arg(
         long = "dlss",
@@ -256,6 +278,17 @@ pub(crate) struct ScreenshotOptions {
     /// trade at four samples and the wrong one at a thousand.
     #[arg(long, value_name = "N")]
     pub(crate) denoise: Option<u32>,
+    /// How much of the lighting painted into each texture to divide back out, from 0 to 1.
+    // A negative strength is nonsense, but it should be refused for saying so rather than for
+    // looking like a flag — which is what clap does with a leading minus unless told otherwise.
+    #[arg(
+        long,
+        value_name = "STRENGTH",
+        default_value_t = 1.0,
+        value_parser = strength,
+        allow_negative_numbers = true,
+    )]
+    pub(crate) delight: f32,
     /// What DLSS runs at: off, performance, balanced, quality or dlaa.
     #[arg(
         long = "dlss",

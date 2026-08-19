@@ -72,6 +72,8 @@ pub(crate) struct App {
     /// What DLSS was asked to run at, kept because the renderer is built when the window appears
     /// rather than when the arguments are read.
     dlss: Upscaling,
+    /// How much baked lighting to divide out, held for the renderer built when the window appears.
+    delight: f32,
     /// Which cell to open in, from the command line.
     cell: CellId,
     /// **Before `window`, and that is load-bearing.** Fields drop in declaration order, and the
@@ -246,6 +248,7 @@ impl App {
         Self {
             cell: options.cell,
             dlss: options.dlss,
+            delight: options.delight,
             exit_after: options.exit_after,
             ..Self::default()
         }
@@ -258,6 +261,7 @@ impl Default for App {
         Self {
             cell: scene_loader::cell_named(scene_loader::DEFAULT_CELL),
             dlss: Upscaling(None),
+            delight: 1.0,
             renderer: None,
             window: None,
             centre: None,
@@ -347,7 +351,7 @@ impl ApplicationHandler for App {
             .expect("failed to create window");
 
         let size = window.inner_size();
-        match Renderer::new(&window, size.width, size.height, self.dlss) {
+        match Renderer::new(&window, size.width, size.height, self.dlss, self.delight) {
             Ok(renderer) => {
                 println!("{}", renderer.capability_report());
                 self.renderer = Some(renderer);

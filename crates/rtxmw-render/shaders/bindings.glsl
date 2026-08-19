@@ -185,6 +185,9 @@ layout(set = 0, binding = 14, scalar) readonly buffer Frame {
     // Which frame this is. It moves the hash streams every frame, so a still camera does not redraw
     // the same noise — see `sample_stream` in `lighting.glsl`.
     uint sequence;
+    // How much of the lighting painted into a texture to divide back out, from zero for the texture
+    // as shipped to one for the whole estimate. See `baked_shading` in `surface.glsl`.
+    float delight;
     // The sinusoids the sea is summed from, built on the host from an empirical spectrum rather
     // than a series chosen by eye — see `wave_spectrum.rs`.
     Wave waves[WAVE_COUNT];

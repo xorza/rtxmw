@@ -47,6 +47,19 @@ vec3 interpolate_normal(uvec3 verts, vec3 weights) {
          + attributes[verts.z].normal * weights.z;
 }
 
+// Where a texture id's colour lands in the bindless array.
+//
+// Slot zero is the fallback a material with no texture takes, and every texture is followed by the
+// shading map estimated from it — one array rather than two because Vulkan allows a variable
+// descriptor count only on a set's final binding.
+uint colour_slot(uint id) {
+    return 1u + 2u * id;
+}
+
+uint shading_slot(uint id) {
+    return 2u + 2u * id;
+}
+
 // Mip level for a hit, from the width of the ray's cone where it landed.
 //
 // A rasterizer takes this from screen-space derivatives, which a compute shader does not have, so
@@ -85,24 +98,51 @@ float cone_lod(uvec3 verts, mat4x3 to_world, vec3 direction, float footprint,
     return max(0.0, log2(tilted * texels_per_unit));
 }
 
-// The material's base colour texel at `uv`.
+// What the map's byte range spans. Declared again as the top of `RANGE` in `shading_map.rs`, which
+// pins the two with a test, because a GLSL shader cannot see a Rust constant.
+const float SHADING_SCALE = 2.0;
+
+// What a texture had painted into it, at the point `uv` names.
 //
-// Slot zero of the array is the fallback, so a material's texture id addresses `id + 1`.
+// **Scaled back up, because the map is stored divided down**: its values run past one and an sRGB
+// byte only holds `0..1`. Neutral is one, so `frame.delight` of zero leaves the texture exactly as
+// it was.
+//
+// Always mip zero: the map is a single level of thirty-two squared, and what it describes varies
+// across the whole texture rather than between neighbouring texels.
+float baked_shading(uint id, vec2 uv) {
+    if (frame.delight <= 0.0) {
+        return 1.0;
+    }
+    float shading =
+        textureLod(textures[nonuniformEXT(shading_slot(id))], uv, 0.0).r * SHADING_SCALE;
+    return mix(1.0, shading, frame.delight);
+}
+
+// The material's base colour texel at `uv`, with the lighting painted into it divided out.
+//
+// **Vanilla textures have shading, ambient occlusion and directional light painted in**, authored
+// for a renderer with none of its own — see `docs/design.md` §5.1. Tracing over that lights every
+// surface twice. Dividing by the estimate removes the low-frequency part of it, which is the part
+// that came from lighting rather than from the artist's detail.
+//
 // `nonuniformEXT` because neighbouring rays in a warp land on different materials, and an index
 // that varies across the warp is undefined without it.
 vec4 base_colour(Material material, vec2 uv, float lod) {
-    return textureLod(textures[nonuniformEXT(material.base_colour + 1u)], uv, lod);
+    vec4 texel = textureLod(textures[nonuniformEXT(colour_slot(material.base_colour))], uv, lod);
+    texel.rgb /= baked_shading(material.base_colour, uv);
+    return texel;
 }
 
 // The four ground textures a `KIND_TERRAIN` material names, as slots in the bindless array.
 //
-// Sixteen bits apiece in the two words `material_buffers.rs` packs them into, and offset by one on
-// the way out because slot zero of the array is the fallback a material with no texture takes.
+// Sixteen bits apiece in the two words `material_buffers.rs` packs them into. Returned as ids
+// rather than slots, because each one addresses a colour and a shading map — see `colour_slot`.
 uint[4] terrain_layers(Material material) {
-    return uint[4]((material.terrain_layers0 & 0xFFFFu) + 1u,
-                   (material.terrain_layers0 >> 16) + 1u,
-                   (material.terrain_layers1 & 0xFFFFu) + 1u,
-                   (material.terrain_layers1 >> 16) + 1u);
+    return uint[4](material.terrain_layers0 & 0xFFFFu,
+                   material.terrain_layers0 >> 16,
+                   material.terrain_layers1 & 0xFFFFu,
+                   material.terrain_layers1 >> 16);
 }
 
 // The ground's colour, blended across the four tiles nearest the point.
@@ -136,7 +176,9 @@ vec3 ground_colour(Material material, vec2 world, vec2 uv, float lod) {
                        (1.0 - weight.x) * weight.y, weight.x * weight.y);
     vec3 colour = vec3(0.0);
     for (int layer = 0; layer < 4; ++layer) {
-        colour += across[layer] * textureLod(textures[nonuniformEXT(layers[layer])], uv, lod).rgb;
+        uint id = layers[layer];
+        vec3 tile = textureLod(textures[nonuniformEXT(colour_slot(id))], uv, lod).rgb;
+        colour += across[layer] * tile / baked_shading(id, uv);
     }
     return colour;
 }
@@ -195,7 +237,7 @@ bool alpha_passes(uint slot, uint primitive, vec2 bary, mat4x3 to_world, vec3 di
     // A footprint of zero means the caller has no cone to resolve with, which is every shadow ray;
     // those keep the finest level, and skip the work of asking for it.
     float lod = footprint > 0.0
-              ? cone_lod(verts, to_world, direction, footprint, material.base_colour + 1u)
+              ? cone_lod(verts, to_world, direction, footprint, colour_slot(material.base_colour))
               : 0.0;
     float alpha = base_colour(material, uv, lod).a;
     return alpha >= material.alpha_cutoff;
@@ -388,12 +430,12 @@ Surface trace(vec3 origin, vec3 direction, float cone_width, float cone_spread, 
         // One lod for all four, chosen from the first: they are sampled over the same footprint
         // with the same uv, and every land texture the game ships is 256 square.
         float lod = cone_lod(verts, to_world, direction, surface.footprint,
-                             terrain_layers(material)[0]);
+                             colour_slot(terrain_layers(material)[0]));
         surface.albedo *= ground_colour(material, surface.position.xy,
                                         interpolate_uv(verts, weights), lod);
     } else if (material.base_colour != NO_TEXTURE) {
         float lod = cone_lod(verts, to_world, direction, surface.footprint,
-                             material.base_colour + 1u);
+                             colour_slot(material.base_colour));
         surface.albedo *= base_colour(material, interpolate_uv(verts, weights), lod).rgb;
     }
     return surface;
