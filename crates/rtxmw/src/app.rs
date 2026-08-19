@@ -12,8 +12,8 @@ use winit::window::{CursorGrabMode, Window, WindowId};
 
 use rtxmw_scene::{CellDetail, CellId, CellStreamer, LoadedCell, SceneError};
 
-use crate::WindowOptions;
 use crate::camera::{Camera, Movement};
+use crate::cli::WindowOptions;
 use crate::renderer::Renderer;
 use crate::scene_loader::{self, WantedCell};
 

@@ -5,7 +5,9 @@ use clap::{CommandFactory, Parser};
 use glam::Vec3;
 use rtxmw_scene::CellId;
 
-use crate::cli::{SCREENSHOT_SIZE, ScreenshotOptions, WindowOptions, size};
+use crate::cli::{
+    SCREENSHOT_SIZE, ScreenshotOptions, WindowOptions, names_help, names_screenshot, size,
+};
 use crate::scene_loader;
 use crate::scene_loader::ViewpointOverride;
 use std::path::PathBuf;
@@ -30,6 +32,62 @@ fn screenshot_options(arguments: &[&str]) -> Result<ScreenshotOptions, String> {
 
 fn interior(name: &str) -> CellId {
     CellId::Interior(name.to_owned())
+}
+
+/// Arguments as the shell hands them over, program name and all.
+fn argv(arguments: &[&str]) -> Vec<String> {
+    std::iter::once("rtxmw")
+        .chain(arguments.iter().copied())
+        .map(str::to_owned)
+        .collect()
+}
+
+#[test]
+fn the_offscreen_command_is_named_wherever_the_flag_falls() {
+    // Leading is how it has always been written and stays valid; the rest is what stopped being a
+    // rule when clap took over reading the arguments.
+    for arguments in [
+        vec!["--screenshot", "out.png"],
+        vec!["--frames", "8", "--screenshot", "out.png"],
+        vec!["--screenshot=out.png"],
+        vec!["--samples", "1", "--screenshot=out.png", "1920x1080"],
+    ] {
+        assert!(
+            names_screenshot(&argv(&arguments)),
+            "{arguments:?} names the offscreen command"
+        );
+    }
+    for arguments in [
+        vec![],
+        vec!["-2,-9"],
+        vec!["--frames", "8"],
+        // A near miss, which must not count: this is a cell whose name begins the same way.
+        vec!["--screenshots"],
+        // **Past a bare `--` the word is a value, not a flag.** Dispatching on it there would send
+        // an argument the user explicitly quoted to the wrong command.
+        vec!["--", "--screenshot"],
+    ] {
+        assert!(
+            !names_screenshot(&argv(&arguments)),
+            "{arguments:?} does not name the offscreen command"
+        );
+    }
+}
+
+#[test]
+fn help_is_recognised_in_both_spellings() {
+    // `--screenshot` takes a value, so clap meets `--screenshot --help` by reporting the value
+    // missing. Catching the request first is the only way that answers what was asked.
+    for arguments in [vec!["--help"], vec!["-h"], vec!["--screenshot", "--help"]] {
+        assert!(names_help(&argv(&arguments)), "{arguments:?} asks for help");
+    }
+    for arguments in [
+        vec!["--screenshot", "out.png"],
+        vec!["--helpful"],
+        vec!["--", "--help"],
+    ] {
+        assert!(!names_help(&argv(&arguments)), "{arguments:?} does not");
+    }
 }
 
 #[test]

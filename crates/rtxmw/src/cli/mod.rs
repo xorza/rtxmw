@@ -1,13 +1,13 @@
-//! The command line: two commands, and the parsers that turn their words into values.
+//! The command line: two commands, which of them was asked for, and the parsers that turn their
+//! words into values.
 //!
-//! Apart from `main.rs` because it is the bulk of the binary's own code and half of it is tests —
-//! the entry point is `main` and the two structs below, and neither should have to be read past to
-//! find the other.
+//! Apart from `main.rs`, which is the entry point and nothing else — this is the bulk of the
+//! binary's own code and half of it is tests, and neither has to be read past to find the other.
 
 use std::path::PathBuf;
 
 use ash::vk;
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use rtxmw_scene::CellId;
 
 use crate::scene_loader;
@@ -15,6 +15,73 @@ use crate::scene_loader::ViewpointOverride;
 
 #[cfg(test)]
 mod tests;
+
+/// What the arguments ask the binary to do.
+#[derive(Debug)]
+pub(crate) enum Command {
+    Window(WindowOptions),
+    Screenshot(ScreenshotOptions),
+}
+
+impl Command {
+    /// Reads the arguments, program name and all.
+    ///
+    /// **Which command was asked for is decided here rather than by clap**, because the two take
+    /// different positionals — a cell, against a size and then a cell — and no argument grammar can
+    /// say that one slot means a different thing depending on a flag elsewhere.
+    ///
+    /// Exits the process on a bad argument or on `--help`, which is what clap's own `parse_from`
+    /// does and what a command line is expected to do.
+    pub(crate) fn parse_from(arguments: &[String]) -> Self {
+        if !names_screenshot(arguments) {
+            return Self::Window(WindowOptions::parse_from(arguments));
+        }
+        match ScreenshotOptions::try_parse_from(arguments) {
+            Ok(options) => Self::Screenshot(options),
+            // **`--screenshot` takes a value, so clap meets a `--help` beside it by reporting the
+            // value missing.** Technically correct and useless: there is nothing else the two
+            // together could mean.
+            //
+            // Behind a failure rather than in front of the parse, so that this crate never
+            // adjudicates an argument clap was willing to read. The two happen to agree on what
+            // `-h` is today; only one of them is the authority on it.
+            Err(_) if names_help(arguments) => {
+                ScreenshotOptions::command()
+                    .print_long_help()
+                    .expect("the help text should reach stdout");
+                std::process::exit(0);
+            }
+            Err(failed) => failed.exit(),
+        }
+    }
+}
+
+/// Whether the arguments name the offscreen command.
+///
+/// **Anywhere among them, not first.** Requiring this one flag to lead was a rule with nothing
+/// behind it once a parser read the rest, so `--frames 8 --screenshot out.png` now works.
+///
+/// A *positional* before it still binds by the offscreen grammar, where the first one is the size —
+/// `-2,-9 --screenshot out.png` is a size that will not parse, not a cell. Nothing can fix that: the
+/// two commands disagree about what the first positional means, which is why they are two.
+///
+fn names_screenshot(arguments: &[String]) -> bool {
+    options(arguments)
+        .any(|argument| argument == "--screenshot" || argument.starts_with("--screenshot="))
+}
+
+/// Whether the arguments ask for help, in either of the two spellings clap accepts.
+fn names_help(arguments: &[String]) -> bool {
+    options(arguments).any(|argument| argument == "--help" || argument == "-h")
+}
+
+/// The arguments that are still options, for a caller reading them before a parser does.
+///
+/// A bare `--` ends option parsing, so everything past it is a value however it is spelled — and a
+/// value someone went to the trouble of writing `--` for is the last thing to mistake for a flag.
+fn options(arguments: &[String]) -> impl Iterator<Item = &String> {
+    arguments.iter().take_while(|argument| *argument != "--")
+}
 
 /// Resolution of a `--screenshot` render when none is given, independent of any window.
 ///
@@ -69,7 +136,13 @@ fn at_least_one(value: &str) -> Result<u32, String> {
 
 /// What the windowed mode was asked for.
 #[derive(Parser, Debug, Clone, PartialEq)]
-#[command(about = "A raytraced Morrowind engine.")]
+#[command(
+    about = "A raytraced Morrowind engine.",
+    after_help = concat!(
+        "Add --screenshot <PATH> to render offscreen and exit, opening no window.\n",
+        "Its own arguments are at `rtxmw --screenshot --help`.",
+    )
+)]
 pub(crate) struct WindowOptions {
     /// Where to start: a coordinate pair like -2,-9 is an exterior, anything else names an
     /// interior.
