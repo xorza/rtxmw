@@ -2113,6 +2113,43 @@ at 176 lines and 43%, `geometry_buffers` at 180 — and are now `{mod.rs, tests.
 
 The whole refactor is **pixel-identical**, which is the only claim worth making about it.
 
+### 7.21 Cell frustum culling buys nothing, and the reason generalises
+
+Built, measured, reverted. The patch is kept because the *measurement* is the useful part and
+someone will otherwise propose this again.
+
+**What it did.** Six planes from the view-projection matrix, each resident cell's world bounds tested
+against them, and the top level rebuilt over what survived — plus the ring of cells around the camera
+kept whatever the frustum said, because the sun does not care which way the camera faces and a cell
+behind it shadows the ground in front.
+
+**What it saved.** Out of 6,455 instances across a 48-cell window: 4,124 looking along the ground,
+and **1,709 looking at the sky**, which is as selective as this can ever get — a 74% cut.
+
+**What it cost in trace time, at that 74%:**
+
+| | median | min | max |
+|---|---|---|---|
+| culled | 1.91 ms | 1.91 | 1.94 |
+| everything resident | 1.88 ms | 1.85 | 2.10 |
+
+**Nothing. Not a small win inside the noise — zero, at three quarters of the scene removed.**
+
+The premise is what is wrong, and it is worth stating because it applies to any culling scheme
+proposed above the acceleration structure: **a bounding volume hierarchy already culls, spatially,
+and does it per ray rather than per frame.** A ray that never travels toward a cell never descends
+the subtree holding it, so removing that subtree removes work nobody was doing. Frustum culling is a
+rasteriser's idea — it exists because a rasteriser must *submit* geometry before it can reject it,
+and a ray tracer never submits anything.
+
+Against that, the costs are real: 1.1 ms and a device-idle stall each time the visible set moves,
+which is every time a turn brings a cell across a frustum edge; and the image changes by 3,066 pixels
+of two million, because bounce and shadow rays that reached a culled cell now escape to the sky.
+
+Worth reaching for instead, if the top level ever does become the cost: fewer *instances* rather than
+fewer cells — merging the static clutter of a cell into one structure — which shrinks what the
+hierarchy has to describe rather than hiding part of it.
+
 ### 7.8 Costs and risks
 
 - **Water pixels cost roughly twice.** Two rays instead of one, each spawning its own shadow rays.
