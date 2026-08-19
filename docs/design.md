@@ -780,8 +780,21 @@ memory and build time are a non-issue in a 16 GB budget. The pressure is **TLAS 
 | `bytemuck` | `#[repr(C)]` GPU structs | |
 | `dotenvy` | locating the game install | production behaviour, not a test helper |
 | build-time: `glslc` | GLSL → SPIR-V | external tool, shelled from `build.rs` |
+| build-time: NGX SDK | DLSS Ray Reconstruction | **not a crate and not in this repository** — see below |
 
-Not yet added: an NGX binding for DLSS-RR at M7, hand-written FFI against the C header.
+**The NGX SDK is fetched, not vendored.** It is NVIDIA's, under the RTX SDK licence, so it lives in
+`.refs/dlss` beside the OpenMW checkout and is gitignored like it:
+
+```
+git clone --depth 1 https://github.com/NVIDIA/DLSS.git .refs/dlss
+```
+
+`DLSS_SDK_DIR` overrides the location. The binding is hand-written FFI against the C header — no
+generator and no crate — and the whole path sits behind the `dlss` feature.
+
+**Absent, it compiles out rather than failing.** `--all-features` is the documented verification
+chain, so a fresh clone has to build with it; `build.rs` warns and disables instead. Naming a wrong
+`DLSS_SDK_DIR` is still an error, because that is a mistake rather than an absence.
 
 ---
 
@@ -1627,3 +1640,33 @@ either way with jitter off.
 
 **Cost:** one more `imageStore` per pixel and an image at 1080p. The visible output is unchanged —
 0 of 921,600 pixels differ, jitter being off.
+
+### 8.17 NGX links by hand, and `wchar_t` is 32 bits here
+
+The first slice of M7's second half: prove the SDK links, and ask it what it needs.
+
+**Hand-written FFI, no generator.** NGX's parameter map is a C++ class with a vtable, which looks
+like a reason to reach for `bindgen` or a C++ shim — and is not. Every call this needs is exported
+with **C linkage**, checked with `nm` on `libnvsdk_ngx.a` before a line was written: the SDK's own
+helper headers reach the map through `NVSDK_NGX_Parameter_SetI` and friends rather than through the
+vtable, and so does this. Twenty mangled symbols exist in that archive and none of them is named
+here.
+
+**The extension query comes first because nothing else can.** `NVSDK_NGX_VULKAN_RequiredExtensions`
+takes no Vulkan objects, and what it returns has to be enabled *when the instance and device are
+created* — so it is the one call that must work before anything else exists. On this driver:
+
+| | |
+|---|---|
+| instance | `VK_KHR_get_physical_device_properties2` |
+| device | `VK_NVX_binary_import`, `VK_NVX_image_view_handle`, `VK_EXT_buffer_device_address`, `VK_KHR_push_descriptor` |
+
+Queried rather than hardcoded: the list has changed between SDK versions, and these are what *this*
+one wants.
+
+**`wchar_t` is 32 bits on Linux**, and declaring `GetNGXResultAsString` as `*const u16` reads UTF-32
+at half the stride — every error name came back one character long, its second byte being the
+terminator. `NVSDK_NGX_Result_FAIL_OutOfDate` rendered as `"N"`. The test caught it because it asks
+for the SDK's actual name rather than for "some letters", which the truncated version would have
+passed. This is the failure mode hand-written FFI has, and the reason each declaration carries the
+header line it was checked against.

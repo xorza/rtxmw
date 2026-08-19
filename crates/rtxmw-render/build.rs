@@ -20,6 +20,9 @@ fn main() {
     println!("cargo:rerun-if-changed={}", shader_dir.display());
     println!("cargo:rerun-if-changed=build.rs");
 
+    #[cfg(feature = "dlss")]
+    link_ngx();
+
     let mut built = 0;
     for entry in std::fs::read_dir(&shader_dir).expect("shaders directory should exist") {
         let source = entry.expect("readable directory entry").path();
@@ -96,4 +99,51 @@ fn validate(module: &Path) {
             String::from_utf8_lossy(&result.stderr)
         );
     }
+}
+
+/// Points the linker at NVIDIA's NGX SDK, or explains where it should be.
+///
+/// **The SDK is not in this repository and cannot be.** It is NVIDIA's, under the RTX SDK licence,
+/// so it is fetched into `.refs/` like the OpenMW checkout and the game data — see `docs/design.md`
+/// §6. `DLSS_SDK_DIR` overrides the location for a machine that keeps it elsewhere.
+///
+/// Only called under the `dlss` feature, so a build without it neither needs the SDK nor mentions
+/// it.
+#[cfg(feature = "dlss")]
+fn link_ngx() {
+    println!("cargo:rustc-check-cfg=cfg(ngx)");
+    println!("cargo:rerun-if-env-changed=DLSS_SDK_DIR");
+    let named = std::env::var_os("DLSS_SDK_DIR").map(PathBuf::from);
+    let sdk = named.clone().unwrap_or_else(|| {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(".refs/dlss")
+    });
+    let lib = sdk.join("lib/Linux_x86_64");
+
+    if !lib.join("libnvsdk_ngx.a").is_file() {
+        // **Missing is not an error unless it was asked for by name.** `--all-features` is the
+        // documented verification chain, so a fresh clone has to build with it; the SDK is NVIDIA's
+        // and cannot be in this repository, and a build that fails without it would make the chain
+        // undocumentable. Absent, the feature compiles to nothing and its tests are not there to
+        // skip — the same shape as a machine without the game.
+        assert!(
+            named.is_none(),
+            "DLSS_SDK_DIR names {}, and there is no libnvsdk_ngx.a under it",
+            sdk.display()
+        );
+        println!(
+            "cargo:warning=no NGX SDK at {}, so DLSS is compiled out. Fetch it with `git clone \
+             --depth 1 https://github.com/NVIDIA/DLSS.git .refs/dlss`, or set DLSS_SDK_DIR.",
+            sdk.display()
+        );
+        return;
+    }
+
+    println!("cargo:rustc-cfg=ngx");
+    println!("cargo:rustc-link-search=native={}", lib.display());
+    println!("cargo:rustc-link-lib=static=nvsdk_ngx");
+    // The SDK is C++ and loads the driver's NGX core at runtime, so it wants both.
+    println!("cargo:rustc-link-lib=dylib=stdc++");
+    println!("cargo:rustc-link-lib=dylib=dl");
 }

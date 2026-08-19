@@ -6,6 +6,9 @@ mod acceleration_structure;
 mod auto_exposure;
 mod composite;
 mod denoiser;
+// Only when the SDK is actually on disk — `build.rs` says so, and says why it may not be.
+#[cfg(all(feature = "dlss", ngx))]
+mod dlss;
 mod gbuffer;
 mod geometry_buffers;
 mod gpu_light;

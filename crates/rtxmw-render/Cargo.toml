@@ -8,6 +8,12 @@ build = "build.rs"
 [lints]
 workspace = true
 
+[features]
+# DLSS Ray Reconstruction through NGX. Off by default because it needs NVIDIA's SDK on disk, which
+# is not redistributable and so is not in this repository — see `build.rs` for where it is looked
+# for. Everything else builds and runs without it.
+dlss = []
+
 [dependencies]
 ash.workspace = true
 bytemuck.workspace = true
