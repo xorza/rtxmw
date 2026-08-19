@@ -1813,6 +1813,278 @@ tilt out of horizontal is *identical* under both orders whenever the Y angle is 
 azimuth differs. What separates them is that things stop resting where they were put — the book's
 base sits 8 units below the board its cups stand on, which is the test.
 
+### 7.15 Caustics tile when the spectrum is spaced too widely
+
+The light on the seabed came out as a lattice — a tiling of near-identical cells, regular enough to
+read as a texture rather than as water. The waves themselves do not look like that, and the reason is
+in the derivative.
+
+**Curvature weights an octave by `A k²`**, a ratio of `WAVE_GAIN / WAVE_LACUNARITY²`. At the original
+0.55 and 0.618 that is **1.44 — above one**, so however many octaves are summed, the finest one or
+two dominate the Hessian entirely. Two plane waves crossing is a grid, and that grid was the caustics.
+The surface escaped it because slope weights an octave by `A k`, a ratio of 0.89, so every octave
+contributes there and the sum looks irregular.
+
+Two changes, and both earn their place — the second alone still leaves a visible grain:
+
+- **The octaves are spaced closely**: 14 of them at a lacunarity of 0.74 rather than 9 at 0.618,
+  holding `WAVE_GAIN / WAVE_LACUNARITY` at 0.89 so the total slope is unchanged and the surface keeps
+  its character. Five or six components now land at comparable short scales pointing in different
+  directions, which is what a real short-wave spectrum is — broad in direction where the swell is
+  narrow. The curvature ratio falls from 1.44 to 1.21.
+- **The ripples are carried by the swell.** A low-frequency displacement field, two long crossing
+  waves at angles the octave sequence never takes, is applied to the sample position before the
+  waves are evaluated. Physically this is short waves riding on the orbital motion of long ones; in
+  practice it bends the crests so the pattern wanders instead of tiling. Thirteen units of drift is
+  most of a wavelength to the shortest waves and a rounding error to the longest, so one field does
+  the whole job.
+
+The Hessian is taken with respect to the drifted position, which drops the chain rule's contribution
+from the drift itself — that field turns over six hundred units against a curvature set by ten, so
+its Jacobian is within a fifth of the identity, and the omission shows up as a slow variation in
+caustic strength that is indistinguishable from what real water does.
+
+Measured: no change in trace time that this machine can resolve (4.48–5.20 ms against 4.70–5.41 over
+interleaved runs), and distant water is slightly calmer rather than sparklier — pixel-to-pixel
+variation 17.1 down to 14.0 — because the ray cone filters more of a finer-spaced spectrum away.
+
+### 7.17 Choppiness is right, and at this sea state it is invisible
+
+§7.16 stage 1. Gerstner's horizontal displacement is in, carried into the caustic Jacobian, and the
+honest result is that **it changes almost nothing to look at** — 788 pixels of a shore by at most a
+twentieth of their value, contrast 18.07 to 18.28. The arithmetic is worth keeping and the
+expectation was worth correcting.
+
+**Why it is small.** The displacement's Jacobian contributes the steepness `A k`, which sums to 0.28
+across the spectrum. The refraction term contributes `bend·depth·A k²`, which at a few metres of
+water is ten times that. Choppiness would matter on a surface steep enough to fold; these waves
+cannot reach the trochoid limit at any choppiness.
+
+**One thing it does buy outright.** With displacement the map from world surface to seabed is a
+*ratio* of determinants — a patch covers `det(I + dD)` of surface and lands on
+`det(I + dD − bend·H)` of bottom. Written as one determinant, a choppy surface would brighten the
+bottom of a puddle that has no depth for light to converge over. The ratio is 1 at zero depth by
+construction.
+
+#### Why the caustics are soft, with numbers
+
+Chasing the stage-1 expectation turned up the real answer, and it is not any of the things it looked
+like. Focus needs the Jacobian to approach zero, which needs `bend·depth·A k² ≈ 1`. Summed over the
+whole spectrum, with every octave aligned in phase and direction — which never happens — that reaches
+**1.21 at the deepest water the term is allowed**, and a fraction of it in practice. The determinant
+stays near one. **This surface does not focus light; it modulates it by tens of percent.** Soft cells
+are the correct answer for a 15° sea over a coastal shelf.
+
+Three plausible culprits were measured and cleared:
+
+| suspected | measured |
+|---|---|
+| the brightness ceiling clipping cusps | raised from 3 to 8: pixel-identical, so nothing was reaching it |
+| the denoiser blurring the filaments | rendered with filtering off: pixel-identical |
+| too little curvature in the spectrum | 14 octaves to 18, shortest wave 8.4 units to 2.5: finer and noisier, not bolder |
+
+That last one is the useful negative. Curvature grows with wavenumber, so adding short waves adds
+curvature — but the cells it focuses are the size of those waves, so the pattern gets *finer* rather
+than sharper, and below a pixel it is noise.
+
+#### What would actually do it
+
+Bold caustics need focusing at a cell size the eye reads as a pattern — call it a metre, 15 units,
+where the spectrum currently carries an amplitude of 0.026 units. Focusing there needs `A k² ≈ 0.04`,
+which is an amplitude of about 0.24 — **roughly nine times the energy** a Phillips-shaped falloff puts
+in that band. A real swimming pool has exactly that: centimetre ripples over a metre of water, which
+is a far higher wavenumber *relative to depth* than a sheltered bay.
+
+So the lever is a wind-chop bump on the metre scale, over the swell, and it is a deliberate departure
+from the physical spectrum in exchange for the look. Worth doing knowingly, and worth not doing by
+accident while tuning something else.
+
+### 7.18 The wind-chop band works and costs too much
+
+§7.17 worked out what bold caustics would need — roughly nine times the energy a swell-shaped
+spectrum puts in the metre band — and said it was a knowing departure to make or not. It was made,
+measured, and **reverted**, and the measurements are the reason to write it down rather than try it
+again.
+
+The change was a second peak in the spectrum at the scale of local wind chop, a log-normal bump over
+the swell's falling series. That is not a fudge — a bimodal sea of swell plus locally raised wind
+waves is ordinary oceanography, and it is the second peak that has a wavenumber high enough, against
+a few metres of water, to actually focus light.
+
+**It does what it was supposed to.** The determinant reaches zero, and the seabed gets bright
+filaments with loops and cusps in place of soft cells. Contrast over a shore patch rose from 20.0 to
+24.2 with a narrow band, and to 27.7 with a wide one.
+
+**It costs more than that is worth**, on three counts, each measured:
+
+| cost | measured |
+|---|---|
+| the whole sea roughens | distant water's pixel-to-pixel variation 14.0 to 23.1, and that is the failure mode `WAVE_TALLEST` is written to avoid |
+| caustics alias where they sharpen | stipple 9.1 to 21.9 with a wide band; a narrow one held it to 9.8 |
+| **the water stops obeying Beer-Lambert** | looking up through it from below, transmission fell to 0.649 of the near view where the analytic answer is 0.807 |
+
+The third is the one that settled it. A surface rough enough to focus light that hard refracts the
+view through it far enough that straight-line attenuation no longer describes what comes out, and the
+rest of the water model — absorption, scattering, the sun's path to the seabed — is built on that
+attenuation. Buying caustics by breaking it is not a trade worth making for one close-up view.
+
+A band-limit was tried against the aliasing, on the argument that a sharpening function of a
+band-limited field carries detail above the band and so needs the ray cone widened for the curvature
+specifically. That argument holds and the filter works — stipple below baseline at a widening of
+three and a half — but it is too blunt: the same widening that cleans a close view erases the pattern
+at a middling one, to the point that `caustics_gather_the_sunlight_without_creating_any` stops seeing
+the caustics move at all. Something that widened with the *sharpness* rather than with the distance
+would be the right shape, and was not worth building for a feature about to be reverted.
+
+**What stands.** Vvardenfell's water is a sheltered coastal shelf, and a sheltered coastal shelf does
+not throw pool caustics. Soft cells are the honest answer; §7.15's respacing and drift are what make
+them look like water rather than a lattice.
+
+### 7.19 The spectrum is empirical now, and its short end is a time limit
+
+§7.16 stages 3 and 4. Dispersion is in and measures at nothing; the spectrum rework is in and is the
+substantial change.
+
+#### Chromatic dispersion, kept and worth almost nothing
+
+Water's index is not one number — Cauchy's fit gives 1.3326, 1.3342 and 1.3392 at 600, 550 and 450
+nanometres, so the three colours are focused by bends a part in seventy apart and a caustic ought to
+have coloured edges. Three determinants over a Hessian that does not depend on the channel, which is
+two extra multiply-adds of numbers already in registers.
+
+**Twelve pixels in ninety thousand differ by more than one level, and none by more than two.** It is
+kept because it is right and free, not because it shows. If the sea ever gets steep enough for the
+determinant to approach zero, this is the term that puts prism edges on the cusps.
+
+#### TMA and Donelan-Banner, replacing a series chosen by eye
+
+`WAVE_TALLEST`, `WAVE_GAIN` and `WAVE_LACUNARITY` are gone. The surface is now summed from a table
+the host builds from the **TMA** spectrum — JONSWAP under Kitaigorodskii's shallow-water attenuation
+— spread over directions by **Donelan-Banner**, which is Horvath's pairing and the one the real-time
+literature follows. Thirty-two components: eight wavenumber bands, four directions each, sampled by
+*quantile* of the directional spread so every component carries the same energy and the spread's
+shape is exact however few are taken.
+
+Three things fall out that the old series could not have:
+
+- **The depth term is the coastal correction this game needs.** A six-metre swell over half a metre
+  of water travels at two thirds of its open-sea speed; over three metres it travels at full speed.
+  That is a shore behaving like a shore, and it is why this is TMA rather than JONSWAP.
+- **The spread is frequency-dependent by construction** — the lowest band fans across 68 degrees and
+  the highest past 120 — which is the empirical form of what §7.15 arrived at from a symptom.
+- **The maths is testable in Rust**, where the old constants were three numbers in a shader with
+  nothing to check them against. Six tests now cover the attenuation's three parts and the continuity
+  between them, the spread's narrowing at the peak, the significant height the table is scaled to,
+  the dispersion relation each component obeys, and the layout the shader reads.
+
+`alpha` never appears: it is a constant multiplier on the whole spectrum, so it cancels, and the
+table is scaled instead to a **significant wave height** — the one number about a sea that a person
+can picture.
+
+#### The short end is a limit in time, not in space
+
+The first cut carried waves down to four units and the seabed came out as dense per-pixel noise.
+TMA's tail is the Phillips saturation range, where steepness is *constant* with wavenumber — so
+`A k^2` climbs without bound and the finest waves own the curvature completely. Root-mean-square
+curvature came out seven times the old series'.
+
+Raising the cut to eighteen units fixed the aliasing and produced the best caustics this renderer has
+drawn — bright filaments with loops and cusps. It also made them **tear**: the pattern changed by
+73% of its own contrast every twelfth of a second, against 49% before, which reads as stripes ripping
+across the bottom rather than as water.
+
+That is not a bug to fix but a trade to choose, and it cannot be had both ways: **a wave's period
+falls with its length, so the waves that focus hardest are the ones that move fastest.** They are the
+same waves.
+
+| shortest wave | caustic contrast | change per twelfth of a second |
+|---|---|---|
+| the old hand-tuned series | 17.7 | 49% |
+| 18 units | 24.6 | 73% |
+| **32 units** | **18.5** | **51%** |
+| 50 units | 16.5 | 33% |
+
+Thirty-two is where the motion is what it was before anyone objected to it, and the light on the
+seabed is a little stronger than the series it replaced. The spectrum is now honest about *why* it
+stops where it does: not because half a metre is too small to see, but because anything shorter
+reshuffles faster than the eye reads as water.
+
+### 7.16 Proposal: what the literature says would make this water beautiful
+
+Research, not a record of work done. §7.15 stopped the caustics tiling; this is what the field says
+about going from "not wrong" to good, and what of it applies to a sum-of-sinusoids surface with
+analytic caustics.
+
+**Where this implementation sits.** Almost every published real-time ocean is FFT-based — a spectrum
+sampled on a grid, inverse-transformed to a height field, tiled across the water. Ours is a direct
+sum of a dozen-odd sinusoids evaluated per sample, which is unusual and is what makes the analytic
+caustic possible at all: a closed-form height field can be differentiated twice, and an FFT texture
+cannot without another pass. The published caustic methods are all image-space — wavefront meshes
+whose triangle areas give ray density, caustic maps, photon splats. **The Jacobian this renderer
+already evaluates is the same quantity those methods estimate**, arrived at exactly instead of by
+splatting, so the improvements below are about what goes *into* it.
+
+#### The spectrum is ad-hoc where the field has an empirical answer
+
+`WAVE_TALLEST`, `WAVE_GAIN` and `WAVE_LACUNARITY` are a geometric series picked by eye. The
+literature's answer is the **TMA spectrum** — JONSWAP with the Kitaigorodskii depth attenuation —
+and Horvath's *Empirical Directional Wave Spectra for Computer Graphics* (DigiPro 2015) is the
+canonical adaptation of it, with an open implementation in EncinoWaves. Two things recommend it here
+beyond accuracy:
+
+- **TMA is the shallow-water correction**, and Vvardenfell's water is a coastal shelf a few metres
+  deep. The depth attenuation is not a detail for this game; it is the regime the game is in.
+- Horvath adds a normalised **`swell` parameter** that elongates waves into parallel trains as a
+  function of wavelength, which is the knob for "sheltered bay" against "open sea" that
+  `WAVE_LONGEST` currently stands in for.
+
+Directional spreading should be **frequency-dependent** — Donelan-Banner is the current
+recommendation, cosine-2s and Mitsuyasu the older ones. That is the empirical form of the thing
+§7.15 arrived at from the symptom: swell is narrow in direction, chop is broad.
+
+#### Choppiness is the biggest single lever, and it lands in the Jacobian
+
+Every ocean renderer applies **horizontal** displacement as well as vertical — Gerstner's circular
+particle motion — which pinches crests to points and flattens troughs. This matters twice over:
+
+- The surface stops looking like a sum of sines, which no amount of spectrum tuning fixes.
+- **Sharp crests are why real caustics are sharp.** A sinusoidal surface focuses light into soft
+  cells, which is what this renderer draws; a surface with pinched crests and flat troughs focuses it
+  into bright filaments with cusps. The caustic map is `q = p - bend·depth·grad(h)`; under
+  displacement it becomes `q = p + D(p) - bend·depth·grad(h)`, so the choppiness enters the same
+  determinant already being computed. Sharper caustics come out of the arithmetic rather than
+  needing a new stage.
+
+The published caution is that choppiness above a threshold makes the surface self-intersect. That
+inversion is detected by the **sign of the Jacobian determinant** — and where it folds is exactly
+where whitecap foam belongs, which is how every FFT ocean generates foam. This renderer computes that
+determinant already and currently takes its absolute value.
+
+#### Caustics have colour
+
+Water's refractive index runs from about **1.3457 in violet to 1.3333 in red**, so `1 - 1/n` spans
+0.2569 to 0.2500 — a 2.8% spread in the bend. Evaluating the determinant per channel with those three
+constants separates the pattern slightly by wavelength: negligible across the flat parts, visible as
+prism fringing exactly on the cusps where the gradient is steepest. This is what the shader articles
+call the thing that "moderates the hotspots", and it costs two more determinants of numbers already
+in registers.
+
+#### Tiling
+
+The FFT literature's remedy is **cascades whose lengthscales share no common factor**, chosen by a
+golden-ratio relation. This renderer has no tile to repeat, and already turns each octave by the
+golden angle, so the lesson is one it applies in the other axis — worth keeping in mind if wavelengths
+are ever regenerated from a spectrum rather than a fixed ratio.
+
+#### Suggested order
+
+1. **Choppiness**, with the displacement carried into the caustic Jacobian. Biggest visual change per
+   line, sharpens waves and caustics together, and needs no new data.
+2. **Foam** from the folded determinant, which stage 1 makes available for free.
+3. **Chromatic dispersion** in the caustic — small, cheap, distinctive.
+4. **TMA plus Donelan-Banner** replacing the geometric series, which is the correctness rework and
+   the one that would want its own before-and-after.
+
 ### 7.8 Costs and risks
 
 - **Water pixels cost roughly twice.** Two rays instead of one, each spawning its own shadow rays.

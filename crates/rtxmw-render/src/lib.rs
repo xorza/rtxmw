@@ -16,6 +16,7 @@ mod scene_residency;
 mod texture_array;
 mod tonemap;
 mod visibility_pass;
+mod wave_spectrum;
 
 // Only what a crate above this one reaches for. Everything else a frame is made of — the passes,
 // their buffers, the G-buffer between them — is assembled by `SceneRenderer` and never named

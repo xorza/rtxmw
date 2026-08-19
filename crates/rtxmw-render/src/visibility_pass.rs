@@ -13,6 +13,7 @@ use crate::light_buffer::LightBuffer;
 use crate::material_buffers::MaterialBuffers;
 use crate::shaders;
 use crate::texture_array::TextureArray;
+use crate::wave_spectrum::{GpuWave, SeaState, WAVE_COUNT};
 
 /// Everything lighting a cell, which arrives together and goes stale together.
 #[derive(Debug, Clone, Copy)]
@@ -75,6 +76,12 @@ pub struct FrameConstants {
     /// Zero unless a caller sets one, so a screenshot and a test are reproducible: the surface at
     /// time zero is a definite shape rather than whatever the clock happened to say.
     time: f32,
+    /// The sinusoids the water surface is summed from — see [`crate::wave_spectrum`].
+    ///
+    /// Static for the life of a sea state, and carried here rather than in a buffer of its own
+    /// because it is six hundred bytes beside a block that is already uploaded every frame, and a
+    /// second binding would cost more to explain than the copy costs to make.
+    waves: [GpuWave; WAVE_COUNT],
 }
 
 impl FrameConstants {
@@ -110,6 +117,10 @@ impl FrameConstants {
             bounce_samples,
             water_level: lighting.water_level.unwrap_or(f32::NEG_INFINITY),
             time,
+            // Rebuilt each frame rather than cached: it is a few hundred floats of arithmetic once
+            // per frame against a million rays that read it, and a cache would need invalidating
+            // the moment the sea state becomes something a cell can set.
+            waves: SeaState::default().waves(),
         }
     }
 
@@ -388,7 +399,9 @@ mod tests {
         assert_eq!(offset_of!(FrameConstants, bounce_samples), 124);
         assert_eq!(offset_of!(FrameConstants, water_level), 128);
         assert_eq!(offset_of!(FrameConstants, time), 132);
-        assert_eq!(size_of::<FrameConstants>(), 136);
+        // The wave table follows, twenty tightly packed bytes apiece.
+        assert_eq!(offset_of!(FrameConstants, waves), 136);
+        assert_eq!(size_of::<FrameConstants>(), 136 + 20 * WAVE_COUNT);
     }
 
     #[test]

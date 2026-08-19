@@ -108,6 +108,22 @@ layout(set = 0, binding = 12) uniform sampler2D textures[];
 // constant.
 const uint NO_TEXTURE = 0xFFFFFFFFu;
 
+// How many sinusoids the surface is summed from. Declared again in `wave_spectrum.rs`, whose test
+// pins the two together.
+const int WAVE_COUNT = 32;
+
+// One of them, as the host builds it: twenty tightly packed bytes, matching `GpuWave` field for
+// field.
+struct Wave {
+    vec2 direction;
+    float wavenumber;
+    float amplitude;
+    // Radians of phase per second, from the dispersion relation at the shelf's depth. Carried
+    // rather than derived, because `sqrt(g k)` is only its deep-water limit and a shore is where
+    // that limit stops holding.
+    float speed;
+};
+
 // A buffer rather than push constants: the block reached the 128 bytes Vulkan guarantees, and then
 // waves needed a clock. Scalar layout, so it matches the `repr(C)` struct in `visibility_pass.rs`
 // field for field. The matrices arrive already multiplied — their product is all unprojection
@@ -130,6 +146,9 @@ layout(set = 0, binding = 11, scalar) readonly buffer Frame {
     // Seconds since the engine started. Zero in a screenshot and in every test, so the water they
     // see is a definite shape rather than whenever they happened to run.
     float time;
+    // The sinusoids the sea is summed from, built on the host from an empirical spectrum rather
+    // than a series chosen by eye — see `wave_spectrum.rs`.
+    Wave waves[WAVE_COUNT];
 } frame;
 
 // A raytracer has no near plane — that is a rasterization artefact. This is only large enough to
@@ -221,50 +240,47 @@ const vec3 WATER_EXTINCTION = vec3(0.004572, 0.000714, 0.001143);
 // chosen by eye, and §5.1 could move them.
 const vec3 WATER_SCATTER = vec3(0.012, 0.042, 0.040);
 
-// Waves, as a sum of trochoidal components: `xy` is the direction they travel, `z` the wavelength
-// in world units, `w` the amplitude.
+// How far a wave draws the water toward its own crest, as a fraction of its height.
 //
-// Four of them, not a spectrum. An FFT ocean exists to sum thousands of components cheaply for
-// deep water at kilometre scale with a horizon; Vvardenfell's water is a coastal shallows thirty
-// metres deep at its worst, and what is wanted here is a surface that *glitters* rather than one
-// that swells. Four components stay analytic — and differentiable in closed form, which is what
-// the caustics work needs and what a texture-based surface could not give.
+// Gerstner's waves move each particle in a circle rather than up and down, so the surface gathers
+// toward the crests and stretches across the troughs: peaks sharpen, hollows flatten. That is the
+// shape a real swell has, and every ocean renderer applies it.
 //
-// Wavelengths of 5 to 1.5 metres with amplitudes under a tenth of a metre: gentle enough that the
-// slope stays shallow, which is what keeps the reflection from tearing into noise.
-// **A spectrum stated as a rule, not a table.** Six waves with hand-picked directions interfere
-// into a weave: the pattern is quasi-periodic, and the eye finds the repeat immediately. Nine
-// octaves whose directions each turn by the golden angle never come back into alignment, which is
-// what a sum of sinusoids needs to read as fractal rather than woven.
+// **At this sea state it is worth almost nothing, and it is kept because it is right rather than
+// because it shows.** Its contribution to the Jacobian is the steepness `A k`, which sums to 0.58
+// across the spectrum, against a refraction term that reaches several times that in deep water — so
+// turning it from nought to one moves a few hundred pixels of a shore by at most a twentieth of
+// their value. It would matter on a surface steep enough to fold, which these waves are not: one is
+// the trochoid limit, where the crest comes to a point, and even there they cannot reach it.
 //
-// Every term is constant per octave and the loop unrolls, so most of this folds away: the compiled
-// module holds one sine and one cosine per octave per derivative and no per-octave direction at
-// all. The two `pow`s do survive — eleven of them across the shader — which is nothing beside the
-// two rays every water pixel already traces, but it is not nothing, so it is written down here
-// rather than assumed away.
-const int WAVE_OCTAVES = 9;
+// What it does buy outright is the zero-depth case below, which is wrong without it.
+const float WAVE_CHOPPINESS = 1.0;
 
-// The longest wave, in world units: six metres, the swell of a sheltered bay rather than an ocean.
-const float WAVE_LONGEST = 420.0;
-
-// Each octave is this fraction of the last in wavelength and this fraction in height. Their product
-// is below one, so **steepness falls as the waves get finer** — the opposite makes small detail the
-// steepest thing on the surface, which is what turns a distant sea into a field of white sparks.
-const float WAVE_LACUNARITY = 0.618;
-const float WAVE_GAIN = 0.55;
-
-// The tallest wave, in world units. Chosen for the total slope it gives across all nine octaves:
-// the steepnesses form a geometric series in `WAVE_GAIN / WAVE_LACUNARITY`, summing to 0.222 — a
-// slope of twelve and a half degrees at its worst, which is a breeze rather than a sea.
-const float WAVE_TALLEST = 2.5;
-
-// The golden angle. Turning each octave by it distributes the directions about as evenly as any
-// sequence can while never repeating, so no two octaves ever line up to draw a grain.
-const float WAVE_TURN = 2.39996;
+// How far the swell carries the ripples riding on it, and over what distance that carrying turns.
+//
+// **A sum of plane waves is a lattice, and curvature is where that shows.** The second derivative
+// weights a component by `A k^2`, which climbs with wavenumber however the spectrum falls, so the
+// shortest few dominate it whatever else is in the sum. A handful of plane waves crossing is a
+// grid, and that grid was the caustics: a tiling of near-identical cells, regular enough to read as
+// a texture rather than as water.
+//
+// So the short waves are carried. On real water they ride on the long swell and are swept along
+// with its orbital motion, which bends their crests and slides them out of step from one trough to
+// the next — the same effect that makes a real pool's caustics wander rather than tile. A drift of
+// a few units is most of a wavelength to the shortest waves and a rounding error to the longest, so
+// one displacement field does the whole job without touching the swell it is derived from.
+//
+// It still earns its place under the empirical spectrum, whose thirty-two directions might have
+// been thought to make it redundant: turning it off moves three quarters of a shore's pixels.
+const float WAVE_DRIFT = 13.0;
+const float WAVE_DRIFT_LENGTH = 640.0;
 
 // Morrowind's gravity, in world units per second squared: 8.96 m/s^2 across 69.99 units to the
-// metre. It sets the dispersion — long waves travel faster than short ones, by `sqrt(g/k)` — which
-// is what stops the components drifting as one rigid pattern.
+// metre.
+//
+// Only the drift field uses it now. The spectrum's own components carry the speeds the host worked
+// out for them, from a dispersion relation that accounts for the depth of the shelf — `sqrt(g k)`
+// is only its deep-water limit, and a shore is where that limit stops holding.
 const float WATER_GRAVITY = 627.1;
 
 const float TAU = 6.2831853;
@@ -282,6 +298,15 @@ const float MIN_FACING = 0.03;
 // water than a reflection is. Derived from the index of refraction rather than written out, so
 // nothing here can come to disagree about what water is.
 const float REFRACTION_BEND = 1.0 - 1.0 / WATER_IOR;
+
+// The same bend, per channel, because water's index is not one number.
+//
+// **Blue light turns harder than red**, so the three colours are focused by slightly different
+// amounts and a caustic has coloured edges — the prism fringing a real pool shows against a white
+// bottom. Cauchy's fit for distilled water, `n = 1.32403 + 3080 / lambda^2` with the wavelength in
+// nanometres, at 600, 550 and 450: indices of 1.3326, 1.3342 and 1.3392, so the bends spread by
+// about a part in seventy.
+const vec3 REFRACTION_BEND_RGB = vec3(0.249579, 0.250494, 0.253308);
 
 // A ceiling on how bright a focus is allowed to get.
 //
@@ -577,20 +602,32 @@ struct WaveSample {
     vec2 direction;
 };
 
+// Where the ripples have been carried to by the time they are sampled — see [`WAVE_DRIFT`].
+//
+// Two long crossing swells at angles the octave sequence never takes, so the drift cannot fall into
+// step with the waves it displaces. Both callers of `sample_wave` pass their positions through this
+// first, and they have to agree: the caustics differentiate the same field the normals come from.
+vec2 drifted(vec2 p, float time) {
+    float wavenumber = TAU / WAVE_DRIFT_LENGTH;
+    float speed = sqrt(WATER_GRAVITY * wavenumber);
+    float along = wavenumber * dot(vec2(0.8347, 0.5507), p) - speed * time;
+    float across = wavenumber * dot(vec2(-0.4132, 0.9106), p) - speed * time * 0.83;
+    return p + WAVE_DRIFT * vec2(sin(along) + 0.6 * cos(across),
+                                 cos(along) - 0.6 * sin(across));
+}
+
 WaveSample sample_wave(int index, vec2 p, float time, float footprint) {
-    float octave = float(index);
-    float wavelength = WAVE_LONGEST * pow(WAVE_LACUNARITY, octave);
-    float angle = WAVE_TURN * octave;
+    Wave component = frame.waves[index];
+    float wavelength = TAU / component.wavenumber;
     WaveSample wave;
-    wave.amplitude = WAVE_TALLEST * pow(WAVE_GAIN, octave);
-    wave.direction = vec2(cos(angle), sin(angle));
+    wave.amplitude = component.amplitude;
+    wave.direction = component.direction;
     // A wave narrower than the pixel looking at it is averaged away rather than drawn: a ray cone a
     // wavelength wide covers a crest and a trough whose slopes cancel, and picking one of them
     // instead is what makes distant water a field of crawling white sparks.
     wave.detail = 1.0 - smoothstep(0.25 * wavelength, 0.75 * wavelength, footprint);
-    wave.wavenumber = TAU / wavelength;
-    wave.phase = wave.wavenumber * dot(wave.direction, p)
-               - sqrt(WATER_GRAVITY * wave.wavenumber) * time;
+    wave.wavenumber = component.wavenumber;
+    wave.phase = wave.wavenumber * dot(wave.direction, p) - component.speed * time;
     return wave;
 }
 
@@ -610,25 +647,48 @@ WaveSample sample_wave(int index, vec2 p, float time, float footprint) {
 //
 // Waves too small for the ray cone are left out of the curvature exactly as they are left out of
 // the normal, and for the same reason — a caustic finer than a pixel is a sparkle, not a pattern.
-float caustic(vec2 p, float depth, float time, float footprint) {
+vec3 caustic(vec2 p, float depth, float time, float footprint) {
     // Second derivatives of `sum(A * sin(k * dot(d, p) - w * t))`, which are `-A k^2 d_i d_j sin`.
+    //
+    // Taken with respect to the drifted position rather than the true one, which drops the chain
+    // rule's contribution from the drift itself. That field turns over six hundred units against a
+    // curvature set by ten, so its Jacobian is within a fifth of the identity — and what the
+    // omission costs is a slow variation in how strong the caustics are, which is indistinguishable
+    // from the variation real water already has.
+    vec2 here = drifted(p, time);
+    // The Hessian of the height, and the Jacobian of the horizontal displacement beside it. They
+    // are the same outer products: differentiating `A cos(phase)` once gives `A k sin(phase)` where
+    // differentiating `A sin(phase)` twice gives `-A k^2 sin(phase)`, so the second is the first
+    // scaled by `-1/k`. One loop produces both.
     vec3 hessian = vec3(0.0);
-    for (int i = 0; i < WAVE_OCTAVES; ++i) {
-        WaveSample wave = sample_wave(i, p, time, footprint);
+    vec3 gathering = vec3(0.0);
+    for (int i = 0; i < WAVE_COUNT; ++i) {
+        WaveSample wave = sample_wave(i, here, time, footprint);
         if (wave.detail <= 0.0) {
             continue;
         }
         float second = -wave.detail * wave.amplitude * wave.wavenumber * wave.wavenumber
                      * sin(wave.phase);
-        hessian += second * vec3(wave.direction.x * wave.direction.x,
-                                 wave.direction.y * wave.direction.y,
-                                 wave.direction.x * wave.direction.y);
+        vec3 axes = vec3(wave.direction.x * wave.direction.x,
+                         wave.direction.y * wave.direction.y,
+                         wave.direction.x * wave.direction.y);
+        hessian += second * axes;
+        gathering += (-second / wave.wavenumber) * axes;
     }
 
-    float bend = REFRACTION_BEND * min(depth, CAUSTIC_MAX_DEPTH);
-    float determinant = (1.0 - bend * hessian.x) * (1.0 - bend * hessian.y)
-                      - (bend * hessian.z) * (bend * hessian.z);
-    return min(1.0 / max(abs(determinant), 1.0 / CAUSTIC_MAX), CAUSTIC_MAX);
+    // **The surface is stretched before the light ever leaves it**, so the caustic is the ratio of
+    // two determinants rather than one. A patch of parameter space covers `det(I + dD)` of world
+    // surface and lands on `det(I + dD - bend*H)` of seabed; the light it carries is spread over the
+    // second having arrived across the first. Written as one determinant instead, a choppy surface
+    // would brighten the bottom of a puddle with no depth for the light to converge over.
+    vec3 bend = REFRACTION_BEND_RGB * min(depth, CAUSTIC_MAX_DEPTH);
+    vec3 spread = vec3(1.0, 1.0, 0.0) + WAVE_CHOPPINESS * gathering;
+    float surface = spread.x * spread.y - spread.z * spread.z;
+    // One determinant per channel, over a Hessian that does not depend on the channel — three
+    // multiply-adds of numbers already in registers, not three passes over the spectrum.
+    vec3 seabed = (spread.x - bend * hessian.x) * (spread.y - bend * hessian.y)
+                - (spread.z - bend * hessian.z) * (spread.z - bend * hessian.z);
+    return min(abs(surface) / max(abs(seabed), vec3(abs(surface) / CAUSTIC_MAX)), vec3(CAUSTIC_MAX));
 }
 
 // How much of the sky's own light survives the trip down to a point.
@@ -971,10 +1031,11 @@ vec3 water_ray(vec3 origin, vec3 direction, float footprint, float lobe, uvec2 p
 // The quad itself stays flat. Displacing two triangles would buy nothing a normal does not, and the
 // silhouette of water against a shore is set by the terrain behind it rather than by the surface.
 vec3 water_normal(vec2 p, float time, float footprint, out float unresolved) {
+    vec2 here = drifted(p, time);
     vec2 slope = vec2(0.0);
     unresolved = 0.0;
-    for (int i = 0; i < WAVE_OCTAVES; ++i) {
-        WaveSample wave = sample_wave(i, p, time, footprint);
+    for (int i = 0; i < WAVE_COUNT; ++i) {
+        WaveSample wave = sample_wave(i, here, time, footprint);
         float steepness = wave.amplitude * wave.wavenumber;
         // **What the cone could not resolve is not gone, it is rough.** Averaging a crest and a
         // trough into a flat facet throws away real slope, and a surface that lost its slope
