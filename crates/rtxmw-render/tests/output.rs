@@ -96,6 +96,10 @@ fn present(scene: &StaticScene) -> Vec<u8> {
     // No bounce rays: the indirect estimator's dither would spread one flat surface across several
     // histogram bins, and every expectation below is computed for a single radiance.
     renderer.set_bounce_samples(0);
+    // **And no fog**, which scatters light into every ray including the ones aimed at nothing. That
+    // is what fog is for and it is exactly what these tests must not have: an unlit surface with fog
+    // on it is a lit one, and half of what is measured here is that the unlit half stays unlit.
+    renderer.set_fog(0.0);
 
     let mut uploader = gpu.uploader();
     renderer

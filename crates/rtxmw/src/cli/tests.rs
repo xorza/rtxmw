@@ -133,6 +133,7 @@ fn the_cell_and_the_frame_limit_go_in_either_order() {
             cell: default.clone(),
             exit_after: None,
             delight: 1.0,
+            fog: 1.0,
             dlss: Upscaling(None),
         })
     );
@@ -144,6 +145,7 @@ fn the_cell_and_the_frame_limit_go_in_either_order() {
             cell: default,
             exit_after: Some(3),
             delight: 1.0,
+            fog: 1.0,
             dlss: Upscaling(None),
         })
     );
@@ -152,6 +154,7 @@ fn the_cell_and_the_frame_limit_go_in_either_order() {
         cell: CellId::Exterior { x: -2, y: -9 },
         exit_after: Some(3),
         delight: 1.0,
+        fog: 1.0,
         dlss: Upscaling(None),
     };
     assert_eq!(parse(&["-2,-9", "--frames", "3"]), Ok(outdoors.clone()));
@@ -194,6 +197,7 @@ fn a_screenshot_can_be_told_where_to_stand_and_which_way_to_look() {
             samples: None,
             denoise: None,
             delight: 1.0,
+            fog: 1.0,
             dlss: Upscaling(None),
         })
     );
@@ -243,6 +247,7 @@ fn a_screenshot_takes_a_path_then_a_size_then_a_cell() {
             samples: None,
             denoise: None,
             delight: 1.0,
+            fog: 1.0,
             dlss: Upscaling(None),
         })
     );
@@ -260,6 +265,7 @@ fn a_screenshot_takes_a_path_then_a_size_then_a_cell() {
             samples: None,
             denoise: None,
             delight: 1.0,
+            fog: 1.0,
             dlss: Upscaling(None),
         })
     );
@@ -288,6 +294,7 @@ fn a_screenshot_takes_a_path_then_a_size_then_a_cell() {
             samples: Some(1024),
             denoise: Some(0),
             delight: 1.0,
+            fog: 1.0,
             dlss: Upscaling(None),
         })
     );

@@ -102,6 +102,9 @@ fn trace(layers: [u32; 4]) -> Vec<u8> {
     // Both off: an indirect bounce would add light the plane did not have, and filtering would
     // smooth the very ramp being measured.
     renderer.set_bounce_samples(0);
+    // And no fog: it is atmosphere between the eye and the ground rather than the ground's own
+    // colour, and every expectation here is a blend weight worked out by hand.
+    renderer.set_fog(0.0);
     renderer.set_denoise_passes(0);
 
     let mut uploader = gpu.uploader();

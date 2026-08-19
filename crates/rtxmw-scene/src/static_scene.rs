@@ -232,11 +232,7 @@ impl StaticScene {
         scene.append_cell(&record, models, vfs, &mut by_path, detail)?;
 
         if cell.is_interior() {
-            scene.ambient = cell.ambient.map(|a| Ambient {
-                colour: srgb::to_linear(a.ambient),
-                sunlight: srgb::to_linear(a.sunlight),
-                fog: srgb::to_linear(a.fog),
-            });
+            scene.ambient = cell.ambient.map(Ambient::from_record);
             scene.add_water(&cell);
             return Ok(scene);
         }
@@ -689,7 +685,6 @@ fn world_transform(cell_ref: &CellRef) -> Affine3A {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rtxmw_esm::LandRecord;
 
     /// `Interior` and `HasWater` from a cell record's flags. Spelled out because the reader keeps
     /// them private, and the shape of the bits belongs to the format rather than to us.

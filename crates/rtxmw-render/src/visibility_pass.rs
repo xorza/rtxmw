@@ -26,6 +26,12 @@ pub(crate) struct Lighting {
     pub(crate) sun: Option<Sun>,
     /// Where the water surface sits, for shading what is under it. Absent for a dry cell.
     pub(crate) water_level: Option<f32>,
+    /// The colour the cell's fog scatters, and how thickly it sits.
+    ///
+    /// Read by the composite rather than by the trace: fog attenuates the whole frame, and the
+    /// trace has only its two halves.
+    pub(crate) fog: Vec3,
+    pub(crate) fog_density: f32,
 }
 
 /// What the shader needs to turn a pixel into a ray.
@@ -136,6 +142,13 @@ pub struct FrameConstants {
     /// have shading and ambient occlusion painted into their albedo for a renderer with no lighting
     /// of its own, so tracing over them lights everything twice — `docs/design.md` §5.1.
     delight: f32,
+    /// The radiance the cell's fog scatters, how thickly it sits, and how much of it to apply.
+    ///
+    /// Read by the trace rather than by the composite, which is where the lights are — see
+    /// `fog.glsl` for why fogging both halves of the split is the same as fogging their sum.
+    fog: [f32; 3],
+    fog_density: f32,
+    fog_strength: f32,
     /// The sinusoids the water surface is summed from — see [`crate::wave_spectrum`].
     ///
     /// Static for the life of a sea state, and carried here rather than in a buffer of its own
@@ -155,6 +168,8 @@ pub(crate) struct Sampling {
     pub(crate) bounce_samples: u32,
     /// How much of the baked lighting to divide out of every texture.
     pub(crate) delight: f32,
+    /// How much of the cell's fog to apply, from none to all of it.
+    pub(crate) fog: f32,
     /// Which frame this is, counted from the renderer's first.
     pub(crate) sequence: u32,
 }
@@ -199,6 +214,9 @@ impl FrameConstants {
             time,
             sequence: sampling.sequence,
             delight: sampling.delight,
+            fog: lighting.fog.to_array(),
+            fog_density: lighting.fog_density,
+            fog_strength: sampling.fog,
             // Rebuilt each frame rather than cached: it is a few hundred floats of arithmetic once
             // per frame against a million rays that read it, and a cache would need invalidating
             // the moment the sea state becomes something a cell can set.
@@ -579,9 +597,12 @@ mod tests {
         assert_eq!(offset_of!(FrameConstants, time), 304);
         assert_eq!(offset_of!(FrameConstants, sequence), 308);
         assert_eq!(offset_of!(FrameConstants, delight), 312);
+        assert_eq!(offset_of!(FrameConstants, fog), 316);
+        assert_eq!(offset_of!(FrameConstants, fog_density), 328);
+        assert_eq!(offset_of!(FrameConstants, fog_strength), 332);
         // The wave table follows, twenty tightly packed bytes apiece.
-        assert_eq!(offset_of!(FrameConstants, waves), 316);
-        assert_eq!(size_of::<FrameConstants>(), 316 + 20 * WAVE_COUNT);
+        assert_eq!(offset_of!(FrameConstants, waves), 336);
+        assert_eq!(size_of::<FrameConstants>(), 336 + 20 * WAVE_COUNT);
     }
 
     #[test]
@@ -638,6 +659,8 @@ mod tests {
                 light_grid: LightGridExtent::default(),
                 sun: None,
                 water_level: None,
+                fog: Vec3::ZERO,
+                fog_density: 0.0,
             },
             Sampling::default(),
             0.0,

@@ -20,6 +20,22 @@ use crate::visibility_pass::Lighting;
 
 /// One cell's placements, held for as long as it is resident.
 ///
+/// How thick an exterior's fog is, until the weather system says.
+///
+/// The record carries fog only for interiors; an exterior's belongs to the weather, which is per
+/// region and per weather out of the original engine's ini fallbacks rather than the ESM. This is
+/// the number to replace when that arrives rather than one to tune for its own sake.
+const OUTDOOR_FOG_DENSITY: f32 = 0.75;
+
+/// What an interior's recorded density is worth against an exterior's.
+///
+/// **The same dial does not mean the same thing indoors.** The original engine set fog by a start
+/// and an end distance scaled to the view range, so a density of 0.75 filled a room and the same
+/// 0.75 filled a valley — very different amounts of air. This renderer's extinction is absolute, so
+/// the conversion has to be explicit: without it a room reads as a smoke-filled cellar at the
+/// setting that gives a landscape its haze.
+const INDOOR_FOG_SCALE: f32 = 0.035;
+
 /// Placements only. Everything a cell *names* — its meshes, its textures, its materials — belongs
 /// to the renderer rather than to the cell, because the cell next door names most of the same
 /// things and uploading them twice is what made a block reload cost eighty milliseconds.
@@ -108,6 +124,8 @@ impl SceneResidency {
                 light_grid: LightGridExtent::default(),
                 sun: None,
                 water_level: None,
+                fog: Vec3::ZERO,
+                fog_density: 0.0,
             },
         })
     }
@@ -156,6 +174,22 @@ impl SceneResidency {
         self.lighting.ambient = scene.ambient.map_or(Vec3::ZERO, |ambient| ambient.colour);
         self.lighting.sun = scene.sun;
         self.lighting.water_level = scene.water_level;
+        // **Only interiors carry fog in the record.** An exterior's comes from the weather system —
+        // per region and per weather, out of the original engine's ini fallbacks rather than the
+        // ESM — and none of that is read yet. Until it is, the sky is the honest stand-in: fog is
+        // lit by it, so a fog the colour of the sky is what aerial perspective looks like anyway.
+        let ambient = scene.ambient;
+        self.lighting.fog = match ambient {
+            Some(ambient) if ambient.fog_density > 0.0 => ambient.fog,
+            _ => self.lighting.ambient,
+        };
+        self.lighting.fog_density = ambient.map_or(OUTDOOR_FOG_DENSITY, |ambient| {
+            if ambient.fog_density > 0.0 {
+                ambient.fog_density * INDOOR_FOG_SCALE
+            } else {
+                OUTDOOR_FOG_DENSITY
+            }
+        });
         Ok(())
     }
 

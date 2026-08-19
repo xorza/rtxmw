@@ -37,6 +37,7 @@ pub(crate) fn screenshot(options: &ScreenshotOptions) -> Result<f32, Box<dyn std
         denoise,
         dlss,
         delight,
+        fog,
     } = options;
 
     // No surface extensions and no swapchain: this device could not present if asked.
@@ -64,6 +65,7 @@ pub(crate) fn screenshot(options: &ScreenshotOptions) -> Result<f32, Box<dyn std
         renderer.set_denoise_passes(passes);
     }
     renderer.set_delight(*delight);
+    renderer.set_fog(*fog);
 
     let cell = LoadedCell::load_at(cell.clone())?
         .ok_or("no game data configured — set MORROWIND_DATA_DIR, or put it in .env")?;

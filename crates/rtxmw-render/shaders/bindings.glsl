@@ -188,6 +188,11 @@ layout(set = 0, binding = 14, scalar) readonly buffer Frame {
     // How much of the lighting painted into a texture to divide back out, from zero for the texture
     // as shipped to one for the whole estimate. See `baked_shading` in `surface.glsl`.
     float delight;
+    // The radiance the cell's fog scatters, how thickly it sits, and how much of the whole effect
+    // to apply — see `fog.glsl`.
+    vec3 fog;
+    float fog_density;
+    float fog_strength;
     // The sinusoids the sea is summed from, built on the host from an empirical spectrum rather
     // than a series chosen by eye — see `wave_spectrum.rs`.
     Wave waves[WAVE_COUNT];

@@ -30,4 +30,65 @@ pub struct Ambient {
     /// Directional term the original engine used for interiors faking a sun.
     pub sunlight: Vec3,
     pub fog: Vec3,
+    /// How thickly that fog sits, as the cell records it.
+    ///
+    /// Morrowind's own number, and its scale is the original engine's rather than anything physical
+    /// — the renderer reads it as a relative thickness, not as an extinction coefficient.
+    pub fog_density: f32,
+}
+
+impl Ambient {
+    /// The lighting an interior's `AMBI` record describes.
+    pub fn from_record(record: rtxmw_esm::CellAmbient) -> Self {
+        Self {
+            colour: crate::srgb::to_linear(record.ambient),
+            sunlight: crate::srgb::to_linear(record.sunlight),
+            fog: crate::srgb::to_linear(record.fog),
+            // **The density is the float's own bits**, which is how the record carries it — and any
+            // four bytes are *some* float, so a malformed or modded cell can hand over a NaN or a
+            // negative. Neither is an assert: this is a file on disk that something else wrote, and
+            // one bad cell should be fog-free rather than fatal.
+            fog_density: match f32::from_bits(record.fog_density) {
+                density if density.is_finite() && density >= 0.0 => density,
+                _ => 0.0,
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record(fog_density: u32) -> rtxmw_esm::CellAmbient {
+        rtxmw_esm::CellAmbient {
+            ambient: 0,
+            sunlight: 0,
+            fog: 0,
+            fog_density,
+        }
+    }
+
+    #[test]
+    fn a_malformed_fog_density_reads_as_no_fog_rather_than_as_a_nan() {
+        // Any four bytes are some float, so a mod or a corrupt file can carry one of these. A NaN
+        // would run through the renderer's `exp` and turn every pixel of that cell into something
+        // the tone curve cannot map, and a negative density is fog that thickens what it passes.
+        for bits in [
+            f32::NAN.to_bits(),
+            f32::INFINITY.to_bits(),
+            (-1.0f32).to_bits(),
+        ] {
+            assert_eq!(
+                Ambient::from_record(record(bits)).fog_density,
+                0.0,
+                "a density stored as {bits:#010x} should read as no fog"
+            );
+        }
+        // And a real one comes through as itself rather than being sanitised into a default.
+        assert_eq!(
+            Ambient::from_record(record(0.75f32.to_bits())).fog_density,
+            0.75
+        );
+    }
 }

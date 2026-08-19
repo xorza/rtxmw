@@ -128,6 +128,11 @@ fn trace_scene(
     // worked out by hand, the Monte Carlo error of the indirect estimator, the fraction of rays
     // that hit. Smoothing the lighting is exactly what would hide the last of those.
     renderer.set_denoise_passes(0);
+    // And unfogged, for the same reason: fog is atmosphere between the eye and the surface rather
+    // than anything the surface does, and it varies with world position — so it would put a
+    // gradient across a wall these tests need flat, and change what a scene renders as when it is
+    // moved away from the origin.
+    renderer.set_fog(0.0);
 
     // One uploader for the whole trace, held across load and render. It wraps a single queue, so
     // the harness serialises every test through it — which is exactly why the renderer borrows one

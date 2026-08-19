@@ -2285,3 +2285,52 @@ find.
 Dispatch generalised while adding it: the scan that told the offscreen command from the windowed one
 now takes the flag as an argument, since there are three commands and two of them are selected the
 same way.
+
+### 8.38 Fog that lies low, drifts, and is lit by what stands in it
+
+Twenty-four steps along the primary ray, density falling off exponentially with height and modulated
+by drifting value noise, with every lamp the light grid offers scattering into each step.
+
+**Marched rather than integrated, deliberately.** Exponential height fog has a closed form — the
+whole ray in a handful of instructions — but only while density is uniform across the horizontal
+plane, and fog that cannot move was the one thing this was not to be. The march is what noise costs.
+
+**It needed no new binding.** Fog attenuates the whole frame, and the trace has only the two halves
+the composite adds together — but
+
+    (emitted + albedo · lighting) · T + inscatter  ==  (emitted · T + inscatter) + albedo · (lighting · T)
+
+so folding it into both halves in the trace is the same as fogging their sum, and the trace is where
+the lights already are. The composite is untouched, and the alternative — binding the light grid, the
+light buffer and a matrix to the composite — would have duplicated the trace's whole view of the
+world.
+
+**Three things the data said that guesswork would not have.**
+
+Exteriors carry *no fog at all*: only interiors have an `AMBI` record, and an exterior's fog belongs
+to the weather system — per region and per weather, out of the original engine's ini fallbacks rather
+than the ESM, none of which is read. Until it is, the sky stands in for the colour, which is what
+aerial perspective looks like anyway.
+
+The same recorded density means different things indoors and out. The original set fog by a start and
+an end distance *scaled to the view range*, so 0.75 filled a room and 0.75 filled a valley — very
+different amounts of air. This renderer's extinction is absolute, so `INDOOR_FOG_SCALE` makes the
+conversion explicit. Without it a room reads as a smoke-filled cellar at the setting that gives a
+landscape its haze.
+
+Height fog alone only fills hollows. Stand above the layer and the air ahead is clear however far it
+runs, which is not what distance looks like; `FOG_FLOOR` is the fraction that does not fall off, and
+it is what turns "pools in the valleys" into "the far hillside is paler".
+
+**Cost**, minimum of six traces at 960×540 to see past this laptop's thermals: 3.09 ms without, 3.14
+with. At 1920×1080 and above the difference is inside the run-to-run spread and cannot be measured
+this way.
+
+Four test files now turn fog off, each for a reason already written beside them: `output.rs` because
+an unlit surface with fog on it is a lit one and that is half of what it measures, `primary_visibility.rs`
+and `terrain.rs` because their assertions are hand-computed radiance and blend weights, and fog is
+atmosphere between the eye and the surface rather than anything the surface does — it also varies
+with world position, which is what caught the scene-far-from-the-origin test.
+
+Not done: shafts. Shadowing the fog needs a ray per light per step, which is a different order of
+cost from this, and the lit fog here is a halo around a lantern rather than a beam through a doorway.

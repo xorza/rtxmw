@@ -37,6 +37,7 @@ const uint STREAM_INDIRECT = 2u;
 // Added to whichever stream is asking, so the sun's samples never repeat a lamp's.
 const uint STREAM_SUN = 4096u;
 const uint STREAM_WATER_REFLECT = 8192u;
+const uint STREAM_FOG = 12288u;
 const uint STREAM_WATER_REFRACT = 8193u;
 
 // A cheap, stable hash of four integers, for decorrelating one pixel's samples from its

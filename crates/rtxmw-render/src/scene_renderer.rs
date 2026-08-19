@@ -139,6 +139,8 @@ pub struct SceneRenderer {
     /// How much of the lighting painted into a texture to divide back out. See
     /// [`SceneRenderer::set_delight`].
     delight: f32,
+    /// How much of the cell's fog to apply. See [`SceneRenderer::set_fog`].
+    fog: f32,
     /// The upscaler, when one was handed over. Absent, the denoiser and the render-resolution tone
     /// curve carry the frame as they always have.
     #[cfg(feature = "dlss")]
@@ -205,6 +207,7 @@ impl SceneRenderer {
             previous_view: None,
             jitter: false,
             delight: DEFAULT_DELIGHT,
+            fog: 1.0,
             #[cfg(feature = "dlss")]
             upscaler: None,
             frames: 0,
@@ -290,6 +293,18 @@ impl SceneRenderer {
             "de-lighting runs from none to the whole estimate, not {strength}"
         );
         self.delight = strength;
+    }
+
+    /// Sets how much of the cell's fog is applied.
+    ///
+    /// Zero is the frame with none of it, whatever the cell records, which is the A/B — the density
+    /// itself belongs to the cell rather than to a caller.
+    pub fn set_fog(&mut self, strength: f32) {
+        assert!(
+            (0.0..=1.0).contains(&strength),
+            "fog runs from none to the cell's own, not {strength}"
+        );
+        self.fog = strength;
     }
 
     /// Sets how many à-trous passes smooth the lighting. Zero leaves it as traced.
@@ -540,6 +555,8 @@ impl SceneRenderer {
                 light_grid: LightGridExtent::default(),
                 sun: None,
                 water_level: None,
+                fog: Vec3::ZERO,
+                fog_density: 0.0,
             },
             SceneResidency::lighting,
         );
@@ -576,6 +593,7 @@ impl SceneRenderer {
                 bounce_samples: self.bounce_samples,
                 sequence: self.frames,
                 delight: self.delight,
+                fog: self.fog,
             },
             // From the renderer's own target height, so the mip a surface samples follows the
             // resolution it is being traced at.
