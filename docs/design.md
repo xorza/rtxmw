@@ -3097,3 +3097,48 @@ falling on surfaces and not on the sky. That light now exists. The floor is left
 same — the hours a moon is down are still lit by it alone, and `NIGHT_STOPS` was settled by eye
 against this number — but lowering it is now a thing that can be tried rather than a thing that was
 ruled out.
+
+### 8.54 The game is opened once, not three times
+
+Opening the installed game costs **46 ms warm**: 25 to read `Morrowind.esm`'s 79 megabytes, 10 to
+index the archives, 2.4 for the cell index and 8.7 for the model table. A single run was paying it
+**twice over, plus a third pass over the archives** — the startup cell opened and indexed everything
+and dropped it, the streaming thread opened and indexed everything again and kept it, and the moons'
+portraits opened the archives for two files. 158 MB read to use 79.
+
+**The reason it was that way turned out not to be true.** `GameFiles`' own note said the cell index
+and the model table borrow the reader, so whatever owns the bytes must outlive all three and only a
+stack of locals could hold them — which is also the comment that justified `cell_streamer.rs` being
+a loop in a thread. They do not borrow it. `CellIndex` and `ModelIndex` take a reader to `build` and
+own every byte they keep; the single borrower is `EsmReader` over the bytes alone, and constructing
+one is a header parse that measures 0.0 ms. So the shared instance that looked impossible needs no
+self-reference at all: `GameData` owns the bytes, the archives and both indices, and hands out a
+reader on demand.
+
+It is a `OnceLock<Option<GameData>>` behind `GameData::shared() -> Result<Option<&'static Self>>`.
+`&'static` rather than an `Arc` because the data lives as long as the process either way and the
+streaming thread can then hold it with no refcount; sharing it across threads was already safe,
+because `BsaArchive::read` reads at an offset rather than seeking — a decision made for exactly this
+and commented as such. **Failures are not cached**, so a caller that reports one and carries on does
+not poison every later attempt, and `shared` keeps returning the crate's own error type rather than
+something clonable enough to store.
+
+**Measured, best of six, on a `--screenshot` run: 2259 ms → 2150 ms.** About 110 ms, which is the 46
+ms open plus two bare archive opens at 10 apiece plus the 11 ms of indexing the streamer no longer
+repeats, plus the page faults on 79 MB of fresh anonymous memory that is now never allocated. A
+first A/B read 259 ms and was not repeatable; the pair above was.
+
+**What was measured and deliberately not built.** The obvious next step is a cache of decoded
+assets, and the numbers say no. Across a 7×7 window round Seyda Neen there are 1837 NIF parses of
+379 distinct meshes (79% repeats) and 2084 texture decodes of 358 distinct textures (83% repeats,
+41.5 MB decoded twice) — which looks damning until the repeats are costed. Parsing every NIF the
+window names takes **27 ms**; parsing each distinct one once takes **7 ms**. The repeated meshes are
+the cheap ones: clutter, furniture and rocks, while the expensive parses are one-offs. Texture
+"decode" is a header parse and a copy rather than a transcode, so all 2084 come to 12 ms.
+
+So a full asset cache saves about 30 ms of a 173 ms window — **17%** — and costs `Arc<Mesh>` or a
+shared arena plumbed across the `rtxmw-scene`/`rtxmw-render` seam, plus a lifetime policy. Cell
+loading already runs on the streamer's thread and never blocks a frame. Not worth it. And it is
+worth recording where the time in that 173 ms actually goes, because it is not asset decoding: under
+40 ms of the 1436 ms initial window fill is reading or decoding anything. The rest is ESM record
+walking, `Mesh::from_nif` and terrain building, which is where a profile should start.

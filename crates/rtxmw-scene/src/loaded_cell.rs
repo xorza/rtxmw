@@ -1,13 +1,13 @@
 //! Everything a cell needs, assembled from the installed game.
 
-use rtxmw_esm::{CellId, CellIndex, EsmReader};
+use rtxmw_esm::CellId;
 use rtxmw_texture::Texture;
 use rtxmw_vfs::Vfs;
 
 use crate::door::Door;
 use crate::error::Result;
-use crate::game_files::GameFiles;
-use crate::static_scene::{CellDetail, ModelIndex, StaticScene};
+use crate::game_data::GameData;
+use crate::static_scene::{CellDetail, StaticScene};
 
 /// A cell's geometry and the textures its materials name.
 ///
@@ -38,24 +38,28 @@ pub struct LoadedCell {
 impl LoadedCell {
     /// Loads whichever cell `id` names, or `None` when no game data is configured.
     ///
-    /// Opens the content file, indexes it, and reads one cell out — so this is the *expensive* way
-    /// in, and the right one exactly once: at startup, for the cell the camera opens in. Anything
-    /// loading a second cell wants [`CellStreamer`], which keeps the file open and the index built
-    /// and pays neither again.
+    /// **The expensive way in, and what makes it expensive is the doors rather than the file.**
+    /// `GameData::shared` has the master file open and both indices built by the time this runs,
+    /// so what is left here is one cell and a pass over the whole file for everything that opens
+    /// into it — which is why this is the right call exactly once, for the cell the camera starts
+    /// in. Anything loading a second cell wants [`CellStreamer`], which skips the door search.
     ///
     /// [`CellStreamer`]: crate::cell_streamer::CellStreamer
     pub fn load_at(id: CellId) -> Result<Option<Self>> {
-        let Some(files) = GameFiles::open()? else {
+        let Some(game) = GameData::shared()? else {
             return Ok(None);
         };
-        let vfs = &files.vfs;
-        let esm = EsmReader::new(&files.esm)?;
-        let index = CellIndex::build(&esm)?;
-        let models = ModelIndex::build(&esm)?;
-
-        let scene = StaticScene::load_cell(&esm, &index, &models, vfs, &id, CellDetail::Full)?;
-        let entrances = Door::leading_to(&esm, &models, &id)?;
-        Ok(Some(Self::assemble(id, scene, vfs, entrances)))
+        let esm = game.reader();
+        let scene = StaticScene::load_cell(
+            &esm,
+            game.cells(),
+            game.models(),
+            game.vfs(),
+            &id,
+            CellDetail::Full,
+        )?;
+        let entrances = Door::leading_to(&esm, game.models(), &id)?;
+        Ok(Some(Self::assemble(id, scene, game.vfs(), entrances)))
     }
 
     /// Loads the named interior from the installed game, or `None` when none is configured.
@@ -63,21 +67,20 @@ impl LoadedCell {
         Self::load_at(CellId::Interior(cell_name.to_owned()))
     }
 
-    /// Assembles one cell from files a caller already has open, without searching for its doors.
+    /// One cell without searching for its doors.
     ///
     /// What streaming loads. The door search is a pass over the whole file costing as much again
     /// as building the cell, and it answers "where would someone arriving here appear" — which a
     /// cell the camera is walking into has already answered for itself.
-    pub fn streamed(
-        esm: &EsmReader<'_>,
-        index: &CellIndex,
-        models: &ModelIndex,
-        vfs: &Vfs,
-        id: CellId,
-        detail: CellDetail,
-    ) -> Result<Self> {
-        let scene = StaticScene::load_cell(esm, index, models, vfs, &id, detail)?;
-        Ok(Self::assemble(id, scene, vfs, Vec::new()))
+    ///
+    /// Took the reader, both indices and the archives as four arguments until they all began coming
+    /// from one place. Building the reader per cell rather than once for the streamer is what that
+    /// costs, and it is a header parse that measures zero.
+    pub(crate) fn streamed(game: &GameData, id: CellId, detail: CellDetail) -> Result<Self> {
+        let esm = game.reader();
+        let scene =
+            StaticScene::load_cell(&esm, game.cells(), game.models(), game.vfs(), &id, detail)?;
+        Ok(Self::assemble(id, scene, game.vfs(), Vec::new()))
     }
 
     /// Decodes the textures a scene's materials name and packages the result.

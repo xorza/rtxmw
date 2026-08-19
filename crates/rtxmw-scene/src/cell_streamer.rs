@@ -3,10 +3,10 @@
 use std::sync::mpsc::{Receiver, Sender, channel};
 
 use crate::error::Result;
-use crate::game_files::GameFiles;
+use crate::game_data::GameData;
 use crate::loaded_cell::LoadedCell;
-use crate::static_scene::{CellDetail, ModelIndex};
-use rtxmw_esm::{CellId, CellIndex, EsmReader};
+use crate::static_scene::CellDetail;
+use rtxmw_esm::CellId;
 
 /// One cell the worker finished with, however it went.
 ///
@@ -30,10 +30,11 @@ struct Request {
 
 /// A worker thread that loads whichever cells it is asked for.
 ///
-/// Two things make this worth a thread rather than a function. The content file is opened, read
-/// and indexed **once** for the life of the streamer — 79 MB and two passes over it, which is most
-/// of what loading a cell used to cost — and the reading, decoding and mesh building that remains
-/// happens while the renderer draws, rather than between two frames.
+/// **What makes it worth a thread is where the work happens, not what it caches.** The reading,
+/// decoding and mesh building happen while the renderer draws rather than between two frames. It
+/// used to be worth one for a second reason — it opened and indexed the 79 MB content file once
+/// for the life of the streamer — and that reason has moved to `GameData`, which does it once for
+/// the life of the *process* and hands the same indices to the startup cell as well.
 ///
 /// Requests and results are separate channels rather than a call and a return, because the two
 /// have nothing to say to each other in order: the camera asks for cells faster than they load,
@@ -47,9 +48,9 @@ pub struct CellStreamer {
 impl CellStreamer {
     /// Starts the worker.
     ///
-    /// The files are opened when the first request arrives, not here, so a session that never
-    /// leaves an interior never reads them — and the cost lands on the thread that can afford it
-    /// rather than on startup.
+    /// The game is reached when the first request arrives, not here, so a session that never leaves
+    /// an interior never asks for it — and where it has not been opened yet, the cost lands on this
+    /// thread rather than on startup.
     pub fn spawn() -> Self {
         let (requests, inbox) = channel();
         let (outbox, results) = channel();
@@ -89,74 +90,47 @@ impl CellStreamer {
     }
 }
 
-/// Waits for something to be wanted, opens the game's files, and answers until the channel closes.
+/// Waits for something to be wanted, reaches the game, and answers until the channel closes.
 ///
-/// Split from [`answer`] so that a failure to open the files is reported *against the request that
-/// was waiting on it*. A caller that asked for a cell and got back an error naming a different one,
-/// or naming none, would have no way to stop waiting for the one it asked for.
+/// **The first request is taken before the game is**, which is the whole shape of this function: a
+/// failure to reach it has to be reported against the request that was waiting on it, and a caller
+/// that asked for a cell and got back an error naming a different one — or naming none — would have
+/// no way to stop waiting for the one it asked for.
+///
+/// Nothing after that point can fail. A cell that will not load is reported as itself and the next
+/// one is taken, so the loop has no error path of its own; it had one when the reader and both
+/// indices were built here, and `GameData` builds them now.
 fn serve(requests: &Receiver<Request>, results: &Sender<StreamedCell>) {
-    let Ok(first) = requests.recv() else {
+    let Ok(mut wanted) = requests.recv() else {
         return;
     };
-    let files = match GameFiles::open() {
-        Ok(Some(files)) => files,
+    let game = match GameData::shared() {
+        Ok(Some(game)) => game,
         // No game data configured at all. The engine has said so already, and there is nothing to
         // answer any request with.
         Ok(None) => return,
         Err(e) => {
             let _ = results.send(StreamedCell {
-                id: first.id,
-                detail: first.detail,
+                id: wanted.id,
+                detail: wanted.detail,
                 loaded: Err(e),
             });
             return;
         }
     };
-    if let Err(e) = answer(&files, requests, results, first.clone()) {
-        let _ = results.send(StreamedCell {
-            id: first.id,
-            detail: first.detail,
-            loaded: Err(e),
-        });
-    }
-}
 
-/// Loads `first`, and everything asked for after it, until the channel closes.
-///
-/// The reader borrows the bytes it reads, and the index and model table borrow the reader, so all
-/// three are locals here — which is the whole reason this is a loop in a thread rather than a
-/// struct holding them. Only those three setup steps can return an error: once the loop is running,
-/// a cell that fails is reported as itself and the next one is taken.
-fn answer(
-    files: &GameFiles,
-    requests: &Receiver<Request>,
-    results: &Sender<StreamedCell>,
-    first: Request,
-) -> Result<()> {
-    let esm = EsmReader::new(&files.esm)?;
-    let index = CellIndex::build(&esm)?;
-    let models = ModelIndex::build(&esm)?;
-
-    let mut wanted = first;
     loop {
-        let loaded = LoadedCell::streamed(
-            &esm,
-            &index,
-            &models,
-            &files.vfs,
-            wanted.id.clone(),
-            wanted.detail,
-        );
+        let loaded = LoadedCell::streamed(game, wanted.id.clone(), wanted.detail);
         let sent = results.send(StreamedCell {
             id: wanted.id,
             detail: wanted.detail,
             loaded,
         });
         if sent.is_err() {
-            return Ok(());
+            return;
         }
         let Ok(next) = requests.recv() else {
-            return Ok(());
+            return;
         };
         wanted = next;
     }

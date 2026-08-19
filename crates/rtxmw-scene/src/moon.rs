@@ -4,7 +4,7 @@ use glam::Vec3;
 use rtxmw_texture::Texture;
 
 use crate::error::Result;
-use crate::game_files::GameFiles;
+use crate::game_data::GameData;
 use crate::sky::Sky;
 use crate::srgb::LUMA;
 use crate::sun::Sun;
@@ -145,13 +145,12 @@ impl MoonFaces {
     /// texture: a moon without its portrait is a flat disc of the right colour, which is worse and
     /// not a reason to have no renderer.
     pub fn load() -> Result<Option<Self>> {
-        // The archives alone: a portrait is a file in a BSA, and the eighty megabytes of
-        // `Morrowind.esm` that a full open reads have nothing in them a moon wants.
-        let Some(vfs) = GameFiles::archives()? else {
+        let Some(game) = GameData::shared()? else {
             return Ok(None);
         };
         let read = |path: &str| {
-            vfs.read(path)
+            game.vfs()
+                .read(path)
                 .ok()
                 .and_then(|bytes| Texture::decode(&bytes).ok())
         };

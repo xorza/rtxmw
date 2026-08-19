@@ -6,7 +6,7 @@
 mod cell_streamer;
 mod door;
 mod error;
-mod game_files;
+mod game_data;
 mod light;
 mod loaded_cell;
 mod material;
