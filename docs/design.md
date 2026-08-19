@@ -1446,3 +1446,71 @@ topic but by **dependency order**, which is the only order GLSL allows:
 through water and water needs a surface shaded, which is a cycle; declaring `sun_through_water` and
 `daylight_reaching` at the top of `lighting.glsl` breaks it. Putting water first instead would have
 cost three. The refactor is pixel-identical, which is the only claim worth making about it.
+
+### 8.13 Motion vectors, and the second place the world's size would have shown
+
+DLSS Ray Reconstruction needs them, and so does the thing worth spending down after it: the sun costs
+sixteen shadow rays a pixel, and reusing that estimate across frames is what makes one a frame
+viable. Both want the same buffer, so it is built once, ahead of either.
+
+**What a pixel stores.** The displacement, *in pixels*, from where its surface is now to where it was
+on the previous frame's screen — the offset to add to a pixel coordinate to find its own history. A
+miss stores zero, which a temporal filter reads as "this pixel did not move"; for the sky that is
+true.
+
+**Reprojected as an offset, never as a world point.** The obvious formulation takes the hit position,
+projects it with the previous frame's view-projection, and subtracts. That is §8.7's mistake with the
+operands swapped: the hit position is world-scale, and so is the previous view's translation. Instead
+the shader keeps everything camera-relative —
+
+```glsl
+vec3 was = direction * surface.t + frame.camera_motion;
+vec4 before = frame.previous_clip_from_offset * vec4(was, 1.0);
+```
+
+`direction * t` is the offset from *this* eye, already computed without forming a world position;
+`camera_motion` is `now - before`, differenced on the host where both are known; and
+`previous_clip_from_offset` is the previous frame's `projection * rotation`, with its translation
+dropped for the same reason the forward matrix has none. Nothing world-scale is ever subtracted on
+the device.
+
+**The camera delta is exact.** Subtracting two `f32`s within a factor of two of each other is exact,
+and a camera does not cross half the world in a frame — so sending the delta costs nothing that
+sending the previous position would have saved, and spares the shader a subtraction it could not
+afford.
+
+**Full floats, unlike the rest of the G-buffer.** A motion vector spans the frame — a couple of
+thousand pixels when the camera turns — and a half float's eleven-bit mantissa lands only on whole
+pixels above 1024. That is exactly the range temporal reuse most needs right.
+
+**Behind the previous eye there is no answer**, and the perspective divide would fold such a point
+back into the frame as a plausible-looking coordinate. `w > 0` is checked and the vector left at
+zero.
+
+**Cost: not measurable.** One eight-byte store and a matrix multiply per pixel, against run-to-run
+variance of ±2 ms at 1920×1080 on a machine that had been busy for hours — the arm *without* the
+write measured higher. Recorded as unmeasured rather than as a number.
+
+**What is asserted**, because a reprojection can be plausible and wrong in three different ways:
+
+- A camera that did not move leaves every pixel where it is. Not exactly, and it cannot be — a still
+  frame is an unproject followed by a project and `f32` rounds in between. A hundred-thousandth of a
+  pixel is what is left, or sixty thousand frames before a history has crept one pixel sideways.
+- A camera that only *turns* moves every surface by the same amount whatever its distance, because
+  rotation has no parallax.
+- A camera that *steps* moves near surfaces further than far ones — checked against the naive
+  world-space projection carried out in **double precision**. That is the calculation the shader must
+  not make, done exactly, which is what makes it an independent answer rather than the same
+  arithmetic agreeing with itself. The first attempt at this test failed because its reference was
+  the `f32` world-space projection: the reference was wrong, not the code, which is §8.7 turning up
+  a second time from the other side.
+
+Over a real trace, two walls at 200 and 400 units move by 0.64 and 0.32 pixels for a four-unit step,
+hand-computed from the field of view. Ignoring the hit distance fails it; dropping the camera delta
+fails it. The sign is asserted too: the camera stepped left, so a surface's *previous* screen position
+is left of where it is now, and a vector pointing the other way smears history backwards.
+
+**One camera, one type.** `view`, `projection` and the eye now travel together as `Viewpoint`, for
+this frame and the previous one alike. They have to agree — the position must be the point the view
+looks from — and passed as three arguments nothing said so; a frame whose rays start somewhere its
+matrices do not would render a plausible picture of the wrong place.

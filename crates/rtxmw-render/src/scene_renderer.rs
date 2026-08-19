@@ -21,7 +21,7 @@ use crate::gbuffer::GBuffer;
 use crate::light_grid::LightGridExtent;
 use crate::scene_residency::SceneResidency;
 use crate::tonemap::Tonemap;
-use crate::visibility_pass::{FrameConstants, Lighting, SceneBindings, VisibilityPass};
+use crate::visibility_pass::{FrameConstants, Lighting, SceneBindings, Viewpoint, VisibilityPass};
 
 /// Half-float rather than 8-bit: the trace writes linear radiance that tone mapping consumes at M8,
 /// and an 8-bit intermediate would clip highlights before anything got the chance to.
@@ -112,6 +112,9 @@ pub struct SceneRenderer {
     bounce_samples: u32,
     denoise_passes: u32,
     time: f32,
+    /// Where the camera stood when [`Self::frame_constants`] was last asked, or `None` before the
+    /// first frame. What this frame's motion vectors are measured against.
+    previous_view: Option<Viewpoint>,
     timestamps: Timestamps,
 }
 
@@ -158,6 +161,7 @@ impl SceneRenderer {
             bounce_samples: DEFAULT_BOUNCE_SAMPLES,
             denoise_passes: DEFAULT_PASSES,
             time: 0.0,
+            previous_view: None,
             // One more than the stages, since a duration needs a timestamp either side of it.
             timestamps: Timestamps::new(device, physical, FrameTimings::STAGES as u32 + 1)?,
         };
@@ -345,6 +349,15 @@ impl SceneRenderer {
         &self.target
     }
 
+    /// Where each pixel's surface was on the previous frame's screen, as a displacement in pixels.
+    ///
+    /// In `GENERAL` once [`SceneRenderer::record`] has run. Written every frame and read by nothing
+    /// yet — DLSS Ray Reconstruction is what will consume it, and temporal reuse of the sun's
+    /// shadow samples after that.
+    pub fn motion(&self) -> &Image {
+        self.gbuffer.motion()
+    }
+
     /// The exposed, tone-mapped, sRGB-encoded image, ready to blit to a swapchain or write to a
     /// PNG unchanged.
     pub fn output(&self) -> &Image {
@@ -357,8 +370,14 @@ impl SceneRenderer {
     }
 
     /// The frame constants for a camera, filled in with the loaded cell's lighting.
+    /// The block for this frame, and the camera it was built from is remembered for the next.
+    ///
+    /// **Takes `&mut self` for that memory, and expects one call per frame.** A motion vector is the
+    /// difference between two consecutive frames' cameras, and nothing else in the renderer knows
+    /// where the camera was — asking a caller to hand back its own previous matrices would put the
+    /// one piece of state that must not drift outside the thing that reads it.
     pub fn frame_constants(
-        &self,
+        &mut self,
         view: glam::Mat4,
         projection: glam::Mat4,
         camera_position: Vec3,
@@ -372,10 +391,18 @@ impl SceneRenderer {
             },
             SceneResidency::lighting,
         );
-        FrameConstants::new(
+        let now = Viewpoint {
             view,
             projection,
-            camera_position,
+            position: camera_position,
+        };
+        // The first frame has no previous one, and is its own: the surfaces then reproject onto
+        // themselves and every motion vector is zero, which is what a temporal filter with no
+        // history should be told.
+        let previous = self.previous_view.replace(now).unwrap_or(now);
+        FrameConstants::new(
+            now,
+            previous,
             lighting,
             // From the renderer's own target height, so the mip a surface samples follows the
             // resolution it is being traced at.

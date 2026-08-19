@@ -41,8 +41,39 @@ pub(crate) struct Lighting {
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub struct FrameConstants {
+    /// A pixel's clip coordinates to its offset from the eye, in world axes.
+    ///
+    /// **The eye is taken out of the view before the inverse, and that is the whole point.** The
+    /// obvious matrix is the inverse view-projection, which unprojects a pixel to a *world point* on
+    /// the near plane — and the shader then has to subtract the camera position from it to get a
+    /// direction. Both are the size of the world and the difference is the near distance, 0.05
+    /// units: at Seyda Neen's 75,000 an `f32` step is 0.024 units, so that subtraction throws away
+    /// almost every bit of the answer. Measured against a double-precision reference, the ray
+    /// through a pixel came out **127 pixels** from where it belonged, and 377 at the far corner of
+    /// Vvardenfell — near zero at the origin, which is why it looked like a jitter that grew as the
+    /// camera travelled rather than like a bug.
+    ///
+    /// Inverting [`Viewpoint::clip_from_offset`] instead lands the unprojection in a space centred
+    /// on the camera, where the near plane is at 0.05 and an `f32` step is 6e-9. There is then
+    /// nothing to cancel, and the error is **0.0001 pixels wherever the camera stands**. It also
+    /// leaves a far better conditioned matrix to invert, since no entry is the size of the world any
+    /// more.
+    ///
+    /// [`Self::camera_position`] is still sent — a ray needs an origin — but it is used only as one,
+    /// never differenced against anything.
     ndc_to_world_offset: [f32; 16],
+    /// The previous frame's `projection * rotation`, taking an offset from *that* frame's eye to
+    /// its clip coordinates. See [`FrameConstants::motion`].
+    previous_clip_from_offset: [f32; 16],
     camera_position: [f32; 3],
+    /// How far the eye moved since the previous frame, `now - before`.
+    ///
+    /// A difference of two positions the size of the world, and exact all the same: subtracting two
+    /// `f32`s within a factor of two of each other is exact, and a camera does not cross half the
+    /// world in a frame. Sending the delta rather than the previous position is what keeps the
+    /// shader from having to make that subtraction itself at world scale — the mistake `§8.7`
+    /// records.
+    camera_motion: [f32; 3],
     /// Reciprocal of the light grid's cell size, so a lookup multiplies rather than divides.
     light_grid_scale: f32,
     /// The corner the light grid is addressed from, and how many cells it spans.
@@ -97,9 +128,8 @@ impl FrameConstants {
     /// `projection` must be the reverse-Z Vulkan projection the shader assumes — it unprojects the
     /// near plane at depth 1, which is the only plane an infinite projection leaves invertible.
     pub(crate) fn new(
-        view: Mat4,
-        projection: Mat4,
-        camera_position: Vec3,
+        now: Viewpoint,
+        previous: Viewpoint,
         lighting: Lighting,
         cone_spread: f32,
         bounce_samples: u32,
@@ -113,8 +143,10 @@ impl FrameConstants {
             angular_radius: 0.0,
         });
         Self {
-            ndc_to_world_offset: Self::ndc_to_world_offset(view, projection),
-            camera_position: camera_position.to_array(),
+            ndc_to_world_offset: now.clip_from_offset().inverse().to_cols_array(),
+            previous_clip_from_offset: previous.clip_from_offset().to_cols_array(),
+            camera_position: now.position.to_array(),
+            camera_motion: (now.position - previous.position).to_array(),
             light_grid_scale: lighting.light_grid.scale,
             light_grid_origin: lighting.light_grid.origin.to_array(),
             light_grid_dimensions: lighting.light_grid.dimensions,
@@ -133,33 +165,6 @@ impl FrameConstants {
         }
     }
 
-    /// The matrix taking a pixel's clip coordinates to its offset from the eye, in world axes.
-    ///
-    /// **The eye is taken out of the view before the inverse, and that is the whole point.** The
-    /// obvious matrix is the inverse view-projection, which unprojects a pixel to a *world point* on
-    /// the near plane — and the shader then has to subtract the camera position from it to get a
-    /// direction. Both are the size of the world and the difference is the near distance, 0.05
-    /// units: at Seyda Neen's 75,000 an `f32` step is 0.024 units, so that subtraction throws away
-    /// almost every bit of the answer. Measured against a double-precision reference, the ray
-    /// through a pixel came out **127 pixels** from where it belonged, and 377 at the far corner of
-    /// Vvardenfell — near zero at the origin, which is why it looked like a jitter that grew as the
-    /// camera travelled rather than like a bug.
-    ///
-    /// Dropping the view's translation makes the unprojection land in a space centred on the camera,
-    /// where the near plane is at 0.05 and an `f32` step is 6e-9. There is then nothing to cancel,
-    /// and the error is **0.0001 pixels wherever the camera stands**. It also leaves a far better
-    /// conditioned matrix to invert, since no entry is the size of the world any more.
-    ///
-    /// The camera's position is still sent — a ray needs an origin — but it is used only as one,
-    /// never differenced against anything.
-    fn ndc_to_world_offset(view: Mat4, projection: Mat4) -> [f32; 16] {
-        let mut rotation = view;
-        // A look-at view is `rotation * translate(-eye)`, so its fourth column *is* the eye's
-        // contribution and clearing it leaves the rotation alone.
-        rotation.w_axis = glam::Vec4::W;
-        (projection * rotation).inverse().to_cols_array()
-    }
-
     /// How wide one pixel's ray cone grows per unit of distance.
     ///
     /// Two pixels' worth of vertical field of view divided by the height, which is the angle one
@@ -169,6 +174,41 @@ impl FrameConstants {
         // The projection's [1][1] is `1 / tan(fov_y / 2)`, negated by the Vulkan Y flip.
         let cot_half_fov = projection.y_axis.y.abs();
         2.0 / (cot_half_fov * height as f32)
+    }
+}
+
+/// A camera as one thing: its matrices and the eye they were built from.
+///
+/// **Bundled because the three have to agree.** The position must be the point the view looks from,
+/// and passed separately nothing says so — a frame whose rays start somewhere its matrices do not
+/// would render a plausible picture of the wrong place. It is also what a motion vector is measured
+/// against, so the previous frame's camera is this same type rather than a second one.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Viewpoint {
+    pub(crate) view: Mat4,
+    pub(crate) projection: Mat4,
+    pub(crate) position: Vec3,
+}
+
+impl Viewpoint {
+    /// The view with its translation dropped, which takes an offset from the eye to view space.
+    ///
+    /// A look-at view is `rotation * translate(-eye)`, so its fourth column *is* the eye's
+    /// contribution and clearing it leaves the rotation alone.
+    fn rotation(&self) -> Mat4 {
+        let mut rotation = self.view;
+        rotation.w_axis = glam::Vec4::W;
+        rotation
+    }
+
+    /// Clip coordinates from an offset to the eye — the forward half of
+    /// [`FrameConstants::ndc_to_world_offset`].
+    ///
+    /// A world point would have to be built and then differenced against the eye, and at
+    /// Vvardenfell's scale that costs the same precision §8.7 is about; the offset never becomes a
+    /// world position at all.
+    fn clip_from_offset(&self) -> Mat4 {
+        self.projection * self.rotation()
     }
 }
 
@@ -242,17 +282,18 @@ impl VisibilityPass {
                     Binding::storage_image(8),
                     Binding::storage_image(9),
                     Binding::storage_image(10),
+                    Binding::storage_image(11),
                     // The frame's own constants. They were push constants until waves needed a
                     // clock and the block was already exactly the 128 bytes Vulkan guarantees —
                     // see `FrameConstants`. Motion vectors at M7 would have forced the same move.
-                    Binding::storage_buffer(11),
-                    // The light grid: prefix offsets, then the light indices they address.
                     Binding::storage_buffer(12),
+                    // The light grid: prefix offsets, then the light indices they address.
                     Binding::storage_buffer(13),
+                    Binding::storage_buffer(14),
                     // Last, because Vulkan allows a variable descriptor count only on a set's final
                     // binding. Adding anything after this one moves it — validation rejects the set
                     // outright, which is how this was caught.
-                    Binding::variable_samplers(14, max_textures),
+                    Binding::variable_samplers(15, max_textures),
                 ],
                 0,
                 shaders::primary_visibility(),
@@ -284,7 +325,7 @@ impl VisibilityPass {
             .range(vk::WHOLE_SIZE)];
         let frame_write = vk::WriteDescriptorSet::default()
             .dst_set(self.pipeline.set())
-            .dst_binding(11)
+            .dst_binding(12)
             .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
             .buffer_info(&frame_info);
 
@@ -309,7 +350,7 @@ impl VisibilityPass {
         let texture_infos = scene.textures.descriptors();
         let texture_write = vk::WriteDescriptorSet::default()
             .dst_set(self.pipeline.set())
-            .dst_binding(14)
+            .dst_binding(15)
             .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
             .image_info(&texture_infos);
 
@@ -322,6 +363,7 @@ impl VisibilityPass {
                 gbuffer.albedo(),
                 gbuffer.normal_depth(),
                 gbuffer.illumination(),
+                gbuffer.motion(),
             ],
         );
 
@@ -348,7 +390,7 @@ impl VisibilityPass {
             .range(vk::WHOLE_SIZE)];
         let grid_offset_write = vk::WriteDescriptorSet::default()
             .dst_set(self.pipeline.set())
-            .dst_binding(12)
+            .dst_binding(13)
             .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
             .buffer_info(&grid_offset_info);
 
@@ -357,7 +399,7 @@ impl VisibilityPass {
             .range(vk::WHOLE_SIZE)];
         let grid_index_write = vk::WriteDescriptorSet::default()
             .dst_set(self.pipeline.set())
-            .dst_binding(13)
+            .dst_binding(14)
             .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
             .buffer_info(&grid_index_info);
 
@@ -449,21 +491,23 @@ mod tests {
         // padding anywhere. A field inserted in the middle, or one Rust chose to align, shifts
         // everything after it and the shader reads the whole frame displaced.
         assert_eq!(offset_of!(FrameConstants, ndc_to_world_offset), 0);
-        assert_eq!(offset_of!(FrameConstants, camera_position), 64);
-        assert_eq!(offset_of!(FrameConstants, light_grid_scale), 76);
-        assert_eq!(offset_of!(FrameConstants, light_grid_origin), 80);
-        assert_eq!(offset_of!(FrameConstants, light_grid_dimensions), 92);
-        assert_eq!(offset_of!(FrameConstants, ambient), 104);
-        assert_eq!(offset_of!(FrameConstants, cone_spread), 116);
-        assert_eq!(offset_of!(FrameConstants, sun_direction), 120);
-        assert_eq!(offset_of!(FrameConstants, sun_cos_radius), 132);
-        assert_eq!(offset_of!(FrameConstants, sun_colour), 136);
-        assert_eq!(offset_of!(FrameConstants, bounce_samples), 148);
-        assert_eq!(offset_of!(FrameConstants, water_level), 152);
-        assert_eq!(offset_of!(FrameConstants, time), 156);
+        assert_eq!(offset_of!(FrameConstants, previous_clip_from_offset), 64);
+        assert_eq!(offset_of!(FrameConstants, camera_position), 128);
+        assert_eq!(offset_of!(FrameConstants, camera_motion), 140);
+        assert_eq!(offset_of!(FrameConstants, light_grid_scale), 152);
+        assert_eq!(offset_of!(FrameConstants, light_grid_origin), 156);
+        assert_eq!(offset_of!(FrameConstants, light_grid_dimensions), 168);
+        assert_eq!(offset_of!(FrameConstants, ambient), 180);
+        assert_eq!(offset_of!(FrameConstants, cone_spread), 192);
+        assert_eq!(offset_of!(FrameConstants, sun_direction), 196);
+        assert_eq!(offset_of!(FrameConstants, sun_cos_radius), 208);
+        assert_eq!(offset_of!(FrameConstants, sun_colour), 212);
+        assert_eq!(offset_of!(FrameConstants, bounce_samples), 224);
+        assert_eq!(offset_of!(FrameConstants, water_level), 228);
+        assert_eq!(offset_of!(FrameConstants, time), 232);
         // The wave table follows, twenty tightly packed bytes apiece.
-        assert_eq!(offset_of!(FrameConstants, waves), 160);
-        assert_eq!(size_of::<FrameConstants>(), 160 + 20 * WAVE_COUNT);
+        assert_eq!(offset_of!(FrameConstants, waves), 236);
+        assert_eq!(size_of::<FrameConstants>(), 236 + 20 * WAVE_COUNT);
     }
 
     #[test]
@@ -482,12 +526,39 @@ mod tests {
         assert!((finer - spread / 2.0).abs() < 1e-5);
     }
 
-    /// A frame built the way the renderer builds one, for a camera at `eye` looking `forward`.
-    fn frame_at(eye: Vec3, forward: Vec3, projection: Mat4) -> FrameConstants {
+    /// A camera, as these tests describe one.
+    #[derive(Debug, Clone, Copy)]
+    struct Shot {
+        eye: Vec3,
+        forward: Vec3,
+    }
+
+    impl Shot {
+        fn new(eye: Vec3, forward: Vec3) -> Self {
+            Self {
+                eye,
+                forward: forward.normalize(),
+            }
+        }
+
+        fn view(self) -> Mat4 {
+            glam::camera::rh::view::look_to_mat4(self.eye, self.forward, Vec3::Z)
+        }
+
+        fn viewpoint(self, projection: Mat4) -> Viewpoint {
+            Viewpoint {
+                view: self.view(),
+                projection,
+                position: self.eye,
+            }
+        }
+    }
+
+    /// A frame built the way the renderer builds one, for a camera that moved `before` to `now`.
+    fn frame_between(before: Shot, now: Shot, projection: Mat4) -> FrameConstants {
         FrameConstants::new(
-            glam::camera::rh::view::look_to_mat4(eye, forward, Vec3::Z),
-            projection,
-            eye,
+            now.viewpoint(projection),
+            before.viewpoint(projection),
             Lighting {
                 ambient: Vec3::ZERO,
                 light_grid: LightGridExtent::default(),
@@ -498,6 +569,12 @@ mod tests {
             0,
             0.0,
         )
+    }
+
+    /// A frame for a camera that has not moved, which is what the first frame gets.
+    fn frame_at(eye: Vec3, forward: Vec3, projection: Mat4) -> FrameConstants {
+        let shot = Shot::new(eye, forward);
+        frame_between(shot, shot, projection)
     }
 
     /// The direction the shader would trace for the pixel at `ndc`.
@@ -588,6 +665,146 @@ mod tests {
                 eye.to_array()
             );
         }
+    }
+
+    /// Where the surface at `ndc`, `offset` from this frame's eye, was on the previous screen.
+    ///
+    /// The lines `primary_visibility.comp` writes into the motion target, over a 1000x1000 frame so
+    /// a pixel is a thousandth of the screen on each axis.
+    fn motion(frame: &FrameConstants, offset: Vec3, ndc: glam::Vec2) -> glam::Vec2 {
+        let was = offset + Vec3::from_array(frame.camera_motion);
+        let before = Mat4::from_cols_array(&frame.previous_clip_from_offset)
+            * glam::Vec4::new(was.x, was.y, was.z, 1.0);
+        assert!(before.w > 0.0, "the point was behind the previous eye");
+        ((before.truncate().truncate() / before.w) - ndc) * 0.5 * 1000.0
+    }
+
+    /// The pixel a surface `offset` from `shot`'s eye lands on, in the same units [`motion`] uses.
+    ///
+    /// **The naive formulation, in double precision**: build the world point, run it through the
+    /// full view-projection, divide. That is the calculation the shader must not make in `f32` — at
+    /// Vvardenfell's corner it is the one §8.7 is about — and doing it exactly here is what makes
+    /// it an independent answer rather than the same arithmetic agreeing with itself.
+    fn projects_to(shot: Shot, projection: Mat4, offset: Vec3) -> glam::DVec2 {
+        let wide = |m: Mat4| glam::DMat4::from_cols_array(&m.to_cols_array().map(f64::from));
+        let eye = shot.eye.as_dvec3();
+        let mut rotation = shot.view();
+        rotation.w_axis = glam::Vec4::W;
+        let view = wide(rotation) * glam::DMat4::from_translation(-eye);
+        let clip = wide(projection) * view * (eye + offset.as_dvec3()).extend(1.0);
+        clip.truncate().truncate() / clip.w * 0.5 * 1000.0
+    }
+
+    /// Where the surface the pixel at `ndc` sees sits, relative to the eye, at distance `t`.
+    ///
+    /// Derived through the frame's own aim, exactly as the shader derives it — the offset it
+    /// reprojects is `direction * t`, and a test that built the same point another way would
+    /// measure the difference between the two constructions rather than the reprojection.
+    fn seen_at(frame: &FrameConstants, ndc: glam::Vec2, t: f32) -> Vec3 {
+        aim(frame, ndc) * t
+    }
+
+    #[test]
+    fn a_still_camera_moves_nothing_and_a_turning_one_moves_everything_alike() {
+        // Two properties that pin the reprojection between them without needing a reference to
+        // compare against: a camera that did not move must leave every pixel where it is, and a
+        // camera that only *turned* must move every surface by the same amount whatever its
+        // distance, because rotation has no parallax.
+        //
+        // Not *exactly* zero, and it cannot be: the shader reprojects `direction * t`, and the
+        // direction came from unprojecting the same pixel — so a still frame is an unproject
+        // followed by a project, and `f32` rounds in between. What is left is a hundred-thousandth
+        // of a pixel, or sixty thousand still frames before a temporal filter's history has crept
+        // one pixel sideways.
+        let projection = glam::camera::rh::proj::vulkan::perspective_infinite_reverse(
+            60f32.to_radians(),
+            1.0,
+            0.05,
+        );
+        let eye = Vec3::new(-16_384.0, -73_728.0, 700.0);
+        let ahead = Vec3::new(1.0, 0.0, 0.0);
+        let still = frame_at(eye, ahead, projection);
+
+        // A pixel off centre, and depths from arm's length to most of a cell.
+        let ndc = glam::Vec2::new(0.3, -0.45);
+        let depths = [40.0f32, 300.0, 5_000.0];
+        for t in depths {
+            let moved = motion(&still, seen_at(&still, ndc, t), ndc);
+            assert!(
+                moved.length() < 1.0e-3,
+                "a camera that did not move reported {moved:?} for a surface {t} away"
+            );
+        }
+
+        // Now the same camera, turned in place. Every surface must move together.
+        let turned = Shot::new(eye, Vec3::new(1.0, 0.03, 0.0));
+        let rotating = frame_between(Shot::new(eye, ahead), turned, projection);
+        let mut moves = Vec::new();
+        for t in depths {
+            moves.push(motion(&rotating, seen_at(&rotating, ndc, t), ndc));
+        }
+        println!("turning in place moved: {moves:?}");
+        for pair in moves.windows(2) {
+            assert!(
+                (pair[0] - pair[1]).length() < 0.01,
+                "a pure rotation moved a near surface by {:?} and a far one by {:?}; motion is \
+                 picking up a parallax that is not there",
+                pair[0],
+                pair[1]
+            );
+        }
+        // And it moved them at all, or the assertion above holds for a reprojection that does
+        // nothing. Turning 0.03 radians of a 60-degree view is about 28 pixels of a thousand.
+        assert!(
+            (moves[0].length() - 28.0).abs() < 2.0,
+            "a 0.03 radian turn moved the frame by {:?}",
+            moves[0]
+        );
+    }
+
+    #[test]
+    fn a_walking_camera_moves_near_surfaces_further_than_far_ones() {
+        // Parallax, which is the half a rotation cannot show and the half that carries depth into a
+        // temporal filter. Checked against the projection itself: where a surface *was* on the
+        // previous screen is something the previous camera can simply be asked, and the motion
+        // vector has to be the difference between that and where it is now.
+        let projection = glam::camera::rh::proj::vulkan::perspective_infinite_reverse(
+            60f32.to_radians(),
+            1.0,
+            0.05,
+        );
+        // At Vvardenfell's far corner, walking a stride north — the precision case as well as the
+        // parallax one, since both eyes are world-scale and their difference is three units.
+        let before = Shot::new(Vec3::new(200_000.0, 150_000.0, 900.0), Vec3::X);
+        let now = Shot::new(before.eye + Vec3::new(0.0, 3.0, 0.0), Vec3::X);
+        let frame = frame_between(before, now, projection);
+
+        let ndc = glam::Vec2::new(0.2, 0.1);
+        let mut moved = Vec::new();
+        for depth in [40.0f32, 300.0, 5_000.0] {
+            let offset = seen_at(&frame, ndc, depth);
+            // The same surface seen from the previous eye is that much further away from it.
+            let here = projects_to(now, projection, offset);
+            let there = projects_to(before, projection, offset + (now.eye - before.eye));
+            let want = there - here;
+
+            let got = motion(&frame, offset, ndc);
+            let got = glam::DVec2::new(got.x.into(), got.y.into());
+            println!("depth {depth}: motion {got:?}, projection says {want:?}");
+            assert!(
+                (got - want).length() < 0.02,
+                "at depth {depth} the motion vector is {got:?} where the previous projection puts \
+                 the surface at {want:?}"
+            );
+            moved.push(got.length());
+        }
+
+        // Nearer is further: three units of parallax is a big move at forty units of depth and
+        // almost none at five thousand.
+        assert!(
+            moved[0] > moved[1] * 5.0 && moved[1] > moved[2] * 5.0,
+            "parallax did not fall off with depth: {moved:?}"
+        );
     }
 
     #[test]

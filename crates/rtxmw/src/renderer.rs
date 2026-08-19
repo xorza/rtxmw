@@ -159,8 +159,11 @@ impl Renderer {
     }
 
     /// The frame constants for a camera, filled in with the loaded cell's lighting.
+    ///
+    /// `&mut` because the scene renderer remembers this camera to measure the next frame's motion
+    /// vectors against — one call per frame, which is what the frame loop does.
     pub(crate) fn frame_constants(
-        &self,
+        &mut self,
         view: glam::Mat4,
         projection: glam::Mat4,
         camera_position: Vec3,

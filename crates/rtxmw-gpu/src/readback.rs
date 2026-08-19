@@ -27,7 +27,60 @@ pub fn image_to_rgba8(
     let pixel = PixelFormat::of(image.format());
     let extent = image.extent();
     let pixels = (extent.width * extent.height) as usize;
-    let size = (pixels * pixel.bytes_per_pixel()) as vk::DeviceSize;
+    let bytes = copy_to_host(
+        uploader,
+        image,
+        current_layout,
+        bytes_per_pixel(image.format()),
+    )?;
+    Ok(pixel.to_rgba8(&bytes, pixels))
+}
+
+/// Copies a floating-point `image` to host memory and returns its channels, row-major.
+///
+/// The values as the shader wrote them, where [`image_to_rgba8`] would quantise them to display
+/// bytes. What a test asking about a motion vector or a world distance needs, neither of which is a
+/// colour and neither of which fits in `0..1`.
+pub fn image_to_f32(
+    uploader: &mut Uploader,
+    image: &Image,
+    current_layout: vk::ImageLayout,
+) -> Result<Vec<f32>> {
+    // How many channels there are never comes up: the result is flat, so all that is needed is how
+    // wide one of them is.
+    let format = image.format();
+    let half = match format {
+        vk::Format::R16G16B16A16_SFLOAT => true,
+        vk::Format::R32G32_SFLOAT | vk::Format::R32G32B32A32_SFLOAT => false,
+        other => panic!("float readback is not implemented for {other:?}"),
+    };
+    let bytes = copy_to_host(uploader, image, current_layout, bytes_per_pixel(format))?;
+    Ok(if half {
+        bytes
+            .chunks_exact(2)
+            .map(|c| f16::from_le_bytes([c[0], c[1]]).to_f32())
+            .collect()
+    } else {
+        bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    })
+}
+
+/// The bytes of `image`, transitioned to `TRANSFER_SRC_OPTIMAL` and left there.
+///
+/// The barrier, the staging buffer and the copy, shared by every readback above — they differ only
+/// in what they make of the bytes afterwards.
+fn copy_to_host(
+    uploader: &mut Uploader,
+    image: &Image,
+    current_layout: vk::ImageLayout,
+    bytes_per_pixel: usize,
+) -> Result<Vec<u8>> {
+    let extent = image.extent();
+    let pixels = (extent.width * extent.height) as usize;
+    let size = (pixels * bytes_per_pixel) as vk::DeviceSize;
 
     let readback = Buffer::new(
         uploader.memory(),
@@ -73,7 +126,23 @@ pub fn image_to_rgba8(
     let bytes = readback
         .mapped()
         .expect("readback memory is host-visible by construction");
-    Ok(pixel.to_rgba8(&bytes[..size as usize], pixels))
+    Ok(bytes[..size as usize].to_vec())
+}
+
+/// How many bytes one texel of `format` occupies.
+///
+/// **One table, because two would drift.** Every readback needs this to size its staging buffer, and
+/// each also needs to know how to *read* what it copied — those are different questions with
+/// different answers per format, but the width is the same number however it is being decoded.
+fn bytes_per_pixel(format: vk::Format) -> usize {
+    match format {
+        vk::Format::R8G8B8A8_UNORM | vk::Format::R8G8B8A8_SRGB => 4,
+        vk::Format::B8G8R8A8_UNORM | vk::Format::B8G8R8A8_SRGB => 4,
+        vk::Format::R32G32_SFLOAT => 8,
+        vk::Format::R16G16B16A16_SFLOAT => 8,
+        vk::Format::R32G32B32A32_SFLOAT => 16,
+        other => panic!("readback is not implemented for {other:?}"),
+    }
 }
 
 /// How to turn raw target bytes into 8-bit RGBA.
@@ -94,13 +163,6 @@ impl PixelFormat {
             vk::Format::B8G8R8A8_UNORM | vk::Format::B8G8R8A8_SRGB => Self::Bgra8,
             vk::Format::R16G16B16A16_SFLOAT => Self::Rgba16Float,
             other => panic!("readback is not implemented for {other:?}"),
-        }
-    }
-
-    fn bytes_per_pixel(self) -> usize {
-        match self {
-            Self::Rgba8 | Self::Bgra8 => 4,
-            Self::Rgba16Float => 8,
         }
     }
 

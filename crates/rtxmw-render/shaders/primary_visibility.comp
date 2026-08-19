@@ -20,6 +20,29 @@
 #include "waves.glsl"
 #include "water.glsl"
 
+// Where the surface at `ndc` was on the previous frame's screen, as a displacement in pixels.
+//
+// Add it to a pixel's coordinate to find the history that belongs to it. Reprojected as an *offset
+// from the eye* throughout: `direction * t` is that offset already, computed without ever forming a
+// world position, and stepping it back by the frame's camera motion lands it in the previous
+// frame's camera space, where that frame's own projection finishes the job. Building the world
+// point and differencing it against the old eye would cost the precision `§8.7` is about.
+//
+// Zero for a miss — a temporal filter reads that as "this pixel did not move", which for the sky is
+// true — and zero behind the previous eye, where there is no screen position at all and the divide
+// would fold the point back into the frame as a plausible-looking coordinate.
+vec2 motion_vector(Surface surface, vec3 direction, vec2 ndc, uvec2 size) {
+    if (!surface.hit) {
+        return vec2(0.0);
+    }
+    vec3 was = direction * surface.t + frame.camera_motion;
+    vec4 before = frame.previous_clip_from_offset * vec4(was, 1.0);
+    if (before.w <= 0.0) {
+        return vec2(0.0);
+    }
+    return (before.xy / before.w - ndc) * 0.5 * vec2(size);
+}
+
 layout(local_size_x = 8, local_size_y = 8) in;
 
 void main() {
@@ -39,8 +62,8 @@ void main() {
     // The projection is reverse-Z, so the near plane is depth 1 and the far plane is depth 0. The
     // far plane is also at infinity, where w collapses to zero — so the near plane is the only one
     // that can be unprojected at all.
-    vec2 screen_uv = (vec2(pixel) + 0.5) / vec2(size);
-    vec4 near_point = frame.ndc_to_world_offset * vec4(screen_uv * 2.0 - 1.0, 1.0, 1.0);
+    vec2 ndc = ((vec2(pixel) + 0.5) / vec2(size)) * 2.0 - 1.0;
+    vec4 near_point = frame.ndc_to_world_offset * vec4(ndc, 1.0, 1.0);
     vec3 direction = normalize(near_point.xyz / near_point.w);
 
     Surface surface = trace(frame.camera_position, direction, 0.0, frame.cone_spread, MASK_ANY);
@@ -70,6 +93,8 @@ void main() {
         emitted = absorbed_by_water(emitted, path);
         albedo *= exp(-WATER_EXTINCTION * path);
     }
+
+    imageStore(motion_target, ivec2(pixel), vec4(motion_vector(surface, direction, ndc, size), 0.0, 0.0));
 
     imageStore(albedo_target, ivec2(pixel), vec4(albedo, 1.0));
     imageStore(normal_depth_target, ivec2(pixel), vec4(surface.normal, surface.t));

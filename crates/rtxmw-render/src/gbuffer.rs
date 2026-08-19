@@ -20,6 +20,14 @@ const NORMAL_DEPTH_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 /// Light arriving at a surface, with its own albedo divided out. Unbounded, so half float.
 const ILLUMINATION_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 
+/// Where each pixel's surface was on the previous frame's screen, in pixels.
+///
+/// **Full floats, unlike everything else here.** A motion vector spans the frame — up to a couple of
+/// thousand pixels when the camera turns — and a half float's mantissa is eleven bits, so above 1024
+/// it can only land on whole pixels and above 2048 on every other one. That is the range temporal
+/// reuse cares most about getting right, and eight megabytes at 1080p is not the constraint.
+const MOTION_FORMAT: vk::Format = vk::Format::R32G32_SFLOAT;
+
 /// The trace's output, split into what a surface is and what light reaches it.
 ///
 /// **The split is what makes denoising possible.** All the noise is in the lighting — the albedo a
@@ -35,22 +43,30 @@ pub(crate) struct GBuffer {
     normal_depth: Image,
     /// The one the trace writes and the composite reads. The filter swaps which is which.
     illumination: [Image; 2],
+    motion: Image,
 }
 
 impl GBuffer {
     /// Allocates every image at `extent`.
     pub(crate) fn new(memory: &Memory, extent: vk::Extent2D) -> rtxmw_gpu::Result<Self> {
         // Every one is written by a compute shader and read by another, so all of them are storage
-        // images; none is ever copied, so none needs a transfer usage.
-        let usage = vk::ImageUsageFlags::STORAGE;
-        let image = |name: &str, format| Image::new(memory, name, extent, format, usage);
+        // images; the motion target is also the one thing here that leaves the device.
+        let storage = vk::ImageUsageFlags::STORAGE;
+        let image = |name: &str, format, usage| Image::new(memory, name, extent, format, usage);
         Ok(Self {
-            albedo: image("gbuffer albedo", ALBEDO_FORMAT)?,
-            normal_depth: image("gbuffer normal and depth", NORMAL_DEPTH_FORMAT)?,
+            albedo: image("gbuffer albedo", ALBEDO_FORMAT, storage)?,
+            normal_depth: image("gbuffer normal and depth", NORMAL_DEPTH_FORMAT, storage)?,
             illumination: [
-                image("illumination", ILLUMINATION_FORMAT)?,
-                image("illumination scratch", ILLUMINATION_FORMAT)?,
+                image("illumination", ILLUMINATION_FORMAT, storage)?,
+                image("illumination scratch", ILLUMINATION_FORMAT, storage)?,
             ],
+            // Copied as well as stored: it goes to an upscaler that has not arrived yet, so reading
+            // it back is the only way to assert on what the shader wrote.
+            motion: image(
+                "gbuffer motion",
+                MOTION_FORMAT,
+                storage | vk::ImageUsageFlags::TRANSFER_SRC,
+            )?,
         })
     }
 
@@ -60,6 +76,11 @@ impl GBuffer {
 
     pub(crate) fn normal_depth(&self) -> &Image {
         &self.normal_depth
+    }
+
+    /// Where each pixel's surface was last frame, as a displacement in pixels.
+    pub(crate) fn motion(&self) -> &Image {
+        &self.motion
     }
 
     /// The image the trace writes its lighting into, and the one a filter reads first.
@@ -73,12 +94,13 @@ impl GBuffer {
     }
 
     /// Every image, for a caller transitioning them together.
-    pub(crate) fn images(&self) -> [&Image; 4] {
+    pub(crate) fn images(&self) -> [&Image; 5] {
         [
             &self.albedo,
             &self.normal_depth,
             &self.illumination[0],
             &self.illumination[1],
+            &self.motion,
         ]
     }
 }

@@ -97,21 +97,23 @@ layout(set = 0, binding = 7, scalar) readonly buffer Positions {
 layout(set = 0, binding = 8, rgba16f) uniform writeonly image2D albedo_target;
 layout(set = 0, binding = 9, rgba16f) uniform writeonly image2D normal_depth_target;
 layout(set = 0, binding = 10, rgba16f) uniform writeonly image2D illumination_target;
+// Where each pixel's surface was on the previous frame's screen, as a displacement in pixels.
+layout(set = 0, binding = 11, rg32f) uniform writeonly image2D motion_target;
 
 // Last binding, and the only runtime-sized one: Vulkan allows a variable descriptor count only on
 // the final element of a set. Slot zero is the fallback, so a material's texture id addresses
 // `id + 1`.
 // The light grid: cell `i` owns `light_grid_indices[light_grid_offsets[i] .. [i + 1]]`, which is
 // why the offsets carry a trailing sentinel. Built in `light_grid.rs`.
-layout(set = 0, binding = 12, scalar) readonly buffer LightGridOffsets {
+layout(set = 0, binding = 13, scalar) readonly buffer LightGridOffsets {
     uint light_grid_offsets[];
 };
 
-layout(set = 0, binding = 13, scalar) readonly buffer LightGridIndices {
+layout(set = 0, binding = 14, scalar) readonly buffer LightGridIndices {
     uint light_grid_indices[];
 };
 
-layout(set = 0, binding = 14) uniform sampler2D textures[];
+layout(set = 0, binding = 15) uniform sampler2D textures[];
 
 // Stands in for a material with no base colour texture. Declared as `NO_TEXTURE` in
 // `material_buffers.rs` too, and pinned there by a test, because a shader cannot see a Rust
@@ -138,12 +140,18 @@ struct Wave {
 // waves needed a clock. Scalar layout, so it matches the `repr(C)` struct in `visibility_pass.rs`
 // field for field. The matrices arrive already multiplied — their product is all unprojection
 // needs, and it is one thing to send rather than two to keep consistent.
-layout(set = 0, binding = 11, scalar) readonly buffer Frame {
+layout(set = 0, binding = 12, scalar) readonly buffer Frame {
     // Clip coordinates to an offset from the eye, in world axes — *not* the inverse
     // view-projection, which would land a world-space point the shader then has to subtract the
     // camera position from. See `ndc_to_world_offset` in `visibility_pass.rs` for what that cost.
     mat4 ndc_to_world_offset;
+    // The previous frame's `projection * rotation`: an offset from *that* frame's eye, to its clip
+    // coordinates. Built in `visibility_pass.rs`.
+    mat4 previous_clip_from_offset;
     vec3 camera_position;
+    // How far the eye moved since the previous frame, `now - before`. Small, and differenced on the
+    // host where both positions are known — never here, where they are world-scale.
+    vec3 camera_motion;
     // Reciprocal of the light grid's cell size, then the corner it is addressed from and how many
     // cells it spans. Zero dimensions is a scene with no lights.
     float light_grid_scale;

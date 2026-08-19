@@ -36,7 +36,7 @@ fn the_shelf_carries_only_what_it_is_deep_enough_for() {
 
 #[test]
 fn the_spread_is_narrow_at_the_swell_and_broad_above_it() {
-    // The property §7.15 arrived at from a symptom, in its empirical form: a swell arrives as
+    // The property §7.7 arrived at from a symptom, in its empirical form: a swell arrives as
     // parallel trains and the chop riding on it does not. Large is narrow.
     let at_peak = spread_of(1.0);
     let chop = spread_of(6.0);
@@ -131,7 +131,7 @@ fn the_table_matches_the_one_the_shader_walks() {
 
 #[test]
 fn the_swell_arrives_in_a_narrow_fan_and_the_chop_in_a_wide_one() {
-    // The lattice §7.15 was about comes from a handful of components sharing directions, and
+    // The lattice §7.7 was about comes from a handful of components sharing directions, and
     // what prevents it is the spread being *wide where it matters*: curvature is dominated by
     // the shortest waves, so those are the ones that have to disagree about which way they are
     // going. Donelan-Banner says they do, and this is that end to end.
