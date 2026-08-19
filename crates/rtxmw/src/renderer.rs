@@ -76,7 +76,7 @@ impl Renderer {
             "selected device cannot present to this surface"
         );
 
-        let device = Device::new(&instance, &physical)?;
+        let device = Device::new(&instance, &physical, &[])?;
         let extent = vk::Extent2D { width, height };
         let swapchain = Swapchain::new(&instance, &physical, &device, &surface, extent)?;
         let frames = Frames::new(

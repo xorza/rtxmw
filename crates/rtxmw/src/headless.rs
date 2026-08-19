@@ -35,7 +35,7 @@ pub(crate) fn screenshot(
     // No surface extensions and no swapchain: this device could not present if asked.
     let instance = Instance::new(c"rtxmw", &[], Validation::for_build())?;
     let physical = PhysicalDevice::select(&instance, Presentation::NotNeeded)?;
-    let device = Device::new(&instance, &physical)?;
+    let device = Device::new(&instance, &physical, &[])?;
     let memory = Memory::new(&instance, &physical, &device)?;
     let mut uploader = Uploader::new(&device, &memory, physical.graphics_queue_family())?;
 

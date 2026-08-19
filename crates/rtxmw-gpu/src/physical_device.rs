@@ -48,6 +48,10 @@ pub struct PhysicalDevice {
     /// Exactly the subset of [`OPTIONAL`] this device offers, resolved once during inspection so
     /// the enable list cannot drift out of step with the capability flags.
     optional_extensions: Vec<&'static std::ffi::CStr>,
+    /// Every extension this device offers, kept so a caller outside this crate can ask about one
+    /// this crate has never heard of — NGX names four, and which four has changed between SDK
+    /// versions, so the list belongs to whoever asked rather than to a constant here.
+    available_extensions: Vec<std::ffi::CString>,
     limits: RayTracingLimits,
     timestamps: TimestampSupport,
 }
@@ -228,6 +232,14 @@ impl PhysicalDevice {
 
         let optional_extensions: Vec<&'static std::ffi::CStr> =
             OPTIONAL.iter().copied().filter(|n| has(n)).collect();
+        let available_extensions: Vec<std::ffi::CString> = available
+            .iter()
+            .filter_map(|e| {
+                e.extension_name_as_c_str()
+                    .ok()
+                    .map(std::ffi::CStr::to_owned)
+            })
+            .collect();
 
         Ok(Self {
             raw,
@@ -241,6 +253,7 @@ impl PhysicalDevice {
             },
             required_extensions,
             optional_extensions,
+            available_extensions,
             limits: RayTracingLimits {
                 max_ray_recursion_depth: ray_tracing_pipeline_properties.max_ray_recursion_depth,
                 shader_group_handle_size: ray_tracing_pipeline_properties.shader_group_handle_size,
@@ -286,6 +299,16 @@ impl PhysicalDevice {
         names.extend(self.required_extensions.iter().map(|n| n.as_ptr()));
         names.extend(self.optional_extensions.iter().map(|n| n.as_ptr()));
         names
+    }
+
+    /// Whether this device offers `name`.
+    ///
+    /// For extensions this crate does not name itself: something outside it has been told what it
+    /// needs — NGX asks for four — and can check before asking for them.
+    pub fn supports(&self, name: &std::ffi::CStr) -> bool {
+        self.available_extensions
+            .iter()
+            .any(|have| have.as_c_str() == name)
     }
 
     /// Limits that acceleration structure and shader binding table layout depend on.

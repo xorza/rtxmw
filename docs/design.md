@@ -733,6 +733,10 @@ specular guide in particular is easy to forget and awkward to add late.
 
 ### 5.3 Output resolution is the hardest constraint in the project
 
+**Confirmed against DLSS itself (§8.19):** asked what to render at for a 3840×2160 output under
+Performance, it answers **1920×1080** — the number this section assumed and the whole frame budget is
+measured at.
+
 Denoising scales with *output* pixels, not internal ones. DLSS-RR alone costs ~6.1 ms at 3200×1800
 on a 3080; even scaling generously for Ada, anything above 4K output spends 10–14 ms on the denoiser
 before a single ray is cast. Driving a high-resolution ultrawide at its native mode is off the
@@ -1670,3 +1674,61 @@ terminator. `NVSDK_NGX_Result_FAIL_OutOfDate` rendered as `"N"`. The test caught
 for the SDK's actual name rather than for "some letters", which the truncated version would have
 passed. This is the failure mode hand-written FFI has, and the reason each declaration carries the
 header line it was checked against.
+
+### 8.18 NGX comes up, and four wrong parameters on the way
+
+**DLSS Ray Reconstruction reports available on the RTX 4090 Laptop GPU.** That is the answer M7 hangs
+on — it depends on the driver, the SDK and the GPU together, so nothing but NGX can give it — and
+reaching it meant getting four things wrong first. Each returned a code that named itself, which is
+the whole reason `Display` asks the SDK rather than printing a number.
+
+**The device could not be created with what NGX asked for.** It names
+`VK_EXT_buffer_device_address`, because it supports drivers older than this one; the same capability
+is core in Vulkan 1.2 and this device enables it there, and the spec forbids both — `vkCreateDevice`
+rejects the pair rather than ignoring one. Superseded names are now dropped, and the test asserts
+they are gone rather than trusting it.
+
+**`FAIL_UnableToWriteToAppDataPath`.** The header gives `InApplicationDataPath` a default of null and
+NGX rejects null: it wants somewhere to put its logs and any feature library it downloads. A C++
+default argument is not the same as an optional parameter, which is the sort of thing a hand-written
+binding has to learn by being told.
+
+**`FAIL_InvalidParameter`.** The project id is a **UUID and is parsed as one**. Mine read
+`…-rtxmw000001`, which is memorable and not hexadecimal. NGX says only that some parameter was
+invalid, not which.
+
+**Available, but reporting itself unavailable.** `libnvidia-ngx-dlssd.so` is neither on the loader
+path nor beside the binary, and NGX's default search is the application folder alone — so it has to
+be *told*, through `NVSDK_NGX_FeatureCommonInfo`. That struct carries its logging block by value
+rather than behind a pointer, so the whole thing has to be declared even though only the path list is
+set; a short one would leave NGX reading past the end.
+
+**What this bought beyond DLSS.** `Device::new` now takes extensions from its caller, enabled where
+present — the rule the optional set already followed — and `PhysicalDevice::supports` answers for
+names this crate has never heard of. Neither belongs to NGX: the point is that the list is queried
+from whoever knows, rather than becoming another constant in the Vulkan layer.
+
+### 8.19 DLSS agrees with the frame budget
+
+The optimal-settings query, and the answer §5.3 was written against:
+
+| preset | render resolution for 3840×2160 |
+|---|---|
+| Performance | **1920×1080** |
+| Balanced | 2227×1253 |
+| Quality | 2560×1440 |
+
+That is the number the entire budget is measured at, now asked of DLSS rather than assumed. Dynamic
+resolution is offered too — the reported range runs from 1920×1080 up to native — which is a lever
+worth remembering if the trace ever overruns.
+
+**The query is not an exported symbol.** It is a function pointer the driver's feature library puts
+*into the capability map*, fetched by name and called with that same map, reading its inputs and
+writing its answers back through it. That is why the SDK's own helper returns `FAIL_OutOfDate` when
+the pointer is absent: it means the feature library was never found, which is a different problem
+than the name suggests and the one §8.18 spent a while on.
+
+**The three presets are asserted against each other, not just against a number.** A query that
+ignored the quality value would return 1920×1080 for all three and pass a test that only checked
+Performance. Each is also required to sit inside the dynamic range it reports, which is what a
+renderer varying resolution would be handed.

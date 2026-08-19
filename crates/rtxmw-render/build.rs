@@ -141,6 +141,13 @@ fn link_ngx() {
     }
 
     println!("cargo:rustc-cfg=ngx");
+    // Where NGX must be told to look for its feature libraries: the default search is the
+    // application folder alone, and these are not beside the binary. Handed down rather than
+    // rebuilt, so `DLSS_SDK_DIR` is honoured everywhere the SDK is named and not only here.
+    println!(
+        "cargo:rustc-env=NGX_FEATURE_DIR={}",
+        lib.join("rel").display()
+    );
     println!("cargo:rustc-link-search=native={}", lib.display());
     println!("cargo:rustc-link-lib=static=nvsdk_ngx");
     // The SDK is C++ and loads the driver's NGX core at runtime, so it wants both.

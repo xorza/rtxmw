@@ -29,7 +29,15 @@ impl Device {
     ///
     /// Buffer device address and descriptor indexing are not optional here: acceleration structure
     /// builds need the former, and bindless material lookup at a hit needs the latter.
-    pub fn new(instance: &Instance, physical: &PhysicalDevice) -> Result<Self> {
+    /// `extra` names extensions beyond this crate's own, **enabled only where the device has
+    /// them**, which is the rule the optional set already follows. Something outside this crate
+    /// knows it needs them and decides what to do when they are missing, so an absent one is not an
+    /// error here.
+    pub fn new(
+        instance: &Instance,
+        physical: &PhysicalDevice,
+        extra: &[&std::ffi::CStr],
+    ) -> Result<Self> {
         let priorities = [1.0f32];
         let queue_infos = [vk::DeviceQueueCreateInfo::default()
             .queue_family_index(physical.graphics_queue_family())
@@ -57,7 +65,13 @@ impl Device {
         let mut position_fetch = vk::PhysicalDeviceRayTracingPositionFetchFeaturesKHR::default()
             .ray_tracing_position_fetch(true);
 
-        let extensions = physical.extensions_to_enable();
+        let mut extensions = physical.extensions_to_enable();
+        extensions.extend(
+            extra
+                .iter()
+                .filter(|name| physical.supports(name))
+                .map(|name| name.as_ptr()),
+        );
         let mut create_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_infos)
             .enabled_extension_names(&extensions)

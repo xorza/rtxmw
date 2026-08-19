@@ -54,7 +54,7 @@ impl TestGpu {
         // take down the whole suite, and each test asserts on its own thread's errors instead.
         let instance = Instance::new(c"rtxmw-test", &[], Validation::Record)?;
         let physical = PhysicalDevice::select(&instance, Presentation::NotNeeded)?;
-        let device = Device::new(&instance, &physical)?;
+        let device = Device::new(&instance, &physical, &[])?;
         let memory = Memory::new(&instance, &physical, &device)?;
         let uploader = Uploader::new(&device, &memory, physical.graphics_queue_family())?;
 
