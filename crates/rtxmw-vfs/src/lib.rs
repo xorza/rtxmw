@@ -14,7 +14,7 @@ pub use crate::error::{Result, VfsError};
 pub use crate::normalized_path::NormalizedPath;
 pub use crate::vfs::Vfs;
 
-pub use crate::game_data::{DATA_DIR_VAR, morrowind_archives, morrowind_data_dir};
+pub use crate::game_data::{DATA_DIR_VAR, from_dotenv, morrowind_archives, morrowind_data_dir};
 
 // The gate must match the module's, or the module is `pub` yet unreachable under cfg(test).
 #[cfg(any(test, feature = "internals"))]

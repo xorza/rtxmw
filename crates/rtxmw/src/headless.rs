@@ -35,6 +35,7 @@ pub(crate) fn screenshot(options: &ScreenshotOptions) -> Result<f32, Box<dyn std
         frames,
         samples,
         denoise,
+        dlss,
     } = options;
 
     // No surface extensions and no swapchain: this device could not present if asked.
@@ -50,7 +51,7 @@ pub(crate) fn screenshot(options: &ScreenshotOptions) -> Result<f32, Box<dyn std
     // With an upscaler the size asked for is the *output* and DLSS says what to trace at, so it is
     // built before the renderer that has to be sized by its answer.
     let output = *size;
-    let upscaler = upscaler::build(&instance, &physical, &device, &mut uploader, output)?;
+    let upscaler = upscaler::build(&instance, &physical, &device, &mut uploader, output, *dlss)?;
     let extent = upscaler::render_size(upscaler.as_ref(), output);
     let mut renderer = SceneRenderer::new(&device, &physical, &memory, extent)?;
     upscaler::attach(&memory, &mut renderer, upscaler)?;

@@ -3,10 +3,12 @@
 use ash::vk;
 use clap::{CommandFactory, Parser};
 use glam::Vec3;
+use rtxmw_render::dlss::Preset;
 use rtxmw_scene::CellId;
 
 use crate::cli::{
-    SCREENSHOT_SIZE, ScreenshotOptions, WindowOptions, names_help, names_screenshot, size,
+    SCREENSHOT_SIZE, ScreenshotOptions, UPSCALING_DEFAULT, Upscaling, WindowOptions, names_help,
+    names_screenshot, size, upscaling,
 };
 use crate::scene_loader;
 use crate::scene_loader::ViewpointOverride;
@@ -18,6 +20,10 @@ use std::path::PathBuf;
 /// what a test has to say about a rejection is what it told the reader anyway.
 fn parse(arguments: &[&str]) -> Result<WindowOptions, String> {
     WindowOptions::try_parse_from(std::iter::once("rtxmw").chain(arguments.iter().copied()))
+        .map(|mut options| {
+            options.dlss = Upscaling(None);
+            options
+        })
         .map_err(|failed| failed.to_string())
 }
 
@@ -27,9 +33,16 @@ fn screenshot_options(arguments: &[&str]) -> Result<ScreenshotOptions, String> {
             .into_iter()
             .chain(arguments.iter().copied()),
     )
+    .map(|mut options| {
+        options.dlss = Upscaling(None);
+        options
+    })
     .map_err(|failed| failed.to_string())
 }
 
+/// **`dlss` is flattened away by both helpers above**, because it reads the process environment
+/// through clap: pinning it would fail every assertion here on a machine that has `RTXMW_DLSS` set,
+/// and none of them is about that setting. It has a test of its own at the end.
 fn interior(name: &str) -> CellId {
     CellId::Interior(name.to_owned())
 }
@@ -106,7 +119,8 @@ fn the_cell_and_the_frame_limit_go_in_either_order() {
         parse(&[]),
         Ok(WindowOptions {
             cell: default.clone(),
-            exit_after: None
+            exit_after: None,
+            dlss: Upscaling(None),
         })
     );
     // A flag on its own must not be mistaken for a cell name, which is exactly what happened
@@ -115,13 +129,15 @@ fn the_cell_and_the_frame_limit_go_in_either_order() {
         parse(&["--frames", "3"]),
         Ok(WindowOptions {
             cell: default,
-            exit_after: Some(3)
+            exit_after: Some(3),
+            dlss: Upscaling(None),
         })
     );
 
     let outdoors = WindowOptions {
         cell: CellId::Exterior { x: -2, y: -9 },
         exit_after: Some(3),
+        dlss: Upscaling(None),
     };
     assert_eq!(parse(&["-2,-9", "--frames", "3"]), Ok(outdoors.clone()));
     assert_eq!(parse(&["--frames", "3", "-2,-9"]), Ok(outdoors));
@@ -162,6 +178,7 @@ fn a_screenshot_can_be_told_where_to_stand_and_which_way_to_look() {
             frames: 1,
             samples: None,
             denoise: None,
+            dlss: Upscaling(None),
         })
     );
     // Either half on its own: what is not said is left to the cell rather than made up here,
@@ -209,6 +226,7 @@ fn a_screenshot_takes_a_path_then_a_size_then_a_cell() {
             frames: 1,
             samples: None,
             denoise: None,
+            dlss: Upscaling(None),
         })
     );
     assert_eq!(
@@ -224,6 +242,7 @@ fn a_screenshot_takes_a_path_then_a_size_then_a_cell() {
             frames: 1,
             samples: None,
             denoise: None,
+            dlss: Upscaling(None),
         })
     );
     // Flagged like the viewpoint, and for the same reason.
@@ -250,6 +269,7 @@ fn a_screenshot_takes_a_path_then_a_size_then_a_cell() {
             frames: 64,
             samples: Some(1024),
             denoise: Some(0),
+            dlss: Upscaling(None),
         })
     );
 
@@ -275,4 +295,45 @@ fn a_screenshot_takes_a_path_then_a_size_then_a_cell() {
             "{arguments:?} failed without mentioning {wanted:?}: {failed}"
         );
     }
+}
+
+#[test]
+fn the_upscaler_defaults_to_on_and_can_be_turned_off() {
+    // **A plain run is the engine with everything switched on**, so this setting exists to switch
+    // one thing off — which is what an A/B against the unupscaled path needs, and the only reason
+    // it is a setting rather than a constant.
+    assert_eq!(
+        upscaling(UPSCALING_DEFAULT).expect("the built-in default has to parse"),
+        Upscaling(Some(Preset::Quality))
+    );
+    for on in ["on", "1"] {
+        assert_eq!(upscaling(on).unwrap(), Upscaling(Some(Preset::Quality)));
+    }
+    for off in ["off", "0"] {
+        assert_eq!(
+            upscaling(off).unwrap(),
+            Upscaling(None),
+            "{off:?} should turn the upscaler off"
+        );
+    }
+    for (name, expected) in [
+        ("performance", Preset::Performance),
+        ("balanced", Preset::Balanced),
+        ("quality", Preset::Quality),
+        ("dlaa", Preset::Dlaa),
+    ] {
+        assert_eq!(upscaling(name).unwrap(), Upscaling(Some(expected)));
+    }
+
+    // **Loudly, not silently.** Rendering at a mode nobody asked for is how a typo becomes a
+    // measurement of the wrong thing, and the message has to say what would have worked.
+    let failed = upscaling("ultra").expect_err("`ultra` is not a mode");
+    assert!(
+        failed.contains("ultra"),
+        "it should name the value: {failed}"
+    );
+    assert!(
+        failed.contains("off") && failed.contains("quality"),
+        "it should list what does work: {failed}"
+    );
 }

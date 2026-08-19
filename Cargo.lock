@@ -1326,6 +1326,7 @@ dependencies = [
  "rtxmw-render",
  "rtxmw-scene",
  "rtxmw-texture",
+ "rtxmw-vfs",
  "winit",
 ]
 

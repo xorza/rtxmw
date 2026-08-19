@@ -1854,6 +1854,9 @@ input" from "DLSS rejects its guides".
 pixel identical to the default build** — checked, 0 of 921,600 — so nothing already working is
 standing on this.
 
+*Both sentences above are history.* §8.31 makes `dlss` a default feature and DLSS on by default, and
+retires `1` as a spelling; `RTXMW_DLSS=off` is what turns it back off.
+
 ### 8.24 The black frame was a missing usage flag
 
 **DLSS samples its inputs.** Every image handed to Ray Reconstruction has to be created with
@@ -2038,3 +2041,95 @@ coc-style jump will need one, and the symptom will be a smear rather than a cras
 Note for a wide display: the output follows the window, so a 7680×2160 one traces 3840×1080 — twice
 the pixels §5.3 budgets for. That is the right answer for that window and the wrong one for the
 budget, and the two only agree at 3840×2160.
+
+### 8.30 The jitter handed to DLSS had the wrong sign, on both axes
+
+The image shook — about a pixel, every frame, plainly visible in motion and invisible in every
+measurement taken until then. A still camera turns it into a number: consecutive frames differed by
+**0.0335 RMSE** under Ray Reconstruction against **0.0073** unupscaled. A temporal accumulator that
+is *less* stable than the raw path with a stationary camera is doing the opposite of its job.
+
+Sweeping the four sign combinations settles it in four renders:
+
+| `Jitter.Offset` | frame-to-frame RMSE, still camera |
+|---|---|
+| `+x, +y` (what it was) | 0.0335 |
+| `+x, -y` | 0.0196 |
+| `-x, +y` | 0.0289 |
+| **`-x, -y`** | **0.0016** |
+
+**The trace adds the offset to the sample coordinate**, moving where inside its pixel a ray is fired.
+NGX wants the offset as applied to the *projection*, which moves the frustum the other way for the
+same picture. Handing over the coordinate's sign leaves Ray Reconstruction un-jittering in the
+direction that doubles the offset rather than cancelling it.
+
+Nothing reports this. The feature builds, evaluates and returns success, and the wrong sign still
+resolves an image — just an unstable one, and one whose stillness nobody had measured because every
+number so far came from a single frame.
+
+Quality against the §8.26 supersampled reference, 1 spp:
+
+| | inverted jitter | corrected |
+|---|---|---|
+| RR DLAA, native | 27.49 dB | **30.23 dB** |
+| RR Quality, 2560×1440 in | — | **27.74 dB** |
+| à-trous, 4 passes, native | 26.80 dB | 26.80 dB |
+
+### 8.31 The default build is the one worth looking at
+
+`dlss` is a default feature and DLSS runs at **Quality** unless told otherwise, so a plain
+`cargo run` is the engine with everything it has switched on. `RTXMW_DLSS` now exists to turn it
+*off* — `off` or `0` — or to name another mode, which is what an A/B against the unupscaled path
+needs and the only reason it is still a variable. An unrecognised value is refused rather than
+silently rendering at a mode nobody asked for.
+
+The cost: NGX's SDK is not in the repository and `.refs/` is gitignored, so a fresh clone builds only
+once the SDK is fetched there or `DLSS_SDK_DIR` points at it. `--no-default-features` is the way out.
+
+### 8.32 One place reads settings
+
+`RTXMW_DLSS` had been read inside `upscaler.rs`, which is a module with no business knowing that an
+environment exists. Every setting is now declared once, in `cli`, as an ordinary argument:
+
+```
+--dlss <MODE>    off, performance, balanced, quality or dlaa
+```
+
+clap covers the flag **and** the variable from that one declaration — `env = "RTXMW_DLSS"` — and the
+`.env` layer sits underneath as the argument's default, read through the same `from_dotenv` the
+game's own directory is found by. So the order is flag, then variable, then `.env`, then the built-in
+default, and there is one reader rather than two. `upscaler::build` takes the resolved mode as a
+parameter; nothing outside `cli` calls `env::var` at all, which is a property a grep can check.
+
+**A setting that reads the environment cannot be pinned in a test.** The parser tests flatten `dlss`
+away in the two helpers every one of them already goes through, because a machine with `RTXMW_DLSS`
+set would otherwise fail all of them, and none of them is about that setting — it has its own test,
+which exercises the value parser directly.
+
+The type is `Upscaling(Option<Preset>)` rather than `Option<Preset>`: clap reads an `Option` field as
+"this argument may be absent", and absent is exactly what this one must not mean.
+
+### 8.33 The exposure residual is a property, not a defect
+
+§8.28 left a 0.85% brightness gap between a filtered frame and the same frame unfiltered, and it is
+closed here by measurement rather than by a change. Output luminance at 1920×1080, DLSS off:
+
+| à-trous passes | 0 | 2 | 4 | 8 |
+|---|---|---|---|---|
+| 4 spp | 0.7303 | 0.7281 | 0.7276 | 0.7272 |
+| 1 spp | 0.7344 | — | 0.7277 | — |
+
+**It scales with the noise and converges with the filtering**, which is what the log's concavity
+predicts: the histogram bins `log2(luminance)` per pixel, the mean of a log sits below the log of the
+mean by roughly the variance, so a noisier frame measures darker and the curve opens. Four passes
+against eight differ by 0.05%, and every configuration that ships is on that end — the default reads
+DLSS's denoised output, and `RTXMW_DLSS=off` reads a filtered frame.
+
+So the gap appears only when an unfiltered frame is asked for, and then it is the honest answer:
+§8.28's rule is that exposure measures the frame the tone curve maps, and a noisy frame measures as
+what it is. Chasing it further would be optimising a diagnostic.
+
+**One attempt is recorded as failed** so it is not retried blind. Averaging luminance over a 2×2
+block before binning does not fix it — the gap flips to −0.77% and the filtered frame's own exposure
+moves with it, because a block average changes which samples fall under the histogram's black cutoff
+as well as how noisy they are. The concavity is the dominant term but not the only one.

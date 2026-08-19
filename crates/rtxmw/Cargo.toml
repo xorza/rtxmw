@@ -8,7 +8,11 @@ license.workspace = true
 workspace = true
 
 [features]
-# Forwards to the renderer's, which needs NVIDIA's NGX SDK on disk. Off by default.
+# **On by default**, so that a plain `cargo run` is the engine with everything it has switched on —
+# which is the build worth looking at. The cost is that it needs NVIDIA's NGX SDK on disk, and
+# `.refs/` is gitignored: a fresh clone builds only once the SDK is fetched there or `DLSS_SDK_DIR`
+# points at it. `--no-default-features` is the way out.
+default = ["dlss"]
 dlss = ["rtxmw-render/dlss"]
 
 [dependencies]
@@ -16,6 +20,7 @@ rtxmw-gpu.workspace = true
 rtxmw-render.workspace = true
 rtxmw-scene.workspace = true
 rtxmw-texture.workspace = true
+rtxmw-vfs.workspace = true
 
 ash.workspace = true
 bytemuck.workspace = true

@@ -24,6 +24,7 @@ bytemuck = { version = "1", features = ["derive"] }
 clap = { version = "4", default-features = false, features = [
     "std",
     "derive",
+    "env",
     "help",
     "usage",
     "error-context",

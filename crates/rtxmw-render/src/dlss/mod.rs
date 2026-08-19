@@ -385,11 +385,9 @@ impl Preset {
     }
 
     /// The preset `name` selects, or `None` where it names none of them.
-    ///
-    /// `1` is Performance so that the plain switch means the mode §5.3 is written against.
     pub fn named(name: &str) -> Option<Self> {
         match name {
-            "1" | "performance" => Some(Self::Performance),
+            "performance" => Some(Self::Performance),
             "balanced" => Some(Self::Balanced),
             "quality" => Some(Self::Quality),
             "dlaa" => Some(Self::Dlaa),
@@ -745,8 +743,15 @@ impl Feature {
         set_resource(map, c"DLSS.Input.SpecularAlbedo", &mut specular);
         set_resource(map, c"GBuffer.Normals", &mut normals);
 
-        set_f32(map, c"Jitter.Offset.X", inputs.jitter.x);
-        set_f32(map, c"Jitter.Offset.Y", inputs.jitter.y);
+        // **Negated, on both axes.** The trace adds the offset to the *sample coordinate* — it
+        // shifts where inside its pixel a ray is fired — where NGX wants the offset as applied to
+        // the projection, which moves the frustum the other way for the same picture. Handing over
+        // the coordinate's sign leaves Ray Reconstruction un-jittering in the direction that
+        // doubles the offset instead of cancelling it, and the image shakes by about a pixel every
+        // frame. Nothing reports it: a still camera measured 0.0335 RMSE between consecutive frames
+        // against 0.0016 here, and the wrong sign still resolves an image, just an unstable one.
+        set_f32(map, c"Jitter.Offset.X", -inputs.jitter.x);
+        set_f32(map, c"Jitter.Offset.Y", -inputs.jitter.y);
         // Ours are already in pixels — see §8.13 — so nothing needs scaling. The SDK's helper reads
         // zero here as "one", which would work by accident; saying it is clearer.
         set_f32(map, c"MV.Scale.X", 1.0);
@@ -1173,7 +1178,6 @@ mod tests {
         // enum is an FFI integer, so a variant landing on the wrong number is a silent change of
         // render resolution rather than a compile error.
         for (name, value) in [
-            ("1", 0),
             ("performance", 0),
             ("balanced", 1),
             ("quality", 2),
@@ -1184,7 +1188,7 @@ mod tests {
         }
         // **Unrecognised is `None`, not a default.** Silently rendering at a mode nobody asked for
         // is how a typo becomes a performance measurement of the wrong thing.
-        for wrong in ["", "0", "Performance", "ultra", "true"] {
+        for wrong in ["", "0", "1", "Performance", "ultra", "true"] {
             assert!(
                 Preset::named(wrong).is_none(),
                 "{wrong:?} named a preset, and it should not"

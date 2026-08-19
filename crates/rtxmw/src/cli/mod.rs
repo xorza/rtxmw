@@ -8,6 +8,7 @@ use std::path::PathBuf;
 
 use ash::vk;
 use clap::{CommandFactory, Parser};
+use rtxmw_render::dlss::Preset;
 use rtxmw_scene::CellId;
 
 use crate::scene_loader;
@@ -124,6 +125,51 @@ fn cell(value: &str) -> Result<CellId, String> {
     Ok(scene_loader::cell_named(value))
 }
 
+/// What the upscaler should do, including nothing.
+///
+/// A type of its own rather than `Option<Preset>` because clap reads an `Option` field as "this
+/// argument may be absent", and absent is exactly what this must not mean.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Upscaling(pub(crate) Option<Preset>);
+
+/// Environment variable, and `.env` key, choosing what DLSS runs at.
+const UPSCALING_VAR: &str = "RTXMW_DLSS";
+
+/// What DLSS runs at when nothing says otherwise.
+///
+/// **Quality rather than the Performance mode §5.3 budgets for.** The default build is the one to
+/// look at rather than the one to measure; the budget is still reachable by name.
+const UPSCALING_DEFAULT: &str = "quality";
+
+/// Reads an upscaling mode: a preset's name, or `off` for none at all.
+fn upscaling(value: &str) -> Result<Upscaling, String> {
+    match value {
+        "off" | "0" => Ok(Upscaling(None)),
+        // Not by recursing through this function: a default that named `on` would then recurse
+        // forever, and the test that pins the default would hang instead of failing. A default that
+        // names no preset is this crate contradicting itself, so it says so and stops.
+        "on" | "1" => Ok(Upscaling(Some(
+            Preset::named(UPSCALING_DEFAULT).expect("the built-in default names a preset"),
+        ))),
+        name => Preset::named(name)
+            .map(|preset| Upscaling(Some(preset)))
+            .ok_or_else(|| {
+                format!("expected off, performance, balanced, quality or dlaa, got {value:?}")
+            }),
+    }
+}
+
+/// What `.env` says the default should be, or the built-in one.
+///
+/// **The one place a file is consulted for a setting.** clap covers the flag and the variable
+/// between them, so the order ends up flag, then variable, then `.env`, then this.
+fn upscaling_default() -> &'static str {
+    static CHOSEN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    CHOSEN.get_or_init(|| {
+        rtxmw_vfs::from_dotenv(UPSCALING_VAR).unwrap_or_else(|| UPSCALING_DEFAULT.to_owned())
+    })
+}
+
 /// Reads a frame count, rejecting zero.
 ///
 /// Zero can only be a mistake, and rendering one frame for it would answer a question nobody asked.
@@ -158,6 +204,15 @@ pub(crate) struct WindowOptions {
     /// Draw this many frames, then exit through the ordinary shutdown path.
     #[arg(long = "frames", value_name = "N", value_parser = at_least_one)]
     pub(crate) exit_after: Option<u32>,
+    /// What DLSS runs at: off, performance, balanced, quality or dlaa.
+    #[arg(
+        long = "dlss",
+        env = UPSCALING_VAR,
+        value_name = "MODE",
+        default_value = upscaling_default(),
+        value_parser = upscaling,
+    )]
+    pub(crate) dlss: Upscaling,
 }
 
 /// What an offscreen render was asked for.
@@ -201,4 +256,13 @@ pub(crate) struct ScreenshotOptions {
     /// trade at four samples and the wrong one at a thousand.
     #[arg(long, value_name = "N")]
     pub(crate) denoise: Option<u32>,
+    /// What DLSS runs at: off, performance, balanced, quality or dlaa.
+    #[arg(
+        long = "dlss",
+        env = UPSCALING_VAR,
+        value_name = "MODE",
+        default_value = upscaling_default(),
+        value_parser = upscaling,
+    )]
+    pub(crate) dlss: Upscaling,
 }

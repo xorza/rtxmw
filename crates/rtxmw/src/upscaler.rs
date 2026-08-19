@@ -7,6 +7,8 @@
 use ash::vk;
 use rtxmw_gpu::{Device, Instance, Memory, PhysicalDevice, Uploader};
 use rtxmw_render::SceneRenderer;
+
+use crate::cli::Upscaling;
 #[cfg(feature = "dlss")]
 use rtxmw_render::dlss::Upscaler;
 
@@ -26,28 +28,24 @@ pub(crate) fn device_extensions() -> Vec<&'static std::ffi::CStr> {
     Vec::new()
 }
 
-/// Builds an upscaler, where DLSS is compiled in and asked for.
+/// Builds an upscaler for `mode`, where DLSS is compiled in and the mode is not `off`.
 ///
-/// **`RTXMW_DLSS` is read here and nowhere else.** Opt-in twice over — the feature to compile it and
-/// the variable to attach it — so that a build carrying DLSS renders identically to one without it
-/// until asked, which is what makes the two comparable.
+/// **Takes the decision rather than making it.** What DLSS runs at is a setting, and settings are
+/// read in `cli` — this module knowing how to consult the environment would be a second place for
+/// the answer to come from.
 pub(crate) fn build(
     _instance: &Instance,
     _physical: &PhysicalDevice,
     _device: &Device,
     _uploader: &mut Uploader,
     _output: vk::Extent2D,
+    _mode: Upscaling,
 ) -> Result<Option<Upscaler>, Box<dyn std::error::Error>> {
     #[cfg(feature = "dlss")]
     {
-        // The variable doubles as the quality selector: `1` is the §5.3 Performance mode the frame
-        // budget is written against, and a name picks another. An unrecognised value is a typo
-        // worth stopping for rather than silently rendering at a mode nobody asked for.
-        let Ok(asked) = std::env::var("RTXMW_DLSS") else {
+        let Upscaling(Some(preset)) = _mode else {
             return Ok(None);
         };
-        let preset = rtxmw_render::dlss::Preset::named(&asked)
-            .ok_or_else(|| format!("RTXMW_DLSS={asked:?} names no preset"))?;
         let upscaler = Upscaler::new(
             _instance,
             _physical,

@@ -12,6 +12,7 @@ use rtxmw_render::{FrameConstants, OUTPUT_FORMAT, SceneRenderer, TARGET_FORMAT};
 use rtxmw_scene::{CellId, StaticScene};
 use rtxmw_texture::Texture;
 
+use crate::cli::Upscaling;
 use crate::upscaler;
 
 /// Rows the trace renders, independent of the window's own height.
@@ -47,11 +48,11 @@ fn internal_extent(window: vk::Extent2D) -> vk::Extent2D {
 pub(crate) struct Renderer {
     /// Everything that does not care about a window: the pass, the target, the loaded cell.
     scene: SceneRenderer,
-    /// Whether an upscaler was asked for, so a resize can build the next one.
+    /// What DLSS was asked to run at, so a resize can build the next one.
     ///
     /// The feature is built for one pair of resolutions and cannot be told a new pair, so a window
     /// that changes size needs a new one — and by then the old one has been handed to the scene.
-    upscaling: bool,
+    dlss: Upscaling,
     /// The size everything downstream of the swapchain was built for.
     ///
     /// A compositor sends a resize on first map that changes nothing, and a drag sends one a frame.
@@ -75,7 +76,12 @@ pub(crate) struct Renderer {
 
 impl Renderer {
     /// Brings up Vulkan for `window` and allocates the frame ring.
-    pub(crate) fn new<W>(window: &W, width: u32, height: u32) -> rtxmw_gpu::Result<Self>
+    pub(crate) fn new<W>(
+        window: &W,
+        width: u32,
+        height: u32,
+        dlss: Upscaling,
+    ) -> rtxmw_gpu::Result<Self>
     where
         W: HasDisplayHandle + HasWindowHandle,
     {
@@ -108,12 +114,12 @@ impl Renderer {
         // than the upscale it is without one. What to trace at is then DLSS's answer, not this
         // crate's — `internal_extent` is the fallback for a frame nothing else will resize.
         let display = swapchain.extent();
-        let upscaler = upscaler::build(&instance, &physical, &device, &mut uploader, display)
+        let upscaler = upscaler::build(&instance, &physical, &device, &mut uploader, display, dlss)
             .map_err(|failed| {
                 eprintln!("DLSS did not start, rendering without it: {failed}");
             })
             .unwrap_or_default();
-        let upscaling = upscaler.is_some();
+
         let mut scene = SceneRenderer::new(
             &device,
             &physical,
@@ -126,7 +132,7 @@ impl Renderer {
 
         Ok(Self {
             scene,
-            upscaling,
+            dlss,
             display,
             uploader,
             frames,
@@ -414,20 +420,16 @@ impl Renderer {
         upscaler::detach(self.uploader.memory(), &mut self.scene)
             .map_err(|failed| eprintln!("DLSS did not release: {failed}"))
             .ok();
-        let upscaler = if self.upscaling {
-            upscaler::build(
-                &self.instance,
-                &self.physical,
-                &self.device,
-                &mut self.uploader,
-                display,
-            )
-            .map_err(|failed| eprintln!("DLSS did not survive the resize: {failed}"))
-            .unwrap_or_default()
-        } else {
-            None
-        };
-        self.upscaling = upscaler.is_some();
+        let upscaler = upscaler::build(
+            &self.instance,
+            &self.physical,
+            &self.device,
+            &mut self.uploader,
+            display,
+            self.dlss,
+        )
+        .map_err(|failed| eprintln!("DLSS did not survive the resize: {failed}"))
+        .unwrap_or_default();
         self.scene.resize(
             self.uploader.memory(),
             upscaler::render_size(upscaler.as_ref(), internal_extent(display)),

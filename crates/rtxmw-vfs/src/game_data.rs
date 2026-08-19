@@ -16,7 +16,7 @@ pub const DATA_DIR_VAR: &str = "MORROWIND_DATA_DIR";
 pub fn morrowind_data_dir() -> Option<PathBuf> {
     let raw = std::env::var_os(DATA_DIR_VAR)
         .map(PathBuf::from)
-        .or_else(from_dotenv)?;
+        .or_else(|| from_dotenv(DATA_DIR_VAR).map(PathBuf::from))?;
 
     assert!(
         raw.is_dir(),
@@ -45,19 +45,24 @@ pub fn morrowind_archives() -> Option<crate::vfs::Vfs> {
     Some(vfs)
 }
 
-/// Reads the key out of the nearest `.env`, without touching the process environment.
+/// Reads `key` out of the nearest `.env`, without touching the process environment.
+///
+/// **The caller checks the process environment first**, so an assignment on the command line always
+/// wins and `.env` is where a machine's standing answer lives.
 ///
 /// Deliberately does not use `dotenvy::dotenv`: that mutates the environment through
 /// `std::env::set_var`, which is `unsafe` in edition 2024 precisely because it races with any other
 /// thread reading the environment — and the test harness runs tests in parallel.
-fn from_dotenv() -> Option<PathBuf> {
+pub fn from_dotenv(key: &str) -> Option<String> {
     let file = find_dotenv()?;
     let entries = dotenvy::from_path_iter(&file).ok()?;
     for entry in entries {
         match entry {
-            Ok((key, value)) if key == DATA_DIR_VAR => return Some(PathBuf::from(value)),
+            Ok((found, value)) if found == key => return Some(value),
             Ok(_) => {}
             // A malformed line elsewhere in the file is not this key's problem, so keep going —
+            // and the example names the data directory whichever key was asked for, because that is
+            // the one whose value has a space in it and so the one this is ever about.
             // but if it *is* this key, silence would look exactly like "the game is not installed".
             // dotenvy hands back only the offending value, not its key, so this cannot say which
             // line failed — only that one did, and that the parse stopped there.
