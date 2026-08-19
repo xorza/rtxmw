@@ -935,6 +935,77 @@ fn bounce_scene(floor_albedo: Vec3, ambient: Vec3, lights: &[Light]) -> StaticSc
     common::scene_of(&meshes, &materials, &instances, lights, ambient)
 }
 
+/// A wall filling the view, glowing by `emissive` and reflecting `albedo`.
+///
+/// Nothing else lights it: no lamp, no ambient, and the caller asks for no bounce — so what reaches
+/// the camera is the emissive term and nothing that could stand in for it.
+fn glowing_wall(albedo: Vec3, emissive: Vec3) -> StaticScene {
+    let meshes = [quad(
+        Vec3::new(100.0, -80.0, -40.0),
+        Vec3::new(0.0, 160.0, 0.0),
+        Vec3::new(0.0, 0.0, 160.0),
+        Vec3::NEG_X,
+        0,
+    )];
+    let materials = [Material {
+        diffuse: albedo,
+        emissive,
+        ..Material::default()
+    }];
+    let instances = [Instance {
+        mesh: MeshId(0),
+        transform: Affine3A::IDENTITY,
+    }];
+    common::scene_of(&meshes, &materials, &instances, &[], Vec3::ZERO)
+}
+
+#[test]
+fn an_emissive_surface_is_lit_by_its_glow_rather_than_painted_with_it() {
+    // **The bug this is for.** Emissive used to be written beside the albedo rather than through it,
+    // so a surface that glowed showed its glow and nothing of itself — a Bitter Coast mushroom cap,
+    // whose material carries 0.5 where its stalk carries zero, came out a flat white disc with no
+    // texture in it at all. The original engine sums emission with the other light and multiplies
+    // the whole by the texture; `docs/design.md` §8.36.
+    let glow = Vec3::splat(0.25);
+    let bright = trace_scene(
+        &glowing_wall(Vec3::ONE, glow),
+        &[],
+        BOUNCE_EYE,
+        Vec3::X,
+        0,
+        Read::Radiance,
+    );
+    let dim = trace_scene(
+        &glowing_wall(Vec3::splat(0.25), glow),
+        &[],
+        BOUNCE_EYE,
+        Vec3::X,
+        0,
+        Read::Radiance,
+    );
+
+    let (lit, unlit) = (
+        patch_mean(&bright, WIDTH / 2, HEIGHT / 2).x,
+        patch_mean(&dim, WIDTH / 2, HEIGHT / 2).x,
+    );
+    println!("the same glow on albedo 1.0 reads {lit:.3}, on 0.25 reads {unlit:.3}");
+
+    // Both have to be lit at all, or the ratio below is two zeroes agreeing.
+    assert!(
+        lit > 0.05,
+        "an emissive surface with nothing else on it should be visible, got {lit}"
+    );
+    // **Four to one, because the albedos are.** Emissive is light the surface receives, so what
+    // leaves it is that light times what it reflects — quartering the albedo quarters the result.
+    // Written past the albedo instead, both would read the same and this ratio would be one.
+    let ratio = lit / unlit;
+    assert!(
+        (ratio - 4.0).abs() < 0.4,
+        "quartering the albedo changed the glow by {ratio:.2}x rather than 4x, so the emissive \
+         term is not going through the albedo: {lit} against {unlit}"
+    );
+}
+
 /// The colour-bleed fixture: a red floor under the white wall, lit from nearly overhead.
 ///
 /// The light lands square on the floor and glances off the wall at about 0.2 of full incidence,

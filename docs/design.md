@@ -2231,3 +2231,31 @@ neutral to within 0.01, a painted 3:1 ramp must be recovered (0.575 to 1.431, me
 checkerboard must be left alone** — detail alternating every texel is not lighting, and following it
 is exactly the over-correction that flattens a texture — and a BC1 block's mean must match the
 hand-computed average of its palette.
+
+### 8.36 Emissive was being added past the albedo
+
+Bitter Coast mushroom caps rendered as flat white discs with no texture in them. `flora_bc_mushroom_01.nif`
+says why: the cap's material carries `emissive: [0.5, 0.5, 0.5]` where the stalk's carries zero, and
+this renderer wrote emissive to the frame *beside* the albedo rather than through it. A term added
+past the texture cannot show the texture, so the cap became a uniform colour whatever it was painted.
+
+**The original engine treats emissive as light, not as colour.** `objects.frag:232` sums it with the
+diffuse and ambient terms, and `:236` multiplies the whole by the diffuse texture. That is the shape
+this now has: `emitted` is zero for a hit and emissive joins the lighting the surface receives.
+
+**Scaled, because the two renderers do not agree on what one means.** There a fully lit surface
+reached one and an emissive of one matched it; here direct sun is `DAYLIGHT = 8` and sky about a
+fifth of that. Carried across at the sky's scale rather than the sun's: what these materials are for
+is being visible in shade, and a mushroom is not as bright as the sun falling on it.
+
+**De-lighting was the obvious suspect and was not the cause.** Measured first: across the mushroom
+textures the brightest cell goes *down* under correction — 0.37 to 0.33, 0.69 to 0.53, 0.65 to 0.58 —
+and no cell is pushed past white. Those textures peak at 0.69 luminance and never approach it.
+
+**A wrong first attempt, worth recording.** Deleting `emitted = surface.emissive` and adding the term
+to the lighting looked like the whole fix, and washed the entire frame out to a blue haze. `emitted`
+is initialised to `sky(direction)` and that line was what *overwrote* it for a hit — so removing it
+left the sky added on top of every surface in the scene. The tell was the scale: with only six of the
+cell's 181 materials emissive, nothing about emissive could touch every pixel, and the difference map
+was every pixel. Zeroing `emitted` explicitly is the other half of the change, and with it the frame
+moves by 0.007 RMS with its mean luminance unchanged to six figures.

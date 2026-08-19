@@ -28,6 +28,11 @@ const REAL_ANGULAR_RADIUS: f32 = 0.004_654;
 /// between direct sun and sky, which on a clear day is roughly five to one on a surface facing it.
 /// Provisional in exactly the way `LightBuffer::INTENSITY` is, and for the same reason — see
 /// `docs/design.md` §5.1.
+///
+/// **`EMISSIVE_INTENSITY` in `primary_visibility.comp` is a fraction of this.** A Morrowind material's
+/// emissive means "as bright as a fully lit surface" in a renderer whose light never passed one, so
+/// it has to be carried onto this scale; change the number here and every glow in the world drifts
+/// with it.
 const DAYLIGHT: f32 = 8.0;
 
 impl Sun {

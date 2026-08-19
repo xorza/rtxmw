@@ -45,6 +45,15 @@ vec2 motion_vector(Surface surface, vec3 direction, vec2 ndc, uvec2 size) {
 
 layout(local_size_x = 8, local_size_y = 8) in;
 
+// What an emissive of one is worth, as light.
+//
+// **The original's scale is not this renderer's.** There a fully lit surface reached one and an
+// emissive of one matched it; here direct sun is `DAYLIGHT` and the sky about a fifth of that, so
+// the same number has to be carried across or a glow that read as bright becomes a rounding error.
+// Matched to the sky rather than to the sun: what these materials are for is being visible in
+// shade, and a mushroom is not as bright as the sun on it.
+const float EMISSIVE_INTENSITY = 1.6;
+
 void main() {
     // Unsigned, because the hash streams index by it and only `imageSize` and `imageStore` want it
     // signed. Carrying both would mean two names for one coordinate.
@@ -87,8 +96,16 @@ void main() {
         // demodulate by, and nothing noisy for the filter to improve.
         emitted = water_shade(surface, direction, pixel, guides);
     } else if (surface.hit) {
-        emitted = surface.emissive;
-        lighting = gather_indirect(surface, pixel)
+        // Nothing of the sky reaches a surface directly, and `emitted` started as the sky.
+        emitted = vec3(0.0);
+        // **Emissive is a lighting term, not a colour beside one.** The original engine sums it
+        // with the diffuse and ambient light and multiplies the whole by the texture —
+        // `objects.frag:232` and `:236` in OpenMW. Adding it past the albedo instead is why a
+        // Bitter Coast mushroom cap, whose material carries 0.5 against the stalk's zero, came out
+        // flat white with no texture in it. Scaled because the original's `1.0` means "as bright as
+        // a fully lit surface" in a renderer whose light never exceeded one, and here it does.
+        lighting = surface.emissive * EMISSIVE_INTENSITY
+                 + gather_indirect(surface, pixel)
                  + direct_light(surface, pixel, STREAM_DIRECT, SHADOW_SAMPLES);
     }
     // Under the surface, everything the ray crossed to get here was water. The albedo is dimmed
