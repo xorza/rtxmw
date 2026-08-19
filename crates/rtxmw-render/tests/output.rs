@@ -138,39 +138,59 @@ fn red_at(pixels: &[u8], x: u32, y: u32) -> u8 {
     pixels[((y * WIDTH + x) * 4) as usize]
 }
 
-/// What a flat frame of any brightness should come out at, worked through by hand.
+/// What a frame whose own mean sits on the key comes out at, worked through by hand.
 ///
-/// Auto-exposure puts the mean luminance on the 0.18 key, so the tone curve sees 0.18. Its shadow
-/// lift subtracts 0.04 from a value that far above the toe, leaving 0.14, which is below the 0.76
-/// the curve starts compressing at and so passes through untouched. sRGB-encoding 0.14 gives
+/// Auto-exposure leaves such a frame alone, so the tone curve sees 0.18. Its shadow lift subtracts
+/// 0.04 from a value that far above the toe, leaving 0.14, which is below the 0.76 the curve starts
+/// compressing at and so passes through untouched. sRGB-encoding 0.14 gives
 /// `1.055 * 0.14^(1/2.4) - 0.055 = 0.404`, or 103 of 255.
 const FLAT_GREY: u8 = 103;
 
 #[test]
-fn a_flat_frame_lands_on_middle_grey_whatever_its_radiance() {
-    // A hundredfold range, which is more than an interior and an exterior differ by. Auto-exposure
-    // means the *same* bytes come out of both — that is the whole property, and it is also what
-    // pins every stage: without the histogram the exposure would be wrong, without the tone curve
-    // the value would be 0.18 rather than 0.14, and without the sRGB encode 0.14 would reach the
-    // file as 36 rather than 103.
-    let dim = present(&backdrop(Vec3::splat(0.02)));
-    let bright = present(&backdrop(Vec3::splat(2.0)));
+fn exposure_carries_a_frame_toward_the_key_without_flattening_it() {
+    // **A hundredfold range used to come out identical, and that was the defect.** Dividing by the
+    // mean normalises every frame onto the key, so midnight, an interior and noon all rendered
+    // within two percent of each other and the renderer had no night in it. Adaptation is
+    // compressive instead: rendered luminance is `KEY^a * mean^(1-a)`, which leaves a frame already
+    // at the key exactly where it was and brings everything else only part of the way.
+    //
+    // This fixture's mean luminance *is* its albedo, so every byte below is arithmetic:
+    //
+    // | albedo | `0.18^0.75 * albedo^0.25` | less the 0.04 lift | sRGB | byte |
+    // |---|---|---|---|---|
+    // | 0.02 | 0.1040 | 0.0640 | 0.283 | 72 |
+    // | 0.18 | 0.1800 | 0.1400 | 0.404 | 103 |
+    // | 2.00 | 0.3287 | 0.2887 | 0.580 | 148 |
+    let at = |albedo: f32| {
+        red_at(
+            &present(&backdrop(Vec3::splat(albedo))),
+            WIDTH / 2,
+            HEIGHT / 2,
+        )
+    };
+    let (dim, key, bright) = (at(0.02), at(0.18), at(2.0));
 
-    for (name, pixels) in [("dim", &dim), ("bright", &bright)] {
-        let value = red_at(pixels, WIDTH / 2, HEIGHT / 2);
-        assert!(
-            value.abs_diff(FLAT_GREY) <= 4,
-            "{name} frame came out at {value}, not the {FLAT_GREY} a correctly exposed flat frame \
-             should be — 36 would mean no sRGB encode, 168 a double one"
-        );
-    }
-
-    let dim_value = red_at(&dim, WIDTH / 2, HEIGHT / 2);
-    let bright_value = red_at(&bright, WIDTH / 2, HEIGHT / 2);
+    // **The key itself is untouched**, which is what pins every stage: without the histogram the
+    // exposure would be wrong, without the tone curve the value would be 0.18 rather than 0.14, and
+    // without the sRGB encode 0.14 would reach the file as 36 rather than 103.
     assert!(
-        dim_value.abs_diff(bright_value) <= 2,
-        "a hundredfold change in radiance moved the exposed result from {dim_value} to \
-         {bright_value}; auto-exposure is supposed to absorb it"
+        key.abs_diff(FLAT_GREY) <= 4,
+        "a frame already on the key came out at {key}, not {FLAT_GREY} — 36 would mean no sRGB \
+         encode, 168 a double one"
+    );
+
+    // And either side of it lands where the exponent says, rather than on top of it.
+    assert!(
+        dim.abs_diff(72) <= 4,
+        "a hundredth-radiance frame came out at {dim}, not 72"
+    );
+    assert!(
+        bright.abs_diff(148) <= 4,
+        "a tenfold-radiance frame came out at {bright}, not 148"
+    );
+    assert!(
+        dim < key && key < bright,
+        "exposure flattened a hundredfold range to {dim}, {key}, {bright}"
     );
 }
 
@@ -215,9 +235,10 @@ fn surfaces_with_no_light_on_them_are_left_out_of_the_average() {
     // keeps them in a bin of their own for exactly that reason.
     //
     // Counted, they halve the mean bin: 70 becomes 35, which reads as 2^-7.9 rather than 2^-5.7 and
-    // opens the exposure from 9 to 42. The lit half then leaves the tone curve at 0.79 instead of
-    // 0.14 and reaches the file at 232 rather than 103 — a blown-out frame, caused by averaging in
-    // the parts of it that were never lit.
+    // takes the mean the exposure is drawn from down from 0.02 to 0.0042. Through `(KEY/mean)^0.75`
+    // that opens the exposure from 5.2 to 16.8, and the lit half reaches the file at about 150
+    // instead of 72 — a washed-out frame, caused by averaging in the parts of it that were never
+    // lit.
     let mut scene = backdrop(Vec3::splat(0.02));
     scene.materials.intern(Material {
         diffuse: Vec3::ZERO,
@@ -231,9 +252,11 @@ fn surfaces_with_no_light_on_them_are_left_out_of_the_average() {
     println!("unlit half {unlit}, lit half {lit}");
 
     assert_eq!(unlit, 0, "a surface with no light on it should be black");
+    // 72 is what a frame of this radiance gets — the same value the test above derives for an
+    // albedo of 0.02, since that is exactly what the lit half is.
     assert!(
-        lit.abs_diff(FLAT_GREY) <= 6,
-        "the lit half came out at {lit}, not the {FLAT_GREY} it should be — 232 would mean the \
-         unlit half was averaged into the exposure"
+        lit.abs_diff(72) <= 6,
+        "the lit half came out at {lit}, not the 72 a frame of its radiance should be — about 150 \
+         would mean the unlit half was averaged into the exposure"
     );
 }

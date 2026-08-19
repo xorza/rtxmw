@@ -36,6 +36,14 @@ pub struct Sun {
 /// with it.
 const DAYLIGHT: f32 = 8.0;
 
+/// How far the sun goes under per unit of orbit past the horizon, in radians.
+///
+/// Seventy degrees, which over the seven hours an orbit unit is worth comes to about ten an hour —
+/// the rate the sun actually leaves the sky at, and close to the rate it climbs at on the other side
+/// of sunrise. It puts the sun sixty degrees under at midnight, which is what makes the night dark
+/// rather than merely dim.
+const NIGHT_DESCENT: f32 = 70.0 * (std::f32::consts::PI / 180.0);
+
 impl Sun {
     /// Angular radius of the real sun, in radians — a disc about half a degree across.
     ///
@@ -56,12 +64,33 @@ impl Sun {
     /// Scaling that component by `sqrt(1 - orbit²)` keeps its noon exactly — 100 of 125, the same
     /// 53 degrees — and lets the ends of the day reach the horizon they are named for.
     ///
+    /// **And past the ends it keeps going, which it has to.** Clamping there leaves the sun parked
+    /// *on* the horizon all night with nothing but an invented fade to say the difference, which is
+    /// how the sky came to be darkest at the moment of sunrise.
+    ///
+    /// Under the horizon it descends at a **steady angle**, `NIGHT_DESCENT` per unit of orbit, on
+    /// the heading it set on. That is what a real sun does — the hour angle turns at a constant rate
+    /// — and it is not what continuing the circle into a hyperbola does: that plunges infinitely fast
+    /// at the boundary and then flattens, reaching only twelve degrees down at midnight, which
+    /// leaves a seventh of the sunset glow burning all night and turns midnight pink. Seventy degrees
+    /// per orbit is about ten an hour, so the sun is sixty degrees under at midnight and the glow is
+    /// gone by an hour after dusk.
+    ///
     /// Full strength, before any air. What a beam has left by the time it arrives depends on how
     /// much atmosphere it crossed, which is [`crate::Sky`]'s to say.
     pub fn at(orbit: f32) -> Self {
-        let arc = (1.0 - orbit * orbit).max(0.0).sqrt();
+        let square = 1.0 - orbit * orbit;
+        let direction = if square >= 0.0 {
+            Vec3::new(-400.0 * orbit, 75.0, -100.0 * square.sqrt())
+        } else {
+            // The heading it set on, tilted under. Light travelling *upward* is a sun below the
+            // horizon, which is what the positive `z` says.
+            let heading = Vec3::new(-400.0 * orbit, 75.0, 0.0).normalize();
+            let below = (orbit.abs() - 1.0) * NIGHT_DESCENT;
+            heading * below.cos() + Vec3::Z * below.sin()
+        };
         Self {
-            direction: Vec3::new(-400.0 * orbit, 75.0, -100.0 * arc).normalize(),
+            direction: direction.normalize(),
             colour: Vec3::new(1.0, 0.95, 0.88) * DAYLIGHT,
             angular_radius: Self::REAL_ANGULAR_RADIUS,
         }

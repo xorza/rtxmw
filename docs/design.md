@@ -2678,3 +2678,107 @@ rather than handing back strings, because the title is built twice a second on t
 `SceneRenderer::set_sky` is called every frame now rather than once, which §8.45 built it for:
 `relight()` is a match and a handful of float assignments over state the residency already holds, and
 allocates nothing.
+
+### 8.47 The darkest frame of the day was the one the sun rose in
+
+Reported from the window: at 05:59 everything went black — darker than midnight — while 05:48 and
+06:01 either side of it looked right. Measured, 05:59 came out at **eighty-two times darker than
+midnight**, and 06:00 exactly was mathematically *zero*.
+
+Three faults, one root.
+
+**The sun never went below the horizon.** `arc = sqrt(1 - orbit²)` was clamped with `max(0.0)`, so
+past sunrise the sun parked *on* the horizon and stayed there all night; the only thing that changed
+after that was an invented `dusk` parameter counting how far the orbit had run past ±1. Every
+statement the renderer made about night came from that fudge rather than from where the sun was. A
+circle has no real square root outside itself, and its continuation is a hyperbola — so the radicand's
+sign flips and the sun goes under. The value matches at the boundary and so does the slope, both
+running to infinity there, which is exactly why a sun sets quickly and then slows.
+
+**The sky's daylight term was scaled by the sine of the sun's elevation, which is zero at the
+horizon.** A sunset sky is the brightest and most colourful sky there is. The sine asks where the sun
+is relative to the *observer*, and what lights a sky is sunlit air — the air above an observer is
+still in sunlight after the sun has left their horizon, which is what twilight is. It is now a
+horizon value of 0.2 rising as the square root of the climb by day, times `exp(climb / sin 6°)` below
+the horizon: six degrees is civil twilight, so the glow is a quarter gone by nautical at twelve and
+into the rounding by astronomical at eighteen.
+
+**And the night floor was crossfaded with that term rather than added to it.** `lerp(daylight,
+NIGHT_SKY, dusk)` between a daylight of *zero* and the floor produces everything below the floor —
+which is why twilight was darker than midnight and why the minimum sat exactly at sunrise. Starlight
+is another source, not a replacement for the sun, and a sum of two positive quantities cannot come
+out under either. It is `+ NIGHT_SKY` now, and the `dusk` parameter is gone entirely: the sun's own
+disc setting, half a degree of it, is the whole of what puts the sun out.
+
+Luminance at the three hours in the report, before and after:
+
+| | 05:48 | 05:59 | 06:01 | midnight |
+|---|---|---|---|---|
+| before | 0.0020 | **0.00017** | 0.046 | 0.014 |
+| after | 0.036 | 0.047 | 0.120 | 0.019 |
+
+**Two tests, because nothing would have caught this.** One walks every minute of the day and asserts
+the sky is never darker than its own night floor. The other asserts it never *dims* from midnight to
+mid-morning — a curve that merely avoids zero could still have had the three-hundredfold dip. That
+second one immediately found something real and not a fault: past about 08:40 the luminance eases off
+toward noon, because `(1 - T) · T` is light that got into the air and then scattered out of it, which
+is largest at middling optical depth, and a noon sky is deep blue where blue carries little
+luminance. The test says so and stops at 08:00.
+
+Hours that already looked right barely moved — 0.7% RMSE at the default, from the horizon term
+lifting the day slightly and the floor being added — and an interior is bit-identical, since it takes
+its own record and the sky never touches it.
+
+### 8.48 A sky that went green, a night that went pink, and a renderer with no night in it
+
+Three more reports off the back of §8.47, and they turned out to be three different faults.
+
+**Green evenings: `(1 - T) * T` is the wrong shape for a sky.** It reads as "light that got into the
+air and then scattered out of it", which is a fair single-path estimate, and it has a property nobody
+notices until it is plotted: each channel peaks where its *own* transmittance is a half. Green's half
+lands at 6.4 air masses, an elevation of nine degrees — so every evening travelled blue, then
+**green**, then red. A sky does not do that.
+
+The fix is to stop computing a magnitude per channel and compute a *direction* between two spectra.
+One end is what the air scatters, which is the Rayleigh spectrum and always blue; the other is what
+survived the air, which reddens as the sun descends. How far along is how much the air took —
+`1 - mean(T)`, nothing at noon and nearly everything at the horizon. Two endpoints and a mix cannot
+produce green, because the line from blue to red runs through grey. A test now walks every minute of
+the day and asserts the green channel never leads.
+
+**Pink midnight: the hyperbola was too shallow.** §8.47 continued the sun's arc past the horizon as
+`-sqrt(orbit² - 1)`, which is elegant — it is the analytic continuation, matching in value and slope
+— and it descends infinitely fast at the boundary and then flattens, reaching only twelve degrees
+under at midnight. A seventh of the sunset glow, deep red, burned all night on top of the blue floor.
+A real sun's hour angle turns at a constant rate, so it now descends at a steady 70° per unit of
+orbit — about ten an hour, close to the rate it climbs at on the other side of dawn. Sixty degrees
+under at midnight, where there is nothing left to add.
+
+The greying also rises with air mass now, which is the part that is not a fudge: more air is more
+bouncing, so less colour survives. Held fixed the twilight tint came out three quarters saturated and
+an hour after sunset was a flat magenta; letting it rise to 0.8 at the horizon halves that and leaves
+noon alone.
+
+**And night was bright because the renderer normalised every frame onto the key.** Measured means at
+1280×720: midnight 0.716, an interior 0.631, noon 0.727 — within two percent of each other. That is
+what dividing by the mean does, and it means the engine had no night in it at any hour. Clamping the
+exposure ceiling was tried first and is not the answer: at a ceiling of 6 night only fell to 0.567
+while the interior fell just as far, so it costs the rooms what it buys the night.
+
+Adaptation is compressive, not complete — a room at dusk goes on looking dimmer than the same room at
+noon however long you sit in it. So `exposure = (KEY / mean)^0.75`, which makes rendered luminance
+`KEY^a · mean^(1-a)`: a frame already on the key is untouched, and a scene fifty times darker comes
+out two and a half times darker rather than identical. Night measured 0.626 against noon's 0.739, and
+the water and foreground go properly dark while the lantern's pool stands out of them.
+
+Two tests changed rather than broke, and their names were the tell. `a_flat_frame_lands_on_middle_grey_whatever_its_radiance`
+asserted the exact property being removed; it is now
+`exposure_carries_a_frame_toward_the_key_without_flattening_it`, and because this fixture's mean
+luminance *is* its albedo every byte in it is arithmetic — 0.02 → 72, 0.18 → 103, 2.0 → 148. The
+other, which proves unlit surfaces are kept out of the average, kept its claim and had its evidence
+recomputed: the lit half lands at 72 rather than 103, and averaging the black back in would put it
+near 150 rather than 232.
+
+Costs elsewhere: the default outdoor hour moved 5.1% RMSE, mostly from the exposure exponent, and the
+census office is dimmer in its far corners — which is what a candle-lit room should look like beside
+a daylit one.
