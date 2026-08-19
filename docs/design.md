@@ -2535,3 +2535,61 @@ merely less than open air, which would pass while leaking.
 
 **Found on the way, not fixed here**: the lamps put light into fog as though their phase function were
 1 per steradian rather than `1/4*pi`.
+
+### 8.44 Lamps: the factor they owed the air, and the reach the records never gave them
+
+Three things, all about lamps and the fog they stand in.
+
+**The `4*pi` the lamps owed.** §8.43 worked out that the sky's inscatter needs no phase function and
+the sun's needs one per steradian. The lamps sat between the two conventions and paid neither: like
+the sun, a lamp arrives at a point as *irradiance*, so even an isotropic fog owes it a factor of
+`1/4*pi`. Without it every lamp lit the air twelve and a half times more strongly than a sky of the
+same radiance did, which is why interiors read as though the air itself were glowing.
+
+They stay isotropic, unlike the sun, for two reasons. A lamp's angle to the view ray changes at every
+step and for every lamp where the sun's is fixed for a whole march; and the real phase function's
+forward peak is 4,300 times isotropic, which for a source at a *finite* distance is a firefly waiting
+for a march step to land on the line from the eye through it. The sun is far enough away that no
+sample can ever sit on top of it.
+
+**Morrowind's radii are tiny, and reach is now separate from brightness.** Seyda Neen's street
+lanterns record 256 units and the census office runs 64 to 256 — 0.9 to 3.7 metres at seventy units
+to the metre, so a lantern lit its own post. That was a fixed falloff curve in an engine with no
+bounce, where the flat ambient term did the work of filling a room; here the ambient *is* real light
+and the lamps have to be what lights the place.
+
+One number in the record was doing three jobs, and they part company in `GpuLight::new`. Intensity
+still comes from the recorded radius, because a lamp's brightness is what the lamp *is* — as does the
+emitter size, which is what gives its shadows a penumbra. Only the falloff's reach is stretched, by
+
+    reach = radius * 2.0 + 128.0
+
+so a lantern is exactly as bright at arm's length as before and its light now runs out to nine metres
+instead of being cut off at three and a half. The flat term is what saves the small lights: doubling
+64 units is still nothing, and it is the candles that most need to leave their own table. The light
+grid bins on the same number, so it follows without a second constant.
+
+It is not free. At 1920x1080, best of five:
+
+| | interior | exterior |
+|---|---|---|
+| recorded radius | 5.01 ms | 7.26 ms |
+| stretched reach | 7.35 ms | 7.75 ms |
+
+The interior pays 2.34 ms, and pays it mostly in shadow rays: more lights reach a point, each gets
+eight. That is the cost being spent on the right thing — a lamp two rooms away reaches a wall and is
+stopped there, and the light that does arrive arrived honestly. It turns a pool-lit room into a lit
+one, which is the largest single change to how an interior reads since de-lighting.
+
+**And the fog is thinner.** `OUTDOOR_FOG_DENSITY` goes 0.75 to 0.30. Half the light off a surface
+survived fifty-three metres at the old figure and the far side of Seyda Neen's bay was simply gone; it
+now survives a hundred and thirty. The bank structure is untouched — the coverage field says where the
+fog *is* and the density only says how thick it is there — so the layer lying over the water and the
+shafts through it both survive being able to see past them.
+
+A test rotted quietly on the way and is worth recording, because it is the failure mode that does not
+announce itself. `a_lamp_in_the_fog_lights_it` proved a lamp lights *air* by standing it far enough
+from a grey wall that its recorded radius could not touch it. Stretching reach moved the lamp past the
+wall, and the test went on passing — on light bouncing off the wall, which is the one thing it was
+written to exclude. Its wall is now black, so no reach can ever make it return anything and the blue
+in the frame can only have come from the air.

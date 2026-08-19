@@ -48,8 +48,8 @@ fn quad(corners: [Vec3; 4]) -> Mesh {
     }
 }
 
-/// A white wall filling the view `distance` away, facing the camera.
-fn wall(distance: f32, lights: &[Light]) -> StaticScene {
+/// A wall of albedo `diffuse` filling the view `distance` away, facing the camera.
+fn wall(distance: f32, lights: &[Light], diffuse: Vec3) -> StaticScene {
     let half = distance;
     let mesh = quad([
         Vec3::new(distance, -half, -half),
@@ -60,7 +60,7 @@ fn wall(distance: f32, lights: &[Light]) -> StaticScene {
     let mut scene = common::scene_of(
         &[mesh],
         &[Material {
-            diffuse: Vec3::splat(0.6),
+            diffuse,
             ..Material::default()
         }],
         &[Instance {
@@ -147,8 +147,8 @@ fn centre(scene: &StaticScene, fog: f32) -> Vec3 {
 
 #[test]
 fn fog_thickens_with_the_distance_it_is_seen_through() {
-    let near = wall(400.0, &[]);
-    let far = wall(6000.0, &[]);
+    let near = wall(400.0, &[], Vec3::splat(0.6));
+    let far = wall(6000.0, &[], Vec3::splat(0.6));
 
     // **Without fog the distance makes no difference at all**, which is what makes the comparison
     // below about the fog rather than about the wall: a flat surface lit only by ambient is the
@@ -336,10 +336,15 @@ fn what_stands_between_the_fog_and_the_sun_cuts_the_sun_out_of_it() {
 
 #[test]
 fn a_lamp_in_the_fog_lights_it() {
-    // The same wall and the same fog, with and without a lamp off to one side. The lamp faces away
-    // from nothing and touches no surface the camera can see at the centre — what it changes is the
-    // air, which is the whole claim.
-    let dark = wall(6000.0, &[]);
+    // The same fog, with and without a lamp standing in it. What the lamp changes is the air, which
+    // is the whole claim.
+    //
+    // **The wall is black**, and that is what makes the claim airtight rather than merely likely.
+    // It used to be grey and far enough away that the lamp's recorded radius could not touch it —
+    // until reach stopped being the recorded radius, the lamp grew past the wall, and the test went
+    // on passing on light bouncing off it. An albedo of zero cannot return light however far the
+    // lamp reaches, so the only place blue can come from is the air.
+    let unlit = wall(6000.0, &[], Vec3::ZERO);
     let lit = wall(
         6000.0,
         &[Light {
@@ -347,14 +352,13 @@ fn a_lamp_in_the_fog_lights_it() {
             colour: Vec3::new(0.0, 0.0, 1.0),
             radius: 3000.0,
         }],
+        Vec3::ZERO,
     );
 
-    let (without, with) = (centre(&dark, 1.0), centre(&lit, 1.0));
+    let (without, with) = (centre(&unlit, 1.0), centre(&lit, 1.0));
     println!("fog alone {without:?}, fog with a blue lamp in it {with:?}");
 
-    // **Blue, which neither the fog nor the wall has any of.** A lamp that only lit surfaces would
-    // leave the centre of this frame alone: the wall is six thousand units away and the light
-    // reaches three thousand.
+    // **Blue, which neither the fog nor the wall has any of**, and the wall returns nothing at all.
     assert!(
         with.z > without.z + 0.05,
         "the blue lamp put no blue into the air between the camera and the wall: {with:?} against \

@@ -23,7 +23,13 @@ use crate::visibility_pass::Lighting;
 /// The record carries fog only for interiors; an exterior's belongs to the weather, which is per
 /// region and per weather out of the original engine's ini fallbacks rather than the ESM. This is
 /// the number to replace when that arrives rather than one to tune for its own sake.
-const OUTDOOR_FOG_DENSITY: f32 = 0.75;
+///
+/// **Down from 0.75, which was a soup.** Half the light from a surface survived fifty-three metres
+/// at that figure and the far shore of Seyda Neen's bay was gone; at this one it survives a hundred
+/// and thirty. The bank structure is untouched by the change — the coverage field says where the fog
+/// *is*, and this only says how thick it is there — so the layer over the water and the shafts
+/// through it both survive being able to see past them.
+const OUTDOOR_FOG_DENSITY: f32 = 0.30;
 
 /// What an interior's recorded density is worth against an exterior's.
 ///

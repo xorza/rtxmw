@@ -136,8 +136,9 @@ impl ModelIndex {
 /// **The lights are the expensive half, not the objects.** Measured on a hilltop over the whole
 /// island at 1920x1080: the objects of four hundred distant cells — 21,772 instances — cost 0.9 ms
 /// of trace, and the 229 `LIGH` references among them cost 3.8 ms on top, because the shader walks
-/// every light in the world for every pixel. A lamp a kilometre away with a radius of a few hundred
-/// units reaches nothing on screen, so dropping them costs the image nothing at all.
+/// every light in the world for every pixel. A lamp a kilometre away reaches nothing on screen even
+/// after the renderer stretches its recorded radius — a few hundred units becomes a bit over a
+/// thousand — so dropping them costs the image nothing at all.
 ///
 /// [`Full`]: CellDetail::Full
 /// [`Distant`]: CellDetail::Distant

@@ -300,25 +300,31 @@ float fog_sun_depth(float extinction) {
 // halo in the murk rather than lighting only what it stands on. Unshadowed: a shaft needs a ray per
 // light per step, which is a different order of cost from this.
 //
-// **No phase function on the lamps.** The sun has one because its angle to the view ray is fixed
-// along a whole march and so costs one evaluation; a lamp's changes at every step and with every
-// lamp, which is a different order of cost. Isotropic is the honest stand-in until there is
-// something to tune a lobe against.
+// **Isotropic, and `1/4*pi` is what isotropic actually is.** A lamp reaches this point as
+// irradiance, the same as the sun does, and what comes back toward the eye is that irradiance times
+// a phase function *per steradian* — so a lamp with no phase function still owes the factor. It was
+// missing, and lamps lit the air twelve and a half times more strongly than a sky of the same
+// radiance did.
+//
+// Not the real phase function, unlike the sun's: a lamp's angle to the view ray changes at every
+// step and for every lamp, where the sun's is fixed for a whole march. It would also be a firefly
+// waiting to happen — the forward peak is 4,300 times isotropic, and a lamp sits at a finite
+// distance where a march step can land almost exactly on the line from the eye through it.
 //
 // `sun` arrives with everything already taken out of it — the phase function, the shadow ray, the
 // fog's own column, the water overhead — so this is a sum and nothing more.
 vec3 fog_light(vec3 position, vec3 sun) {
-    vec3 total = frame.fog + sun;
+    vec3 lamps = vec3(0.0);
     uvec2 near = lights_reaching(position);
     for (uint k = near.x; k < near.y; ++k) {
         Light light = lights[light_grid_indices[k]];
         vec3 offset = light.position - position;
         float reach = length(offset);
         if (reach < light.radius) {
-            total += light.colour * attenuation(reach, light.radius);
+            lamps += light.colour * attenuation(reach, light.radius);
         }
     }
-    return total;
+    return frame.fog + sun + INV_FOUR_PI * lamps;
 }
 
 // `colour` and `lighting` as they reach the eye through `distance` units of fog.

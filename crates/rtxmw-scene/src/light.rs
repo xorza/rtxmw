@@ -13,7 +13,12 @@ pub struct Light {
     pub position: Vec3,
     /// Linear-space RGB in `0..1`.
     pub colour: Vec3,
-    /// Reach in world units, beyond which the light contributes nothing.
+    /// The radius the record carries, in world units.
+    ///
+    /// **Not how far the light reaches.** It is the only number `LIGH` gives, so everything about a
+    /// lamp is derived from it, and a renderer is free to derive reach as something other than the
+    /// value itself — this one does, because Morrowind's radii light a lantern's own post and
+    /// nothing else.
     pub radius: f32,
 }
 

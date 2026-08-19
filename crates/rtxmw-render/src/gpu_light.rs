@@ -9,6 +9,11 @@ use rtxmw_scene::Light;
 pub(crate) struct GpuLight {
     pub(crate) position: [f32; 3],
     /// Reach in world units. Nothing beyond this receives any of the light.
+    ///
+    /// **Not `Light::radius`** — `REACH_SCALE` and `REACH_BONUS` stretch the recorded number on the
+    /// way in, so this is the larger of the two and the only one anything downstream should ask. A
+    /// fog test once stood a lamp just outside its recorded radius and went on passing after the
+    /// stretch carried it past.
     pub(crate) radius: f32,
     /// Linear RGB, already scaled by the intensity the record does not carry.
     pub(crate) colour: [f32; 3],
@@ -42,6 +47,27 @@ const INTENSITY: f32 = 0.25 * std::f32::consts::PI;
 /// relationship the sizes would have had.
 const SOURCE_FRACTION: f32 = 0.08;
 
+/// How much further a lamp reaches than its record says.
+///
+/// **Morrowind's radii are tiny.** Seyda Neen's street lanterns record 256 units and its census
+/// office runs 64 to 256 — 0.9 to 3.7 metres at seventy units to the metre, so a lantern lights its
+/// own post and nothing else. That was a fixed falloff curve in a renderer with no bounce, where
+/// the ambient term did the work of filling a room; here the ambient is real light and the lamps
+/// have to reach far enough to be the thing lighting the place.
+///
+/// **Reach only, not brightness.** The intensity above stays on the recorded radius, so a lantern is
+/// exactly as bright at arm's length as it was — what changes is that its falloff runs out to nine
+/// metres instead of being cut off at three and a half.
+const REACH_SCALE: f32 = 2.0;
+
+/// And how much further again, whatever it recorded.
+///
+/// **What the smallest lights live on.** Scaling alone widens the gap it is meant to close: a
+/// candle's 64 units doubles to 128, which is still nothing, while a lantern's 256 gains a whole
+/// lantern's worth. A flat term narrows the two instead, and it is the candles that most need to
+/// leave their own table.
+const REACH_BONUS: f32 = 128.0;
+
 /// Floor on the emitter size, in world units.
 ///
 /// About 14 cm at Morrowind's scale — roughly a candle flame. Without it the smallest lights would
@@ -50,11 +76,15 @@ const MIN_SOURCE_RADIUS: f32 = 10.0;
 
 impl GpuLight {
     /// Flattens a scene light, folding its intensity into the colour.
+    ///
+    /// Three different things come out of the one number the record carries, and they part company
+    /// here: how bright the lamp is and how large its emitter is both stay on the recorded radius,
+    /// because those are what the lamp *is*; only how far its falloff runs is stretched.
     pub(crate) fn new(light: Light) -> Self {
         let scale = light.radius * light.radius * INTENSITY;
         Self {
             position: light.position.to_array(),
-            radius: light.radius,
+            radius: light.radius * REACH_SCALE + REACH_BONUS,
             colour: (light.colour * scale).to_array(),
             source_radius: (light.radius * SOURCE_FRACTION).max(MIN_SOURCE_RADIUS),
         }
@@ -97,7 +127,31 @@ mod tests {
             radius: 64.0,
         });
         assert_eq!(warm.colour[1] / warm.colour[0], 0.5);
-        assert_eq!(warm.radius, 64.0);
+    }
+
+    #[test]
+    fn a_lamp_reaches_further_than_its_record_says_without_getting_brighter() {
+        let of = |radius: f32| {
+            GpuLight::new(Light {
+                position: Vec3::ZERO,
+                colour: Vec3::ONE,
+                radius,
+            })
+        };
+
+        // Seyda Neen's street lanterns, and the census office's candles.
+        assert_eq!(of(256.0).radius, 640.0);
+        assert_eq!(of(64.0).radius, 256.0);
+
+        // **The flat term is what the small lights live on.** Scaling alone leaves a candle at 128
+        // units against a lantern's 512, and the gap between them widens; adding to both narrows it,
+        // which is what stops a room being lit in isolated pools.
+        assert!(of(256.0).radius / of(64.0).radius < 256.0 / 64.0);
+
+        // **Nothing asserts here that brightness and emitter size were left alone**, because the
+        // two tests either side of this one already do: both pin their values against the *recorded*
+        // radius, so switching either onto the stretched reach fails them. `of(64.0)` would light
+        // like a 256-unit lamp and throw a 256-unit lamp's penumbra.
     }
 
     #[test]
