@@ -111,7 +111,48 @@ pub struct Sky {
     pub scale: f32,
     /// How much of the star field is out, from none to all of it — [`TimeOfDay::starlight`].
     pub stars: f32,
+    /// What the hour multiplies the metered exposure by — a bias on it, never the exposure itself.
+    ///
+    /// **Keyed to the sky rather than to the frame.** Metering says how bright the picture is; this
+    /// says how bright the world is, and only the second knows a cave at noon from a field at
+    /// midnight. Noon is one and the deepest night is `NIGHT_STOPS` below it.
+    pub exposure_bias: f32,
 }
+
+/// What the eye makes of a colour, which is the only sense in which a sky has one brightness.
+const LUMA: Vec3 = Vec3::new(0.2126, 0.7152, 0.0722);
+
+/// The dome's luminance at noon, which is the bright end the curve below is fitted against.
+///
+/// Measured from `Sky::at` rather than derived — the dome's average has no closed form and asking
+/// for it here would need a `Sky` that is still being built. A test holds it to the real thing, which
+/// is what stops `SKY_STRENGTH` moving and this quietly fitting the wrong range.
+const DAY_LUMINANCE: f32 = 0.702;
+
+/// How many stops darker than noon the darkest night is allowed to render.
+///
+/// **Metering the frame alone gives a renderer with no night in it**, which is the oldest complaint
+/// in this corner of the subject. Krawczyk, Myszkowski and Seidel fitted a key value to the scene's
+/// own luminance for exactly this reason, and Narkowicz states the principle plainly: *"we want to
+/// have a darker image in low light conditions and a brighter image in high light conditions. This
+/// way viewer has a clue as to how bright the lighting is in the current scene."* Their curve runs
+/// about four and a half stops from sunlight to starlight.
+///
+/// **Two rather than the four and a half the curve was measured at**, because this renderer has no
+/// absolute luminance
+/// scale to hang the published curve on — `DAYLIGHT` is admittedly not a physical figure, and the
+/// night floor is a number picked so an exterior stays legible rather than a measured one. The
+/// distance between noon and midnight here is fifty to one where the world's is a hundred million to
+/// one, so the curve is fitted to the range that exists rather than the one that should. Giving the
+/// renderer real units is the fix that would let the published curve be used as published, and it is
+/// the same fix `docs/design.md` §5.1 has been waiting for.
+///
+/// **Even this much needed the tone curve to stop squaring its shadows first.** Before that fix two
+/// stops already sent the ground black while the sky still read, and it was the reference operator's
+/// offset doing it rather than the bias — see `SHADOW_OFFSET` in `tonemap.comp`. Two and a half was
+/// tried afterwards and judged too dark by eye, which is the right way to settle a number whose whole
+/// job is how a frame looks.
+const NIGHT_STOPS: f32 = 2.0;
 
 impl Sky {
     /// What every direction of the dome gets whatever the hour.
@@ -161,9 +202,37 @@ impl Sky {
             warmth,
             scale: SKY_STRENGTH * lit,
             stars: time.starlight(),
+            exposure_bias: 1.0,
         };
         sky.ambient = sky.dome_average();
+        sky.exposure_bias = sky.bias_from_dome();
         sky
+    }
+
+    /// What the hour itself multiplies the metered exposure by.
+    ///
+    /// **Keyed to the sky rather than to the frame**, which is the point: metering says how bright
+    /// the picture is and this says how bright the *world* is, and only the second one knows the
+    /// difference between a cave at noon and a field at midnight. CryEngine animates its EV
+    /// compensation over the same 24-hour curve and Infamous: Second Son shipped a manual offset per
+    /// time of day; this is that, computed rather than authored, because the sky already knows.
+    ///
+    /// The shape is Krawczyk's — a soft S in log luminance that saturates at both ends rather than a
+    /// clamp, which is what keeps dusk from stepping — fitted between the dome's own darkest and
+    /// brightest so that noon is untouched and the deepest night is `NIGHT_STOPS` below it.
+    fn bias_from_dome(&self) -> f32 {
+        // The dome's own brightness, which is the one number that says what hour it is.
+        let luminance = self.ambient.dot(LUMA);
+        // Krawczyk's key value, which is flat below a hundredth and above a thousand and an S
+        // between: `1.03 - 2 / (2 + log10(L + 1))`.
+        let key = |level: f32| 1.03 - 2.0 / (2.0 + (level + 1.0).log10());
+        // Fitted between the two ends this renderer actually has rather than the ones the curve was
+        // measured over, and normalised so the brightest hour comes out at one.
+        // The dark end is the floor itself: with the sun far enough under, the dome is nothing else.
+        let night = NIGHT_SKY.dot(LUMA);
+        let span = key(DAY_LUMINANCE) - key(night);
+        let along = ((key(luminance) - key(night)) / span).clamp(0.0, 1.0);
+        (2.0f32).powf(NIGHT_STOPS * (along - 1.0))
     }
 
     /// What the sky radiates in one direction, before the night floor.
@@ -259,7 +328,7 @@ mod tests {
 
     /// What the eye makes of a colour, which is the only thing a "darker" claim can mean.
     fn luminance(colour: Vec3) -> f32 {
-        colour.dot(Vec3::new(0.2126, 0.7152, 0.0722))
+        colour.dot(LUMA)
     }
 
     #[test]
@@ -276,6 +345,52 @@ mod tests {
             "the sun is not half a degree across: {}",
             Sun::REAL_ANGULAR_RADIUS
         );
+    }
+
+    #[test]
+    fn the_hour_carries_its_own_exposure_down_to_night() {
+        let bias = |hour: f32| Sky::at(TimeOfDay::hours(hour)).exposure_bias;
+        // **`DAY_LUMINANCE` is a measurement and this is what keeps it one.** The curve is fitted
+        // between the dome's own two ends, so a `SKY_STRENGTH` that moved without this moving would
+        // leave the bias anchored to a noon that no longer exists — and it would fail silently, as a
+        // slightly wrong exposure at every hour rather than as anything visible.
+        let noon = luminance(Sky::at(TimeOfDay::hours(12.0)).ambient);
+        assert!(
+            (noon - DAY_LUMINANCE).abs() < 0.005,
+            "the dome measures {noon} at noon, not the {DAY_LUMINANCE} the bias is fitted against"
+        );
+
+        // Noon is the anchor and everything else is below it, which is the whole principle: a
+        // renderer that meters the frame alone renders midnight and midday the same brightness.
+        assert!((bias(12.0) - 1.0).abs() < 1e-4, "{}", bias(12.0));
+        assert!(
+            (bias(23.0).log2() + NIGHT_STOPS).abs() < 0.05,
+            "midnight is {} stops down, not {NIGHT_STOPS}",
+            bias(23.0).log2()
+        );
+
+        // **Monotonic from midnight to noon**, because a step anywhere in it is a step the eye sees
+        // as the sun comes up — a clamp would give one at each end and this is a curve for that
+        // reason.
+        let mut hour = 0.0;
+        while hour < 12.0 {
+            assert!(
+                bias(hour + 0.25) >= bias(hour) - 1e-6,
+                "the exposure jumped backwards at {hour}: {} to {}",
+                bias(hour),
+                bias(hour + 0.25)
+            );
+            hour += 0.25;
+        }
+
+        // And the whole night sits at the bottom of it rather than only the one instant of midnight.
+        for hour in [21.0, 23.0, 1.0, 3.0] {
+            assert!(
+                bias(hour).log2() < -NIGHT_STOPS + 0.2,
+                "{hour} is {}",
+                bias(hour).log2()
+            );
+        }
     }
 
     #[test]

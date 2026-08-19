@@ -39,6 +39,8 @@ struct ExposureConstants {
     min_log_luminance: f32,
     log_range: f32,
     pixels: u32,
+    /// What the hour multiplies the metered exposure by — [`rtxmw_scene::Sky::exposure_bias`].
+    bias: f32,
 }
 
 /// Measures a frame's average luminance and turns it into an exposure multiplier.
@@ -157,6 +159,7 @@ impl AutoExposure {
         device: &ash::Device,
         command_buffer: vk::CommandBuffer,
         extent: vk::Extent2D,
+        bias: f32,
     ) {
         let range = MAX_LOG_LUMINANCE - MIN_LOG_LUMINANCE;
         let histogram_constants = HistogramConstants {
@@ -167,6 +170,7 @@ impl AutoExposure {
             min_log_luminance: MIN_LOG_LUMINANCE,
             log_range: range,
             pixels: extent.width * extent.height,
+            bias,
         };
 
         // SAFETY: the caller guarantees the command buffer is recording and the sets are written.
@@ -207,7 +211,8 @@ mod tests {
     #[test]
     fn the_push_blocks_match_what_the_shaders_declare() {
         assert_eq!(size_of::<HistogramConstants>(), 8);
-        assert_eq!(size_of::<ExposureConstants>(), 12);
+        // Four floats' worth: the range's two ends, the pixel count, and the hour's own bias.
+        assert_eq!(size_of::<ExposureConstants>(), 16);
     }
 
     #[test]

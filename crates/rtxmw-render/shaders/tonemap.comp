@@ -26,15 +26,39 @@ layout(set = 0, binding = 2) readonly buffer Exposure {
 //
 // The desaturation term is what keeps a bright torch flame reading as orange going white rather
 // than clipping channel by channel, which turns it yellow then green on its way.
-const float START = 0.8 - 0.04;
+// **The reference operator's shadow offset, kept but ramped, which is a departure worth the words.**
+//
+// PBR Neutral subtracts `x - 6.25x^2` from the darkest channel below 0.08 and a flat 0.04 above it.
+// For that minimum channel the result is exactly `6.25x^2` — a log-log slope of *two*, contrast
+// doubled through the whole bottom of the range. A linear 0.01 keeps 6% of itself and a 0.005 keeps
+// 3%, and because the same amount is taken from all three channels while only the smallest is
+// squared, a night colour comes out of it with its blue-to-red ratio inflated fivefold on the ground.
+// That is the whole of why an exterior at midnight went black while its sky stayed legible.
+//
+// **What the offset is for does not apply here.** Khronos put it in so that a glTF baseColor
+// reproduces exactly under even white lighting: a dielectric of IOR 1.5 adds a 4% Fresnel floor,
+// which desaturates the render against the authored albedo, and shifting the curve down by 0.04
+// cancels it. It is a colour-management guarantee for an asset viewer, and the write-up's own scoping
+// is that for any other use it is probably not the right tool. This renderer is judged against
+// Morrowind screenshots, not against authored albedo, so it buys nothing and costs the night.
+//
+// **What is not fixed here**, and §M8 has been quietly wrong about it since the curve was chosen:
+// PBR Neutral is *not* the identity below its shoulder. The offset applies at full strength above
+// `3 * SHADOW_OFFSET`, so middle grey goes in at 0.18 and comes out at 0.14 — a fifth of it — and 0.5
+// comes out at 0.46. The ramp below rescues the *darks*; the midtones the vanilla-screenshot
+// comparison rests on are still shifted down by a flat 0.04, and putting that right is a decision
+// about what the comparison is worth rather than a bug fix.
+const float SHADOW_OFFSET = 0.04;
+const float START = 0.8 - SHADOW_OFFSET;
 const float DESATURATION = 0.15;
 
 vec3 tone_map(vec3 colour) {
-    // Lift the darkest channel off zero, which is what stops a colour with one channel at zero from
-    // staying fully saturated as it brightens.
+    // **Ramped to zero rather than squared into it.** The offset still does the work it is good at —
+    // deepening shadows so a frame has somewhere to be dark — but the amount taken now falls away
+    // with the colour itself, so black stays black and nothing is multiplied by its own smallness.
+    // A linear 0.01 keeps two thirds of itself here where the reference curve left it six percent.
     float darkest = min(colour.r, min(colour.g, colour.b));
-    float offset = darkest < 0.08 ? darkest - 6.25 * darkest * darkest : 0.04;
-    colour -= offset;
+    colour -= SHADOW_OFFSET * clamp(darkest / (3.0 * SHADOW_OFFSET), 0.0, 1.0);
 
     float peak = max(colour.r, max(colour.g, colour.b));
     if (peak < START) {

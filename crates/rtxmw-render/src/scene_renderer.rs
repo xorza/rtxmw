@@ -716,7 +716,19 @@ impl SceneRenderer {
 
             // After the upscaler as well as the composite: what exposure measures has to be what
             // the tone curve maps.
-            self.exposure.record(device, command_buffer, displayed);
+            // The hour's own bias, which an interior does not have: a room's brightness is its
+            // own business and its record says what it is, and a scale of zero is what says so.
+            let outdoors = self
+                .scene
+                .as_ref()
+                .is_some_and(|residency| residency.lighting().sky_scale > 0.0);
+            let bias = if outdoors {
+                self.sky.exposure_bias
+            } else {
+                1.0
+            };
+            self.exposure
+                .record(device, command_buffer, displayed, bias);
             self.timestamps.write(command_buffer, 5);
 
             self.tonemap.record(command_buffer, displayed);

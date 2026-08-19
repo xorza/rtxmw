@@ -21,6 +21,9 @@ layout(push_constant) uniform Frame {
     float log_range;
     // Total pixels binned, so the black bin can be discounted from the divisor.
     uint pixels;
+    // What the hour multiplies the metered exposure by, which is how the world's own brightness
+    // reaches a system that otherwise only knows the picture's — see `Sky::exposure_bias`.
+    float bias;
 } frame;
 
 const uint BINS = 256u;
@@ -83,5 +86,6 @@ void main() {
         exposure = 1.0;
         return;
     }
-    exposure = clamp(pow(KEY / max(mean_luminance, 1e-6), ADAPTATION), MIN_EXPOSURE, MAX_EXPOSURE);
+    exposure = frame.bias
+             * clamp(pow(KEY / max(mean_luminance, 1e-6), ADAPTATION), MIN_EXPOSURE, MAX_EXPOSURE);
 }

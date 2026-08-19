@@ -465,9 +465,16 @@ finished writing it and a dispatch boundary is the only barrier that wide:
 
 **The tone curve is Khronos PBR Neutral**, chosen against the milestone's own done-when: the test is
 that an original Morrowind screenshot and a render of the same viewpoint compare without a gamma
-mismatch, and the original applied no tone curve at all. PBR Neutral is the identity below 0.76, so
-the midtones the comparison rests on are untouched where ACES would darken and twist every one. Its
-desaturation term keeps a torch flame going white instead of clipping channel by channel.
+mismatch, and the original applied no tone curve at all. It rolls off only above 0.76 where ACES
+would darken and twist every midtone, and its desaturation term keeps a torch flame going white
+instead of clipping channel by channel.
+
+**It is not the identity below the shoulder, and this said it was until §8.52 went looking.** The
+operator subtracts a flat 0.04 from every channel above the toe, so middle grey enters at 0.18 and
+leaves at 0.14 and 0.5 leaves at 0.46 — the midtones the screenshot comparison rests on are shifted
+down by a fifth of middle grey. §8.52 fixed what that offset did to the *darks*, where it was squaring
+them; the midtone shift is still there, and whether to take it out is a decision about what the
+vanilla comparison is worth rather than a defect to fix quietly.
 
 **sRGB is encoded in the shader and the swapchain is `UNORM`** to stop it happening twice. sRGB
 formats expose no storage capability; the alternative, a linear 8-bit intermediate for the
@@ -2866,3 +2873,115 @@ forgotten what colour it scattered, so that direction is **neutral**, and the bl
 degrees up where it is three times the red. The test now asserts the pale horizon, the blue above it
 and the dimming against the sunward side — all of which the model actually claims, and none of which
 rest on rounding.
+
+### 8.51 Night as a thing the world knows, not a thing the picture measures
+
+Reported from the window: the night sky reads too bright and flat — overcast dusk rather than night.
+Three attempts at it failed in instructive ways before the reading was right.
+
+**Measured first.** The scene really is dark: mean linear luminance 0.189 at noon against 0.00352 at
+23:00, a ratio of 53. So the lighting is fine and something downstream is giving it back. Sweeping the
+adaptation exponent from 0.75 to 0.42 — a 5.5-fold change in exposure by the formula — moved the night
+sky by 1.25. Clamping the exposure ceiling to 1.5, which is nearly no lift at all, moved it to 0.52
+and took the interior down with it. **Every lever that scales the whole frame was blunt**, because
+auto-exposure has no absolute anchor: whatever the scene's level, it maps onto the key.
+
+Lowering the night floor is worse than blunt. The sky and the ground are the same number here by
+construction — §8.49 tied the ambient to the dome's own average, which is right — so it takes the
+ground with it, and the ground has an albedo besides. It lands where Khronos PBR Neutral's shadow
+offset crushes: that operator subtracts `x - 6.25x²` below 0.08, which at `x = 0.01` removes 94% of
+the value. Seyda Neen went black while the sky stayed legible.
+
+**What the literature says.** Narkowicz states the principle: *"we want to have a darker image in low
+light conditions and a brighter image in high light conditions. This way viewer has a clue as to how
+bright the lighting is in the current scene."* Krawczyk, Myszkowski and Seidel fitted a key value to
+the scene's own luminance for exactly this, `1.03 - 2 / (2 + log10(L + 1))`, which Stride ships with
+the equation number cited; evaluated, it runs about **four and a half stops** from sunlight to
+starlight. Unreal exposes it as an `AutoExposureBiasCurve` keyed to average scene EV100, Unity HDRP
+as a `curveMap` plus per-EV min and max curves, CryEngine as EV Min / EV Max / EV Auto Compensation
+**animated over the 24-hour Time-of-Day curve**, and Infamous: Second Son shipped a manual exposure
+offset per time of day. The clamp windows are worth noting too: HDRP ships −1…14 EV100, Source a
+two-stop window, Godot three stops of ISO — Unreal's default −10…20 is the outlier, and is why an
+unconfigured Unreal night looks washed.
+
+**So the bias is keyed to the sky, not to the frame.** `Sky` already knows the hour absolutely, which
+is a thing the histogram can only guess at, so it emits the multiplier directly and the metering
+argument disappears. The shape is Krawczyk's — a soft S in log luminance, saturating at both ends
+rather than clamping, which is what keeps dusk from stepping — fitted between this dome's own darkest
+and brightest rather than the curve's original range, and normalised so noon is untouched. Sunset
+lands 2.0 stops down and midnight 1.75 — the numbers this slice shipped, and §8.52 found what was
+capping the second and moved it to 2.
+
+**1.75 stops rather than the literature's 4.5** (2 after §8.52), and the reason for falling short of
+it is worth writing down: this renderer has no absolute luminance scale to hang the published curve
+on. `DAYLIGHT` is admittedly not a physical figure and the night floor was picked so an exterior stays
+legible. Noon to midnight here is fifty to one where the world's is a hundred million to one. At 2.5
+stops the night sky read beautifully and the near ground went black — which is the same crush as
+before, reached from the other direction.
+
+**And that trade is exactly the one the literature says cannot be won with exposure.** Ghost of
+Tsushima's slide names both halves of it: *"Make night feel like night, and not just darker day.
+Increase visibility in dark areas."* Their answer is a Purkinje shift — rods taking over below about
+3 cd/m², which desaturates, shifts blue, and **raises** the apparent brightness of dark areas — in
+four instructions and two precomputed matrices, demonstrated at an average illuminance of 0.05 lux.
+It is a different lever from exposure and it moves both things at once, which no exposure setting can.
+The matrices come from spectral integration the talk does not print, so it is the next slice rather
+than this one.
+
+Giving the renderer real units is what would let the published curve be used as published, and it is
+the same fix §5.1 has been waiting for.
+
+### 8.52 The tone curve was squaring its own shadows
+
+§8.51 landed the hour's exposure bias at 1.75 stops because 2.5 read beautifully in the sky and sent
+the ground black. That turned out not to be the bias's fault.
+
+**Khronos PBR Neutral subtracts `x - 6.25x²` from the darkest channel below 0.08.** For that channel
+the output is therefore exactly `6.25x²` — a log-log slope of **two**, contrast doubled through the
+whole bottom of the range. A linear 0.01 keeps 6% of itself and a 0.005 keeps 3%. And because the
+same amount is taken from all three channels while only the smallest is squared, a night colour comes
+out with its blue-to-red ratio inflated about fivefold on the ground. Every attempt this session to
+darken the night ran into that wall, from both directions.
+
+**What the offset is for does not apply here.** Khronos put it in so a glTF `baseColor` reproduces
+exactly under even white lighting: a dielectric of IOR 1.5 adds a 4% Fresnel floor which desaturates
+the render against the authored albedo, and shifting the curve down by 0.04 cancels it. It is a
+colour-management guarantee for an asset viewer, and the write-up's own scoping is that for any other
+use it is probably not the right tool. This renderer is judged against Morrowind screenshots rather
+than against authored albedo.
+
+It also quietly cost the property the curve was chosen for. §M8 says PBR Neutral "is the identity
+below `START`". It was not: middle grey went in at 0.18 and came out at 0.14, a fifth of it gone.
+
+**Removing it outright was worse, and that is the useful half of the experiment.** The night's ground
+came back and the *day* went flat — the offset had been doing real shadow-contrast work. What both
+wants is the offset ramped to zero rather than squared into it:
+
+    colour -= SHADOW_OFFSET * clamp(darkest / (3 * SHADOW_OFFSET), 0, 1)
+
+The amount taken now falls away with the colour itself, so black stays black and nothing is multiplied
+by its own smallness. Above `3 × offset` it saturates and the curve is bit-for-bit the reference one,
+which is why every pinned midtone in the tests held unchanged — `FLAT_GREY` is still 103.
+
+| darkest channel | reference keeps | ramped keeps |
+|---|---|---|
+| 0.005 | 3.1% | 66.7% |
+| 0.01 | 6.3% | 66.7% |
+| 0.05 | 31.2% | 66.7% |
+| 0.18 | 77.8% | 77.8% |
+
+With the crush gone the hour's bias reaches **2 stops**, where the sky reads properly deep and the
+ground keeps its path, its grass and its fence. Two and a half was tried and judged too dark by eye —
+before the fix it was not reachable at all, since the ground went black at two.
+
+**What the research says is still missing**, in the order it ranked them. Give the renderer absolute
+units — everything else in the literature is keyed to cd/m² and cannot be applied while `SKY_STRENGTH`
+is a number tuned to reproduce a screenshot; that is §5.1's fix again. Then the bias becomes a retarget
+curve keyed on true EV100 rather than fitted to this dome's range, which is the mechanism Assassin's
+Creed Unity → Watch Dogs 2 → Far Cry 5 arrived at, and which Unreal and HDRP both ship. Then meter
+illuminance rather than post-albedo luminance, so a snow-covered corridor and a dark one do not meter
+alike. Then the moons: a full moon raises the sky five to eight times but the ground sixty to four
+hundred, a four-stop swing that is the only thing which inverts sky-brighter-than-ground. Then the
+Purkinje shift, per pixel and after the curve, so the blue lives in the viewer's response rather than
+in the illuminant — Far Cry 5 declined it precisely because they had pushed the moon off physical, and
+Ghost of Tsushima ran it because they had not, which is a fork to take deliberately.
