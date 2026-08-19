@@ -2835,3 +2835,34 @@ Frame cost at 1920×1080, best of five: 5.68 ms.
 **Still not modelled**, and now the most visible gap: the anti-solar dark band and the Belt of Venus
 above it are a geometric shadow rather than a path length, and `AWAY_SHARE` stands in for both with
 one number. Night is still a floor with no moons and no stars in it.
+
+### 8.50 Morrowind's day is twelve hours long, not fourteen
+
+Found while reading the game's own `[Moons]` constants for the night sky: `TimeOfDay`'s sunset was
+20:00, and the doc above it said the pair came from the original engine's ini fallbacks. One of them
+did. `Morrowind.ini` ships `Sunrise Time=6` and **`Sunset Time=18`** in its own `[Weather]` section,
+and OpenMW's fallback list agrees — the two-hour-longer day was invented to go with a citation that
+was half right, which is the worst kind of wrong: sourced, and not.
+
+**The fix costs nothing at the hour everything was tuned at.** The default moved from 9:30 to 9:00,
+which is the hour whose `orbit()` is 0.5 on a twelve-hour day — the same sun, reached over a shorter
+one, so `SKY_STRENGTH` and every image made against it still hold. What changed is that the middle of
+the day is now the hour the clock calls noon rather than 13:00, and that dusk arrives two hours
+earlier.
+
+Everything downstream that had counted the old day was carrying its arithmetic:
+
+- `NIGHT_DESCENT` is 70° per unit of orbit, described as "about ten an hour over the seven hours an
+  orbit unit is worth". An orbit unit is six hours now, so it is twelve an hour and the sun reaches
+  seventy degrees under at midnight rather than sixty.
+- `WorldClock`'s speed table is a table of how long a day takes, and every row of it was for a
+  fourteen-hour one: at speed 1 the day is 24 minutes rather than 28, and at 256 it is 5.6 seconds.
+- Eight test hours meant "noon" or "just before sunset" by number rather than by name and had to move.
+
+**And one of those tests turned out to be weaker than it read.** `sky_dome.rs` asserted the horizon
+opposite a low sun is *cool*; it passed on a difference of two parts in ten thousand. The model says
+something else and says it clearly: at the horizon the paleness has saturated and the air has
+forgotten what colour it scattered, so that direction is **neutral**, and the blue lives thirty
+degrees up where it is three times the red. The test now asserts the pale horizon, the blue above it
+and the dimming against the sunward side — all of which the model actually claims, and none of which
+rest on rounding.

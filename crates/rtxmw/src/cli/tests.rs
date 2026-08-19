@@ -139,7 +139,7 @@ fn an_hour_reads_as_a_decimal_or_off_a_clock_face() {
 
     // Sunrise and sunset are where the day is defined to start and end.
     assert_eq!(at("6").orbit(), 1.0);
-    assert_eq!(at("20").orbit(), -1.0);
+    assert_eq!(at("18").orbit(), -1.0);
     // And the day wraps, so an hour past midnight is not an hour before it.
     assert_eq!(at("25:00"), at("1:00"));
 

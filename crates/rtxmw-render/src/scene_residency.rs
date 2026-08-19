@@ -216,6 +216,12 @@ impl SceneResidency {
         };
         self.lighting.sky_scale = scale;
         self.lighting.sky_floor = floor;
+        // A room has no stars in it however late it is.
+        self.lighting.sky_stars = if self.record.is_some() {
+            0.0
+        } else {
+            self.sky.stars
+        };
 
         // **Only interiors carry fog in the record**, so a recorded density is what identifies one
         // and settles all three of these together. An exterior's fog belongs to the weather system —

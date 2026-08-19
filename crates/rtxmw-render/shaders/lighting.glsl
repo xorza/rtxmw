@@ -206,13 +206,77 @@ const vec3 RAYLEIGH_TINT = vec3(0.110687, 0.257634, 0.631679);
 const float PALE_MASS = 6.0;
 const float AWAY_SHARE = 0.25;
 
+// How coarsely the sky is diced to place stars, and how many of the cells get one.
+//
+// **Procedural rather than the game's own texture**, which is the one place this file departs from
+// vanilla content and does so deliberately: `tx_sky_*` is a painted star field at a resolution that
+// was generous on a 2002 monitor and is four pixels a star now. Stars are points of light rather than
+// art, so generating them costs nothing, gives a crisp one at any resolution, and lets the field be
+// *stable in world space* — the same star sits in the same place as the camera turns, which a
+// screen-space dither cannot do.
+const float STAR_CELLS = 170.0;
+const float STAR_SHARE = 0.0100;
+
+// How wide a star is drawn, as a multiple of the ray's own footprint, and how wide it may ever get.
+//
+// **Never narrower than a pixel**, which is what keeps them from boiling under the upscaler: a point
+// smaller than the sampling rate is aliasing whatever else is true about it, and the temporal
+// accumulation downstream would turn that into a crawl. Sized against the cone the ray already
+// carries, so it holds at any resolution.
+//
+// **And never wider than half a cell**, which is the other half of drawing them at all. A star is
+// found by hashing the cell a direction falls in, so only that cell draws it — one that reaches past
+// its own boundary is simply cut off there, because the neighbour hashes to a different star and
+// knows nothing about this one. At 340 cells the radius came to 0.62 of a cell at 1080p and 0.93 at
+// 720p, so most of the field was fragments. Halving the cell count doubles a cell's angular size and
+// brings the radius under the cap at every resolution the renderer targets.
+const float STAR_WIDTH = 1.5;
+const float STAR_REACH = 0.45;
+
+// What a star is worth against the night sky it sits on.
+//
+// The brightest come out some sixty times the moonless sky's own floor, which is far above the real
+// ratio — a real star is a hundredth of the sky around it and invisible against anything else. This
+// is a sky meant to be looked at rather than measured.
+const float STAR_BRIGHTNESS = 0.9;
+
+// The star field in one direction: how bright a star is there, if there is one.
+//
+// A hash per cell of a diced sphere gives each its own position and magnitude, so the field is fixed
+// in the world rather than on the screen. The cells are cubes rather than anything spherical, which
+// bunches them a little toward the axes and does not matter for stars.
+float star_field(vec3 direction, float footprint) {
+    vec3 scaled = direction * STAR_CELLS;
+    ivec3 cell = ivec3(floor(scaled));
+    uint seed = hash(uvec4(uvec3(cell + 8192), 0u));
+    // Most cells hold nothing; the share that do are the field's density.
+    if (float(seed & 0xFFFFu) / 65535.0 > STAR_SHARE) {
+        return 0.0;
+    }
+    // **Dead centre of its cell**, and no jitter: a star placed anywhere else can reach past a
+    // boundary its neighbour will not draw across, and comes out a fragment. The grid is already an
+    // irregular lattice in angle — the cells are cubes projected onto a sphere — so it supplies all
+    // the disorder a star field needs without moving anything inside one.
+    vec3 at = vec3(cell) + 0.5;
+    // The cell's own scale back to radians, so a star is as wide as the ray is however far the grid
+    // has stretched it — up to the point where it would leave the cell.
+    float radius = min(max(footprint, 1e-5) * STAR_WIDTH * STAR_CELLS, STAR_REACH);
+    float away = length(scaled - at);
+    // **Cubed, because star brightness is nothing like uniform.** A flat distribution gives a sky
+    // of identical pinpricks that reads as static; the real thing is mostly faint with a scattering
+    // of bright ones, and the eye finds the constellations in that rather than in the average.
+    float pick = float((seed >> 16) & 0xFFFFu) / 65535.0;
+    float magnitude = 0.08 + 0.92 * pick * pick * pick;
+    return magnitude * (1.0 - smoothstep(0.0, radius, away));
+}
+
 // How many atmospheres a beam crosses to something `climb` above the horizon — Kasten and Young.
 float air_mass(float climb) {
     float degrees = degrees(asin(clamp(climb, 0.0, 1.0)));
     return 1.0 / (climb + 0.50572 * pow(degrees + 6.07995, -1.6364));
 }
 
-vec3 sky_seen_through(vec3 direction, float lobe) {
+vec3 sky_seen_through(vec3 direction, float lobe, bool stars) {
     // **The sky has a direction, and this is `Sky::shape` drawn per pixel.** Deep blue overhead,
     // pale at the horizon where the air is thick enough to have forgotten what colour it was, and
     // once the sun is low, orange on its side and dim blue on the other. Everything that knows what
@@ -233,6 +297,21 @@ vec3 sky_seen_through(vec3 direction, float lobe) {
     // own recorded ambient as the floor, so the same expression covers a room and a sky.
     vec3 colour = tint * (phase * (1.0 + pale) * side * frame.sky_scale) + frame.sky_floor;
 
+    // **Behind the fog and under the sun**, which is why they are added here rather than composited
+    // later: a star is a thing in the sky, so the fog attenuates it and the dawn drowns it exactly as
+    // they do everything else the sky sends. The schedule is Morrowind's own — see
+    // `TimeOfDay::starlight`.
+    //
+    // **Drawn, and lighting nothing**, which is why `stars` is a flag rather than always on. The
+    // brightest here is sixty times the sky's floor, and a bounce ray finds one about once in eight
+    // hundred — so with four samples a pixel, one in two hundred would come back with a sixteenfold
+    // spike in it and the night would crawl with fireflies. Real starlight is a rounding error on a
+    // moonless landscape, so the honest answer and the cheap one agree.
+    if (stars && frame.sky_stars > 0.0) {
+        colour += vec3(STAR_BRIGHTNESS * frame.sky_stars
+                     * star_field(direction, frame.cone_spread + lobe));
+    }
+
     // **`lobe` is how far a rough surface smears the sun**, in radians. Water too fine to resolve
     // is not flat — the slopes are still there, they are simply smaller than a pixel — and what
     // they do to a reflected sun is spread it. That spreading *is* the glitter path: a mirror shows
@@ -250,7 +329,13 @@ vec3 sky_seen_through(vec3 direction, float lobe) {
 
 // What a ray that hits nothing sees, from a surface sharp enough not to smear it.
 vec3 sky(vec3 direction) {
-    return sky_seen_through(direction, 0.0);
+    return sky_seen_through(direction, 0.0, true);
+}
+
+// The same sky as a *source of light* rather than a thing to look at, which is the same sky without
+// its stars — see the note beside them in `sky_seen_through`.
+vec3 sky_lighting(vec3 direction) {
+    return sky_seen_through(direction, 0.0, false);
 }
 
 // The cosine-weighted mean radiance arriving at a surface over its hemisphere, one bounce deep.
@@ -288,7 +373,7 @@ vec3 gather_indirect(Surface surface, uvec2 pixel) {
             // function the frame already runs on every pixel that sees sky — and it is what makes a
             // directional dome do any work: a wall facing a sunset takes its colour from the part of
             // the sky that is orange, not from the average of a sky that is orange on one side.
-            total += sky(towards) * daylight_reaching(surface.position);
+            total += sky_lighting(towards) * daylight_reaching(surface.position);
             continue;
         }
         // Terminated with a flat ambient rather than a second bounce: the next order is ambient

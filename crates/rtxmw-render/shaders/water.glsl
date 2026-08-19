@@ -208,7 +208,9 @@ vec3 water_ray(vec3 origin, vec3 direction, float footprint, float lobe, uvec2 p
     Surface hit = trace(origin, direction, footprint, frame.cone_spread + lobe, MASK_SOLID);
     travelled = hit.hit ? hit.t : WATER_MAX_PATH;
     if (!hit.hit) {
-        return sky_seen_through(direction, lobe);
+        // Stars kept: a reflection is something looked *at*, so the sea shows them the way it
+        // shows the sun. It is the lighting path that leaves them out.
+        return sky_seen_through(direction, lobe, true);
     }
     return shade(hit, frame.ambient * daylight_reaching(hit.position), pixel, salt,
                  BOUNCE_SHADOW_SAMPLES);

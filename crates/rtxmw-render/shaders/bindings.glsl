@@ -200,6 +200,7 @@ layout(set = 0, binding = 14, scalar) readonly buffer Frame {
     float sky_warmth;
     float sky_scale;
     vec3 sky_floor;
+    float sky_stars;
     // One where the fog should be an even haze rather than banks — indoors, where the air is still
     // and a room is smaller than a single bank would be.
     float fog_uniform;

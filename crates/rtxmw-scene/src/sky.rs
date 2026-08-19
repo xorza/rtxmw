@@ -28,9 +28,19 @@ const SKY_STRENGTH: f32 = 1.5786;
 
 /// What the sky radiates once the sun is properly down.
 ///
-/// Not moonlight — Morrowind has two moons and a night sky texture and this renderer draws neither.
-/// It is the floor that keeps a night exterior legible rather than black, and it is blue because
-/// scotopic vision is.
+/// Not moonlight — Morrowind has two moons and this renderer draws neither yet. It is the floor that
+/// keeps a night exterior legible rather than black, and it is blue because scotopic vision is.
+///
+/// **Quartering this to darken the night sky was tried and put back.** The sky and the ground are the
+/// same number here by construction — §8.49 tied the ambient to the dome's own average, which is
+/// right — so lowering it takes the ground down with the sky, and the ground has an albedo on it
+/// besides. It lands in the range the tone curve crushes: Khronos PBR Neutral subtracts an offset
+/// that for a linear 0.01 is 0.0094, sixteen times the value, and Seyda Neen went black while the
+/// sky stayed legible.
+///
+/// Nothing that scales the whole scene can separate the two. What can is a second light source that
+/// falls on surfaces and not on the sky — which is moonlight, and is why the moons are the next thing
+/// to build rather than a smaller number here.
 ///
 /// **Added to the daylight term rather than crossfaded with it**, which is not a detail: starlight
 /// is another source and not a replacement for the sun, and a sum of two positive things cannot come
@@ -99,6 +109,8 @@ pub struct Sky {
     pub warmth: f32,
     /// What the dome's shape is multiplied by to give radiance.
     pub scale: f32,
+    /// How much of the star field is out, from none to all of it — [`TimeOfDay::starlight`].
+    pub stars: f32,
 }
 
 impl Sky {
@@ -148,6 +160,7 @@ impl Sky {
             warm,
             warmth,
             scale: SKY_STRENGTH * lit,
+            stars: time.starlight(),
         };
         sky.ambient = sky.dome_average();
         sky
@@ -353,13 +366,13 @@ mod tests {
         // Sunrise and sunset put it *on* the horizon, which Morrowind's own constant never does —
         // its vertical component is fixed, so its sun cannot fall below fourteen degrees.
         assert!(climb(6.0).abs() < 1e-6, "{}", climb(6.0));
-        assert!(climb(20.0).abs() < 1e-6, "{}", climb(20.0));
+        assert!(climb(18.0).abs() < 1e-6, "{}", climb(18.0));
 
         // Highest at the middle of the day, and symmetric either side of it.
-        assert!(climb(13.0) > climb(10.0) && climb(10.0) > climb(7.0));
-        assert!((climb(10.0) - climb(16.0)).abs() < 1e-6);
+        assert!(climb(12.0) > climb(10.0) && climb(10.0) > climb(7.0));
+        assert!((climb(10.0) - climb(14.0)).abs() < 1e-6);
         // Morrowind's noon, out of its own `(0, 75, -100)`: 100/125 of the way up.
-        assert!((climb(13.0) - 0.8).abs() < 1e-6, "{}", climb(13.0));
+        assert!((climb(12.0) - 0.8).abs() < 1e-6, "{}", climb(12.0));
     }
 
     #[test]
@@ -369,19 +382,19 @@ mod tests {
         // fade to disagree with where the sun actually is.
         assert!(Sky::at(TimeOfDay::hours(6.2)).sun.colour.x > 0.0);
         assert_eq!(Sky::at(TimeOfDay::hours(5.5)).sun.colour, Vec3::ZERO);
-        assert_eq!(Sky::at(TimeOfDay::hours(20.5)).sun.colour, Vec3::ZERO);
+        assert_eq!(Sky::at(TimeOfDay::hours(18.5)).sun.colour, Vec3::ZERO);
 
         // Half a degree of disc against fourteen hours of day is a minute or so of setting, and the
         // beam has crossed thirty-eight atmospheres by then — so what goes out is already a deep
         // red, and the blue left it long before.
-        let setting = Sky::at(TimeOfDay::hours(20.0)).sun.colour;
+        let setting = Sky::at(TimeOfDay::hours(18.0)).sun.colour;
         assert!(setting.x > setting.z * 100.0, "{setting:?}");
     }
 
     #[test]
     fn the_sun_reddens_and_dims_as_it_sets() {
-        let noon = Sky::at(TimeOfDay::hours(13.0)).sun.colour;
-        let dusk = Sky::at(TimeOfDay::hours(19.5)).sun.colour;
+        let noon = Sky::at(TimeOfDay::hours(12.0)).sun.colour;
+        let dusk = Sky::at(TimeOfDay::hours(17.5)).sun.colour;
 
         // **Hand-computed from the constants above.** At noon the sun stands at 53.1 degrees, which
         // is 1.249 air masses, so `exp(-0.0464 * 1.249)` = 0.944 of the red survives and
@@ -401,7 +414,7 @@ mod tests {
 
     #[test]
     fn the_sky_is_blue_by_day_and_warm_at_dusk_and_gone_at_night() {
-        let noon = Sky::at(TimeOfDay::hours(13.0)).ambient;
+        let noon = Sky::at(TimeOfDay::hours(12.0)).ambient;
         // Blue above green above red is what Rayleigh scattering means, and the reason the sky has
         // a colour at all.
         assert!(noon.z > noon.y && noon.y > noon.x, "{noon:?}");
@@ -418,7 +431,7 @@ mod tests {
         );
 
         // At dusk the order inverts: the blue never got through the air to be scattered.
-        let dusk = Sky::at(TimeOfDay::hours(19.8)).ambient;
+        let dusk = Sky::at(TimeOfDay::hours(17.8)).ambient;
         assert!(dusk.x > dusk.z, "{dusk:?}");
         assert!(dusk.length() < noon.length(), "{dusk:?} against {noon:?}");
 

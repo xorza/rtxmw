@@ -106,8 +106,14 @@ fn at(pixels: &[u8], index: usize) -> Vec3 {
 fn every_pixel_of_the_sky_is_what_the_scene_crate_says_it_is() {
     // Three hours that exercise the whole dome: overhead, low enough to have a warm side, and under
     // the horizon where only the floor is left.
-    for hour in [13.0, 19.5, 23.0] {
-        let sky = Sky::at(TimeOfDay::hours(hour));
+    for hour in [12.0, 17.5, 23.0] {
+        // **Stars off for the comparison**, because they are an addition on top of the dome rather
+        // than part of its shape — `Sky::shape` has no notion of them and the shader draws them from
+        // a hash. The test below is what says they are there at all; this one is about the dome.
+        let sky = Sky {
+            stars: 0.0,
+            ..Sky::at(TimeOfDay::hours(hour))
+        };
         let to_sun = -sky.sun.direction;
         // Facing across the sun rather than at it, so one edge of the frame is the sunward sky and
         // the other is the sky opposite — the axis the dome varies most along.
@@ -136,34 +142,79 @@ fn every_pixel_of_the_sky_is_what_the_scene_crate_says_it_is() {
 }
 
 #[test]
-fn the_sky_is_warm_toward_a_low_sun_and_cool_away_from_it() {
+fn the_stars_come_out_at_night_and_only_at_night() {
+    // The cross-check above turns the stars off to compare the dome, so something has to say they
+    // are drawn at all — and that they are drawn *only* when the game's own schedule says.
+    // How far the brightest pixel stands above the middle one — which is what a star *is*, and what
+    // an empty sky of any brightness has none of.
+    let contrast = |hour: f32| {
+        let (pixels, _) = looking(
+            Sky::at(TimeOfDay::hours(hour)),
+            Vec3::new(0.3, 0.0, 0.95).normalize(),
+        );
+        let mut values: Vec<f32> = (0..(WIDTH * HEIGHT) as usize)
+            .map(|i| at(&pixels, i).max_element())
+            .collect();
+        values.sort_by(f32::total_cmp);
+        values[values.len() - 1] / values[values.len() / 2].max(1e-4)
+    };
+    assert!(
+        contrast(23.0) > 3.0,
+        "no stars at 23:00: {}",
+        contrast(23.0)
+    );
+    // Noon and mid-afternoon are both outside the schedule, and an empty sky is nearly flat.
+    assert!(
+        contrast(12.0) < 1.5,
+        "something is out at noon: {}",
+        contrast(12.0)
+    );
+    assert!(
+        contrast(16.0) < 1.5,
+        "something is out at 16:00: {}",
+        contrast(16.0)
+    );
+}
+
+#[test]
+fn the_sky_is_warm_toward_a_low_sun_and_pale_and_dim_away_from_it() {
     // **What the whole change is for**, and it is worth asserting separately from the cross-check
     // above: that one would still pass if both implementations were a flat colour.
-    let sky = Sky::at(TimeOfDay::hours(19.5));
+    let sky = Sky::at(TimeOfDay::hours(17.8));
     let to_sun = -sky.sun.direction;
-    let horizon = |towards: Vec3| {
-        let flat = Vec3::new(towards.x, towards.y, 0.0).normalize();
-        sky.shape(flat)
-    };
-    let (sunward, away) = (horizon(to_sun), horizon(-to_sun));
+    let flat = |towards: Vec3| Vec3::new(towards.x, towards.y, 0.0).normalize();
+    let (sunward, away) = (sky.shape(flat(to_sun)), sky.shape(flat(-to_sun)));
 
-    // Warm on the sun's side and cool on the other, which a sky with one colour cannot be.
+    // Warm on the sun's side, which a sky with one colour cannot be.
     assert!(
-        sunward.x > sunward.z,
+        sunward.x > 4.0 * sunward.z,
         "the sunward horizon is not warm: {sunward:?}"
     );
-    assert!(
-        away.z > away.x,
-        "the horizon opposite the sun is not cool: {away:?}"
-    );
-    // And brighter on the sun's side, because the other one is in the Earth's shadow.
+    // And brighter there, because the other side is in the Earth's shadow.
     assert!(
         sunward.length() > 2.0 * away.length(),
         "{sunward:?} against {away:?}"
     );
 
-    // Overhead keeps its blue at every hour — it is the thinnest air on the dome.
-    for hour in [9.5, 13.0, 19.5] {
+    // **The horizon opposite it is pale rather than blue**, and that is the model rather than a
+    // shortfall: thirty-eight atmospheres of air have forgotten what colour they scattered. Asserting
+    // *cool* there passed on a difference of two parts in ten thousand, which is a strong-sounding
+    // claim resting on rounding.
+    let neutral = (away.max_element() - away.min_element()) / away.max_element();
+    assert!(
+        neutral < 0.01,
+        "the horizon opposite the sun is not pale: {away:?}"
+    );
+
+    // The blue lives higher up, where the air is thin enough to keep it.
+    let up = sky.shape((flat(-to_sun) + Vec3::Z * 0.577).normalize());
+    assert!(
+        up.z > 2.0 * up.x,
+        "the sky above the anti-sun horizon is not blue: {up:?}"
+    );
+
+    // And overhead it is blue at every hour — the thinnest air on the dome.
+    for hour in [9.0, 12.0, 17.5] {
         let overhead = Sky::at(TimeOfDay::hours(hour));
         let zenith = overhead.shape(Vec3::Z);
         assert!(

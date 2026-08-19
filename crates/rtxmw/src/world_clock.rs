@@ -4,7 +4,7 @@ use rtxmw_scene::TimeOfDay;
 
 /// Game seconds per real second at speed 1.
 ///
-/// Morrowind's own `timescale`, which makes its fourteen-hour day take twenty-eight minutes of
+/// Morrowind's own `timescale`, which makes its twelve-hour day take twenty-four minutes of
 /// sitting still. That is the right rate to *play* at and far too slow to look at, which is what
 /// everything below is for.
 const TIMESCALE: f32 = 30.0;
@@ -17,17 +17,17 @@ const TIMESCALE: f32 = 30.0;
 ///
 /// What that buys, per press:
 ///
-/// | speed | the fourteen-hour day | a fog bank crossing its own width |
+/// | speed | the twelve-hour day | a fog bank crossing its own width |
 /// |---|---|---|
-/// | 1 | 28 minutes | 64 s |
-/// | 16 | 105 s | 4 s |
-/// | 64 | 26 s | 1 s |
-/// | 256 | 6.6 s | a quarter second |
+/// | 1 | 24 minutes | 64 s |
+/// | 16 | 90 s | 4 s |
+/// | 64 | 22 s | 1 s |
+/// | 256 | 5.6 s | a quarter second |
 ///
 /// 64 is where the fog reads — banks forming and pulling apart at about a bank a second — and 256 is
 /// where a whole day is a few seconds. Beyond that both stop being watchable rather than starting:
-/// the ceiling was 4096 until the arithmetic was done, and at 4096 the entire day passes in four
-/// tenths of a second.
+/// the ceiling was 4096 until the arithmetic was done, and at 4096 the whole day passes in a tenth of
+/// a second.
 const SPEED_STEP: f32 = 4.0;
 const SPEED_MAX: f32 = 256.0;
 const SPEED_MIN: f32 = 1.0;

@@ -41,6 +41,8 @@ pub(crate) struct Lighting {
     /// What every direction gets on top of the shape: the night floor out of doors, and an
     /// interior's own recorded colour indoors, which is the whole of its sky.
     pub(crate) sky_floor: Vec3,
+    /// How much of the star field is out. Zero by day and indoors.
+    pub(crate) sky_stars: f32,
     /// Whether the fog forms banks. Weather does that to a landscape; a room's air is still.
     pub(crate) fog_banked: bool,
 }
@@ -63,6 +65,7 @@ impl Default for Lighting {
             sky_warmth: 0.0,
             sky_scale: 0.0,
             sky_floor: Vec3::ZERO,
+            sky_stars: 0.0,
         }
     }
 }
@@ -189,6 +192,7 @@ pub struct FrameConstants {
     sky_warmth: f32,
     sky_scale: f32,
     sky_floor: [f32; 3],
+    sky_stars: f32,
     /// One where the fog is an even haze rather than banks, which is what a room wants.
     fog_uniform: f32,
     /// The sinusoids the water surface is summed from — see [`crate::wave_spectrum`].
@@ -263,6 +267,7 @@ impl FrameConstants {
             sky_warmth: lighting.sky_warmth,
             sky_scale: lighting.sky_scale,
             sky_floor: lighting.sky_floor.to_array(),
+            sky_stars: lighting.sky_stars,
             fog_uniform: if lighting.fog_banked { 0.0 } else { 1.0 },
             // Rebuilt each frame rather than cached: it is a few hundred floats of arithmetic once
             // per frame against a million rays that read it, and a cache would need invalidating
@@ -651,10 +656,11 @@ mod tests {
         assert_eq!(offset_of!(FrameConstants, sky_warmth), 348);
         assert_eq!(offset_of!(FrameConstants, sky_scale), 352);
         assert_eq!(offset_of!(FrameConstants, sky_floor), 356);
-        assert_eq!(offset_of!(FrameConstants, fog_uniform), 368);
+        assert_eq!(offset_of!(FrameConstants, sky_stars), 368);
+        assert_eq!(offset_of!(FrameConstants, fog_uniform), 372);
         // The wave table follows, twenty tightly packed bytes apiece.
-        assert_eq!(offset_of!(FrameConstants, waves), 372);
-        assert_eq!(size_of::<FrameConstants>(), 372 + 20 * WAVE_COUNT);
+        assert_eq!(offset_of!(FrameConstants, waves), 376);
+        assert_eq!(size_of::<FrameConstants>(), 376 + 20 * WAVE_COUNT);
     }
 
     #[test]
