@@ -36,13 +36,12 @@ pub(crate) struct Lighting {
 /// matches this `repr(C)` struct field for field — under std430's sixteen-byte vector alignment the
 /// two would disagree from the first `vec3` onward. Every offset is pinned by a test below.
 ///
-/// The combined inverse view-projection rather than the two matrices separately. That began as a
-/// way to fit the old 128-byte block and is kept because it is simply less to send and less to get
-/// wrong: their product is all unprojection needs.
+/// The combined matrix rather than the two separately. That began as a way to fit the old 128-byte
+/// block and is kept because it is simply less to send and less to get wrong.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub struct FrameConstants {
-    inverse_view_projection: [f32; 16],
+    ndc_to_world_offset: [f32; 16],
     camera_position: [f32; 3],
     /// Reciprocal of the light grid's cell size, so a lookup multiplies rather than divides.
     light_grid_scale: f32,
@@ -114,7 +113,7 @@ impl FrameConstants {
             angular_radius: 0.0,
         });
         Self {
-            inverse_view_projection: (projection * view).inverse().to_cols_array(),
+            ndc_to_world_offset: Self::ndc_to_world_offset(view, projection),
             camera_position: camera_position.to_array(),
             light_grid_scale: lighting.light_grid.scale,
             light_grid_origin: lighting.light_grid.origin.to_array(),
@@ -132,6 +131,33 @@ impl FrameConstants {
             // the moment the sea state becomes something a cell can set.
             waves: SeaState::default().waves(),
         }
+    }
+
+    /// The matrix taking a pixel's clip coordinates to its offset from the eye, in world axes.
+    ///
+    /// **The eye is taken out of the view before the inverse, and that is the whole point.** The
+    /// obvious matrix is the inverse view-projection, which unprojects a pixel to a *world point* on
+    /// the near plane — and the shader then has to subtract the camera position from it to get a
+    /// direction. Both are the size of the world and the difference is the near distance, 0.05
+    /// units: at Seyda Neen's 75,000 an `f32` step is 0.024 units, so that subtraction throws away
+    /// almost every bit of the answer. Measured against a double-precision reference, the ray
+    /// through a pixel came out **127 pixels** from where it belonged, and 377 at the far corner of
+    /// Vvardenfell — near zero at the origin, which is why it looked like a jitter that grew as the
+    /// camera travelled rather than like a bug.
+    ///
+    /// Dropping the view's translation makes the unprojection land in a space centred on the camera,
+    /// where the near plane is at 0.05 and an `f32` step is 6e-9. There is then nothing to cancel,
+    /// and the error is **0.0001 pixels wherever the camera stands**. It also leaves a far better
+    /// conditioned matrix to invert, since no entry is the size of the world any more.
+    ///
+    /// The camera's position is still sent — a ray needs an origin — but it is used only as one,
+    /// never differenced against anything.
+    fn ndc_to_world_offset(view: Mat4, projection: Mat4) -> [f32; 16] {
+        let mut rotation = view;
+        // A look-at view is `rotation * translate(-eye)`, so its fourth column *is* the eye's
+        // contribution and clearing it leaves the rotation alone.
+        rotation.w_axis = glam::Vec4::W;
+        (projection * rotation).inverse().to_cols_array()
     }
 
     /// How wide one pixel's ray cone grows per unit of distance.
@@ -422,7 +448,7 @@ mod tests {
         // aligned to four — so the block the shader reads is this struct packed tightly, with no
         // padding anywhere. A field inserted in the middle, or one Rust chose to align, shifts
         // everything after it and the shader reads the whole frame displaced.
-        assert_eq!(offset_of!(FrameConstants, inverse_view_projection), 0);
+        assert_eq!(offset_of!(FrameConstants, ndc_to_world_offset), 0);
         assert_eq!(offset_of!(FrameConstants, camera_position), 64);
         assert_eq!(offset_of!(FrameConstants, light_grid_scale), 76);
         assert_eq!(offset_of!(FrameConstants, light_grid_origin), 80);
@@ -456,19 +482,10 @@ mod tests {
         assert!((finer - spread / 2.0).abs() < 1e-5);
     }
 
-    #[test]
-    fn the_inverse_maps_a_projected_point_back_to_where_it_started() {
-        let eye = Vec3::new(1.0, 2.0, 3.0);
-        let view = glam::camera::rh::view::look_to_mat4(eye, Vec3::X, Vec3::Z);
-        // The Vulkan variant, matching the camera — it flips Y for Vulkan's Y-down NDC, and a test
-        // built on the DirectX one would agree with itself while disagreeing with the renderer.
-        let projection = glam::camera::rh::proj::vulkan::perspective_infinite_reverse(
-            75f32.to_radians(),
-            16.0 / 9.0,
-            0.05,
-        );
-        let constants = FrameConstants::new(
-            view,
+    /// A frame built the way the renderer builds one, for a camera at `eye` looking `forward`.
+    fn frame_at(eye: Vec3, forward: Vec3, projection: Mat4) -> FrameConstants {
+        FrameConstants::new(
+            glam::camera::rh::view::look_to_mat4(eye, forward, Vec3::Z),
             projection,
             eye,
             Lighting {
@@ -480,18 +497,129 @@ mod tests {
             0.0,
             0,
             0.0,
-        );
+        )
+    }
 
-        // Round-trip a world point through the forward transform and back through the stored
-        // inverse. Anything that transposed or reordered the matrix survives multiplication but
-        // not this.
-        let world = glam::Vec4::new(40.0, -12.0, 7.0, 1.0);
-        let clip = projection * view * world;
-        let back = Mat4::from_cols_array(&constants.inverse_view_projection) * clip;
-        let recovered = back.truncate() / back.w;
+    /// The direction the shader would trace for the pixel at `ndc`.
+    ///
+    /// The three lines of `primary_visibility.comp` that read the matrix, so what these tests
+    /// assert is what the frame actually produces rather than an arrangement of it they agree with
+    /// among themselves.
+    fn aim(frame: &FrameConstants, ndc: glam::Vec2) -> Vec3 {
+        let near = Mat4::from_cols_array(&frame.ndc_to_world_offset)
+            * glam::Vec4::new(ndc.x, ndc.y, 1.0, 1.0);
+        (near.truncate() / near.w).normalize()
+    }
+
+    #[test]
+    fn a_pixel_aims_the_same_way_wherever_in_the_world_the_camera_stands() {
+        // **The bug this exists for**: the matrix used to be the inverse view-projection, which
+        // unprojects a pixel to a world-space point on the near plane, and the shader subtracted the
+        // camera position from it. Both operands are the size of the world; their difference is the
+        // near distance. At Seyda Neen that lost all but a couple of bits of the direction, and the
+        // aim drifted as the camera travelled — invisible at the origin and 127 pixels out at
+        // 75,000, which is what made it read as jitter rather than as a wrong projection.
+        //
+        // Every direction is checked against the same unprojection carried out in double precision,
+        // which is the only reference that does not share the fault being measured.
+        const FOV: f32 = 60.0;
+        let projection = glam::camera::rh::proj::vulkan::perspective_infinite_reverse(
+            FOV.to_radians(),
+            16.0 / 9.0,
+            0.05,
+        );
+        let forward = Vec3::new(0.3, 0.9, -0.2).normalize();
+        // What one pixel of a 1080-tall view of that field subtends.
+        let pixel = f64::from(FOV.to_radians()) / 1080.0;
+
+        // **Built once, outside the loop, because it does not depend on where the camera is** — that
+        // is the property under test. Its own view, its own product and its own inverse, all in
+        // double precision, so it shares nothing with the matrix it judges but the inputs.
+        let wide = |m: Mat4| glam::DMat4::from_cols_array(&m.to_cols_array().map(f64::from));
+        let reference = (wide(projection)
+            * wide(glam::camera::rh::view::look_to_mat4(
+                Vec3::ZERO,
+                forward,
+                Vec3::Z,
+            )))
+        .inverse();
+
+        let mut worst_by_eye = Vec::new();
+        for eye in [
+            Vec3::ZERO,
+            Vec3::new(1_000.0, 1_000.0, 100.0),
+            // Seyda Neen, and then the far corner of Vvardenfell.
+            Vec3::new(-16_384.0, -73_728.0, 700.0),
+            Vec3::new(200_000.0, 150_000.0, 900.0),
+        ] {
+            // Through the whole builder rather than the one function under test: the matrix has to
+            // be the one a frame carries, or `new` could go back to the old formula unnoticed.
+            let frame = frame_at(eye, forward, projection);
+
+            let mut worst = 0.0f64;
+            for i in 0..=8 {
+                for j in 0..=8 {
+                    let ndc = glam::Vec2::new(-1.0 + i as f32 * 0.25, -1.0 + j as f32 * 0.25);
+                    let aimed = aim(&frame, ndc);
+                    let aimed = glam::DVec3::new(aimed.x.into(), aimed.y.into(), aimed.z.into());
+
+                    let want = reference * glam::DVec4::new(ndc.x.into(), ndc.y.into(), 1.0, 1.0);
+                    let want = (want.truncate() / want.w).normalize();
+                    worst = worst.max((aimed - want).length());
+                }
+            }
+            worst_by_eye.push((eye, worst / pixel));
+        }
+
+        for (eye, pixels) in &worst_by_eye {
+            println!(
+                "eye {:?}: worst aim error {pixels:.5} pixels",
+                eye.to_array()
+            );
+        }
+        // A hundredth of a pixel, at every one of them. The old matrix passes this at the origin
+        // and fails it by four orders of magnitude at Seyda Neen, which is exactly the shape of the
+        // fault: the check has to be made away from the origin to mean anything.
+        for (eye, pixels) in worst_by_eye {
+            assert!(
+                pixels < 0.01,
+                "a pixel's ray at {:?} aims {pixels} pixels away from where double precision puts \
+                 it; the unprojection is losing the camera's position",
+                eye.to_array()
+            );
+        }
+    }
+
+    #[test]
+    fn the_matrix_reaches_the_shader_the_way_it_was_built() {
+        // Transposition and column order survive any amount of multiplication and show up only
+        // against a known answer. Straight ahead from the origin is that answer: the centre pixel
+        // of a view looking along +X must aim along +X, and the corners must splay off it by half
+        // the field of view.
+        let projection = glam::camera::rh::proj::vulkan::perspective_infinite_reverse(
+            90f32.to_radians(),
+            1.0,
+            0.05,
+        );
+        let frame = frame_at(Vec3::ZERO, Vec3::X, projection);
+        let centre = aim(&frame, glam::Vec2::ZERO);
         assert!(
-            (recovered - world.truncate()).length() < 1e-2,
-            "recovered {recovered:?} from {world:?}"
+            (centre - Vec3::X).length() < 1e-5,
+            "the centre pixel aims {centre:?}"
+        );
+        // At 90 degrees the frustum's edge is 45 degrees off centre, so a corner ray makes an angle
+        // whose cosine is 1/sqrt(3) with the forward axis.
+        let corner = aim(&frame, glam::Vec2::NEG_ONE);
+        assert!(
+            (corner.dot(Vec3::X) - 1.0 / 3f32.sqrt()).abs() < 1e-4,
+            "a corner ray aims {corner:?}"
+        );
+        // Vulkan's NDC runs Y *down*, so (-1, -1) is the image's top-left rather than its bottom
+        // left — and looking east, left is north. The ray there must go north and up; a transposed
+        // matrix, or the DirectX projection in place of the Vulkan one, reverses one of the two.
+        assert!(
+            corner.y > 0.0 && corner.z > 0.0,
+            "the top-left ray aims {corner:?}, which is not north and up"
         );
     }
 }

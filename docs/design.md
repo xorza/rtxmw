@@ -2322,6 +2322,64 @@ The old reading fails it with "left 5 of its 31 tail bytes unread". The same mis
 direction is already annotated three blocks away at `NiSourceTexture`, where a `char` read as a
 `bool` over-consumed by three.
 
+### 7.26 The unprojection lost the world, and it looked like jitter
+
+Reported as the camera shaking when it moved, everywhere except near the world origin. That last
+detail is the whole diagnosis: the error was proportional to how far the camera stood from `(0, 0)`.
+
+**What it was.** The shader turned a pixel into a ray like this:
+
+```glsl
+vec4 target = frame.inverse_view_projection * vec4(ndc, 1.0, 1.0);
+vec3 direction = normalize(target.xyz / target.w - frame.camera_position);
+```
+
+The unprojection lands a **world-space point on the near plane** — 0.05 units from the eye — and the
+subtraction recovers the direction. Both operands are the size of the world; their difference is
+0.05. At Seyda Neen's 75,000 units the gap between representable `f32` values is 0.024, so the
+answer had two or three bits left in it. Measured against the same unprojection carried out in
+double precision:
+
+| camera | aim error |
+|---|---|
+| the world origin | 0.00 px |
+| 1,000 units out | 2.1 px |
+| Seyda Neen | **127 px** |
+| the far corner of Vvardenfell | **377 px** |
+
+It read as jitter rather than as a broken projection because the error is a *smooth* field — a still
+frame looks like a slightly wrong field of view, and it is only when the camera moves that the field
+moves with it.
+
+**The fix is not more bits.** Sending the matrix as `f64`, or the camera position as two floats,
+would buy an order of magnitude and leave the same subtraction in place. The subtraction is what
+should not exist: **the eye is removed from the view before the inverse is taken**, so the
+unprojection lands in a space centred on the camera and hands back an offset directly.
+
+```rust
+let mut rotation = view;
+rotation.w_axis = glam::Vec4::W;   // a look-at view is rotation * translate(-eye)
+(projection * rotation).inverse()
+```
+
+Nothing then cancels, and the aim is **0.00013 pixels wrong wherever the camera stands** — the
+number no longer depends on position at all. It also leaves a far better conditioned matrix to
+invert, since no entry is the size of the world any more. The camera's position is still sent, and
+still used as a ray origin; it is simply never differenced against anything.
+
+**Why nothing caught it.** The unprojection had a test, and it was a round trip: project a world
+point, unproject it, check it comes back. Correct, and blind to this — the round trip was run with
+the camera at `(1, 2, 3)`. **A precision fault that vanishes at the origin needs a test that leaves
+it**, so the assertion is now made at four camera positions out to the far corner of the map, and
+the same scene rendered at the origin and at 200,000 units has to produce the same picture. The old
+unprojection fails the second one on pixel coverage alone — whole surfaces leave the frame.
+
+**What is still `f32`, and why that is fine.** Hit positions are `origin + direction * t`, so they
+quantise to 0.024 units out there; the shadow ray bias is 1.5 units, a terrain blend weight moves by
+5e-5 of a tile, and a wave phase by 0.005 radians. Terrain vertices are baked in world space and
+carry the same 0.024, but that is a static property of the geometry rather than something that moves
+when the camera does. None of it is a jitter, which is what the ray direction was.
+
 ### 7.8 Costs and risks
 
 - **Water pixels cost roughly twice.** Two rays instead of one, each spawning its own shadow rays.

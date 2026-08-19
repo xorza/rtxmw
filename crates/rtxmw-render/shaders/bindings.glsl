@@ -139,7 +139,10 @@ struct Wave {
 // field for field. The matrices arrive already multiplied — their product is all unprojection
 // needs, and it is one thing to send rather than two to keep consistent.
 layout(set = 0, binding = 11, scalar) readonly buffer Frame {
-    mat4 inverse_view_projection;
+    // Clip coordinates to an offset from the eye, in world axes — *not* the inverse
+    // view-projection, which would land a world-space point the shader then has to subtract the
+    // camera position from. See `ndc_to_world_offset` in `visibility_pass.rs` for what that cost.
+    mat4 ndc_to_world_offset;
     vec3 camera_position;
     // Reciprocal of the light grid's cell size, then the corner it is addressed from and how many
     // cells it spans. Zero dimensions is a scene with no lights.

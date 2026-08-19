@@ -31,14 +31,17 @@ void main() {
         return;
     }
 
-    // Unproject the pixel centre onto the near plane, then aim from the eye through it.
+    // Unproject the pixel centre onto the near plane, which the matrix gives *relative to the eye*
+    // — see `ndc_to_world_offset`. Subtracting the camera position from a world-space near point
+    // instead is a difference of two numbers the size of the world, and it cost 116 pixels of aim
+    // at Seyda Neen.
     //
     // The projection is reverse-Z, so the near plane is depth 1 and the far plane is depth 0. The
     // far plane is also at infinity, where w collapses to zero — so the near plane is the only one
     // that can be unprojected at all.
     vec2 screen_uv = (vec2(pixel) + 0.5) / vec2(size);
-    vec4 target_point = frame.inverse_view_projection * vec4(screen_uv * 2.0 - 1.0, 1.0, 1.0);
-    vec3 direction = normalize(target_point.xyz / target_point.w - frame.camera_position);
+    vec4 near_point = frame.ndc_to_world_offset * vec4(screen_uv * 2.0 - 1.0, 1.0, 1.0);
+    vec3 direction = normalize(near_point.xyz / near_point.w);
 
     Surface surface = trace(frame.camera_position, direction, 0.0, frame.cone_spread, MASK_ANY);
 

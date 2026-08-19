@@ -1062,6 +1062,97 @@ fn ambient_is_occluded_by_what_a_surface_faces() {
 ///
 /// Against a converged reference this is the Monte Carlo error of the indirect estimate, in the
 /// 0..1 units the target stores — the baseline M7's denoiser has to beat.
+/// The same handful of surfaces, placed `offset` from the world origin.
+///
+/// Instance transforms rather than moved vertices, which is how the engine places everything but
+/// terrain: a mesh is authored about its own origin and the transform puts it somewhere.
+fn scattered_at(offset: Vec3) -> StaticScene {
+    let meshes = [
+        // A wall filling the view, and two panels in front of it at different depths — enough
+        // structure that a ray aimed a pixel or two wrong lands on something else.
+        wall(300.0, -200.0..200.0, -200.0..200.0),
+        wall(150.0, -40.0..40.0, -40.0..40.0),
+        wall(80.0, -15.0..15.0, -60.0..-20.0),
+    ];
+    let materials = [0.9, 0.35, 0.6].map(|albedo| Material {
+        diffuse: Vec3::splat(albedo),
+        ..Material::default()
+    });
+    let instances = [0, 1, 2].map(|mesh| Instance {
+        mesh: MeshId(mesh),
+        transform: Affine3A::from_translation(offset),
+    });
+    common::scene_of(
+        &meshes,
+        &materials,
+        &instances,
+        &[Light {
+            position: offset + Vec3::new(60.0, 40.0, 90.0),
+            colour: Vec3::splat(2.0),
+            radius: 600.0,
+        }],
+        Vec3::splat(0.15),
+    )
+}
+
+#[test]
+fn a_scene_far_from_the_origin_renders_as_it_does_at_the_origin() {
+    // **A world is not a neighbourhood of the origin, and the arithmetic has to know it.** The
+    // unprojection used to hand back a world-space point on the near plane which the shader then
+    // differenced against the camera — two numbers the size of the world, whose difference is the
+    // near distance. At the origin that is exact, so nothing showed; at Seyda Neen it aimed every
+    // ray more than a hundred pixels wide, and moving the camera moved the error, which is what
+    // made it look like the picture was shaking.
+    //
+    // Placing the *same* scene at the far corner of Vvardenfell and asking for the same picture is
+    // the end-to-end statement of that: whatever the renderer does, where the world sits must not
+    // be part of it.
+    let eye = Vec3::ZERO;
+    let here = trace_scene(
+        &scattered_at(Vec3::ZERO),
+        &[],
+        eye,
+        Vec3::X,
+        0,
+        Read::Radiance,
+    );
+
+    let far = Vec3::new(200_000.0, 150_000.0, 900.0);
+    let there = trace_scene(
+        &scattered_at(far),
+        &[],
+        eye + far,
+        Vec3::X,
+        0,
+        Read::Radiance,
+    );
+
+    // Both have to be pictures of something, or agreeing is easy.
+    let covered = |image: &[u8]| image.chunks_exact(4).filter(|p| is_hit(p)).count();
+    assert!(
+        covered(&here) > (WIDTH * HEIGHT / 4) as usize,
+        "the fixture fills only {} pixels at the origin",
+        covered(&here)
+    );
+    assert_eq!(
+        covered(&here),
+        covered(&there),
+        "the scene covers a different number of pixels once it is moved, so rays are landing \
+         somewhere else entirely"
+    );
+
+    let error = rmse(&here, &there);
+    println!("rmse between the origin and {far:?}: {error:.5}");
+    // Not bit-identical and cannot be: the vertices themselves are `f32`, and at 200,000 units the
+    // spacing between representable positions is 0.024 — so the geometry really is a shade
+    // different out there. A hundredth is far inside that and far outside what the old
+    // unprojection did, which moved whole surfaces off the frame.
+    assert!(
+        error < 0.01,
+        "the same scene renders differently at {far:?}: rmse {error}"
+    );
+}
+
 fn rmse(image: &[u8], reference: &[u8]) -> f32 {
     let mut sum = 0.0f64;
     let mut count = 0usize;
