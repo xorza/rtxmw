@@ -36,6 +36,31 @@ pub(super) struct FeatureCommonInfo {
     pub(super) disable_other_logging_sinks: bool,
 }
 
+/// `NVSDK_NGX_ImageViewInfo_VK`, from `nvsdk_ngx_defs_vk.h:52`.
+#[repr(C)]
+pub(super) struct ImageViewInfo {
+    pub(super) view: ash::vk::ImageView,
+    pub(super) image: ash::vk::Image,
+    pub(super) subresource: ash::vk::ImageSubresourceRange,
+    pub(super) format: ash::vk::Format,
+    pub(super) width: c_uint,
+    pub(super) height: c_uint,
+}
+
+/// `NVSDK_NGX_Resource_VK`, from `nvsdk_ngx_defs_vk.h:93`.
+///
+/// Its first member is a union of an image view and a buffer. Only the image arm is used here and it
+/// is the larger of the two, so declaring it directly gives the union its correct size without a
+/// second arm nothing reads.
+#[repr(C)]
+pub(super) struct Resource {
+    pub(super) view: ImageViewInfo,
+    /// `NVSDK_NGX_RESOURCE_VK_TYPE_VK_IMAGEVIEW`, which is zero.
+    pub(super) kind: c_int,
+    /// True where the image was created with `STORAGE` usage — every one of ours is.
+    pub(super) read_write: bool,
+}
+
 unsafe extern "C" {
     /// Instance and device extensions NGX needs enabled. Takes no Vulkan objects.
     pub(super) fn NVSDK_NGX_VULKAN_RequiredExtensions(
@@ -122,6 +147,29 @@ unsafe extern "C" {
         feature: c_int,
         parameters: *mut c_void,
         out: *mut *mut c_void,
+    ) -> u32;
+
+    /// Writes a pointer into a parameter map. How a resource is handed to a feature.
+    pub(super) fn NVSDK_NGX_Parameter_SetVoidPointer(
+        parameters: *mut c_void,
+        name: *const c_char,
+        value: *mut c_void,
+    );
+
+    /// Writes a float into a parameter map.
+    pub(super) fn NVSDK_NGX_Parameter_SetF(
+        parameters: *mut c_void,
+        name: *const c_char,
+        value: f32,
+    );
+
+    /// Runs a feature. **The `_C` variant**, which is the one the SDK's own helper calls: the
+    /// unsuffixed symbol beside it takes a C++ callback type.
+    pub(super) fn NVSDK_NGX_VULKAN_EvaluateFeature_C(
+        cmd: ash::vk::CommandBuffer,
+        handle: *mut c_void,
+        parameters: *mut c_void,
+        progress: *const c_void,
     ) -> u32;
 
     /// Releases a feature and everything it holds.

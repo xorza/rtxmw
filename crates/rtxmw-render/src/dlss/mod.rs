@@ -17,7 +17,7 @@
 
 use std::ffi::{CStr, c_char, c_int, c_uint, c_void};
 
-use rtxmw_gpu::{Device, Instance, PhysicalDevice};
+use rtxmw_gpu::{Device, Image, Instance, PhysicalDevice};
 
 mod ffi;
 
@@ -133,6 +133,31 @@ fn set_u32(parameters: *mut c_void, name: &CStr, value: u32) {
 fn set_i32(parameters: *mut c_void, name: &CStr, value: c_int) {
     // SAFETY: as above.
     unsafe { ffi::NVSDK_NGX_Parameter_SetI(parameters, name.as_ptr(), value) };
+}
+
+/// Writes a float into a parameter map. See [`set_u32`].
+///
+/// # Safety
+/// `parameters` must be a live NGX parameter map.
+fn set_f32(parameters: *mut c_void, name: &CStr, value: f32) {
+    // SAFETY: as above.
+    unsafe { ffi::NVSDK_NGX_Parameter_SetF(parameters, name.as_ptr(), value) };
+}
+
+/// Hands a resource to a parameter map. See [`set_u32`].
+///
+/// # Safety
+/// `parameters` must be a live NGX parameter map, and `value` must outlive every call that reads the
+/// map — the map keeps the pointer rather than what it points at.
+fn set_resource(parameters: *mut c_void, name: &CStr, value: &mut ffi::Resource) {
+    // SAFETY: as above, and the caller guarantees the resource's lifetime.
+    unsafe {
+        ffi::NVSDK_NGX_Parameter_SetVoidPointer(
+            parameters,
+            name.as_ptr(),
+            (value as *mut ffi::Resource).cast(),
+        )
+    };
 }
 
 /// A path as NGX takes one: nul-terminated UTF-32.
@@ -511,6 +536,106 @@ impl Ngx {
     }
 }
 
+/// Everything one evaluation reads and the one image it writes.
+///
+/// Borrowed rather than owned: the images belong to the G-buffer and the frame decides what to hand
+/// over, which is the shape the pass will take when it is wired into the renderer.
+#[derive(Debug, Clone, Copy)]
+struct Inputs<'a> {
+    /// The trace's radiance, **undenoised** — Ray Reconstruction is the denoiser.
+    colour: &'a Image,
+    diffuse_albedo: &'a Image,
+    specular_albedo: &'a Image,
+    /// Normal in `xyz`, roughness in `w`.
+    normal_roughness: &'a Image,
+    /// Clip depth in `r`.
+    depth: &'a Image,
+    motion: &'a Image,
+    output: &'a Image,
+    /// Where inside its pixel this frame sampled, in render pixels.
+    jitter: glam::Vec2,
+    /// Whether the previous frame is usable. True after a jump no motion vector can describe.
+    reset: bool,
+}
+
+impl Feature {
+    /// Records one evaluation into `cmd`.
+    ///
+    /// Every image must be in `GENERAL`, which is where the renderer's own barrier leaves the
+    /// G-buffer, and must have been written by the frame this is upscaling.
+    fn evaluate(&self, cmd: ash::vk::CommandBuffer, inputs: Inputs<'_>) -> Result<(), Status> {
+        // Held by value for the whole call: the map keeps the pointers rather than the contents, so
+        // these have to outlive `EvaluateFeature`.
+        let mut colour = resource(inputs.colour);
+        let mut diffuse = resource(inputs.diffuse_albedo);
+        let mut specular = resource(inputs.specular_albedo);
+        let mut normals = resource(inputs.normal_roughness);
+        let mut depth = resource(inputs.depth);
+        let mut motion = resource(inputs.motion);
+        let mut output = resource(inputs.output);
+
+        let map = self.parameters;
+        set_resource(map, c"Color", &mut colour);
+        set_resource(map, c"Output", &mut output);
+        set_resource(map, c"Depth", &mut depth);
+        set_resource(map, c"MotionVectors", &mut motion);
+        // Ray Reconstruction's own names, which are not the generic `GBuffer.Albedo` beside them.
+        set_resource(map, c"DLSS.Input.DiffuseAlbedo", &mut diffuse);
+        set_resource(map, c"DLSS.Input.SpecularAlbedo", &mut specular);
+        set_resource(map, c"GBuffer.Normals", &mut normals);
+
+        set_f32(map, c"Jitter.Offset.X", inputs.jitter.x);
+        set_f32(map, c"Jitter.Offset.Y", inputs.jitter.y);
+        // Ours are already in pixels — see §8.13 — so nothing needs scaling. The SDK's helper reads
+        // zero here as "one", which would work by accident; saying it is clearer.
+        set_f32(map, c"MV.Scale.X", 1.0);
+        set_f32(map, c"MV.Scale.Y", 1.0);
+        set_i32(map, c"Reset", i32::from(inputs.reset));
+
+        let render = inputs.colour.extent();
+        set_u32(map, c"DLSS.Render.Subrect.Dimensions.Width", render.width);
+        set_u32(map, c"DLSS.Render.Subrect.Dimensions.Height", render.height);
+
+        // SAFETY: the command buffer is recording, the handle and map are this feature's, and every
+        // resource named in the map is alive until this returns. No progress callback.
+        Status(unsafe {
+            ffi::NVSDK_NGX_VULKAN_EvaluateFeature_C(
+                cmd,
+                self.handle,
+                self.parameters,
+                std::ptr::null(),
+            )
+        })
+        .ok()
+    }
+}
+
+/// An image as NGX takes one.
+///
+/// Read-write because every image here was created with `STORAGE` usage, which is what that flag
+/// means — not that this evaluation writes to it.
+fn resource(image: &Image) -> ffi::Resource {
+    let extent = image.extent();
+    ffi::Resource {
+        view: ffi::ImageViewInfo {
+            view: image.view(),
+            image: image.raw(),
+            subresource: ash::vk::ImageSubresourceRange {
+                aspect_mask: ash::vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            },
+            format: image.format(),
+            width: extent.width,
+            height: extent.height,
+        },
+        kind: 0,
+        read_write: true,
+    }
+}
+
 impl Drop for Feature {
     fn drop(&mut self) {
         if !self.handle.is_null() {
@@ -583,6 +708,7 @@ mod tests {
         // Its own instance and device rather than the shared test one: those extensions have to be
         // present at *creation*, and the shared device is built without them for every other test in
         // the workspace.
+        // 1. What NGX needs before any Vulkan object exists.
         let required = Requirements::query().expect("the SDK should answer");
         let instance =
             Instance::new(c"rtxmw-ngx", &[], Validation::Record).expect("an instance should build");
@@ -610,6 +736,7 @@ mod tests {
         // again would work on this machine and quietly look in the wrong place on one that overrides
         // it. Shipping a copy beside the binary is what a release would do instead.
         let libraries = std::path::Path::new(env!("NGX_FEATURE_DIR"));
+        // 2. NGX itself, on a device built from that answer.
         let ngx = Ngx::new(&instance, &physical, &device, &data, libraries)
             .unwrap_or_else(|e| panic!("NGX should initialise: {e}"));
         let available = ngx.ray_reconstruction();
@@ -634,6 +761,7 @@ mod tests {
         // internal to 3840x2160 output, and Performance is the mode that ratio comes from — so if
         // DLSS asks for something else, the frame budget the whole project is written against is
         // measured at the wrong resolution.
+        // 3. What to render at, which the frame budget is measured against.
         const OUTPUT: (u32, u32) = (3840, 2160);
         let settings = ngx
             .optimal_settings(OUTPUT, Preset::Performance)
@@ -686,6 +814,7 @@ mod tests {
         let mut uploader =
             rtxmw_gpu::Uploader::new(&device, &memory, physical.graphics_queue_family())
                 .expect("an uploader should build");
+        // 4. The feature, whose creation uploads weights into a command buffer.
         let mut built = None;
         uploader
             .submit_and_wait(|_, cmd| {
@@ -700,6 +829,94 @@ mod tests {
             !feature.handle.is_null(),
             "the build reported success and produced no feature"
         );
+
+        // **And it runs.** Every input is a real image of the right size and format, in `GENERAL`,
+        // and the output is the 4K one DLSS was built to fill. What this proves is the resource
+        // wrapper and the parameter names — the picture is the *next* thing, once the renderer's own
+        // frame feeds this instead of a set of empty targets.
+        let image = |name: &str, size: (u32, u32), format: ash::vk::Format| {
+            Image::new(
+                &memory,
+                name,
+                ash::vk::Extent2D {
+                    width: size.0,
+                    height: size.1,
+                },
+                format,
+                ash::vk::ImageUsageFlags::STORAGE,
+            )
+            .expect("an image should allocate")
+        };
+        // 5. One evaluation over real images.
+        let half = ash::vk::Format::R16G16B16A16_SFLOAT;
+        let colour = image("colour", settings.render, half);
+        let diffuse = image("diffuse", settings.render, half);
+        let specular = image("specular", settings.render, half);
+        let normals = image("normals", settings.render, half);
+        let depth = image("depth", settings.render, ash::vk::Format::R32G32_SFLOAT);
+        let motion = image("motion", settings.render, ash::vk::Format::R32G32_SFLOAT);
+        let output = image("output", OUTPUT, half);
+
+        let mut ran = None;
+        uploader
+            .submit_and_wait(|device, cmd| {
+                // DLSS reads and writes them as storage images, which is the layout the renderer's
+                // own frame leaves the G-buffer in.
+                for target in [
+                    &colour, &diffuse, &specular, &normals, &depth, &motion, &output,
+                ] {
+                    // SAFETY: the command buffer is recording and every image is alive.
+                    unsafe {
+                        rtxmw_gpu::image_barrier::transition(
+                            device,
+                            cmd,
+                            target.raw(),
+                            ash::vk::ImageLayout::UNDEFINED,
+                            ash::vk::ImageLayout::GENERAL,
+                        );
+                    }
+                }
+                ran = Some(feature.evaluate(
+                    cmd,
+                    Inputs {
+                        colour: &colour,
+                        diffuse_albedo: &diffuse,
+                        specular_albedo: &specular,
+                        normal_roughness: &normals,
+                        depth: &depth,
+                        motion: &motion,
+                        output: &output,
+                        jitter: glam::Vec2::ZERO,
+                        // The first frame has no history, which is exactly what a reset means.
+                        reset: true,
+                    },
+                ));
+            })
+            .expect("the evaluation should submit");
+        ran.expect("the recording ran")
+            .unwrap_or_else(|e| panic!("Ray Reconstruction should evaluate: {e}"));
+        println!(
+            "evaluated {:?} to {:?}",
+            settings.render,
+            (output.extent().width, output.extent().height)
+        );
+
+        // **DLSS records its own commands into that buffer**, and a status of success says only
+        // that NGX was happy with the map — not that what it recorded was valid. The layer is what
+        // has an opinion about the resources it then touched.
+        if let Some(log) = instance.validation_log() {
+            let errors = log.errors_on_this_thread();
+            assert!(
+                errors.is_empty(),
+                "{} validation error(s) from the evaluation:\n{}",
+                errors.len(),
+                errors
+                    .iter()
+                    .map(|e| format!("  {}", e.text))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
+        }
         // Released here rather than at the end of the scope, so a failure to release is this test's
         // and not the next one's — NGX keeps its state per device and a leaked feature outlives the
         // handle that owned it.

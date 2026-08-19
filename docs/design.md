@@ -1799,3 +1799,23 @@ built from is not the capability map — that one is NGX's, for asking questions
 outlive the feature. Both belong to one `Feature`, released together: the handle first, then the map.
 The first attempt handed the map to a closure that `map_err` dropped whether or not the error path
 ran, which would have destroyed it on *success*.
+
+### 8.22 Ray Reconstruction runs, and what that test does not prove
+
+1920×1080 in, 3840×2160 out, on real Vulkan images, with the validation layer silent — which is a
+separate claim from NGX returning success. A status of success says only that NGX liked the parameter
+map; DLSS records its own commands into the buffer afterwards, and the layer is what has an opinion
+about the resources those commands touch.
+
+**Two names that are not the obvious ones.** Ray Reconstruction reads its albedos from
+`DLSS.Input.DiffuseAlbedo` and `DLSS.Input.SpecularAlbedo`, not the generic `GBuffer.Albedo` and
+`GBuffer.Specular` sitting beside them in the same header. And the entry point is
+`NVSDK_NGX_VULKAN_EvaluateFeature_C`, not the unsuffixed symbol next to it, which takes a C++
+callback type — the SDK's own helper calls the `_C` one.
+
+**What the test proves and what it does not.** Swapping the output for a 1080p image fails it, so the
+plumbing has teeth. Swapping *depth* for *motion vectors* does **not** — both are `rg32f` at render
+resolution, and neither NGX nor the validation layer can tell one from the other. Every input here is
+an empty allocation, so there is no picture to check either. What this establishes is the resource
+wrapper, the parameter names and the call sequence; whether the right image reaches the right name is
+a question only a real frame can answer, and that is the next step rather than a gap in this one.
