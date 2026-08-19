@@ -37,7 +37,25 @@ pub enum MaterialKind {
     Diffuse,
     /// A water surface. Its `diffuse` and texture are ignored — the shader owns its appearance.
     Water,
+    /// Ground, whose albedo is blended across the four terrain textures it carries.
+    ///
+    /// A cell names one texture per 512-unit tile and nothing in between, so a surface that simply
+    /// sampled the tile it stood on would meet its neighbours along a straight edge — which is what
+    /// the ground did.
+    ///
+    /// The four ride in the variant rather than beside it because ground without them is not a
+    /// thing: a shader handed the terrain model with no textures to blend would sample slot zero
+    /// four times and draw the fallback, silently.
+    Terrain(TerrainLayers),
 }
+
+/// The four terrain textures a point on the ground is blended from.
+///
+/// In the order the blend wants them: the tile below-left of the point, then across, then the row
+/// above. A cell's tiles are laid out on a 512-unit grid and the blend is bilinear between their
+/// *centres*, so the four are the corners of the square of centres the point falls inside.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerrainLayers(pub [TextureId; 4]);
 
 /// One surface description, resolved from a NIF's property stack.
 ///
@@ -54,7 +72,13 @@ pub struct Material {
     /// Constant opacity from the material property, before any texture alpha.
     pub opacity: f32,
     pub alpha: AlphaMode,
-    /// Which shading model this surface uses. Everything loaded from a NIF is [`Diffuse`].
+    /// Which shading model this surface uses, and whatever that model needs of its own. Everything
+    /// loaded from a NIF is [`Diffuse`].
+    ///
+    /// The ground's four textures live in here rather than in a table of their own because they are
+    /// what makes one patch of ground differ from another: two patches blending the same four tiles
+    /// are the same material and intern to one entry, which is what keeps a cell's thirty-two
+    /// squared quadrants down to the seventy-odd distinct blends it actually has.
     ///
     /// [`Diffuse`]: MaterialKind::Diffuse
     pub kind: MaterialKind,

@@ -112,8 +112,8 @@ fn fill_window(
     scene_loader::wanted_cells(centre, &mut wanted);
     let streamer = CellStreamer::spawn();
     let mut outstanding = 0;
-    for id in wanted.iter().filter(|id| *id != centre) {
-        streamer.request(id.clone());
+    for cell in wanted.iter().filter(|cell| cell.id != *centre) {
+        streamer.request(cell.id.clone(), scene_loader::detail_at(cell.rings));
         outstanding += 1;
     }
     if outstanding == 0 {

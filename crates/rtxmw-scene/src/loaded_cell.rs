@@ -7,7 +7,7 @@ use rtxmw_vfs::Vfs;
 use crate::door::Door;
 use crate::error::Result;
 use crate::game_files::GameFiles;
-use crate::static_scene::{ModelIndex, StaticScene};
+use crate::static_scene::{CellDetail, ModelIndex, StaticScene};
 
 /// A cell's geometry and the textures its materials name.
 ///
@@ -53,7 +53,7 @@ impl LoadedCell {
         let index = CellIndex::build(&esm)?;
         let models = ModelIndex::build(&esm)?;
 
-        let scene = StaticScene::load_cell(&esm, &index, &models, vfs, &id)?;
+        let scene = StaticScene::load_cell(&esm, &index, &models, vfs, &id, CellDetail::Full)?;
         let entrances = Door::leading_to(&esm, &models, &id)?;
         Ok(Some(Self::assemble(id, scene, vfs, entrances)))
     }
@@ -74,8 +74,9 @@ impl LoadedCell {
         models: &ModelIndex,
         vfs: &Vfs,
         id: CellId,
+        detail: CellDetail,
     ) -> Result<Self> {
-        let scene = StaticScene::load_cell(esm, index, models, vfs, &id)?;
+        let scene = StaticScene::load_cell(esm, index, models, vfs, &id, detail)?;
         Ok(Self::assemble(id, scene, vfs, Vec::new()))
     }
 

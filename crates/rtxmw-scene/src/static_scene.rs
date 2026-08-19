@@ -12,9 +12,9 @@ use rtxmw_vfs::Vfs;
 
 use crate::error::{Result, SceneError};
 use crate::light::{Ambient, Light};
-use crate::material::{self, Material, MaterialKind};
+use crate::material::{self, Material, MaterialKind, TerrainLayers, TextureId};
 use crate::material_table::MaterialTable;
-use crate::mesh::{Bounds, Mesh};
+use crate::mesh::{Bounds, Mesh, TERRAIN_QUADRANTS};
 use crate::srgb;
 use crate::sun::Sun;
 
@@ -127,6 +127,49 @@ impl ModelIndex {
     }
 }
 
+/// How much of a cell is built, which is what makes a horizon affordable.
+///
+/// The window the camera stands in is [`Full`]; everything beyond it out to the far edge of the
+/// world is [`Distant`], where the heightmap is decimated to a sixteenth of its triangles and the
+/// cell's lights are dropped.
+///
+/// **The lights are the expensive half, not the objects.** Measured on a hilltop over the whole
+/// island at 1920x1080: the objects of four hundred distant cells — 21,772 instances — cost 0.9 ms
+/// of trace, and the 229 `LIGH` references among them cost 3.8 ms on top, because the shader walks
+/// every light in the world for every pixel. A lamp a kilometre away with a radius of a few hundred
+/// units reaches nothing on screen, so dropping them costs the image nothing at all.
+///
+/// [`Full`]: CellDetail::Full
+/// [`Distant`]: CellDetail::Distant
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CellDetail {
+    /// The heightmap at its own resolution, every object the cell places, and its lights.
+    #[default]
+    Full,
+    /// Terrain at [`CellDetail::DISTANT_STRIDE`], water, and the objects — but no lights.
+    Distant,
+}
+
+impl CellDetail {
+    /// One vertex in four on each axis: 17x17 rather than 65x65, and 512 triangles rather than
+    /// 8,192.
+    ///
+    /// Chosen for the *shape* rather than the count — at four the silhouette of a ridge is still
+    /// the ridge's, and the whole of Vvardenfell at this stride is under a million triangles, which
+    /// is not what the acceleration structure is sized by.
+    pub const DISTANT_STRIDE: usize = 4;
+
+    /// The stride [`Mesh::from_land`] is built at for this level of detail.
+    ///
+    /// [`Mesh::from_land`]: crate::mesh::Mesh::from_land
+    pub fn stride(self) -> usize {
+        match self {
+            Self::Full => 1,
+            Self::Distant => Self::DISTANT_STRIDE,
+        }
+    }
+}
+
 /// Everything one cell places, ready to hand to a renderer.
 ///
 /// Meshes are deduplicated: a cell that places the same crate forty times holds one mesh and forty
@@ -176,6 +219,7 @@ impl StaticScene {
         models: &ModelIndex,
         vfs: &Vfs,
         id: &CellId,
+        detail: CellDetail,
     ) -> Result<Self> {
         let offsets = index
             .cell(id)
@@ -185,7 +229,7 @@ impl StaticScene {
 
         let mut scene = Self::default();
         let mut by_path = HashMap::new();
-        scene.append_cell(&record, models, vfs, &mut by_path)?;
+        scene.append_cell(&record, models, vfs, &mut by_path, detail)?;
 
         if cell.is_interior() {
             scene.ambient = cell.ambient.map(|a| Ambient {
@@ -216,7 +260,9 @@ impl StaticScene {
             let tile_materials =
                 terrain_materials(&land, index.land_textures(), &mut scene.materials);
             let mesh = MeshId(scene.meshes.len() as u32);
-            scene.meshes.push(Mesh::from_land(&land, &tile_materials));
+            scene
+                .meshes
+                .push(Mesh::from_land(&land, &tile_materials, detail.stride()));
             // Keyed by the cell rather than by a file, because a heightmap belongs to exactly one
             // and is the one mesh no other cell can share.
             scene
@@ -299,6 +345,7 @@ impl StaticScene {
         models: &ModelIndex,
         vfs: &Vfs,
         by_path: &mut HashMap<String, MeshId>,
+        detail: CellDetail,
     ) -> Result<()> {
         for cell_ref in Cell::references(record) {
             let cell_ref = cell_ref?;
@@ -332,8 +379,10 @@ impl StaticScene {
             };
 
             // A `LIGH` reference places both a mesh and the light it casts, and the two are
-            // independent: a lamp whose mesh failed to load should still light the room.
-            if let Some(light) = models.light_of(&cell_ref.object_id)
+            // independent: a lamp whose mesh failed to load should still light the room. Far enough
+            // away it lights nothing at all — see [`CellDetail`] for what that is worth.
+            if detail == CellDetail::Full
+                && let Some(light) = models.light_of(&cell_ref.object_id)
                 && light.is_placeable()
             {
                 self.lights.push(Light {
@@ -448,7 +497,15 @@ fn height_at(a: Vec3, b: Vec3, c: Vec3, at: Vec2) -> Option<f32> {
     Some(a.z + u * (b.z - a.z) + v * (c.z - a.z))
 }
 
-/// A material for every terrain tile, interned into the scene's table.
+/// One material per *quadrant* of a cell's texture grid, naming the four tiles it blends.
+///
+/// **A quadrant is the largest patch of ground whose blend never changes which tiles it draws
+/// from.** The blend is bilinear between tile centres, so its four corners switch every half tile —
+/// and half a tile is a quadrant. Splitting the ground any finer would name the same four textures
+/// twice; any coarser would need a patch to blend between more than four.
+///
+/// A cell has 1,024 of them and about seventy distinct blends, because interning collapses every
+/// quadrant that draws the same four.
 ///
 /// **A `VTEX` index is one past its `LTEX` index.** Zero is not the palette's first entry but the
 /// default texture every cell falls back to, so everything real is offset by one — reading them as
@@ -459,7 +516,7 @@ fn terrain_materials(
     palette: &[String],
     materials: &mut MaterialTable,
 ) -> Vec<u32> {
-    (0..TEXTURE_GRID * TEXTURE_GRID)
+    let tiles: Vec<TextureId> = (0..TEXTURE_GRID * TEXTURE_GRID)
         .map(|tile| {
             let name = match land.textures.get(tile).copied().unwrap_or(0) {
                 0 => DEFAULT_TERRAIN_TEXTURE,
@@ -471,9 +528,36 @@ fn terrain_materials(
                     .filter(|name| !name.is_empty())
                     .map_or(DEFAULT_TERRAIN_TEXTURE, String::as_str),
             };
-            let texture = materials.intern_texture(&material::texture_path(name));
+            materials.intern_texture(&material::texture_path(name))
+        })
+        .collect();
+
+    // Clamped at the cell's edge, which is where this stops short of the whole answer: the tiles it
+    // should blend with there belong to the next cell, and a cell is loaded without them. So the
+    // outermost half-tile blends with itself and a seam can survive at a cell boundary — one every
+    // 8,192 units rather than one every 512.
+    let tile_at = |x: i32, y: i32| {
+        let x = x.clamp(0, TEXTURE_GRID as i32 - 1) as usize;
+        let y = y.clamp(0, TEXTURE_GRID as i32 - 1) as usize;
+        tiles[y * TEXTURE_GRID + x]
+    };
+
+    (0..TERRAIN_QUADRANTS * TERRAIN_QUADRANTS)
+        .map(|quadrant| {
+            let (qx, qy) = (
+                (quadrant % TERRAIN_QUADRANTS) as i32,
+                (quadrant / TERRAIN_QUADRANTS) as i32,
+            );
+            // The square of tile centres this quadrant sits inside. Centres are half a tile in from
+            // the grid, so the quadrant at `q` falls between the tiles at `(q - 1) / 2` and one on.
+            let (bx, by) = ((qx - 1).div_euclid(2), (qy - 1).div_euclid(2));
             materials.intern(Material {
-                base_colour: Some(texture),
+                kind: MaterialKind::Terrain(TerrainLayers([
+                    tile_at(bx, by),
+                    tile_at(bx + 1, by),
+                    tile_at(bx, by + 1),
+                    tile_at(bx + 1, by + 1),
+                ])),
                 ..Material::default()
             })
         })
@@ -577,11 +661,14 @@ mod tests {
         }
     }
 
-    /// The texture path a tile's material ends up naming.
-    fn tile_texture(materials: &MaterialTable, tile_material: u32) -> &str {
-        let material = &materials.materials()[tile_material as usize];
-        let id = material.base_colour.expect("terrain draws with a texture");
-        &materials.textures()[id.0 as usize]
+    /// The texture a patch of ground blends *from* — the first of its four, which is the tile whose
+    /// centre the patch straddles and so the one it draws at full weight.
+    fn tile_texture(materials: &MaterialTable, patch_material: u32) -> &str {
+        let MaterialKind::Terrain(layers) = materials.materials()[patch_material as usize].kind
+        else {
+            panic!("ground blends between named textures")
+        };
+        &materials.textures()[layers.0[0].0 as usize]
     }
 
     #[test]
@@ -590,22 +677,33 @@ mod tests {
         // Index 1 is the *first* palette entry, not the second; index 0 is not an entry at all.
         let land = land_with(vec![0, 1, 2]);
         let mut materials = MaterialTable::default();
-        let tiles = terrain_materials(&land, &palette, &mut materials);
+        let patches = terrain_materials(&land, &palette, &mut materials);
 
-        assert_eq!(tiles.len(), TEXTURE_GRID * TEXTURE_GRID);
+        assert_eq!(patches.len(), TERRAIN_QUADRANTS * TERRAIN_QUADRANTS);
+        // Read through the blend: the patch at the far corner of a tile draws that tile alone,
+        // because clamping at the cell's edge gives it the same texture from all four directions.
         assert_eq!(
-            tile_texture(&materials, tiles[0]),
+            tile_texture(&materials, patches[0]),
             "textures/_land_default.dds"
         );
-        assert_eq!(tile_texture(&materials, tiles[1]), "textures/sand.dds");
-        assert_eq!(tile_texture(&materials, tiles[2]), "textures/rock.dds");
-        // Tiles the record says nothing about fall back the same way the zero index does.
+        // Tile 1 is the second along the bottom row, so the patch centred on it is at quadrant 3.
+        assert_eq!(tile_texture(&materials, patches[3]), "textures/sand.dds");
+        assert_eq!(tile_texture(&materials, patches[5]), "textures/rock.dds");
+        // Tiles the record says nothing about fall back the same way the zero index does: the
+        // record named three, so the patch over tile 3 draws the default.
         assert_eq!(
-            tile_texture(&materials, tiles[3]),
+            tile_texture(&materials, patches[7]),
             "textures/_land_default.dds"
         );
-        // One material per distinct texture, not one per tile.
+        // One texture per distinct name, not one per tile.
         assert_eq!(materials.textures().len(), 3);
+        // And far fewer materials than the 1,024 patches that asked for them, because a patch
+        // blending the same four tiles as another is the same material.
+        assert!(
+            materials.materials().len() < 20,
+            "{} materials for a cell of three textures",
+            materials.materials().len()
+        );
     }
 
     #[test]
@@ -617,13 +715,14 @@ mod tests {
         let palette = ["sand.tga".to_owned(), String::new(), "rock.tga".to_owned()];
         let land = land_with(vec![2, 3]);
         let mut materials = MaterialTable::default();
-        let tiles = terrain_materials(&land, &palette, &mut materials);
+        let patches = terrain_materials(&land, &palette, &mut materials);
 
         assert_eq!(
-            tile_texture(&materials, tiles[0]),
+            tile_texture(&materials, patches[0]),
             "textures/_land_default.dds"
         );
-        assert_eq!(tile_texture(&materials, tiles[1]), "textures/rock.dds");
+        // Tile 1's centre falls in patch 3, as in the test above.
+        assert_eq!(tile_texture(&materials, patches[3]), "textures/rock.dds");
     }
 
     use crate::mesh::Submesh;

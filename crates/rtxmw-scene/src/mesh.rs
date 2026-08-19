@@ -20,6 +20,18 @@ const NON_VISUAL_NODES: &[&str] = &["RootCollisionNode", "AvoidNode"];
 /// Compared case-insensitively, because the content is inconsistent about it.
 const MARKER_PREFIXES: &[&str] = &["editormarker", "tri editormarker"];
 
+/// How many patches of ground a cell's side is split into for texturing.
+///
+/// Twice the texture grid, because the ground is blended between tile *centres* and which four
+/// centres a point sits between changes every half tile. See `static_scene::terrain_materials`.
+pub(crate) const TERRAIN_QUADRANTS: usize = TEXTURE_GRID * 2;
+
+/// Quads a side in one 512-unit texture tile, at the heightmap's own resolution.
+const QUADS_PER_TILE: usize = (GRID - 1) / TEXTURE_GRID;
+
+/// Quads a side in one of those patches — half a tile, so half as many.
+const QUADS_PER_PATCH: usize = QUADS_PER_TILE / 2;
+
 /// A vertex position rounded to eighths of a unit, which is how two triangles agree that they meet.
 type EdgeKey = (i32, i32, i32);
 
@@ -225,77 +237,96 @@ impl Mesh {
     /// The grid's last row and column are shared with the neighbouring cell rather than being this
     /// one's own — which is what makes adjacent terrain meet without a seam, and why a cell spans
     /// 64 quads across 65 vertices.
-    /// `tile_materials` gives the material of each of the cell's `TEXTURE_GRID` squared texture
-    /// tiles, row-major. Quads are emitted grouped by it, so each distinct material comes out as
-    /// one contiguous submesh — which is what the acceleration structure wants, and what lets a hit
-    /// on a patch of sand resolve to sand.
     ///
-    /// One texture per tile with a hard edge between them, where the original engine blended
-    /// neighbouring layers across the seam. That is the next thing to fix here and needs a blend
-    /// map rather than a material split.
-    pub fn from_land(land: &LandRecord, tile_materials: &[u32]) -> Self {
+    /// `quadrant_materials` gives the material of each of the 32 by 32 patches a cell's ground is
+    /// split into, row-major. Quads are emitted grouped by it, so each distinct material comes out
+    /// as one contiguous submesh — which is what the acceleration structure wants, and what lets a
+    /// hit on a patch of sand resolve to sand.
+    ///
+    /// `stride` takes one vertex in that many on each axis, so a cell too far away to read detail
+    /// from costs a fraction of the triangles. It must divide the 64 quads a cell spans, and it
+    /// keeps the shared last row and column whatever it is — so two cells built at the *same*
+    /// stride still meet exactly. Two at different strides do not, and the seam between them is
+    /// what a caller mixing them has to answer for.
+    pub fn from_land(land: &LandRecord, quadrant_materials: &[u32], stride: usize) -> Self {
         assert_eq!(
-            tile_materials.len(),
-            TEXTURE_GRID * TEXTURE_GRID,
-            "a cell has one texture tile per {TEXTURE_GRID} squared"
+            quadrant_materials.len(),
+            TERRAIN_QUADRANTS * TERRAIN_QUADRANTS,
+            "a cell is split into {TERRAIN_QUADRANTS} squared patches of ground"
+        );
+        // Quads a side in a cell, which is one fewer than its vertices because the last row is
+        // shared with the neighbour.
+        const SPAN: usize = GRID - 1;
+        assert!(
+            stride.is_power_of_two() && stride < GRID,
+            "a stride of {stride} does not divide the {SPAN} quads a cell spans"
         );
         let origin = Vec2::new(
             land.grid_x as f32 * CELL_SIZE,
             land.grid_y as f32 * CELL_SIZE,
         );
+        // Quads a side at this stride, and the vertices that span them — one more, because the last
+        // row and column belong to the neighbour as much as to this cell.
+        let quads = SPAN / stride;
+        let side = quads + 1;
 
         let mut mesh = Self {
-            positions: Vec::with_capacity(land.heights.len()),
-            normals: Vec::with_capacity(land.heights.len()),
-            uvs: Vec::with_capacity(land.heights.len()),
-            indices: Vec::with_capacity((GRID - 1) * (GRID - 1) * 6),
+            positions: Vec::with_capacity(side * side),
+            normals: Vec::with_capacity(side * side),
+            uvs: Vec::with_capacity(side * side),
+            indices: Vec::with_capacity(quads * quads * 6),
             submeshes: Vec::new(),
         };
-        for row in 0..GRID {
-            for column in 0..GRID {
-                let index = row * GRID + column;
+        for row in 0..side {
+            for column in 0..side {
+                let (x, y) = (column * stride, row * stride);
                 mesh.positions.push(Vec3::new(
-                    origin.x + column as f32 * SPACING,
-                    origin.y + row as f32 * SPACING,
-                    land.height(column, row),
+                    origin.x + x as f32 * SPACING,
+                    origin.y + y as f32 * SPACING,
+                    land.height(x, y),
                 ));
                 // Per-vertex normals come from the file, so terrain is smooth-shaded without the
                 // loader averaging anything. A cell carrying none leaves zeroes, which is the same
                 // signal a NIF without normals gives.
                 mesh.normals.push(
                     land.normals
-                        .get(index)
+                        .get(y * GRID + x)
                         .map_or(Vec3::ZERO, |n| Vec3::from_array(*n)),
                 );
-                // One texture repeat per four vertex spacings, which is the 512-unit tile the
-                // texture indices are laid out on.
-                mesh.uvs.push(Vec2::new(column as f32, row as f32) / 4.0);
+                // One texture repeat per tile, which is what the texture indices are laid out on.
+                mesh.uvs
+                    .push(Vec2::new(x as f32, y as f32) / QUADS_PER_TILE as f32);
             }
         }
 
-        // Each tile spans four quads a side, since 16 tiles cover the 64 quads of a cell.
-        const QUADS: usize = (GRID - 1) / TEXTURE_GRID;
-        let mut distinct: Vec<u32> = tile_materials.to_vec();
+        // Which patch of ground a quad takes its material from: the one its *centre* falls in, so a
+        // quad coarse enough to span several picks the middle rather than a corner. At stride 1 the
+        // half-quad offset rounds away and each pair of quads takes the patch they sit in.
+        let patch_of = |column: usize, row: usize| {
+            let centre = |quad: usize| (quad * stride + stride / 2) / QUADS_PER_PATCH;
+            quadrant_materials[centre(row) * TERRAIN_QUADRANTS + centre(column)]
+        };
+
+        // Only the materials some quad actually uses. A coarse stride skips whole patches, and a
+        // submesh covering none of the cell would be an empty range in the geometry table.
+        let mut distinct: Vec<u32> = (0..quads * quads)
+            .map(|quad| patch_of(quad % quads, quad / quads))
+            .collect();
         distinct.sort_unstable();
         distinct.dedup();
 
         for material in distinct {
             let first_index = mesh.indices.len() as u32;
-            for (tile, &tile_material) in tile_materials.iter().enumerate() {
-                if tile_material != material {
-                    continue;
-                }
-                let (tile_x, tile_y) = (tile % TEXTURE_GRID, tile / TEXTURE_GRID);
-                for quad_y in 0..QUADS {
-                    for quad_x in 0..QUADS {
-                        let row = tile_y * QUADS + quad_y;
-                        let column = tile_x * QUADS + quad_x;
-                        let corner = (row * GRID + column) as u32;
-                        let above = corner + GRID as u32;
-                        // Counter-clockwise seen from above, matching the upward normals.
-                        mesh.indices.extend([corner, corner + 1, above + 1]);
-                        mesh.indices.extend([corner, above + 1, above]);
+            for row in 0..quads {
+                for column in 0..quads {
+                    if patch_of(column, row) != material {
+                        continue;
                     }
+                    let corner = (row * side + column) as u32;
+                    let above = corner + side as u32;
+                    // Counter-clockwise seen from above, matching the upward normals.
+                    mesh.indices.extend([corner, corner + 1, above + 1]);
+                    mesh.indices.extend([corner, above + 1, above]);
                 }
             }
             mesh.submeshes.push(Submesh {
@@ -718,8 +749,8 @@ mod tests {
         );
     }
 
-    /// Texture tiles in a cell, which is how many materials `from_land` wants.
-    const TILES: usize = TEXTURE_GRID * TEXTURE_GRID;
+    /// Patches of ground in a cell, which is how many materials `from_land` wants.
+    const PATCHES: usize = TERRAIN_QUADRANTS * TERRAIN_QUADRANTS;
 
     /// A heightmap sloping up to the east, on the cell at `(grid_x, grid_y)`.
     fn sloping_land(grid_x: i32, grid_y: i32) -> LandRecord {
@@ -737,7 +768,7 @@ mod tests {
         // Cell (-2, -9) is Seyda Neen's, and its south-west corner is at -2 and -9 times the
         // 8,192-unit cell. A heightmap placed at the origin regardless would put every cell in the
         // world on top of every other.
-        let mesh = Mesh::from_land(&sloping_land(-2, -9), &[0; TILES]);
+        let mesh = Mesh::from_land(&sloping_land(-2, -9), &[0; PATCHES], 1);
         assert_eq!(mesh.positions.len(), VERTICES);
         assert_eq!(
             mesh.positions[0].truncate(),
@@ -759,7 +790,7 @@ mod tests {
 
     #[test]
     fn every_quad_becomes_two_triangles_covering_it() {
-        let mesh = Mesh::from_land(&sloping_land(0, 0), &[3; TILES]);
+        let mesh = Mesh::from_land(&sloping_land(0, 0), &[3; PATCHES], 1);
         // 64 quads a side, two triangles each.
         assert_eq!(mesh.triangle_count(), (GRID - 1) * (GRID - 1) * 2);
         // One material across every tile, so one submesh.
@@ -776,13 +807,89 @@ mod tests {
     }
 
     #[test]
-    fn tiles_are_grouped_into_one_submesh_per_material() {
-        // Two materials in a chequer, which is the case a single run cannot represent: each
-        // submesh has to gather the quads of every tile using its material, wherever they are.
-        let tiles: Vec<u32> = (0..TILES)
-            .map(|t| ((t / TEXTURE_GRID + t % TEXTURE_GRID) % 2) as u32)
+    fn a_stride_samples_the_heightmap_rather_than_averaging_it() {
+        // Stride 4 keeps one vertex in four on each axis: 17 a side, 16 quads, 512 triangles
+        // against 8,192. The count is arithmetic; what the test is really for is the *values* —
+        // every vertex it keeps has to be a vertex the full-detail mesh has, in the same place,
+        // because a heightmap that was smoothed on the way down would no longer meet its
+        // neighbours at the shared edge.
+        let land = sloping_land(3, -4);
+        let fine = Mesh::from_land(&land, &[0; PATCHES], 1);
+        let coarse = Mesh::from_land(&land, &[0; PATCHES], 4);
+
+        assert_eq!(coarse.positions.len(), 17 * 17);
+        assert_eq!(coarse.triangle_count(), 16 * 16 * 2);
+        assert_eq!(fine.triangle_count() / coarse.triangle_count(), 16);
+
+        for row in 0..17 {
+            for column in 0..17 {
+                assert_eq!(
+                    coarse.positions[row * 17 + column],
+                    fine.positions[row * 4 * GRID + column * 4],
+                    "the vertex at ({column}, {row}) of the coarse grid moved"
+                );
+            }
+        }
+        // And the shared edge is still shared: the last column is the neighbour's first, whatever
+        // the stride, which is the one thing decimation must not drop.
+        assert_eq!(
+            coarse.positions[16].truncate(),
+            fine.positions[GRID - 1].truncate()
+        );
+        assert_eq!(
+            *coarse.positions.last().unwrap(),
+            *fine.positions.last().unwrap()
+        );
+    }
+
+    #[test]
+    fn a_coarse_quad_takes_the_material_of_the_patch_under_its_middle() {
+        // Patches run 32 to a side and a stride-4 quad spans four of them, so it cannot have all
+        // their materials and has to choose. Half the cell one material and half the other, split
+        // down the middle: at any stride the boundary lands between quads, so both meshes are two
+        // submeshes of equal size — and a quad taking a *corner* patch instead of the middle one
+        // would put the boundary half a quad out at stride 4 and nowhere at stride 1.
+        let patches: Vec<u32> = (0..PATCHES)
+            .map(|p| u32::from(p % TERRAIN_QUADRANTS >= TERRAIN_QUADRANTS / 2))
             .collect();
-        let mesh = Mesh::from_land(&sloping_land(0, 0), &tiles);
+        for stride in [1, 2, 4, 8] {
+            let mesh = Mesh::from_land(&sloping_land(0, 0), &patches, stride);
+            assert_eq!(mesh.submeshes.len(), 2, "at stride {stride}");
+            let west = mesh.submeshes[0].index_count;
+            let east = mesh.submeshes[1].index_count;
+            assert_eq!(
+                west, east,
+                "the split is not down the middle at stride {stride}"
+            );
+            let quads = (GRID - 1) / stride;
+            assert_eq!(
+                (west + east) as usize,
+                quads * quads * 6,
+                "at stride {stride}"
+            );
+        }
+
+        // A patch the coarse grid never samples must not leave an empty submesh behind. One patch
+        // in the far corner, at a stride whose quads all sample the middles of four-patch blocks.
+        let mut lone = vec![0u32; PATCHES];
+        lone[0] = 7;
+        let mesh = Mesh::from_land(&sloping_land(0, 0), &lone, 8);
+        assert_eq!(
+            mesh.submeshes.len(),
+            1,
+            "a material no quad uses became a submesh covering nothing"
+        );
+        assert!(mesh.submeshes.iter().all(|s| s.index_count > 0));
+    }
+
+    #[test]
+    fn patches_are_grouped_into_one_submesh_per_material() {
+        // Two materials in a chequer, which is the case a single run cannot represent: each
+        // submesh has to gather the quads of every patch using its material, wherever they are.
+        let patches: Vec<u32> = (0..PATCHES)
+            .map(|p| ((p / TERRAIN_QUADRANTS + p % TERRAIN_QUADRANTS) % 2) as u32)
+            .collect();
+        let mesh = Mesh::from_land(&sloping_land(0, 0), &patches, 1);
 
         assert_eq!(mesh.submeshes.len(), 2);
         // Between them they cover every quad exactly once. Comparing the submeshes against the
@@ -801,7 +908,7 @@ mod tests {
     fn a_cell_without_normals_leaves_them_zero_rather_than_guessing() {
         let mut land = sloping_land(0, 0);
         land.normals.clear();
-        let mesh = Mesh::from_land(&land, &[0; TILES]);
+        let mesh = Mesh::from_land(&land, &[0; PATCHES], 1);
         // Parallel to positions either way, which is what every consumer relies on.
         assert_eq!(mesh.normals.len(), mesh.positions.len());
         assert!(mesh.normals.iter().all(|n| *n == Vec3::ZERO));

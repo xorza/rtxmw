@@ -990,9 +990,9 @@ compile failure as "the test passed", and `mesh.rs`'s unit tests had stopped com
 `from_land` changed signature. It now distinguishes *did not build* from *not caught*, which is the
 second time in this project that a verification step quietly reported success for work it never ran.
 
-**Not built, and needed before this milestone closes:** the 3×3 active grid and streaming; distant
-statics; blending between neighbouring texture layers, which the original engine did and this
-replaces with a hard edge per tile; and **the sun**. An exterior carries no `AMBI`, so out of doors
+**Not built at the time of writing, and each has its own section since:** the active grid and
+streaming, distant terrain and statics (§7.23), blending between neighbouring texture layers
+(§7.22), and **the sun**. An exterior carries no `AMBI`, so out of doors
 there is nothing lighting the world at all — the placeholder is a fixed overcast daylight standing
 in for a sky the weather system will eventually drive.
 
@@ -1154,8 +1154,7 @@ In the windowed engine at 1920×1080: **81 fps while a cell arrives every frame*
 the window is full. The stall is gone — the frame that takes a cell is a slower frame, not a
 dropped one.
 
-M9's remaining pieces are distant statics and terrain layer blending, which is still a hard edge per
-512-unit tile.
+The horizon beyond that window is §7.23, and terrain layer blending is §7.22.
 
 
 ### M5 — Direct lighting
@@ -1186,12 +1185,16 @@ end to end; optional HDR output.
 **Done when:** a Morrowind screenshot and an rtxmw render of the same viewpoint can be compared
 side by side without gamma mismatch.
 
-### M9 — Exteriors: terrain and streaming
+### M9 — Exteriors: terrain and streaming — **done**
 `LAND` decode (delta-coded VHGT, transposed VTEX), terrain as BLAS geometry, texture layer blending,
-the 3×3 active cell grid, distant statics.
+the active cell grid, distant statics.
 **Done when:** the camera can fly from Seyda Neen to Balmora with the grid streaming and no hitching.
 **Note:** this is where TLAS instance counts get large — the point at which wgpu's CPU marshalling
-would have become the bottleneck.
+would have become the bottleneck. It did not become one here: the 477 cells resident from a hilltop
+rebuild the top level once a frame without showing up in the budget.
+**What was measured:** §7.22 for the layer blending, §7.23 for the horizon.
+**Not done:** the layer blend is bilinear between tile *centres*, which is not what the original
+engine's per-vertex blend map did, and distant terrain is one stride rather than a hierarchy.
 
 ### M10 — Water — **done**
 Per-cell water plane, RT reflection and refraction, absorption and scattering, analytic caustics.
@@ -2149,6 +2152,111 @@ of two million, because bounce and shadow rays that reached a culled cell now es
 Worth reaching for instead, if the top level ever does become the cost: fewer *instances* rather than
 fewer cells — merging the static clutter of a cell into one structure — which shrinks what the
 hierarchy has to describe rather than hiding part of it.
+
+### 7.22 Terrain blends four tile centres, and the quadrant is what carries them
+
+A cell's `VTEX` names **one texture per 512-unit tile**, 16×16 of them, and nothing in between. Ground
+that sampled the tile it stood on met its neighbours along a straight edge, and Seyda Neen's shore
+was a staircase of them running diagonally across the slope. The fix is the standard one — bilinear
+blending between the four nearest tile *centres* — and the whole design question is where the four
+ids live.
+
+**Not a splat map.** The obvious shape is a per-cell weight texture and a second descriptor binding,
+and it is not worth it: the weights are a fixed function of world position and need no storage at
+all. What does need storing is *which four* textures a point blends, and that is constant over a
+region.
+
+**The quadrant.** Split each tile into 2×2 quads — 32×32 quadrants per cell — and give each one the
+2×2 block of tile centres it falls inside. The four ids pack as 4×u16 into the two words
+`GpuMaterial` already had spare, so **no new binding, no new buffer, and 48 bytes stays 48 bytes.**
+They intern like any other material: a cell has 1,024 quadrants and about **78 distinct tuples**
+(worst measured 121), because most quadrants sit inside a run of tiles that all named the same
+texture.
+
+**The weights cost nothing to derive.** A cell origin is a whole number of tiles, so it cancels, and
+the position within the square of centres is
+
+```glsl
+vec2 weight = fract(world.xy / 512.0 - 0.5);
+```
+
+which is 0 at the lower-left centre and approaches 1 at the upper-right — wrapping exactly where the
+quadrant's own tuple shifts by one tile, so the ramp is continuous across the boundary.
+
+**What it costs.** Three extra texture taps on ground pixels: **6.60 ms against 5.95 ms** of trace at
+1920×1080 on a view that is almost entirely terrain, so 0.65 ms, and less than that on anything with
+a horizon in it. An early-out for the case where all four ids agree — most of a cell — was written
+and measured at **6.60 ms, no change at all**, on that view and on an inland one; the taps are not
+serialised on anything a branch can skip, and the branch is not coherent across a warp where it would
+matter. Reverted.
+
+**Proof.** `crates/rtxmw-render/tests/terrain.rs` renders a plane through the real `SceneRenderer`
+with the four layers set to red, green, blue and white, so each channel reads back a known sum of
+weights — green *is* the x weight and blue *is* the y weight — and predicts every pixel of the frame
+to within two levels of 8-bit quantisation. Transposing the weights in the shader fails it; dropping
+one of the four fails it and the flat-ground test beside it.
+
+### 7.23 A horizon costs 1.5 ms, and the lights would have more than tripled it
+
+Before this the world ended at the streaming window — 7×7 cells, about 410 m — and from anywhere
+with a view the land stopped mid-slope against the sky. Vvardenfell is only some 36 cells across, so
+the fix is not a level-of-detail hierarchy but a second tier: **[`CellDetail::Distant`] out to twelve
+rings, terrain and objects, at a sixteenth of the triangles.**
+
+**Decimating is enough, and stitching is not needed.** `Mesh::from_land` takes a stride; at 4 a cell
+is 17×17 vertices and 512 triangles rather than 65×65 and 8,192. Because the stride divides the 64
+quads a cell spans and the shared last row is kept whatever it is, **two cells at the same stride
+still meet vertex for vertex** — asserted exactly, not to a tolerance. Only the one ring where the
+detailed window meets the distant tier can crack, and measured over five real cells the coarse chord
+parts from the fine surface by at most **64 units, half a vertex spacing** — under three pixels at
+1080p, at a boundary that is never closer than three cells. Skirts and stitching were designed and
+not built; the measurement is why.
+
+**The cost, at 1920×1080 from a hilltop over the whole island** — the worst case there is, since
+every pixel is horizon:
+
+| | trace | window load |
+|---|---|---|
+| the 7×7 window alone | 4.77 ms | 208 ms |
+| + distant terrain, 12 rings | 5.40 ms | 511 ms |
+| + the objects on it | **6.29 ms** | 1,155 ms |
+| + the lights those objects carry | 9.85 ms | — |
+
+**That last row is the finding.** Distant objects — 21,772 instances over 428 cells — cost 0.89 ms.
+The 229 `LIGH` references among them cost **3.8 ms more**, because the shader walks every light in
+the scene for every pixel with no bound on count or distance. A lamp a kilometre away with a radius
+of a few hundred units reaches nothing on screen, so a distant cell places its lamps and drops their
+lights, and the image is unchanged.
+
+Three filters were tried before the lights were suspected, and their failure is what pointed at
+them: keeping only opaque meshes saved 0.8 ms, only meshes over 400 units saved nothing, and
+**removing 99% of the instances — 21,772 down to 220 — saved 0.9 ms.** A cost that does not move
+when the geometry does is not the geometry's.
+
+**Peak GPU memory with the whole visible world resident is 620 MB.** Nothing here is near a limit.
+
+**Residency and detail are separate questions, and keeping them separate is what stops a hole.** The
+first shape of this evicted a cell whose tier no longer matched where it was — and a camera crossing
+one cell boundary demotes a whole column at ring 3, so every crossing deleted seven cells of good
+coarse terrain and showed sky until the detailed copies loaded. Now `still_resident` is blind to the
+tier and only asks whether a cell has left the world's edge, while `rebuild_as` asks whether to
+*request* the other tier; the swap happens in the frame the replacement lands, not the frame the
+camera moved. **The hysteresis lives in `rebuild_as`** — a cell earns a rebuild only a whole ring
+past the boundary, so walking back and forth over one rebuilds nothing.
+
+**Cells arrive sixteen a frame rather than one, and "arrive" has to include the misses.** One at a
+time was right for a 49-cell window. Of the 625 squares the horizon asks for, only 428 exist — the
+rest are open sea with no record — and a loop that stops as soon as a cell fails to place still
+drains one sea square a frame. Measured from a cold start at Seyda Neen, frames until the world is
+fully resident:
+
+| | frame 50 | frame 100 | full |
+|---|---|---|---|
+| stopping on a miss | 163 cells | 268 | ~250 frames |
+| taking sixteen either way | 234 cells | 429 | ~100 frames |
+
+What made one a time the rule was the top-level rebuild, and that happens once per frame however many
+cells landed in it.
 
 ### 7.8 Costs and risks
 

@@ -3,7 +3,7 @@
 use ash::vk;
 use bytemuck::{Pod, Zeroable};
 use rtxmw_gpu::{Buffer, BufferMemory, Uploader};
-use rtxmw_scene::{AlphaMode, Material, MaterialKind};
+use rtxmw_scene::{AlphaMode, Material, MaterialKind, TerrainLayers};
 
 use crate::geometry_buffers::GeometryBuffers;
 
@@ -33,6 +33,9 @@ const KIND_DIFFUSE: u32 = 0;
 
 /// A water surface, which the shader reflects, refracts and attenuates through rather than lighting.
 const KIND_WATER: u32 = 1;
+
+/// Ground, blended across the four terrain textures in [`GpuMaterial::terrain_layers`].
+const KIND_TERRAIN: u32 = 2;
 
 /// Set on a run whose triangles are a sheet rather than the skin of something solid, which is what
 /// lets the shader light a sail or a rug from whichever side the sun is on.
@@ -72,7 +75,25 @@ pub(crate) struct GpuMaterial {
     /// A number rather than a flag bit because it selects between models rather than modifying one,
     /// and Morrowind's lava and slime will each want a value of their own.
     pub(crate) kind: u32,
-    pub(crate) padding: [u32; 2],
+    /// The four textures a [`KIND_TERRAIN`] surface blends, packed sixteen bits apiece.
+    ///
+    /// Packed rather than given four words of their own because the block had exactly two spare and
+    /// a texture id has never needed more than sixteen bits — the whole shipped library is under
+    /// four thousand. `GpuMaterial::new` asserts that rather than trusting it.
+    pub(crate) terrain_layers: [u32; 2],
+}
+
+/// The four ground textures as two words, sixteen bits each.
+fn pack_layers(TerrainLayers(ids): TerrainLayers) -> [u32; 2] {
+    let ids = ids.map(|id| {
+        assert!(
+            id.0 <= u32::from(u16::MAX),
+            "texture {} is past what a packed layer can name",
+            id.0
+        );
+        id.0
+    });
+    [ids[0] | (ids[1] << 16), ids[2] | (ids[3] << 16)]
 }
 
 impl GpuMaterial {
@@ -93,8 +114,14 @@ impl GpuMaterial {
             kind: match material.kind {
                 MaterialKind::Diffuse => KIND_DIFFUSE,
                 MaterialKind::Water => KIND_WATER,
+                MaterialKind::Terrain(_) => KIND_TERRAIN,
             },
-            padding: [0; 2],
+            // Zeroes for anything but ground, which never reads them: the shader branches on
+            // `kind` first.
+            terrain_layers: match material.kind {
+                MaterialKind::Terrain(layers) => pack_layers(layers),
+                _ => [0; 2],
+            },
         }
     }
 }

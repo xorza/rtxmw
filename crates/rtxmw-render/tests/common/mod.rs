@@ -4,7 +4,10 @@
 //! left here is describing a scene without a content file, which only a test wants.
 
 use glam::Vec3;
-use rtxmw_scene::{Ambient, Instance, Light, Material, MaterialTable, Mesh, StaticScene};
+use rtxmw_scene::{
+    Ambient, Instance, Light, Material, MaterialKind, MaterialTable, Mesh, StaticScene,
+    TerrainLayers,
+};
 
 /// Assembles a scene from loose parts, so a test can describe one without a content file.
 ///
@@ -25,7 +28,16 @@ pub(crate) fn scene_of(
     // known by — and the ids have to line up with the images the caller passes alongside.
     let named = materials
         .iter()
-        .filter_map(|material| material.base_colour)
+        .flat_map(|material| {
+            let ground = match material.kind {
+                MaterialKind::Terrain(TerrainLayers(ids)) => Some(ids),
+                _ => None,
+            };
+            material
+                .base_colour
+                .into_iter()
+                .chain(ground.into_iter().flatten())
+        })
         .map(|id| id.0 + 1)
         .max()
         .unwrap_or(0);

@@ -32,12 +32,18 @@ struct Material {
     // Which shading model this surface runs. Declared in `material_buffers.rs` too, and pinned
     // there by a test, because a shader cannot see a Rust constant.
     uint kind;
-    uint padding0;
-    uint padding1;
+    // The four ground textures a `KIND_TERRAIN` surface blends, packed sixteen bits apiece.
+    uint terrain_layers0;
+    uint terrain_layers1;
 };
 
 const uint KIND_DIFFUSE = 0u;
 const uint KIND_WATER = 1u;
+const uint KIND_TERRAIN = 2u;
+
+// The side of one terrain texture tile, in world units. A cell is sixteen of them across, which is
+// why a cell's origin drops out of the blend below: it is always a whole number of tiles.
+const float TERRAIN_TILE = 512.0;
 
 // Instance mask bits. A ray asking for `MASK_SOLID` alone cannot see water; `MASK_ANY` sees all.
 const uint MASK_SOLID = 0x01u;

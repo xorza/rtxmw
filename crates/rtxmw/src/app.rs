@@ -1,5 +1,6 @@
 //! winit event loop: window lifecycle, input, and driving the renderer.
 
+use std::collections::HashMap;
 use std::time::Instant;
 
 use glam::Vec3;
@@ -9,15 +10,38 @@ use winit::event_loop::ActiveEventLoop;
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowId};
 
-use rtxmw_scene::{CellId, CellStreamer, LoadedCell};
+use rtxmw_scene::{CellDetail, CellId, CellStreamer, LoadedCell, SceneError};
 
 use crate::WindowOptions;
 use crate::camera::{Camera, Movement};
 use crate::renderer::Renderer;
-use crate::scene_loader;
+use crate::scene_loader::{self, WantedCell};
 
 /// Starting resolution — the internal render target from the design's performance budget.
 const INITIAL_SIZE: (u32, u32) = (1920, 1080);
+
+/// Cells taken from the streamer in one frame.
+///
+/// One at a time was right when the window was 49 cells; the distant ring is six hundred more, and
+/// at one a frame the horizon would take ten seconds to arrive. What made one a time the rule was
+/// the top-level rebuild, and that happens once per frame however many cells landed in it — so this
+/// buys the whole ring for a handful of extra uploads on the frames that take them.
+const CELLS_PER_FRAME: u32 = 16;
+
+/// What came of taking one cell off the streamer.
+///
+/// Three outcomes rather than two because most of what the horizon asks for is open sea, and
+/// "nothing arrived" and "what arrived was nothing" have to be told apart: stopping on the second
+/// would drain one grid square a frame across six hundred of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Taken {
+    /// Nothing had finished loading.
+    Nothing,
+    /// A cell arrived and was not placed — open sea, or a cell that failed to load or upload.
+    Skipped,
+    /// A cell arrived and is now on the device.
+    Placed,
+}
 
 /// Held keys, tracked as flags so held-down movement is smooth rather than repeat-driven.
 #[derive(Debug, Default)]
@@ -57,15 +81,19 @@ pub(crate) struct App {
     /// The exterior cell the camera was last known to be in, and the window's centre. Unset until
     /// the first frame outdoors, which is what makes that frame ask for the window.
     centre: Option<CellId>,
-    /// Cells on the device, so the window knows what it already has.
-    resident: Vec<CellId>,
+    /// Cells on the device and which tier each is at, so the window knows what it already has.
+    ///
+    /// A map rather than a list because the distant ring makes it six hundred entries, and the
+    /// wanted set is scanned against it every time the camera crosses a boundary.
+    resident: HashMap<CellId, CellDetail>,
     /// Cells asked for and not yet arrived, so the window does not ask twice while one is in
     /// flight. Cleared of a cell however it turns out, so a square that is open sea is asked for
     /// again the next time the window moves over it — which costs an index lookup and no file.
-    requested: Vec<CellId>,
+    requested: HashMap<CellId, CellDetail>,
     /// Scratch for the wanted set, refilled rather than reallocated. Only refilled when the camera
-    /// crosses into another cell, which is what keeps sorting 49 of them off the frame path.
-    wanted: Vec<CellId>,
+    /// crosses into another cell, which is what keeps sorting six hundred of them off the frame
+    /// path.
+    wanted: Vec<WantedCell>,
     streamer: CellStreamer,
     /// Frames to draw before exiting, for scripting the windowed path.
     exit_after: Option<u32>,
@@ -98,10 +126,17 @@ impl App {
         if !matches!(self.cell, CellId::Exterior { .. }) {
             return;
         }
-        let mut changed = self.take_one_loaded();
+        let mut changed = false;
+        for _ in 0..CELLS_PER_FRAME {
+            match self.take_one_loaded() {
+                Taken::Nothing => break,
+                Taken::Skipped => {}
+                Taken::Placed => changed = true,
+            }
+        }
 
         // The window only moves when the camera crosses into another cell, which is also what
-        // keeps this frame-path free of the work — and the allocation — of sorting 49 cells.
+        // keeps this frame-path free of the work — and the allocation — of sorting six hundred.
         let position = self.camera.position();
         let centre = CellId::containing(position.x, position.y);
         if self.centre.as_ref() != Some(&centre) {
@@ -118,46 +153,60 @@ impl App {
         }
     }
 
-    /// Uploads one cell that finished loading, if any has. Returns whether anything changed.
-    fn take_one_loaded(&mut self) -> bool {
+    /// Uploads one cell that finished loading, if any has.
+    fn take_one_loaded(&mut self) -> Taken {
         let Some(ready) = self.streamer.take_ready() else {
-            return false;
+            return Taken::Nothing;
         };
-        self.requested.retain(|id| *id != ready.id);
+        // Only when it answers what was last asked. A cell whose tier changed while it was in
+        // flight has a newer request outstanding, and that one is what clears the entry.
+        if self.requested.get(&ready.id) == Some(&ready.detail) {
+            self.requested.remove(&ready.id);
+        }
         let loaded = match ready.loaded {
             Ok(loaded) => loaded,
-            // Most often a grid square that is open sea, which has no record at all. Asked for
-            // again the next time the window moves over it, and cheaply: the cell index answers
-            // "no such cell" without touching the file.
+            // A grid square that is open sea has no record at all, and most of the six hundred the
+            // horizon asks for are exactly that — so it is silent rather than a line each. Asked
+            // for again the next time the window moves over it, and cheaply: the cell index
+            // answers without touching the file.
+            Err(SceneError::NoSuchCell(_)) => return Taken::Skipped,
             Err(e) => {
                 eprintln!("could not load {}: {e}", ready.id);
-                return false;
+                return Taken::Skipped;
             }
         };
         let Some(renderer) = self.renderer.as_mut() else {
-            return false;
+            return Taken::Skipped;
         };
+        // A cell changing tier arrives as a second copy of itself, so the one it replaces goes
+        // first — otherwise the coarse terrain would sit inside the detailed terrain and every ray
+        // near the ground would hit whichever the traversal reached. It goes first *here*, on
+        // arrival, rather than when the camera crossed: the coarse copy is better than the hole
+        // that dropping it early would leave.
+        if self.resident.remove(&loaded.id).is_some() {
+            renderer.remove_cell(&loaded.id);
+        }
         match renderer.add_cell(loaded.id.clone(), &loaded.scene, &loaded.textures) {
             Ok(()) => {
-                self.resident.push(loaded.id);
-                true
+                self.resident.insert(loaded.id, ready.detail);
+                Taken::Placed
             }
             Err(e) => {
                 eprintln!("could not upload {}: {e}", loaded.id);
-                false
+                Taken::Skipped
             }
         }
     }
 
-    /// Drops cells further from `centre` than the window keeps. Returns whether anything changed.
+    /// Drops cells that have left the window altogether. Returns whether anything changed.
     fn evict_beyond(&mut self, centre: &CellId) -> bool {
         let Some(renderer) = self.renderer.as_mut() else {
             return false;
         };
         let before = self.resident.len();
-        self.resident.retain(|id| {
-            let keep = scene_loader::rings_from(centre, id)
-                .is_none_or(|rings| rings <= scene_loader::KEEP_RADIUS);
+        self.resident.retain(|id, _| {
+            let keep =
+                scene_loader::rings_from(centre, id).is_none_or(scene_loader::still_resident);
             if !keep {
                 renderer.remove_cell(id);
             }
@@ -166,15 +215,22 @@ impl App {
         before != self.resident.len()
     }
 
-    /// Asks for whichever cells around `centre` are neither resident nor already on the way.
+    /// Asks for whichever cells around `centre` are missing, or resident at the wrong tier.
     fn request_missing(&mut self, centre: &CellId) {
         scene_loader::wanted_cells(centre, &mut self.wanted);
-        for id in &self.wanted {
-            if self.resident.contains(id) || self.requested.contains(id) {
+        for wanted in &self.wanted {
+            let asked = match self.resident.get(&wanted.id) {
+                Some(&resident) => match scene_loader::rebuild_as(resident, wanted.rings) {
+                    Some(tier) => tier,
+                    None => continue,
+                },
+                None => scene_loader::detail_at(wanted.rings),
+            };
+            if self.requested.get(&wanted.id) == Some(&asked) {
                 continue;
             }
-            self.streamer.request(id.clone());
-            self.requested.push(id.clone());
+            self.streamer.request(wanted.id.clone(), asked);
+            self.requested.insert(wanted.id.clone(), asked);
         }
     }
 
@@ -200,8 +256,8 @@ impl Default for App {
             renderer: None,
             window: None,
             centre: None,
-            resident: Vec::new(),
-            requested: Vec::new(),
+            resident: HashMap::new(),
+            requested: HashMap::new(),
             wanted: Vec::new(),
             streamer: CellStreamer::spawn(),
             exit_after: None,
@@ -314,7 +370,7 @@ impl ApplicationHandler for App {
                 // The cell the camera opens in is resident; outdoors, the rest of the window
                 // streams in around it over the following frames. `centre` stays unset so the
                 // first of those frames sees the camera's cell as a change and asks for the rest.
-                self.resident.push(cell.id);
+                self.resident.insert(cell.id, CellDetail::Full);
             }
             Ok(None) => eprintln!(
                 "no game data configured — set MORROWIND_DATA_DIR, or put it in .env at the repo root"

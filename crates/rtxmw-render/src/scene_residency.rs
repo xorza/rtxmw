@@ -4,7 +4,10 @@ use std::collections::HashMap;
 
 use glam::Vec3;
 use rtxmw_gpu::{Device, RayTracingLimits, Uploader};
-use rtxmw_scene::{CellId, Instance, Light, MaterialTable, Mesh, MeshId, StaticScene, TextureId};
+use rtxmw_scene::{
+    CellId, Instance, Light, MaterialKind, MaterialTable, Mesh, MeshId, StaticScene, TerrainLayers,
+    TextureId,
+};
 use rtxmw_texture::Texture;
 
 use crate::geometry_buffers::GeometryBuffers;
@@ -271,6 +274,12 @@ impl SceneResidency {
                 shared.base_colour = shared
                     .base_colour
                     .map(|id| TextureId(texture_remap[id.0 as usize]));
+                // Ground names four textures rather than one, and every one of them has to be
+                // moved onto the shared slots or a patch blends whatever happens to sit at that
+                // index in the array this renderer built.
+                if let MaterialKind::Terrain(TerrainLayers(ids)) = &mut shared.kind {
+                    *ids = ids.map(|id| TextureId(texture_remap[id.0 as usize]));
+                }
                 self.materials.intern(shared)
             })
             .collect()

@@ -4,7 +4,8 @@
 
 use rtxmw_esm::{CellId, CellIndex, EsmReader};
 use rtxmw_scene::{
-    CellStreamer, Door, Light, LoadedCell, MaterialTable, Mesh, ModelIndex, StaticScene,
+    CellDetail, CellStreamer, Door, Light, LoadedCell, MaterialKind, MaterialTable, Mesh,
+    ModelIndex, StaticScene,
 };
 use rtxmw_vfs::{DATA_DIR_VAR, Vfs, morrowind_archives, morrowind_data_dir};
 
@@ -12,6 +13,9 @@ const CELL: &str = "Seyda Neen, Census and Excise Office";
 
 /// Seyda Neen's shore, which has the trees, the boat and the silt strider on it.
 const SHORE: CellId = CellId::Exterior { x: -2, y: -9 };
+
+/// An exterior that places `LIGH` references as well as objects, which few of them do.
+const LIT_EXTERIOR: CellId = CellId::Exterior { x: 0, y: -7 };
 
 /// `Morrowind.esm`'s bytes, or nothing when the game is not installed.
 ///
@@ -46,7 +50,11 @@ impl<'a> Content<'a> {
     }
 
     fn cell(&self, id: &CellId) -> StaticScene {
-        StaticScene::load_cell(&self.esm, &self.index, &self.models, &self.vfs, id)
+        self.cell_at(id, CellDetail::Full)
+    }
+
+    fn cell_at(&self, id: &CellId, detail: CellDetail) -> StaticScene {
+        StaticScene::load_cell(&self.esm, &self.index, &self.models, &self.vfs, id, detail)
             .expect("cell should load")
     }
 }
@@ -456,16 +464,31 @@ fn an_exterior_cell_carries_its_terrain_as_well_as_its_objects() {
     let covered: u32 = terrain.submeshes.iter().map(|s| s.index_count).sum();
     assert_eq!(covered as usize, terrain.indices.len());
 
+    // Every layer of every patch, because the ground blends four textures at a time and a fixup
+    // missed on any one of them is a magenta square somewhere on the shore.
     let names: Vec<&str> = terrain
         .submeshes
         .iter()
-        .map(|submesh| {
-            let material = &scene.materials.materials()[submesh.material as usize];
-            let texture = material.base_colour.expect("terrain draws with a texture");
-            scene.materials.textures()[texture.0 as usize].as_str()
+        .flat_map(|submesh| {
+            let MaterialKind::Terrain(layers) =
+                scene.materials.materials()[submesh.material as usize].kind
+            else {
+                panic!("ground blends between named textures")
+            };
+            layers
+                .0
+                .into_iter()
+                .map(|texture| scene.materials.textures()[texture.0 as usize].as_str())
         })
         .collect();
-    println!("  terrain textures: {names:?}");
+    let mut distinct = names.clone();
+    distinct.sort_unstable();
+    distinct.dedup();
+    println!(
+        "  terrain blends {} textures across {} patches: {distinct:?}",
+        distinct.len(),
+        terrain.submeshes.len()
+    );
     for path in &names {
         assert!(
             path.starts_with("textures/") && path.ends_with(".dds"),
@@ -478,8 +501,11 @@ fn an_exterior_cell_carries_its_terrain_as_well_as_its_objects() {
     // reading a `VTEX` index without its offset still lands on Bitter Coast art — `Tx_BC_rock_01`
     // where `Tx_BC_rock_03` belongs. Every wrong answer looks as plausible as the right one, so
     // only naming them works. The content file never changes, which is what makes that reasonable.
+    // Deduplicated: the ground names four textures per patch and most patches share most of them,
+    // so the raw list is a thousand entries of a handful of names.
     let mut sorted = names.clone();
     sorted.sort_unstable();
+    sorted.dedup();
     assert_eq!(
         sorted,
         [
@@ -510,6 +536,105 @@ fn an_exterior_cell_carries_its_terrain_as_well_as_its_objects() {
     assert_eq!(placements[0].transform, glam::Affine3A::IDENTITY);
 }
 
+/// The terrain of `scene`, which an exterior with a heightmap has exactly one of.
+fn terrain(scene: &StaticScene) -> &Mesh {
+    let index = scene
+        .mesh_sources
+        .iter()
+        .position(|source| source.starts_with("land:"))
+        .expect("an exterior with a heightmap has terrain");
+    &scene.meshes[index]
+}
+
+#[test]
+fn distant_terrain_meets_its_own_kind_and_reports_what_it_costs_at_the_seam() {
+    let Some(bytes) = game_bytes() else { return };
+    let content = Content::open(&bytes);
+
+    let side = 65 / CellDetail::DISTANT_STRIDE + 1;
+    let distant = |x, y| {
+        let scene = content.cell_at(&CellId::Exterior { x, y }, CellDetail::Distant);
+        terrain(&scene).positions.clone()
+    };
+    let here = distant(-2, -9);
+    assert_eq!(here.len(), side * side);
+
+    // Two cells built at the same stride keep the same shared row of vertices, so their edges
+    // coincide to the bit rather than to a tolerance. This is the property that lets the whole
+    // distant world be decimated without a stitching pass between neighbours.
+    let east = distant(-1, -9);
+    let north = distant(-2, -8);
+    for i in 0..side {
+        assert_eq!(
+            here[i * side + side - 1],
+            east[i * side],
+            "row {i} of the eastern edge does not meet the neighbour"
+        );
+        assert_eq!(
+            here[(side - 1) * side + i],
+            north[i],
+            "column {i} of the northern edge does not meet the neighbour"
+        );
+    }
+
+    // What it does *not* meet is a full-detail cell, and this is how far out: along a shared edge
+    // the fine mesh follows every vertex and the coarse one cuts a chord between every fourth, so
+    // the two part company by the relief in between. Reported rather than bounded tightly — the
+    // number is what decides whether a distant ring can sit straight against the window or needs
+    // something covering the seam.
+    let mut worst: f32 = 0.0;
+    for (x, y) in [(-2, -9), (-2, -8), (-1, -9), (-3, -10), (2, -9)] {
+        let scene = content.cell_at(&CellId::Exterior { x, y }, CellDetail::Full);
+        let fine = &terrain(&scene).positions;
+        let coarse = distant(x, y);
+        for row in 0..65 {
+            let z = fine[row * 65 + 64].z;
+            // The coarse chord under this row, between the two vertices the stride kept.
+            let low = row / CellDetail::DISTANT_STRIDE;
+            let along =
+                (row % CellDetail::DISTANT_STRIDE) as f32 / CellDetail::DISTANT_STRIDE as f32;
+            let below = coarse[low * side + side - 1].z;
+            let above = coarse[(low + 1).min(side - 1) * side + side - 1].z;
+            worst = worst.max((z - (below + (above - below) * along)).abs());
+        }
+    }
+    println!(
+        "worst gap between a full edge and a distant chord over five cells: {worst:.0} units \
+         ({:.2} of a vertex spacing)",
+        worst / 128.0
+    );
+    assert!(
+        worst < 8192.0,
+        "a chord across four vertices parted from the surface by {worst} units, which is more \
+         relief than a cell has"
+    );
+}
+
+#[test]
+fn a_distant_cell_keeps_its_objects_and_drops_the_lights_they_carry() {
+    let Some(bytes) = game_bytes() else { return };
+    let content = Content::open(&bytes);
+    // A cell with objects but no lights would prove nothing, and most of the outdoors is exactly
+    // that — 229 lights across the four hundred cells around Seyda Neen. This one has six.
+    let near = content.cell(&LIT_EXTERIOR);
+    let far = content.cell_at(&LIT_EXTERIOR, CellDetail::Distant);
+
+    assert!(!near.lights.is_empty(), "the fixture cell has no lights");
+    assert!(
+        far.lights.is_empty(),
+        "a distant cell contributed {} lights; the shader walks every one of them for every pixel \
+         in the frame, and none of these reaches it",
+        far.lights.len()
+    );
+    // The objects stay, and they stay whole: dropping the lights must not drop the lamps casting
+    // them, which would leave a hole in the town rather than an unlit one.
+    assert_eq!(
+        far.instances.len(),
+        near.instances.len(),
+        "a distant cell placed a different number of objects than the same cell up close"
+    );
+}
+
 #[test]
 fn a_streamed_cell_is_the_same_cell_the_direct_path_loads() {
     if morrowind_data_dir().is_none() {
@@ -521,8 +646,8 @@ fn a_streamed_cell_is_the_same_cell_the_direct_path_loads() {
     let sea = CellId::Exterior { x: 9_999, y: 9_999 };
 
     let streamer = CellStreamer::spawn();
-    streamer.request(shore.clone());
-    streamer.request(sea.clone());
+    streamer.request(shore.clone(), CellDetail::Full);
+    streamer.request(sea.clone(), CellDetail::Full);
 
     // Answered in the order asked, which is what lets a caller send a whole window at once and
     // still get the nearest cell first.

@@ -94,6 +94,43 @@ vec4 base_colour(Material material, vec2 uv, float lod) {
     return textureLod(textures[nonuniformEXT(material.base_colour + 1u)], uv, lod);
 }
 
+// The four ground textures a `KIND_TERRAIN` material names, as slots in the bindless array.
+//
+// Sixteen bits apiece in the two words `material_buffers.rs` packs them into, and offset by one on
+// the way out because slot zero of the array is the fallback a material with no texture takes.
+uint[4] terrain_layers(Material material) {
+    return uint[4]((material.terrain_layers0 & 0xFFFFu) + 1u,
+                   (material.terrain_layers0 >> 16) + 1u,
+                   (material.terrain_layers1 & 0xFFFFu) + 1u,
+                   (material.terrain_layers1 >> 16) + 1u);
+}
+
+// The ground's colour, blended across the four tiles nearest the point.
+//
+// **A cell names one texture per 512-unit tile and nothing in between.** Drawn as it is written,
+// each tile meets its neighbours along a straight line, and a coast comes out as a patchwork of
+// squares. Real ground has no such edges, and neither did the original engine's — it blended.
+//
+// Bilinear between tile *centres*, which is why the half-tile offset is here: a point exactly on a
+// centre draws that tile alone, and one on the seam between two draws half of each. The cell's own
+// origin never enters it — a cell is a whole number of tiles across, so it falls out of the
+// fractional part and the ground is continuous across a cell boundary for free.
+//
+// Four samples where an unblended ground took one. They are of the same texture more often than
+// not: most of a cell is interior to a tile whose neighbours match it, and the sampler's cache is
+// what makes that cheap.
+vec3 ground_colour(Material material, vec2 world, vec2 uv, float lod) {
+    uint layers[4] = terrain_layers(material);
+    vec2 weight = fract(world / TERRAIN_TILE - 0.5);
+    vec4 across = vec4((1.0 - weight.x) * (1.0 - weight.y), weight.x * (1.0 - weight.y),
+                       (1.0 - weight.x) * weight.y, weight.x * weight.y);
+    vec3 colour = vec3(0.0);
+    for (int layer = 0; layer < 4; ++layer) {
+        colour += across[layer] * textureLod(textures[nonuniformEXT(layers[layer])], uv, lod).rgb;
+    }
+    return colour;
+}
+
 // Whether a candidate intersection survives its material's alpha cutout.
 //
 // Only non-opaque geometry reaches this: the build marks a run `OPAQUE` when its material is, and
@@ -305,7 +342,14 @@ Surface trace(vec3 origin, vec3 direction, float cone_width, float cone_spread, 
 
     surface.emissive = material.emissive;
     surface.albedo = material.diffuse;
-    if (material.base_colour != NO_TEXTURE) {
+    if (material.kind == KIND_TERRAIN) {
+        // One lod for all four, chosen from the first: they are sampled over the same footprint
+        // with the same uv, and every land texture the game ships is 256 square.
+        float lod = cone_lod(verts, to_world, direction, surface.footprint,
+                             terrain_layers(material)[0]);
+        surface.albedo *= ground_colour(material, surface.position.xy,
+                                        interpolate_uv(verts, weights), lod);
+    } else if (material.base_colour != NO_TEXTURE) {
         float lod = cone_lod(verts, to_world, direction, surface.footprint,
                              material.base_colour + 1u);
         surface.albedo *= base_colour(material, interpolate_uv(verts, weights), lod).rgb;
