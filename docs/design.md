@@ -1958,3 +1958,48 @@ matched resolution while costing five times as much there. What is established i
 frozen noise, not the sky guides, not exposure, and not the jitter sequence length; §3.5's other
 requirements — hash quality and sample correlation — and the hit-distance guides RR is never given
 are what remain.
+
+### 8.28 The upscaled frame was exposed by the noisy one
+
+Ray Reconstruction trailed the à-trous filter it replaces by 1.9 dB, and §3.5's sampling requirements
+turned out not to be why. Two things it names were tested and neither moved: replacing the sampler's
+hash with `pcg4d` from the paper it cites gained **+0.01 dB**, and taking two full 32-bit words per
+sample instead of two 16-bit halves gained **+0.005 dB**. Both were reverted — the old hash is a XOR
+of four products with a short finaliser, which is the family that paper measures as weak, and on this
+content it measures as sufficient.
+
+**What it was: a 2.7% brightness bias, uniform across the frame.** Mean luminance came out 0.7493
+against the reference's 0.7298, and splitting the frame into sky, middle and ground gave +2.5%, +2.8%
+and +2.9% — a global gain, not a region getting it wrong.
+
+The auto-exposure histogram bins `log2(luminance)` **per pixel**, and the mean of a log sits below
+the log of the mean by roughly the variance. A noisy frame therefore measures darker than it is and
+the tone curve opens to compensate. Attaching an upscaler sets the à-trous passes to zero — Ray
+Reconstruction is the denoiser — so what exposure read was a single sample per pixel.
+
+The fix is one binding: exposure measures **the frame the tone curve is about to map**, which is the
+upscaled one where there is an upscaler. It had read the render-resolution frame either way, to avoid
+averaging four times the pixels for what looked like the same answer; it is not the same answer. The
+ordering already allowed it, since DLSS runs before exposure in the frame, so no lag is introduced.
+
+| 1 spp, 3840×2160 out, vs the §8.26 supersampled reference | before | after |
+|---|---|---|
+| à-trous, 4 passes, native | 26.80 dB | 26.80 dB (bit-identical) |
+| RR DLAA, native | 24.89 dB | **27.49 dB** |
+| RR Performance, 1920×1080 in | 22.23 dB | **23.54 dB** |
+
+Ray Reconstruction now **beats** the filter it replaces at matched resolution, by 0.7 dB, while also
+antialiasing. Exposure at 4K costs 0.10 ms against 0.05 at render resolution, and the shipped frame
+is 11.27 ms.
+
+**A residual, deliberately left.** Rendering natively with `--denoise 0` still exposes 0.7% bright,
+because there is then no denoised image for exposure to read. That is a diagnostic setting rather
+than a shipping one, and the real cure is a histogram that averages luminance before taking its log.
+The bias is smaller there only because the tone curve's own compression of noisy highlights happens
+to pull the other way.
+
+**No test guards this**, and that is a choice rather than an omission: without an upscaler the change
+is provably inert — the native figure is bit-identical — so only a DLSS-gated test on this hardware
+could see it, and it would re-measure what this section records. The invariant is instead structural:
+`bind_targets` binds both passes from one `source`, and `record` dispatches both over one extent
+expression.

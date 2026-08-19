@@ -209,13 +209,10 @@ impl SceneRenderer {
     /// Separate from [`SceneRenderer::bind_scene`] because the two go stale for different reasons:
     /// these follow the images, which only a resize replaces, and that one follows the cell.
     fn bind_targets(&mut self) {
-        // Exposure reads the *render*-resolution frame whether or not it is upscaled afterwards: it
-        // wants an average, and averaging four times the pixels for the same answer is waste.
-        self.exposure.bind(&self.target);
         self.denoiser.bind(&self.gbuffer);
         self.composite.bind(&self.target, &self.gbuffer);
-        // Read as fields rather than through a method: `tonemap` is borrowed mutably here, and
-        // asking `self` for the source would borrow the whole of it.
+        // Read as fields rather than through a method: the two passes below are borrowed mutably
+        // here, and asking `self` for the source would borrow the whole of it.
         #[cfg(feature = "dlss")]
         let source = self
             .upscaler
@@ -223,6 +220,12 @@ impl SceneRenderer {
             .map_or(&self.target, crate::dlss::Upscaler::output);
         #[cfg(not(feature = "dlss"))]
         let source = &self.target;
+        // **The same image the tone curve maps**, not the render-resolution one it read before. The
+        // histogram bins `log2(luminance)` per pixel and the mean of a log sits below the log of the
+        // mean, so a noisy frame measures darker than it is and the curve opens to compensate —
+        // which under an upscaler, where the à-trous passes are off, is a single sample per pixel.
+        // See `docs/design.md` §8.28 for what that cost.
+        self.exposure.bind(source);
         self.tonemap.bind(source, self.exposure.buffer());
     }
 
@@ -634,16 +637,18 @@ impl SceneRenderer {
             memory_barrier::full(device, command_buffer);
             self.timestamps.write(command_buffer, 4);
 
-            // Exposure is measured on the composed frame, so it has to follow the composite rather
-            // than run alongside the trace.
-            self.exposure.record(device, command_buffer, extent);
+            // The size of the frame the tone curve maps, which is the upscaled one where there is
+            // an upscaler. Its *output's* size, because the curve is per pixel and the two are
+            // therefore the same — and dispatching either pass over the render size instead would
+            // leave three quarters of a 4K frame as the allocator left it.
+            let displayed = self.tonemap.output().extent();
+
+            // After the upscaler as well as the composite: what exposure measures has to be what
+            // the tone curve maps.
+            self.exposure.record(device, command_buffer, displayed);
             self.timestamps.write(command_buffer, 5);
 
-            // Over the tone curve's *own* size, which is the upscaled one where there is an
-            // upscaler — dispatching over the render size would leave three quarters of a 4K frame
-            // as the allocator left it.
-            self.tonemap
-                .record(command_buffer, self.tonemap.output().extent());
+            self.tonemap.record(command_buffer, displayed);
             memory_barrier::full(device, command_buffer);
             self.timestamps.write(command_buffer, 6);
 
