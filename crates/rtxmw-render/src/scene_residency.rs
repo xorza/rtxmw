@@ -205,6 +205,17 @@ impl SceneResidency {
         };
         self.lighting.ambient = ambient;
         self.lighting.sun = sun;
+        // **The dome's shape goes with the sky it came from, and an interior has no dome.** Its
+        // record is one colour by definition, so it gets a scale of zero and that colour as the
+        // floor — which leaves the shader one expression for both rather than a branch.
+        self.lighting.sky_warm = self.sky.warm;
+        self.lighting.sky_warmth = self.sky.warmth;
+        let (scale, floor) = match self.record {
+            Some(record) => (0.0, record.colour),
+            None => (self.sky.scale, Sky::NIGHT_FLOOR),
+        };
+        self.lighting.sky_scale = scale;
+        self.lighting.sky_floor = floor;
 
         // **Only interiors carry fog in the record**, so a recorded density is what identifies one
         // and settles all three of these together. An exterior's fog belongs to the weather system —

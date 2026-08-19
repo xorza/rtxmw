@@ -2782,3 +2782,56 @@ near 150 rather than 232.
 Costs elsewhere: the default outdoor hour moved 5.1% RMSE, mostly from the exposure exponent, and the
 census office is dimmer in its far corners — which is what a candle-lit room should look like beside
 a daylit one.
+
+### 8.49 A sky with a direction, and the bounce that finally sees it
+
+§8.45 left this written down: the sky is one colour over the whole dome bar a height gradient, so
+dawn is a uniform gold wash where it should be orange toward the sun and blue away from it. It was
+the most visible thing left at every hour, and closing it turned out to be two changes rather than
+one.
+
+**The shape.** `Sky` already derived the two spectra a sky interpolates between — the Rayleigh
+spectrum the air scatters, always blue, and what survived the sun's own path, reddening as it
+descends — and then averaged them into a single ambient and threw the rest away. `Sky::shape` now
+gives a direction's radiance from three things a view direction knows:
+
+- **Paleness**, `1 - exp(-(m_view - 1) / 6)`. Looking at the horizon is looking through thirty-eight
+  atmospheres, and light that has scattered that many times has forgotten what wavelength it started
+  as — so the tint runs from the Rayleigh blue overhead to white at the horizon, and the zenith is
+  the only part of the dome that keeps its colour at every hour.
+- **Warmth**, the same mix toward the transmitted spectrum, but weighted by how sunward the direction
+  is rather than applied to the whole sky at once.
+- **Brightness**, the Rayleigh phase function normalised to average one, times the paleness again
+  (thicker air is more lit air), times a term that dims the anti-solar side once the sun is low —
+  which is the Earth's own shadow said as a fraction rather than modelled.
+
+Two mixes, never a product. That is the third time this file has had to learn it: multiplying a
+rising spectrum by a falling one peaks in the middle and the middle is green.
+
+**The ambient is now derived from the shape rather than beside it.** `Sky::ambient` is the dome's
+average over 256 Fibonacci-sphere directions — the cheapest quadrature that is even everywhere and
+has no seam at a pole, which matters when the dome's whole point is that it is not the same all the
+way round. The light a surface is given and the sky behind it are therefore the same sky by
+construction, where before they were two expressions that happened to agree. `SKY_STRENGTH` was
+re-tuned so the default hour still lands on 0.518.
+
+**And the bounce finally sees it, which is the half that makes it matter.** `gather_indirect`
+terminated escaped rays with the flat ambient, so a directional sky would have been *drawn* and
+invisible to lighting — a wall facing a sunset would have stayed grey. Escaped rays now take
+`sky(towards)`, which is what the ray actually found and costs one evaluation of a function the frame
+already runs on every pixel that sees sky. At 06:30 the buildings take warm light on their sunrise
+side while the sky above them is still blue, which is the whole point of the exercise.
+
+The equation is now written twice — in Rust so the host can average it, in GLSL so a pixel can have
+its own direction — and nothing but a test stops those drifting. `tests/sky_dome.rs` renders a frame
+of nothing but sky at three hours and checks **every unclipped pixel** against `Sky::shape` for that
+pixel's direction; they agree to under one part in 255, which is all an 8-bit target can carry. A
+second test asserts the thing the cross-check cannot: that the sunward horizon is warm, the opposite
+one cool and dimmer, and the zenith blue at every hour — a pair of implementations that were both
+flat would pass the first test and fail this one.
+
+Frame cost at 1920×1080, best of five: 5.68 ms.
+
+**Still not modelled**, and now the most visible gap: the anti-solar dark band and the Belt of Venus
+above it are a geometric shadow rather than a path length, and `AWAY_SHARE` stands in for both with
+one number. Night is still a floor with no moons and no stars in it.

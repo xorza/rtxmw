@@ -193,6 +193,13 @@ layout(set = 0, binding = 14, scalar) readonly buffer Frame {
     vec3 fog;
     float fog_density;
     float fog_strength;
+    // The sky dome's shape: the warm end of every tint on it, how far the sunward side has gone
+    // toward that, and what the whole shape is multiplied by. Zero scale is an interior, which has
+    // no dome — see `Sky::shape` in `rtxmw-scene`, which this draws per pixel.
+    vec3 sky_warm;
+    float sky_warmth;
+    float sky_scale;
+    vec3 sky_floor;
     // One where the fog should be an even haze rather than banks — indoors, where the air is still
     // and a room is smaller than a single bank would be.
     float fog_uniform;

@@ -32,6 +32,15 @@ pub(crate) struct Lighting {
     /// trace has only its two halves.
     pub(crate) fog: Vec3,
     pub(crate) fog_density: f32,
+    /// The warm end of every tint on the sky's dome — see [`rtxmw_scene::Sky::shape`].
+    pub(crate) sky_warm: Vec3,
+    /// How far the sunward side of it has gone toward that: nothing at noon, nearly all at dusk.
+    pub(crate) sky_warmth: f32,
+    /// What the dome's shape is multiplied by. **Zero is an interior**, which has no dome.
+    pub(crate) sky_scale: f32,
+    /// What every direction gets on top of the shape: the night floor out of doors, and an
+    /// interior's own recorded colour indoors, which is the whole of its sky.
+    pub(crate) sky_floor: Vec3,
     /// Whether the fog forms banks. Weather does that to a landscape; a room's air is still.
     pub(crate) fog_banked: bool,
 }
@@ -48,6 +57,12 @@ impl Default for Lighting {
             fog_density: 0.0,
             // Unobservable at zero density, and this is what a cell gets until one records its own.
             fog_banked: true,
+            // Unobservable at zero scale, the same as `fog_banked` is at zero density: with no
+            // dome to shape there is nothing for a tint to tint.
+            sky_warm: Vec3::ONE / 3.0,
+            sky_warmth: 0.0,
+            sky_scale: 0.0,
+            sky_floor: Vec3::ZERO,
         }
     }
 }
@@ -167,6 +182,13 @@ pub struct FrameConstants {
     fog: [f32; 3],
     fog_density: f32,
     fog_strength: f32,
+    /// The sky dome's shape, which `lighting.glsl` draws per pixel from these four and
+    /// `tests/sky_dome.rs` cross-checks against [`rtxmw_scene::Sky::shape`]. See [`Lighting`] for
+    /// what each is.
+    sky_warm: [f32; 3],
+    sky_warmth: f32,
+    sky_scale: f32,
+    sky_floor: [f32; 3],
     /// One where the fog is an even haze rather than banks, which is what a room wants.
     fog_uniform: f32,
     /// The sinusoids the water surface is summed from — see [`crate::wave_spectrum`].
@@ -237,6 +259,10 @@ impl FrameConstants {
             fog: lighting.fog.to_array(),
             fog_density: lighting.fog_density,
             fog_strength: sampling.fog,
+            sky_warm: lighting.sky_warm.to_array(),
+            sky_warmth: lighting.sky_warmth,
+            sky_scale: lighting.sky_scale,
+            sky_floor: lighting.sky_floor.to_array(),
             fog_uniform: if lighting.fog_banked { 0.0 } else { 1.0 },
             // Rebuilt each frame rather than cached: it is a few hundred floats of arithmetic once
             // per frame against a million rays that read it, and a cache would need invalidating
@@ -621,10 +647,14 @@ mod tests {
         assert_eq!(offset_of!(FrameConstants, fog), 316);
         assert_eq!(offset_of!(FrameConstants, fog_density), 328);
         assert_eq!(offset_of!(FrameConstants, fog_strength), 332);
-        assert_eq!(offset_of!(FrameConstants, fog_uniform), 336);
+        assert_eq!(offset_of!(FrameConstants, sky_warm), 336);
+        assert_eq!(offset_of!(FrameConstants, sky_warmth), 348);
+        assert_eq!(offset_of!(FrameConstants, sky_scale), 352);
+        assert_eq!(offset_of!(FrameConstants, sky_floor), 356);
+        assert_eq!(offset_of!(FrameConstants, fog_uniform), 368);
         // The wave table follows, twenty tightly packed bytes apiece.
-        assert_eq!(offset_of!(FrameConstants, waves), 340);
-        assert_eq!(size_of::<FrameConstants>(), 340 + 20 * WAVE_COUNT);
+        assert_eq!(offset_of!(FrameConstants, waves), 372);
+        assert_eq!(size_of::<FrameConstants>(), 372 + 20 * WAVE_COUNT);
     }
 
     #[test]

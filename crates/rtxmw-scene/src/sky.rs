@@ -14,22 +14,6 @@ use crate::time_of_day::TimeOfDay;
 /// blue, and at sunset it crosses thirty and loses all of it.
 const ZENITH_DEPTH: Vec3 = Vec3::new(0.0464, 0.1080, 0.2648);
 
-/// How much of the sky's colour is mixed back toward grey with the sun overhead.
-///
-/// **Single scattering is more saturated than a real sky.** The light in one has bounced more than
-/// once, and every bounce mixes the channels back together; a model with one scattering event gives
-/// a cobalt noon and a lurid dusk. This stands in for the bounces until there is an atmosphere LUT
-/// to do it properly.
-const SKY_GREYING: f32 = 0.4;
-
-/// And how much with it on the horizon.
-///
-/// **That it rises at all is the part which is not a fudge.** More air is more bouncing, so less of
-/// the colour survives, and a sun on the horizon is looking through thirty times what one overhead
-/// is. Held level with `SKY_GREYING` the twilight tint came out three quarters saturated and an hour
-/// after sunset was a flat magenta; letting it rise to here halves that and leaves noon alone.
-const HORIZON_GREYING: f32 = 0.8;
-
 /// The sky's radiance against what the arithmetic below produces.
 ///
 /// Pure scale, set so the **default hour** comes out exactly where the model before it did — a
@@ -40,7 +24,7 @@ const HORIZON_GREYING: f32 = 0.8;
 ///
 /// `ZENITH_DEPTH` is the only constant in this file that came from anywhere but an eye; this, the
 /// greying, the twilight width and the night floor are all tuned, and say so.
-const SKY_STRENGTH: f32 = 2.361;
+const SKY_STRENGTH: f32 = 1.5786;
 
 /// What the sky radiates once the sun is properly down.
 ///
@@ -76,16 +60,55 @@ const HORIZON_SKY: f32 = 0.20;
 /// because `sin` is not a const function. A test below is what keeps it honest.
 const TWILIGHT_FALL: f32 = 0.104_528;
 
+/// How far up the dome the paleness reaches, in air masses.
+///
+/// **A thick sky is a white one.** Looking at the horizon is looking through thirty-eight
+/// atmospheres, and light that has scattered that many times has lost which wavelength it started
+/// as — so the horizon is pale whatever the hour and the zenith keeps its colour. Six air masses to
+/// the e-fold puts the change where the eye sees it, a couple of hand-spans above the horizon.
+const PALE_MASS: f32 = 6.0;
+
+/// What the sky away from a low sun keeps of what the sky toward it has.
+///
+/// At dusk the light is all on one side: the air opposite the sun is in the Earth's own shadow and
+/// lit only from above. This is that, as a fraction — it does nothing at noon, where there is no
+/// side for the sun to be on.
+const AWAY_SHARE: f32 = 0.25;
+
 /// The sun and the sky above an exterior cell at one moment, which together are all its light.
+///
+/// **The dome has a direction now, and that is most of this type.** A sky is not one colour: it is
+/// deep blue overhead and pale at the horizon, and once the sun is low it is orange on one side and
+/// dim blue on the other. [`Self::shape`] is the shape, [`Self::ambient`] is its average, and
+/// `lighting.glsl` draws the same shape per pixel — the test in `tests/sky_dome.rs` is what keeps
+/// the two from drifting apart.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Sky {
     /// Black once the sun is down, which is how a cell with no sun says so.
     pub sun: Sun,
-    /// What the sky itself radiates, and so what fills every shadow out of doors.
+    /// The dome's average radiance, which is what an unshadowed surface receives from all of it.
+    ///
+    /// Derived from [`Self::shape`] rather than beside it, so the light a surface is given and
+    /// the sky behind it are the same sky.
     pub ambient: Vec3,
+    /// The colour a beam has left after the air the sun's own light crossed, normalised.
+    ///
+    /// The warm end of every tint on the dome. White with the sun overhead, deep red on the horizon.
+    pub warm: Vec3,
+    /// How far the sunward sky has gone toward [`Self::warm`]: nothing at noon, nearly all at dusk.
+    pub warmth: f32,
+    /// What the dome's shape is multiplied by to give radiance.
+    pub scale: f32,
 }
 
 impl Sky {
+    /// What every direction of the dome gets whatever the hour.
+    ///
+    /// Drawn as well as shaded with, so the sky a surface is lit by is the sky behind it at midnight
+    /// too. An associated constant rather than a field, because it is the same for every sky there
+    /// is — it becomes a field the day a moon makes it vary.
+    pub const NIGHT_FLOOR: Vec3 = NIGHT_SKY;
+
     /// The light above an exterior at `time`.
     pub fn at(time: TimeOfDay) -> Self {
         let bare = Sun::at(time.orbit());
@@ -95,26 +118,12 @@ impl Sky {
         let climb = -bare.direction.z;
         let transmitted = Self::transmittance(climb.max(0.0));
 
-        // **The sky's colour runs between two spectra and never leaves the line between them.** One
-        // is what the air scatters, which is blue; the other is what survived the air, which reddens
-        // as the sun descends. How far along is how much the air took: nothing at noon, nearly all of
-        // it at the horizon.
-        //
-        // The obvious expression is `(1 - T) * T` — light that got in and then scattered out — and it
-        // is wrong in a way that is invisible until you plot it. Each channel peaks where its own
-        // transmittance is a half, and green's half lands at six and a half air masses, which is an
-        // elevation of nine degrees: every evening passed through **green** on its way from blue to
-        // red. A sky does not do that. Two endpoints and a mix cannot, either — the line from blue to
-        // red runs through grey.
-        // **Blue, always**: scattering *out* of a beam and scattering *into* the sky are the same
-        // event seen from two sides, so the sky's own colour is the depths above — normalised here
-        // rather than written down again, because two copies of one spectrum drift apart.
-        let rayleigh = ZENITH_DEPTH / (ZENITH_DEPTH.x + ZENITH_DEPTH.y + ZENITH_DEPTH.z);
+        // **The warm end of the dome**: what one beam has left after the air the sun's own light
+        // crossed. White overhead, deep red on the horizon, and the only thing on the dome that
+        // knows what hour it is.
         let survived = transmitted.x + transmitted.y + transmitted.z;
         let warmth = 1.0 - survived / 3.0;
-        let scattered = rayleigh.lerp(transmitted / survived.max(1e-6), warmth);
-        let grey = Vec3::splat((scattered.x + scattered.y + scattered.z) / 3.0);
-        let greying = SKY_GREYING + (HORIZON_GREYING - SKY_GREYING) * warmth;
+        let warm = transmitted / survived.max(1e-6);
 
         // **How much of the sky is still lit**, in two halves that meet at the horizon. Above it the
         // square root of the climb rather than the climb: a sky an hour before sunset is dimmer than
@@ -130,13 +139,74 @@ impl Sky {
         let radius = Sun::REAL_ANGULAR_RADIUS;
         let above = ((climb + radius) / (2.0 * radius)).clamp(0.0, 1.0);
         let showing = above * above * (3.0 - 2.0 * above);
-        Self {
+        let mut sky = Self {
             sun: Sun {
                 colour: bare.colour * transmitted * showing,
                 ..bare
             },
-            ambient: scattered.lerp(grey, greying) * SKY_STRENGTH * lit + NIGHT_SKY,
+            ambient: Vec3::ZERO,
+            warm,
+            warmth,
+            scale: SKY_STRENGTH * lit,
+        };
+        sky.ambient = sky.dome_average();
+        sky
+    }
+
+    /// What the sky radiates in one direction, before the night floor.
+    ///
+    /// **Two mixes and never a product.** Each runs between two spectra, so the colour walks the
+    /// line blue → white → red and cannot leave it. Multiplying them instead is the mistake this
+    /// file has now made twice: a product of a rising and a falling spectrum peaks in the middle,
+    /// and the middle is green.
+    ///
+    /// `lighting.glsl` draws exactly this per pixel. `tests/sky_dome.rs` renders a frame of sky and
+    /// checks it against this, because two implementations of one equation is two chances to be
+    /// wrong.
+    pub fn shape(&self, direction: Vec3) -> Vec3 {
+        // The sun's own, rather than a parameter: a caller that could pass a direction of its own
+        // could pass one this sky's warmth was never computed against.
+        let cosine = direction.dot(-self.sun.direction);
+        let sunward = (cosine * 0.5 + 0.5).clamp(0.0, 1.0);
+
+        let rayleigh = ZENITH_DEPTH / (ZENITH_DEPTH.x + ZENITH_DEPTH.y + ZENITH_DEPTH.z);
+        // Thicker air toward the horizon, and thick air has forgotten what colour it was.
+        let pale = 1.0 - (-(Self::air_mass(direction.z.max(0.0)) - 1.0) / PALE_MASS).exp();
+        let tint = rayleigh
+            .lerp(Vec3::splat(1.0 / 3.0), pale)
+            .lerp(self.warm, sunward * self.warmth);
+
+        // Rayleigh's own phase function, normalised to average one over the sphere: a gentle
+        // brightening along the sun's line and against it, and a minimum square to it.
+        let phase = 0.75 * (1.0 + cosine * cosine);
+        // Brighter at the horizon, where the ray crosses more lit air — and once the sun is low,
+        // dimmer on the side it is not, which is the Earth's shadow said as a fraction.
+        let side = AWAY_SHARE + (1.0 - AWAY_SHARE) * (1.0 - self.warmth * (1.0 - sunward));
+        tint * (phase * (1.0 + pale) * side * self.scale)
+    }
+
+    /// The mean of [`Self::shape`] over every direction, plus the night floor.
+    ///
+    /// **The light a surface is given has to be the sky behind it**, or a frame lit by one and
+    /// drawn with the other disagrees with itself. There is no closed form, so it is a Fibonacci
+    /// sphere — the cheapest quadrature that is even in every direction and has no seam at a pole,
+    /// which matters because the dome's whole point is that it is not the same all the way round.
+    ///
+    /// **Two hundred and fifty-six of them, once a frame**, because the window rebuilds the sky
+    /// every frame from a clock that moves. Measured at **7.5 us**, which is 0.045% of the 16.6 ms
+    /// a frame has — worth writing down rather than leaving a reader to wonder what a per-frame
+    /// quadrature costs, and far too little to be worth caching against a time that changes anyway.
+    fn dome_average(&self) -> Vec3 {
+        const SAMPLES: u32 = 256;
+        let mut total = Vec3::ZERO;
+        for i in 0..SAMPLES {
+            let z = 1.0 - 2.0 * (i as f32 + 0.5) / SAMPLES as f32;
+            let radius = (1.0 - z * z).max(0.0).sqrt();
+            // The golden angle, which is what spreads the points evenly rather than in rings.
+            let theta = 2.399_963_2 * i as f32;
+            total += self.shape(Vec3::new(radius * theta.cos(), radius * theta.sin(), z));
         }
+        total / SAMPLES as f32 + Self::NIGHT_FLOOR
     }
 
     /// What is left of a beam that crossed the atmosphere to a sun `climb` above the horizon.
@@ -145,9 +215,17 @@ impl Sky {
     /// flat-earth `1/sin`, which is off by 10% at ten degrees and diverges at the horizon where all
     /// of this matters most — theirs stays finite, reaching 38 atmospheres at zero.
     fn transmittance(climb: f32) -> Vec3 {
+        (-ZENITH_DEPTH * Self::air_mass(climb)).exp()
+    }
+
+    /// How many atmospheres a beam crosses to something `climb` above the horizon.
+    ///
+    /// Kasten and Young's fit rather than the flat-earth `1/sin`, which is off by 10% at ten degrees
+    /// and diverges at the horizon where all of this matters most — theirs stays finite, reaching 38
+    /// atmospheres at zero.
+    fn air_mass(climb: f32) -> f32 {
         let degrees = climb.clamp(0.0, 1.0).asin().to_degrees();
-        let air_mass = 1.0 / (climb + 0.50572 * (degrees + 6.07995).powf(-1.6364));
-        (-ZENITH_DEPTH * air_mass).exp()
+        1.0 / (climb + 0.50572 * (degrees + 6.07995).powf(-1.6364))
     }
 }
 

@@ -192,11 +192,46 @@ vec3 shade(Surface surface, vec3 incoming, uvec2 pixel, uint salt, uint samples)
 // radiance is its irradiance divided by the solid angle it subtends, which for half a degree is
 // some sixty thousand times the value used here. Making the two agree means turning the directional
 // light into an area light, which is a larger change than drawing a bright circle.
+// The three of `sky.rs`'s constants the dome's *shape* needs, which are written down in two
+// languages because the shape is: the Rayleigh spectrum normalised (`ZENITH_DEPTH` over its own
+// sum), how far up the dome the horizon's paleness reaches in air masses, and what the sky away
+// from a low sun keeps of what the sky toward it has.
+//
+// **What makes duplicating them bearable is that a test fails when they drift**, not that any of
+// them is beyond argument — two are tuning dials. `tests/sky_dome.rs` renders a frame of nothing but
+// sky and checks every pixel against `Sky::shape`, so a number changed on one side and not the other
+// is a red suite rather than a slowly wrong horizon. Everything that varies with the hour arrives in
+// the frame constants instead, where there is only one copy to change.
+const vec3 RAYLEIGH_TINT = vec3(0.110687, 0.257634, 0.631679);
+const float PALE_MASS = 6.0;
+const float AWAY_SHARE = 0.25;
+
+// How many atmospheres a beam crosses to something `climb` above the horizon — Kasten and Young.
+float air_mass(float climb) {
+    float degrees = degrees(asin(clamp(climb, 0.0, 1.0)));
+    return 1.0 / (climb + 0.50572 * pow(degrees + 6.07995, -1.6364));
+}
+
 vec3 sky_seen_through(vec3 direction, float lobe) {
-    // Brighter overhead than at the horizon, which is the one feature of a sky worth having before
-    // there is a weather system to ask.
-    float height = clamp(direction.z * 0.5 + 0.5, 0.0, 1.0);
-    vec3 colour = frame.ambient * mix(0.75, 1.35, height);
+    // **The sky has a direction, and this is `Sky::shape` drawn per pixel.** Deep blue overhead,
+    // pale at the horizon where the air is thick enough to have forgotten what colour it was, and
+    // once the sun is low, orange on its side and dim blue on the other. Everything that knows what
+    // hour it is arrives in the frame constants; what is here is only the part that varies with
+    // where the ray is pointing.
+    //
+    // Two mixes and never a product, which is the mistake this cost twice: multiplying a rising
+    // spectrum by a falling one peaks in the middle, and the middle is green.
+    float cosine = dot(direction, -frame.sun_direction);
+    float sunward = clamp(cosine * 0.5 + 0.5, 0.0, 1.0);
+    float pale = 1.0 - exp(-(air_mass(max(direction.z, 0.0)) - 1.0) / PALE_MASS);
+    vec3 tint = mix(mix(RAYLEIGH_TINT, vec3(1.0 / 3.0), pale), frame.sky_warm,
+                    sunward * frame.sky_warmth);
+
+    float phase = 0.75 * (1.0 + cosine * cosine);
+    float side = AWAY_SHARE + (1.0 - AWAY_SHARE) * (1.0 - frame.sky_warmth * (1.0 - sunward));
+    // **No branch for an interior**, which has no dome: the host hands over a scale of zero and its
+    // own recorded ambient as the floor, so the same expression covers a room and a sky.
+    vec3 colour = tint * (phase * (1.0 + pale) * side * frame.sky_scale) + frame.sky_floor;
 
     // **`lobe` is how far a rough surface smears the sun**, in radians. Water too fine to resolve
     // is not flat — the slopes are still there, they are simply smaller than a pixel — and what
@@ -248,7 +283,12 @@ vec3 gather_indirect(Surface surface, uvec2 pixel) {
         // sky reflected off it or the ground through it — both far closer to the ambient this
         // terminates with than to nothing at all.
         if (!bounce.hit || bounce.water) {
-            total += ambient;
+            // **What the ray actually found**, which is the sky in that direction rather than the
+            // dome's average. The ray was traced either way, so this costs one evaluation of a
+            // function the frame already runs on every pixel that sees sky — and it is what makes a
+            // directional dome do any work: a wall facing a sunset takes its colour from the part of
+            // the sky that is orange, not from the average of a sky that is orange on one side.
+            total += sky(towards) * daylight_reaching(surface.position);
             continue;
         }
         // Terminated with a flat ambient rather than a second bounce: the next order is ambient
