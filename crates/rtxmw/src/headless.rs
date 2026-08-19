@@ -12,17 +12,12 @@ use rtxmw_gpu::{
     readback,
 };
 use rtxmw_render::SceneRenderer;
-#[cfg(feature = "dlss")]
-use rtxmw_render::dlss::Upscaler;
 use rtxmw_scene::{CellId, CellStreamer, LoadedCell};
 
 use crate::cli::ScreenshotOptions;
 use crate::scene_loader;
-
-/// Stands in for the upscaler where DLSS is not compiled in, so one code path serves both builds.
-#[cfg(not(feature = "dlss"))]
-type Upscaler = std::convert::Infallible;
 use crate::scene_loader::Viewpoint;
+use crate::upscaler;
 
 /// Renders a cell and writes the last frame to `options.path` as a PNG.
 ///
@@ -48,17 +43,17 @@ pub(crate) fn screenshot(options: &ScreenshotOptions) -> Result<f32, Box<dyn std
     // NGX names extensions of its own, and they have to be enabled when the device is created —
     // enabled where present, so a machine without them still builds a device that simply cannot
     // upscale. Empty when the feature is compiled out.
-    let device = Device::new(&instance, &physical, &upscaler_extensions())?;
+    let device = Device::new(&instance, &physical, &upscaler::device_extensions())?;
     let memory = Memory::new(&instance, &physical, &device)?;
     let mut uploader = Uploader::new(&device, &memory, physical.graphics_queue_family())?;
 
     // With an upscaler the size asked for is the *output* and DLSS says what to trace at, so it is
     // built before the renderer that has to be sized by its answer.
     let output = *size;
-    let upscaler = build_upscaler(&instance, &physical, &device, &mut uploader, output)?;
-    let extent = render_size(upscaler.as_ref(), output);
+    let upscaler = upscaler::build(&instance, &physical, &device, &mut uploader, output)?;
+    let extent = upscaler::render_size(upscaler.as_ref(), output);
     let mut renderer = SceneRenderer::new(&device, &physical, &memory, extent)?;
-    attach_upscaler(&memory, &mut renderer, upscaler)?;
+    upscaler::attach(&memory, &mut renderer, upscaler)?;
 
     if let Some(samples) = *samples {
         renderer.set_bounce_samples(samples);
@@ -185,101 +180,4 @@ fn fill_window(
         started.elapsed().as_secs_f32() * 1000.0
     );
     Ok(())
-}
-
-/// Extensions NGX needs enabled on the device, or none when DLSS is not compiled in.
-fn upscaler_extensions() -> Vec<&'static std::ffi::CStr> {
-    #[cfg(feature = "dlss")]
-    {
-        rtxmw_render::dlss::Requirements::query()
-            .map(|required| required.device)
-            .unwrap_or_default()
-    }
-    #[cfg(not(feature = "dlss"))]
-    Vec::new()
-}
-
-/// Builds an upscaler, where DLSS is compiled in and asked for.
-///
-/// **`RTXMW_DLSS` is read here and nowhere else.** Opt-in twice over — the feature to compile it and
-/// the variable to attach it — so that a build carrying DLSS renders identically to one without it
-/// until asked, which is what makes the two comparable.
-fn build_upscaler(
-    _instance: &Instance,
-    _physical: &PhysicalDevice,
-    _device: &Device,
-    _uploader: &mut Uploader,
-    _output: vk::Extent2D,
-) -> Result<Option<Upscaler>, Box<dyn std::error::Error>> {
-    #[cfg(feature = "dlss")]
-    {
-        // The variable doubles as the quality selector: `1` is the §5.3 Performance mode the frame
-        // budget is written against, and a name picks another. An unrecognised value is a typo
-        // worth stopping for rather than silently rendering at a mode nobody asked for.
-        let Ok(asked) = std::env::var("RTXMW_DLSS") else {
-            return Ok(None);
-        };
-        let preset = rtxmw_render::dlss::Preset::named(&asked)
-            .ok_or_else(|| format!("RTXMW_DLSS={asked:?} names no preset"))?;
-        let upscaler = Upscaler::new(
-            _instance,
-            _physical,
-            _device,
-            _uploader,
-            _output,
-            preset,
-            upscaler_paths(),
-        )
-        .map_err(|e| format!("DLSS would not start: {e}"))?;
-        Ok(Some(upscaler))
-    }
-    #[cfg(not(feature = "dlss"))]
-    Ok(None)
-}
-
-/// What to trace at to produce `output`, which is `output` itself when nothing upscales it.
-fn render_size(_upscaler: Option<&Upscaler>, output: vk::Extent2D) -> vk::Extent2D {
-    #[cfg(feature = "dlss")]
-    return _upscaler.map_or(output, Upscaler::render_size);
-    #[cfg(not(feature = "dlss"))]
-    output
-}
-
-/// Hands `upscaler` to the renderer, if there is one.
-fn attach_upscaler(
-    _memory: &Memory,
-    _renderer: &mut SceneRenderer,
-    _upscaler: Option<Upscaler>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    #[cfg(feature = "dlss")]
-    if let Some(upscaler) = _upscaler {
-        let render = upscaler.render_size();
-        let output = upscaler.output().extent();
-        // Ray Reconstruction denoises as it upscales, so the à-trous passes would be filtering
-        // something about to be filtered again.
-        _renderer.set_denoise_passes(0);
-        _renderer.set_upscaler(_memory, Some(upscaler))?;
-        println!(
-            "  DLSS Ray Reconstruction: {}x{} to {}x{}",
-            render.width, render.height, output.width, output.height
-        );
-    }
-    Ok(())
-}
-
-/// Where NGX may write and where its feature libraries are.
-#[cfg(feature = "dlss")]
-fn upscaler_paths() -> rtxmw_render::dlss::Paths<'static> {
-    // Held for the life of the process, which is how long NGX keeps the pointer it is given.
-    static DATA: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
-    let data = DATA.get_or_init(|| {
-        let path = std::env::temp_dir().join("rtxmw-ngx");
-        // NGX wants somewhere it may write; it says so as `FAIL_UnableToWriteToAppDataPath`.
-        let _ = std::fs::create_dir_all(&path);
-        path
-    });
-    rtxmw_render::dlss::Paths {
-        data,
-        feature_libraries: std::path::Path::new(rtxmw_render::dlss::FEATURE_LIBRARIES),
-    }
 }

@@ -6,6 +6,7 @@ mod cli;
 mod headless;
 mod renderer;
 mod scene_loader;
+mod upscaler;
 
 use winit::event_loop::{ControlFlow, EventLoop};
 

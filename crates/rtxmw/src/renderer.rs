@@ -12,6 +12,8 @@ use rtxmw_render::{FrameConstants, OUTPUT_FORMAT, SceneRenderer, TARGET_FORMAT};
 use rtxmw_scene::{CellId, StaticScene};
 use rtxmw_texture::Texture;
 
+use crate::upscaler;
+
 /// Rows the trace renders, independent of the window's own height.
 ///
 /// The design budgets for 1080 internal rows upscaled to a 2160-row display (`docs/design.md`
@@ -45,6 +47,17 @@ fn internal_extent(window: vk::Extent2D) -> vk::Extent2D {
 pub(crate) struct Renderer {
     /// Everything that does not care about a window: the pass, the target, the loaded cell.
     scene: SceneRenderer,
+    /// Whether an upscaler was asked for, so a resize can build the next one.
+    ///
+    /// The feature is built for one pair of resolutions and cannot be told a new pair, so a window
+    /// that changes size needs a new one — and by then the old one has been handed to the scene.
+    upscaling: bool,
+    /// The size everything downstream of the swapchain was built for.
+    ///
+    /// A compositor sends a resize on first map that changes nothing, and a drag sends one a frame.
+    /// Rebuilding Ray Reconstruction means uploading its weights again, so the size is remembered
+    /// rather than assumed to have changed.
+    display: vk::Extent2D,
     /// Holds the only `Memory` clone the renderer needs: every buffer and image keeps its own, and
     /// everything that creates one goes through the uploader to reach it.
     uploader: Uploader,
@@ -76,7 +89,10 @@ impl Renderer {
             "selected device cannot present to this surface"
         );
 
-        let device = Device::new(&instance, &physical, &[])?;
+        // NGX names device extensions of its own and they have to be enabled at creation, so the
+        // decision to upscale is made before there is anything to upscale. Empty without the
+        // feature, and empty on a machine whose driver does not offer them.
+        let device = Device::new(&instance, &physical, &upscaler::device_extensions())?;
         let extent = vk::Extent2D { width, height };
         let swapchain = Swapchain::new(&instance, &physical, &device, &surface, extent)?;
         let frames = Frames::new(
@@ -86,11 +102,32 @@ impl Renderer {
         )?;
 
         let memory = Memory::new(&instance, &physical, &device)?;
-        let uploader = Uploader::new(&device, &memory, physical.graphics_queue_family())?;
-        let scene = SceneRenderer::new(&device, &physical, &memory, internal_extent(extent))?;
+        let mut uploader = Uploader::new(&device, &memory, physical.graphics_queue_family())?;
+
+        // **The window's own size is the output**, so the blit that follows is a pure copy rather
+        // than the upscale it is without one. What to trace at is then DLSS's answer, not this
+        // crate's — `internal_extent` is the fallback for a frame nothing else will resize.
+        let display = swapchain.extent();
+        let upscaler = upscaler::build(&instance, &physical, &device, &mut uploader, display)
+            .map_err(|failed| {
+                eprintln!("DLSS did not start, rendering without it: {failed}");
+            })
+            .unwrap_or_default();
+        let upscaling = upscaler.is_some();
+        let mut scene = SceneRenderer::new(
+            &device,
+            &physical,
+            &memory,
+            upscaler::render_size(upscaler.as_ref(), internal_extent(display)),
+        )?;
+        if let Err(failed) = upscaler::attach(&memory, &mut scene, upscaler) {
+            eprintln!("DLSS did not attach: {failed}");
+        }
 
         Ok(Self {
             scene,
+            upscaling,
+            display,
             uploader,
             frames,
             swapchain,
@@ -362,10 +399,42 @@ impl Renderer {
         // Against the *swapchain's* extent rather than the one asked for: a compositor may hand
         // back something else, and the internal image has to match what is actually presented or
         // the aspect correction is computed for a window that does not exist.
+        let display = self.swapchain.extent();
+        if display == self.display {
+            // The swapchain still had to be rebuilt — it may have been out of date for its own
+            // reasons — but nothing sized by the window has changed.
+            self.needs_recreate = false;
+            return Ok(());
+        }
+        self.display = display;
+
+        // **The old feature goes first.** NGX builds Ray Reconstruction for a fixed pair of
+        // resolutions and cannot be told another, so a resize needs a new one — and releasing the
+        // old one shuts NGX down for the device, which would orphan a replacement built before it.
+        upscaler::detach(self.uploader.memory(), &mut self.scene)
+            .map_err(|failed| eprintln!("DLSS did not release: {failed}"))
+            .ok();
+        let upscaler = if self.upscaling {
+            upscaler::build(
+                &self.instance,
+                &self.physical,
+                &self.device,
+                &mut self.uploader,
+                display,
+            )
+            .map_err(|failed| eprintln!("DLSS did not survive the resize: {failed}"))
+            .unwrap_or_default()
+        } else {
+            None
+        };
+        self.upscaling = upscaler.is_some();
         self.scene.resize(
             self.uploader.memory(),
-            internal_extent(self.swapchain.extent()),
+            upscaler::render_size(upscaler.as_ref(), internal_extent(display)),
         )?;
+        if let Err(failed) = upscaler::attach(self.uploader.memory(), &mut self.scene, upscaler) {
+            eprintln!("DLSS did not reattach: {failed}");
+        }
         self.needs_recreate = false;
         Ok(())
     }

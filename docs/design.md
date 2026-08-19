@@ -2003,3 +2003,38 @@ is provably inert — the native figure is bit-identical — so only a DLSS-gate
 could see it, and it would re-measure what this section records. The invariant is instead structural:
 `bind_targets` binds both passes from one `source`, and `record` dispatches both over one extent
 expression.
+
+### 8.29 Ray Reconstruction reaches the window
+
+It had been reachable only from `--screenshot`, which is to say only from a stationary camera —
+and a stationary camera cannot show what a temporal upscaler gets wrong. The windowed renderer now
+builds the same upscaler: NGX's device extensions at device creation, the **window's own size as the
+output** so the blit to the swapchain is a copy rather than the upscale it is without one, and DLSS's
+answer as the size to trace at.
+
+The wiring is shared rather than copied. `upscaler.rs` holds what both front ends need, because the
+two bring up Vulkan separately and a second copy would be a second place for them to disagree about
+what DLSS was told.
+
+**Two bugs, both only reachable from a window.**
+
+A compositor sends a resize on first map that changes nothing, so `recreate` ran on frame one — and
+it built the replacement upscaler *before* releasing the old one. Each `Upscaler` owns its own `Ngx`,
+and dropping one calls `Shutdown1` for the whole device, so the feature just built was orphaned the
+moment the old one went. NGX reports that as `FAIL_NotInitialized` at every evaluation and says
+nothing at build time; the log showed the shape of it — one context initialised, **two** features
+created, **three** shutdowns. The order is now release, then build.
+
+The same first-map resize also meant a full rebuild for a size that had not changed, which costs a
+weight upload. The swapchain still has to be recreated — it may be out of date for its own reasons —
+but everything sized by the window is now left alone when the window's size is what it already was.
+That matters more during a drag, which sends one of these a frame.
+
+**What this does not yet cover.** There is no explicit history reset for a camera that jumps: `reset`
+is derived from whether a previous frame exists, which is true from the second frame onward. Nothing
+in the engine teleports yet, so there is nothing to test it against — but a fast-travel or a
+coc-style jump will need one, and the symptom will be a smear rather than a crash.
+
+Note for a wide display: the output follows the window, so a 7680×2160 one traces 3840×1080 — twice
+the pixels §5.3 budgets for. That is the right answer for that window and the wrong one for the
+budget, and the two only agree at 3840×2160.

@@ -230,7 +230,10 @@ impl SceneRenderer {
     }
 
     /// Hands this renderer an upscaler, which replaces the denoiser and moves the tone curve to the
-    /// upscaled resolution.
+    /// upscaled resolution — and taking one away restores both.
+    ///
+    /// A caller wanting some other pass count says so afterwards, through
+    /// [`SceneRenderer::set_denoise_passes`].
     ///
     /// **Built by the caller**, because NGX comes up on a Vulkan instance and this does not own one.
     /// Passing one also turns jitter on: DLSS resolves detail across frames and cannot do that if
@@ -246,6 +249,14 @@ impl SceneRenderer {
             None => self.target.extent(),
         };
         self.jitter = upscaler.is_some();
+        // **Ray Reconstruction stands in for the à-trous filter rather than beside it**, so taking
+        // one away has to put the filter back. Leaving that to the caller is what left a renderer
+        // whose upscaler failed to rebuild running with neither.
+        self.denoise_passes = if upscaler.is_some() {
+            0
+        } else {
+            crate::denoiser::DEFAULT_PASSES
+        };
         self.upscaler = upscaler;
         // The tone curve now runs at the upscaled size, so its own output follows.
         self.tonemap.resize(memory, output)?;
