@@ -21,6 +21,39 @@ use rtxmw_gpu::{Device, Instance, PhysicalDevice};
 
 mod ffi;
 
+/// How much NGX says about what it is doing, from `RTXMW_NGX_LOG`.
+///
+/// **Off unless asked, and worth asking.** Every failure this API has is a one-word status —
+/// `FAIL_InvalidParameter` names no parameter — while NGX's own log says exactly what it disliked:
+/// "Low resolution Motion Vectors required" is reachable no other way, and cost two wrong guesses
+/// before it was found.
+///
+/// It is not on by default because it cannot be had quietly: the feature libraries write 422 lines
+/// to the console on a single successful run, which is enough to bury the assertion message of
+/// whatever failure sent someone looking. Set `RTXMW_NGX_LOG=1` for that, or `2` for everything;
+/// the files land beside the logs in the data path.
+fn logging_level() -> c_int {
+    std::env::var("RTXMW_NGX_LOG")
+        .ok()
+        .and_then(|level| level.parse().ok())
+        .unwrap_or(0)
+}
+
+/// `NVSDK_NGX_Feature_RayReconstruction`, from `nvsdk_ngx_defs.h:214`.
+const FEATURE_RAY_RECONSTRUCTION: c_int = 13;
+
+/// How the frame is described to DLSS, from `nvsdk_ngx_defs.h:291`.
+///
+/// `IsHDR` because the trace's output is scene-referred radiance rather than a tone-mapped image —
+/// the whole point of the G-buffer split — and `DepthInverted` because the projection is reverse-Z,
+/// so the near plane is 1 and the far plane 0.
+///
+/// **`MVLowRes` reads as a description, not a request**: it says the motion vectors *are* at the
+/// low — render — resolution, which §8.13 writes them at. Reasoning it the other way round and
+/// leaving it out is what Ray Reconstruction rejects with "Low resolution Motion Vectors required",
+/// a message reachable only from NGX's own log.
+const CREATE_FLAGS: c_int = (1 << 0) | (1 << 1) | (1 << 3);
+
 /// Extensions NGX names that Vulkan 1.2 provides itself, and which must therefore not be enabled.
 ///
 /// Enabling one beside the core feature it was promoted into is invalid rather than redundant.
@@ -78,6 +111,28 @@ impl Requirements {
             .retain(|name| !SUPERSEDED_BY_CORE.contains(name));
         Ok(asked)
     }
+}
+
+/// Writes an unsigned into a parameter map.
+///
+/// A free function taking the map, because there are two of them and they are not interchangeable:
+/// NGX owns the capability map and answers questions from it, while a feature is built from one the
+/// caller allocates. Both are written the same way and neither belongs to the other.
+///
+/// # Safety
+/// `parameters` must be a live NGX parameter map.
+fn set_u32(parameters: *mut c_void, name: &CStr, value: u32) {
+    // SAFETY: the caller guarantees the map; the name is a nul-terminated static.
+    unsafe { ffi::NVSDK_NGX_Parameter_SetUI(parameters, name.as_ptr(), value) };
+}
+
+/// Writes an integer into a parameter map. See [`set_u32`].
+///
+/// # Safety
+/// `parameters` must be a live NGX parameter map.
+fn set_i32(parameters: *mut c_void, name: &CStr, value: c_int) {
+    // SAFETY: as above.
+    unsafe { ffi::NVSDK_NGX_Parameter_SetI(parameters, name.as_ptr(), value) };
 }
 
 /// A path as NGX takes one: nul-terminated UTF-32.
@@ -212,7 +267,7 @@ impl Ngx {
             },
             internal: std::ptr::null_mut(),
             logging_callback: std::ptr::null(),
-            minimum_logging_level: 0,
+            minimum_logging_level: logging_level(),
             disable_other_logging_sinks: false,
         };
 
@@ -332,11 +387,11 @@ impl Ngx {
             return Err(Status::OUT_OF_DATE);
         }
 
-        self.set_u32(c"Width", output.0);
-        self.set_u32(c"Height", output.1);
-        self.set_i32(c"PerfQualityValue", preset.value());
+        set_u32(self.capabilities, c"Width", output.0);
+        set_u32(self.capabilities, c"Height", output.1);
+        set_i32(self.capabilities, c"PerfQualityValue", preset.value());
         // Older feature libraries still read this, and the SDK's helper always clears it.
-        self.set_i32(c"RTXValue", 0);
+        set_i32(self.capabilities, c"RTXValue", 0);
 
         // SAFETY: the pointer came from the map under the name the SDK documents for exactly this
         // signature, and it is called with that map.
@@ -372,16 +427,6 @@ impl Ngx {
         })
     }
 
-    fn set_u32(&self, name: &CStr, value: u32) {
-        // SAFETY: the map outlives this and the name is a nul-terminated static.
-        unsafe { ffi::NVSDK_NGX_Parameter_SetUI(self.capabilities, name.as_ptr(), value) };
-    }
-
-    fn set_i32(&self, name: &CStr, value: c_int) {
-        // SAFETY: as above.
-        unsafe { ffi::NVSDK_NGX_Parameter_SetI(self.capabilities, name.as_ptr(), value) };
-    }
-
     /// An unsigned the map holds, or `None` where it holds none by that name.
     ///
     /// `None` rather than zero, matching [`Self::capability`]: a render resolution of zero and a
@@ -393,6 +438,87 @@ impl Ngx {
             ffi::NVSDK_NGX_Parameter_GetUI(self.capabilities, name.as_ptr(), &mut value)
         });
         status.is_ok().then_some(value)
+    }
+}
+
+/// A built DLSS Ray Reconstruction feature, and the parameter map it was built from.
+///
+/// **Both belong to it.** The map a feature is created with is not the capability map — that one is
+/// NGX's and is for asking questions — and it has to outlive the feature, so the two are released
+/// together and in that order.
+#[derive(Debug)]
+struct Feature {
+    handle: *mut c_void,
+    parameters: *mut c_void,
+}
+
+impl Ngx {
+    /// Builds Ray Reconstruction to take `render` and produce `output`.
+    ///
+    /// Records into `cmd`, which must be recording and must be submitted before the feature is
+    /// used: NGX uploads its weights here.
+    fn build(
+        &self,
+        cmd: ash::vk::CommandBuffer,
+        render: (u32, u32),
+        output: (u32, u32),
+        preset: Preset,
+    ) -> Result<Feature, Status> {
+        let mut parameters: *mut c_void = std::ptr::null_mut();
+        // SAFETY: NGX is initialised and writes a map it allocates through this pointer.
+        Status(unsafe { ffi::NVSDK_NGX_VULKAN_AllocateParameters(&mut parameters) }).ok()?;
+        // **Owned from here on**, so a failure below releases the map rather than leaking it — and
+        // owned by exactly one value, so success does not release it out from under the caller.
+        let mut feature = Feature {
+            handle: std::ptr::null_mut(),
+            parameters,
+        };
+
+        // What `NGX_VULKAN_CREATE_DLSSD_EXT1` sets, which is a header-only helper rather than a
+        // symbol — `nvsdk_ngx_helpers_dlssd_vk.h:100`.
+        // One GPU, so both masks are the first node.
+        set_u32(parameters, c"CreationNodeMask", 1);
+        set_u32(parameters, c"VisibilityNodeMask", 1);
+        set_u32(parameters, c"Width", render.0);
+        set_u32(parameters, c"Height", render.1);
+        set_u32(parameters, c"OutWidth", output.0);
+        set_u32(parameters, c"OutHeight", output.1);
+        set_i32(parameters, c"PerfQualityValue", preset.value());
+        set_i32(parameters, c"DLSS.Feature.Create.Flags", CREATE_FLAGS);
+        set_i32(parameters, c"DLSS.Enable.Output.Subrects", 0);
+        // The only denoise mode Ray Reconstruction has, and the helper hardcodes it too.
+        set_i32(parameters, c"DLSS.Denoise.Mode", 1);
+        // Roughness comes from the normal target's fourth channel — see the G-buffer's layout.
+        set_u32(parameters, c"DLSS.Roughness.Mode", 1);
+        // **The enum is about the depth's shape, not where it came from**: `Linear` is 0 and `HW`
+        // is 1, and what §8.20 writes is clip depth — projected and reverse-Z — whoever computed it.
+        // Saying `Linear` for it is what `FAIL_InvalidParameter` meant.
+        set_u32(parameters, c"DLSS.Use.HW.Depth", 1);
+
+        // SAFETY: the command buffer is recording, the map is ours and fully populated, and 13 is
+        // `NVSDK_NGX_Feature_RayReconstruction`.
+        Status(unsafe {
+            ffi::NVSDK_NGX_VULKAN_CreateFeature1(
+                self.device,
+                cmd,
+                FEATURE_RAY_RECONSTRUCTION,
+                parameters,
+                &mut feature.handle,
+            )
+        })
+        .ok()?;
+        Ok(feature)
+    }
+}
+
+impl Drop for Feature {
+    fn drop(&mut self) {
+        if !self.handle.is_null() {
+            // SAFETY: built by `Ngx::build` and released once.
+            unsafe { ffi::NVSDK_NGX_VULKAN_ReleaseFeature(self.handle) };
+        }
+        // SAFETY: allocated by `Ngx::build`, and after the feature that was built from it.
+        unsafe { ffi::NVSDK_NGX_VULKAN_DestroyParameters(self.parameters) };
     }
 }
 
@@ -551,6 +677,33 @@ mod tests {
                 mode
             );
         }
+
+        // **And the feature builds.** NGX uploads its weights into the command buffer, so this is
+        // the first call that does real work on the device rather than answering from a table — and
+        // the first place a wrong parameter map shows up as something other than a query result.
+        let memory = rtxmw_gpu::Memory::new(&instance, &physical, &device)
+            .expect("device memory should open");
+        let mut uploader =
+            rtxmw_gpu::Uploader::new(&device, &memory, physical.graphics_queue_family())
+                .expect("an uploader should build");
+        let mut built = None;
+        uploader
+            .submit_and_wait(|_, cmd| {
+                built = Some(ngx.build(cmd, settings.render, OUTPUT, Preset::Performance));
+            })
+            .expect("the build should submit");
+        let feature = built
+            .expect("the recording ran")
+            .unwrap_or_else(|e| panic!("Ray Reconstruction should build: {e}"));
+
+        assert!(
+            !feature.handle.is_null(),
+            "the build reported success and produced no feature"
+        );
+        // Released here rather than at the end of the scope, so a failure to release is this test's
+        // and not the next one's — NGX keeps its state per device and a leaked feature outlives the
+        // handle that owned it.
+        drop(feature);
     }
 
     #[test]

@@ -106,6 +106,27 @@ unsafe extern "C" {
         out: *mut c_int,
     ) -> u32;
 
+    /// A parameter map of the caller's own, for a feature rather than for queries.
+    pub(super) fn NVSDK_NGX_VULKAN_AllocateParameters(out: *mut *mut c_void) -> u32;
+
+    /// Releases one of those.
+    pub(super) fn NVSDK_NGX_VULKAN_DestroyParameters(parameters: *mut c_void) -> u32;
+
+    /// Builds a feature. Records into `cmd`, which must be recording.
+    ///
+    /// The `1` variant, which the SDK's own helper prefers whenever a device is to hand — the
+    /// older one leaves NGX to find the device itself.
+    pub(super) fn NVSDK_NGX_VULKAN_CreateFeature1(
+        device: ash::vk::Device,
+        cmd: ash::vk::CommandBuffer,
+        feature: c_int,
+        parameters: *mut c_void,
+        out: *mut *mut c_void,
+    ) -> u32;
+
+    /// Releases a feature and everything it holds.
+    pub(super) fn NVSDK_NGX_VULKAN_ReleaseFeature(handle: *mut c_void) -> u32;
+
     /// The SDK's own name for a result code, as a wide string it owns.
     ///
     /// `wchar_t`, which on Linux is **32 bits** — declaring it as `u16` reads UTF-32 at half the

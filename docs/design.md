@@ -1762,3 +1762,40 @@ seeing exact distances where it had quantised ones. Small, and in the direction 
 would have kept passing had roughness been written to the wrong target. It now reads each from where
 DLSS reads it: the albedo from the material target's `rgb`, the roughness from the *normal* target's
 `w`.
+
+### 8.21 The feature builds, once NGX is asked what it dislikes
+
+Ray Reconstruction is created at 1920×1080 → 3840×2160 and released cleanly. Two faults on the way,
+and the second is the more useful lesson.
+
+**`Use.HW.Depth` describes the depth's shape, not where it came from.** The enum is `Linear = 0`,
+`HW = 1`, and §8.20 writes clip depth — projected and reverse-Z — whoever computed it. I set `Linear`
+on the reasoning that a compute shader wrote it rather than the depth test, which is true and
+irrelevant.
+
+**`MVLowRes` reads as a description, not a request.** It says the motion vectors *are* at the low —
+render — resolution, which §8.13 writes them at. I reasoned it the other way round and left it out.
+
+Both came back as `FAIL_InvalidParameter`, which names no parameter.
+
+**What found it was NGX's own log**, which is off by default and was off here because the logging
+level in `NVSDK_NGX_FeatureCommonInfo` was left at zero. Turned up, it says:
+
+```
+Error: Low resolution Motion Vectors required
+NVSDK_NGX_Result_FAIL_InvalidParameter
+```
+
+That message exists nowhere in the API surface — no status code carries it, and no parameter can be
+queried for it. It is the difference between reading the answer and bisecting a parameter map.
+
+**And it cannot be had quietly**, which is why it is `RTXMW_NGX_LOG` rather than simply on: the
+feature libraries write **1,018 lines to the console** on one successful run, enough to bury the
+assertion message of whatever failure sent someone looking. Off, they write nothing at all — not even
+the files. So it is a switch, in the shape `DLSS_SDK_DIR` and `MORROWIND_DATA_DIR` already use.
+
+**Ownership, since NGX has two things to release and an order.** The parameter map a feature is
+built from is not the capability map — that one is NGX's, for asking questions — and it has to
+outlive the feature. Both belong to one `Feature`, released together: the handle first, then the map.
+The first attempt handed the map to a closure that `map_err` dropped whether or not the error path
+ran, which would have destroyed it on *success*.
