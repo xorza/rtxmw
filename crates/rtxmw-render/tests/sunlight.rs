@@ -156,7 +156,7 @@ fn penumbra_rows(pixels: &[u8]) -> usize {
 
 #[test]
 fn the_suns_disc_is_what_makes_its_shadow_soft() {
-    let real = trace_wall(&shadowed_wall(Sun::default_daylight().angular_radius));
+    let real = trace_wall(&shadowed_wall(Sun::REAL_ANGULAR_RADIUS));
     // A sun of no size at all: the same light from the same direction, cast by a point.
     let point = trace_wall(&shadowed_wall(0.0));
 
@@ -199,7 +199,7 @@ fn the_suns_disc_is_what_makes_its_shadow_soft() {
 #[test]
 fn a_cell_with_no_sun_is_lit_by_nothing() {
     // How an interior says it has no sky: a black sun contributes nothing, needing no flag.
-    let mut scene = shadowed_wall(Sun::default_daylight().angular_radius);
+    let mut scene = shadowed_wall(Sun::REAL_ANGULAR_RADIUS);
     scene.sun.as_mut().expect("the fixture has a sun").colour = Vec3::ZERO;
     let pixels = trace_wall(&scene);
     assert_eq!(row(&pixels, HEIGHT - 8), 0.0);

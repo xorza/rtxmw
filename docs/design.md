@@ -2593,3 +2593,48 @@ from a grey wall that its recorded radius could not touch it. Stretching reach m
 wall, and the test went on passing — on light bouncing off the wall, which is the one thing it was
 written to exclude. Its wall is now black, so no reach can ever make it return anything and the blue
 in the frame can only have come from the air.
+
+### 8.45 The sun moves, and Morrowind's own constant would not let it
+
+Everything in §8.38 through §8.44 — the low fog, the Mie phase function, the shafts — had only ever
+been seen at one hour, because the sun was `Sun::at(0.5)` and nothing called it with anything else.
+The engine could render mid-morning and nothing else.
+
+**Morrowind has no sunrise.** The game's own direction is `(-400 · orbit, 75, -100)`, and the third
+component is a constant: the sun swings east to west without ever descending, standing fourteen
+degrees above the horizon at the moment the clock says it rises and the same fourteen at nightfall.
+That is what a fixed falloff curve in a renderer with no shadows can get away with. So the vertical
+is now scaled by `sqrt(1 - orbit²)`, which leaves noon exactly where the constant put it — 100 of
+125, the same 53 degrees — and lets both ends of the day reach the horizon they are named for. It is
+a deliberate departure from the game data, and the only one here.
+
+**The atmosphere does the colour, so nothing is a tint chosen by hand.** A beam to a sun `h` above
+the horizon crosses Kasten and Young's air mass — 1.25 atmospheres at noon, 38 at the horizon, and
+finite there, which `1/sin h` is not — and loses `exp(-tau * mass)` per channel against the Rayleigh
+depths everyone uses, `(0.046, 0.108, 0.265)`. That one expression is the whole of why a low sun is
+orange. The sky is the same arithmetic read the other way: what the air took out of the beam is what
+it gives back, and it had to get in through the same air to do it, so the sky's colour is
+`(1 - T) * T`. At noon that is what was lost, which is blue; at dusk it is what survived thirty
+atmospheres, which is red. Two constants are tuned rather than derived — a greying term standing in
+for the multiple scattering a single-scattering model has none of, and a scale set so the default
+hour lands on the fixed overcast blue this all replaced.
+
+**The sky belongs to the renderer, not to the cell.** It used to be two literals in `StaticScene`,
+written at load time, which is the wrong place by construction: an hour later the same geometry is
+lit by a different sun and nothing about the cell has changed. An exterior now records *no* lighting
+at all — which is already what "an exterior carries no `AMBI`" means — and `SceneResidency` keeps
+whatever record the resident cell had so `relight()` can re-derive from it whenever the cell or the
+sky moves. `SceneRenderer::set_sky` is the whole of the per-frame path, which is what a day/night
+cycle will need and what `--time` uses now.
+
+Three things are pinned by rendering rather than by argument. An interior is **bit-identical** at
+03:00 and at 13:00, because it takes its own record and the sky never touches it; it is also
+bit-identical to before any of this existed. And `--time 9:30` is bit-identical to no argument at
+all, which is what the default being 9.5 is for. The default exterior did move — 2.8% RMSE — because
+the sun sits three degrees lower on the new arc and now has an atmosphere in front of it.
+
+**Not done, and visible.** The sky is one colour over the whole dome bar a height gradient, so dawn
+is a uniform gold wash where it should be orange toward the sun and blue away from it — the shader's
+`sky_seen_through` needs the same treatment the ground fog got. Night is a floor value and a dark
+frame that auto-exposure lifts to a pale one: Morrowind has two moons and a night sky texture, and
+this renderer draws neither.

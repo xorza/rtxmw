@@ -12,7 +12,7 @@ use rtxmw_gpu::{
     readback,
 };
 use rtxmw_render::SceneRenderer;
-use rtxmw_scene::{CellId, CellStreamer, LoadedCell};
+use rtxmw_scene::{CellId, CellStreamer, LoadedCell, Sky};
 
 use crate::cli::ScreenshotOptions;
 use crate::scene_loader;
@@ -38,6 +38,7 @@ pub(crate) fn screenshot(options: &ScreenshotOptions) -> Result<f32, Box<dyn std
         dlss,
         delight,
         fog,
+        time,
     } = options;
 
     // No surface extensions and no swapchain: this device could not present if asked.
@@ -66,6 +67,7 @@ pub(crate) fn screenshot(options: &ScreenshotOptions) -> Result<f32, Box<dyn std
     }
     renderer.set_delight(*delight);
     renderer.set_fog(*fog);
+    renderer.set_sky(Sky::at(*time));
 
     let cell = LoadedCell::load_at(cell.clone())?
         .ok_or("no game data configured — set MORROWIND_DATA_DIR, or put it in .env")?;

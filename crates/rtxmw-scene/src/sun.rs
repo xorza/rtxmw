@@ -19,15 +19,16 @@ pub struct Sun {
     pub angular_radius: f32,
 }
 
-/// Angular radius of the real sun, in radians — a disc about half a degree across.
-const REAL_ANGULAR_RADIUS: f32 = 0.004_654;
-
 /// Radiance of the sun against the sky's ambient.
 ///
 /// Not a physical figure: auto-exposure absorbs any overall scale, so what matters is the *ratio*
 /// between direct sun and sky, which on a clear day is roughly five to one on a surface facing it.
 /// Provisional in exactly the way `LightBuffer::INTENSITY` is, and for the same reason — see
 /// `docs/design.md` §5.1.
+///
+/// **Before any air, and so no longer that ratio at every hour.** [`crate::Sky`] attenuates this by
+/// the atmosphere a beam crossed and derives the sky from what it lost, so the two move apart as the
+/// sun descends — which is the point. This is the figure at the top of the atmosphere.
 ///
 /// **`EMISSIVE_INTENSITY` in `primary_visibility.comp` is a fraction of this.** A Morrowind material's
 /// emissive means "as bright as a fully lit surface" in a renderer whose light never passed one, so
@@ -36,25 +37,34 @@ const REAL_ANGULAR_RADIUS: f32 = 0.004_654;
 const DAYLIGHT: f32 = 8.0;
 
 impl Sun {
+    /// Angular radius of the real sun, in radians — a disc about half a degree across.
+    ///
+    /// Public because it is the width every soft shadow in the game is judged against, and the
+    /// tests that measure a penumbra need the number the renderer actually used rather than one
+    /// written down twice.
+    pub const REAL_ANGULAR_RADIUS: f32 = 0.004_654;
+
     /// Morrowind's sun at a point in its day, `orbit` running from 1 at sunrise to −1 at nightfall.
     ///
-    /// **The direction is the game's own hardcoded constant**, `(-400 · orbit, 75, -100)` from
+    /// **The horizontal swing is the game's own hardcoded constant**, `(-400 · orbit, 75, ...)` from
     /// `apps/openmw/mwworld/weather.cpp:900`. It is not an astronomical model: the sun runs east to
-    /// west at a fixed angle from overhead, sitting to the south, and the numbers are Morrowind's
-    /// rather than anything derived.
+    /// west and sits to the south, and the numbers are Morrowind's rather than anything derived.
+    ///
+    /// **The vertical is not, and it is a deliberate departure.** The game's third component is the
+    /// constant −100, so its sun swings east to west without ever descending: at sunrise it stands
+    /// fourteen degrees up and it has stood there since the world began. Morrowind has no sunrise.
+    /// Scaling that component by `sqrt(1 - orbit²)` keeps its noon exactly — 100 of 125, the same
+    /// 53 degrees — and lets the ends of the day reach the horizon they are named for.
+    ///
+    /// Full strength, before any air. What a beam has left by the time it arrives depends on how
+    /// much atmosphere it crossed, which is [`crate::Sky`]'s to say.
     pub fn at(orbit: f32) -> Self {
+        let arc = (1.0 - orbit * orbit).max(0.0).sqrt();
         Self {
-            direction: Vec3::new(-400.0 * orbit, 75.0, -100.0).normalize(),
-            // Warm white, and warmer as it nears the horizon, which is the one part of a weather
-            // system cheap enough to have without one.
+            direction: Vec3::new(-400.0 * orbit, 75.0, -100.0 * arc).normalize(),
             colour: Vec3::new(1.0, 0.95, 0.88) * DAYLIGHT,
-            angular_radius: REAL_ANGULAR_RADIUS,
+            angular_radius: Self::REAL_ANGULAR_RADIUS,
         }
-    }
-
-    /// Mid-morning, until time of day is something the engine tracks.
-    pub fn default_daylight() -> Self {
-        Self::at(0.5)
     }
 }
 
@@ -63,7 +73,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_sun_crosses_from_east_to_west_and_stays_above_the_horizon() {
+    fn the_sun_crosses_from_east_to_west_and_reaches_the_horizon_at_both_ends() {
         // Light travelling toward -X comes *from* the east, which is where the sun rises.
         let sunrise = Sun::at(1.0);
         assert!(sunrise.direction.x < -0.5, "{:?}", sunrise.direction);
@@ -77,23 +87,34 @@ mod tests {
         for orbit in [-1.0, -0.5, 0.0, 0.5, 1.0] {
             let sun = Sun::at(orbit);
             assert!((sun.direction.length() - 1.0).abs() < 1e-5);
-            // Light travels downward at every hour: the constant's z is fixed and negative, so the
-            // sun never sets in this model — night is something the weather system turns off.
-            assert!(sun.direction.z < 0.0, "orbit {orbit} sends light upward");
-            // And northward, which puts the sun in the south.
+            // Never upward, and northward throughout, which puts the sun in the south.
+            assert!(sun.direction.z <= 0.0, "orbit {orbit} sends light upward");
             assert!(sun.direction.y > 0.0, "orbit {orbit}");
         }
 
-        // Highest at noon, lowest at the ends: the vertical share of a unit vector is largest when
-        // the horizontal one is smallest.
-        assert!(noon.direction.z < sunrise.direction.z);
+        // **On the horizon at both ends of the day, which is the departure from the game's own
+        // constant.** Morrowind's third component is a fixed −100, so its sun swings across the sky
+        // without ever descending and stands fourteen degrees up at the moment it is said to rise.
+        // Scaling by `sqrt(1 - orbit²)` leaves noon exactly where the constant put it and lets
+        // sunrise and sunset mean what they say.
+        assert_eq!(sunrise.direction.z, 0.0);
+        assert_eq!(dusk.direction.z, 0.0);
+        // Morrowind's noon out of its own `(0, 75, -100)`: 100 of 125 of the way down.
+        assert!(
+            (noon.direction.z + 0.8).abs() < 1e-6,
+            "{:?}",
+            noon.direction
+        );
+        // Highest at noon, and monotonic between.
+        assert!(noon.direction.z < Sun::at(0.5).direction.z);
+        assert!(Sun::at(0.5).direction.z < sunrise.direction.z);
     }
 
     #[test]
     fn the_disc_is_the_size_of_the_real_one() {
         // Half a degree across, which is what gives a shadow a penumbra a few centimetres wide at
         // arm's length and metres wide at the foot of a cliff.
-        let diameter = Sun::default_daylight().angular_radius * 2.0;
+        let diameter = Sun::REAL_ANGULAR_RADIUS * 2.0;
         assert!((diameter.to_degrees() - 0.533).abs() < 0.01, "{diameter}");
     }
 }

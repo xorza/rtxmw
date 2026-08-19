@@ -238,17 +238,11 @@ impl StaticScene {
             return Ok(scene);
         }
 
-        // An exterior carries no `AMBI`: out of doors the ambient *is* the sky, which the original
-        // engine drove from weather and time of day. Until that exists this is a fixed overcast
-        // daylight. Blue-shifted because sky light is, and bright enough that auto-exposure has
-        // something to work from.
-        scene.ambient = Some(Ambient {
-            colour: Vec3::new(0.35, 0.42, 0.55),
-            ..Ambient::default()
-        });
-        // Fixed for now: the orbit is a function of time of day, and nothing tracks that yet.
-        scene.sun = Some(Sun::default_daylight());
-
+        // **An exterior carries no `AMBI`, and leaving both of these empty is what says so.** Out of
+        // doors the ambient *is* the sky and the sun is in it, and neither is a property of the cell
+        // — they are a property of the hour, which changes without anything here being reloaded. The
+        // renderer holds a `Sky` and applies it to whichever resident cell recorded no lighting of
+        // its own.
         scene.add_water(&cell);
 
         if let Some(offset) = offsets.land

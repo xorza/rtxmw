@@ -11,7 +11,7 @@ use rtxmw_gpu::{
     Device, Image, Memory, PhysicalDevice, RayTracingLimits, Timestamps, Uploader, image_barrier,
     memory_barrier,
 };
-use rtxmw_scene::{CellId, StaticScene};
+use rtxmw_scene::{CellId, Sky, StaticScene};
 use rtxmw_texture::Texture;
 
 use crate::auto_exposure::AutoExposure;
@@ -140,6 +140,8 @@ pub struct SceneRenderer {
     delight: f32,
     /// How much of the cell's fog to apply. See [`SceneRenderer::set_fog`].
     fog: f32,
+    /// The sky every resident exterior stands under. See [`SceneRenderer::set_sky`].
+    sky: Sky,
     /// The upscaler, when one was handed over. Absent, the denoiser and the render-resolution tone
     /// curve carry the frame as they always have.
     #[cfg(feature = "dlss")]
@@ -207,6 +209,7 @@ impl SceneRenderer {
             jitter: false,
             delight: DEFAULT_DELIGHT,
             fog: 1.0,
+            sky: Sky::default(),
             #[cfg(feature = "dlss")]
             upscaler: None,
             frames: 0,
@@ -294,6 +297,18 @@ impl SceneRenderer {
         self.delight = strength;
     }
 
+    /// Moves the sky: the sun in it, and the light it casts on everything out of doors.
+    ///
+    /// **Not part of a cell**, and that is the whole reason this is here: an hour later the same
+    /// geometry is lit by a different sun, and nothing about the cell has changed. An interior keeps
+    /// the lighting its own record carries and ignores this entirely.
+    pub fn set_sky(&mut self, sky: Sky) {
+        self.sky = sky;
+        if let Some(residency) = self.scene.as_mut() {
+            residency.set_sky(sky);
+        }
+    }
+
     /// Sets how much of the cell's fog is applied.
     ///
     /// Zero is the frame with none of it, whatever the cell records, which is the A/B — the density
@@ -374,9 +389,15 @@ impl SceneRenderer {
     ) -> rtxmw_gpu::Result<()> {
         let residency = match self.scene.as_mut() {
             Some(residency) => residency,
-            None => self
-                .scene
-                .insert(SceneResidency::new(device, uploader, limits)?),
+            None => {
+                let residency = self
+                    .scene
+                    .insert(SceneResidency::new(device, uploader, limits)?);
+                // A fresh residency starts under the default sky; this one is standing under
+                // whatever the caller last set.
+                residency.set_sky(self.sky);
+                residency
+            }
         };
         residency.add(device, uploader, limits, id, scene, textures)?;
         assert!(

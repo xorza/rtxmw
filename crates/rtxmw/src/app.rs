@@ -10,7 +10,7 @@ use winit::event_loop::ActiveEventLoop;
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowId};
 
-use rtxmw_scene::{CellDetail, CellId, CellStreamer, LoadedCell, SceneError};
+use rtxmw_scene::{CellDetail, CellId, CellStreamer, LoadedCell, SceneError, Sky, TimeOfDay};
 
 use crate::camera::{Camera, Movement};
 use crate::cli::{Upscaling, WindowOptions};
@@ -76,6 +76,8 @@ pub(crate) struct App {
     delight: f32,
     /// How much of the cell's fog to apply, held for the renderer built when the window appears.
     fog: f32,
+    /// The hour an exterior is lit at, likewise held until there is a renderer to give it to.
+    time: TimeOfDay,
     /// Which cell to open in, from the command line.
     cell: CellId,
     /// **Before `window`, and that is load-bearing.** Fields drop in declaration order, and the
@@ -252,6 +254,7 @@ impl App {
             dlss: options.dlss,
             delight: options.delight,
             fog: options.fog,
+            time: options.time,
             exit_after: options.exit_after,
             ..Self::default()
         }
@@ -266,6 +269,7 @@ impl Default for App {
             dlss: Upscaling(None),
             delight: 1.0,
             fog: 1.0,
+            time: TimeOfDay::default(),
             renderer: None,
             window: None,
             centre: None,
@@ -362,6 +366,7 @@ impl ApplicationHandler for App {
             self.dlss,
             self.delight,
             self.fog,
+            Sky::at(self.time),
         ) {
             Ok(renderer) => {
                 println!("{}", renderer.capability_report());

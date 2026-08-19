@@ -9,7 +9,7 @@ use rtxmw_gpu::{
     Validation, image_blit,
 };
 use rtxmw_render::{FrameConstants, OUTPUT_FORMAT, SceneRenderer, TARGET_FORMAT};
-use rtxmw_scene::{CellId, StaticScene};
+use rtxmw_scene::{CellId, Sky, StaticScene};
 use rtxmw_texture::Texture;
 
 use crate::cli::Upscaling;
@@ -83,6 +83,7 @@ impl Renderer {
         dlss: Upscaling,
         delight: f32,
         fog: f32,
+        sky: Sky,
     ) -> rtxmw_gpu::Result<Self>
     where
         W: HasDisplayHandle + HasWindowHandle,
@@ -130,6 +131,7 @@ impl Renderer {
         )?;
         scene.set_delight(delight);
         scene.set_fog(fog);
+        scene.set_sky(sky);
         if let Err(failed) = upscaler::attach(&memory, &mut scene, upscaler) {
             eprintln!("DLSS did not attach: {failed}");
         }

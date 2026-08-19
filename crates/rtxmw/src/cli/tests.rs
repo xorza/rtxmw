@@ -4,7 +4,7 @@ use ash::vk;
 use clap::{CommandFactory, Parser};
 use glam::Vec3;
 use rtxmw_render::dlss::Preset;
-use rtxmw_scene::CellId;
+use rtxmw_scene::{CellId, TimeOfDay};
 
 use crate::cli::{
     SCREENSHOT_FLAG, SCREENSHOT_SIZE, SHEET_FLAG, ScreenshotOptions, UPSCALING_DEFAULT, Upscaling,
@@ -125,6 +125,30 @@ fn both_commands_are_internally_consistent() {
 }
 
 #[test]
+fn an_hour_reads_as_a_decimal_or_off_a_clock_face() {
+    let at = |value: &str| {
+        parse(&["--time", value])
+            .unwrap_or_else(|failed| panic!("{value:?} should parse: {failed}"))
+            .time
+    };
+    // **The two forms are the same hour**, which is the whole reason both are taken: nobody writes
+    // half past nine as 9.5 and the clock underneath is a float.
+    assert_eq!(at("9:30"), at("9.5"));
+    assert_eq!(at("18:45"), at("18.75"));
+    assert_eq!(at("6"), at("6:00"));
+
+    // Sunrise and sunset are where the day is defined to start and end.
+    assert_eq!(at("6").orbit(), 1.0);
+    assert_eq!(at("20").orbit(), -1.0);
+    // And the day wraps, so an hour past midnight is not an hour before it.
+    assert_eq!(at("25:00"), at("1:00"));
+
+    // Absent, it is the hour this renderer was built against — taken from `TimeOfDay` itself
+    // rather than from a literal here, so the two cannot drift apart.
+    assert_eq!(parse(&[]).expect("should parse").time, TimeOfDay::default());
+}
+
+#[test]
 fn the_cell_and_the_frame_limit_go_in_either_order() {
     let default = interior(scene_loader::DEFAULT_CELL);
     assert_eq!(
@@ -134,6 +158,7 @@ fn the_cell_and_the_frame_limit_go_in_either_order() {
             exit_after: None,
             delight: 1.0,
             fog: 1.0,
+            time: TimeOfDay::default(),
             dlss: Upscaling(None),
         })
     );
@@ -146,6 +171,7 @@ fn the_cell_and_the_frame_limit_go_in_either_order() {
             exit_after: Some(3),
             delight: 1.0,
             fog: 1.0,
+            time: TimeOfDay::default(),
             dlss: Upscaling(None),
         })
     );
@@ -155,6 +181,7 @@ fn the_cell_and_the_frame_limit_go_in_either_order() {
         exit_after: Some(3),
         delight: 1.0,
         fog: 1.0,
+        time: TimeOfDay::default(),
         dlss: Upscaling(None),
     };
     assert_eq!(parse(&["-2,-9", "--frames", "3"]), Ok(outdoors.clone()));
@@ -198,6 +225,7 @@ fn a_screenshot_can_be_told_where_to_stand_and_which_way_to_look() {
             denoise: None,
             delight: 1.0,
             fog: 1.0,
+            time: TimeOfDay::default(),
             dlss: Upscaling(None),
         })
     );
@@ -248,6 +276,7 @@ fn a_screenshot_takes_a_path_then_a_size_then_a_cell() {
             denoise: None,
             delight: 1.0,
             fog: 1.0,
+            time: TimeOfDay::default(),
             dlss: Upscaling(None),
         })
     );
@@ -266,6 +295,7 @@ fn a_screenshot_takes_a_path_then_a_size_then_a_cell() {
             denoise: None,
             delight: 1.0,
             fog: 1.0,
+            time: TimeOfDay::default(),
             dlss: Upscaling(None),
         })
     );
@@ -295,6 +325,7 @@ fn a_screenshot_takes_a_path_then_a_size_then_a_cell() {
             denoise: Some(0),
             delight: 1.0,
             fog: 1.0,
+            time: TimeOfDay::default(),
             dlss: Upscaling(None),
         })
     );
@@ -312,6 +343,12 @@ fn a_screenshot_takes_a_path_then_a_size_then_a_cell() {
         (vec!["out.png", "1920"], "a size like 1920x1080"),
         (vec!["out.png", "1920x"], "a size like 1920x1080"),
         (vec!["out.png", "widexhigh"], "a size like 1920x1080"),
+        (vec!["out.png", "--time", "half nine"], "9.5 or 9:30"),
+        // A clock has sixty minutes in an hour and the parser is not a calculator.
+        (vec!["out.png", "--time", "9:60"], "9.5 or 9:30"),
+        (vec!["out.png", "--time", "9:"], "9.5 or 9:30"),
+        (vec!["out.png", "--time", ":30"], "9.5 or 9:30"),
+        (vec!["out.png", "--time", "inf"], "9.5 or 9:30"),
     ] {
         let Err(failed) = screenshot_options(&arguments) else {
             panic!("{arguments:?} should not parse");

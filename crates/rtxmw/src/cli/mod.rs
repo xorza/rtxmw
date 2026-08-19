@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use ash::vk;
 use clap::{CommandFactory, Parser};
 use rtxmw_render::dlss::Preset;
-use rtxmw_scene::CellId;
+use rtxmw_scene::{CellId, TimeOfDay};
 
 use crate::scene_loader;
 use crate::scene_loader::ViewpointOverride;
@@ -204,6 +204,28 @@ fn at_least_one(value: &str) -> Result<u32, String> {
     }
 }
 
+/// Reads an hour of the game's day, as `9.5` or as `9:30`.
+///
+/// The colon form is the one anybody would reach for and the decimal one is what the clock actually
+/// is, so both are taken. Any hour is legal, including the small ones nobody can see anything in.
+fn hour(value: &str) -> Result<TimeOfDay, String> {
+    let hours = match value.split_once(':') {
+        Some((hours, minutes)) => match (hours.parse::<f32>(), minutes.parse::<f32>()) {
+            (Ok(hours), Ok(minutes)) if (0.0..60.0).contains(&minutes) => {
+                Ok(hours + minutes / 60.0)
+            }
+            _ => Err(()),
+        },
+        None => value.parse::<f32>().map_err(|_| ()),
+    };
+    match hours {
+        Ok(hours) if hours.is_finite() => Ok(TimeOfDay::hours(hours)),
+        _ => Err(format!(
+            "expected an hour of the day like 9.5 or 9:30, got {value:?}"
+        )),
+    }
+}
+
 /// What the windowed mode was asked for.
 #[derive(Parser, Debug, Clone, PartialEq)]
 #[command(
@@ -249,6 +271,9 @@ pub(crate) struct WindowOptions {
         allow_negative_numbers = true,
     )]
     pub(crate) fog: f32,
+    /// The hour to light an exterior at: 6 is sunrise, 13 noon, 20 sunset, and anything else night.
+    #[arg(long = "time", value_name = "HOUR", default_value_t, value_parser = hour)]
+    pub(crate) time: TimeOfDay,
     /// What DLSS runs at: off, performance, balanced, quality or dlaa.
     #[arg(
         long = "dlss",
@@ -321,6 +346,9 @@ pub(crate) struct ScreenshotOptions {
         allow_negative_numbers = true,
     )]
     pub(crate) fog: f32,
+    /// The hour to light an exterior at: 6 is sunrise, 13 noon, 20 sunset, and anything else night.
+    #[arg(long = "time", value_name = "HOUR", default_value_t, value_parser = hour)]
+    pub(crate) time: TimeOfDay,
     /// What DLSS runs at: off, performance, balanced, quality or dlaa.
     #[arg(
         long = "dlss",

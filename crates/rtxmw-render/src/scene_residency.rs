@@ -2,11 +2,10 @@
 
 use std::collections::HashMap;
 
-use glam::Vec3;
 use rtxmw_gpu::{Buffer, Device, RayTracingLimits, Uploader};
 use rtxmw_scene::{
-    CellId, Instance, Light, MaterialKind, MaterialTable, Mesh, MeshId, StaticScene, TerrainLayers,
-    TextureId,
+    Ambient, CellId, Instance, Light, MaterialKind, MaterialTable, Mesh, MeshId, Sky, StaticScene,
+    Sun, TerrainLayers, TextureId,
 };
 use rtxmw_texture::Texture;
 
@@ -89,6 +88,15 @@ pub(crate) struct SceneResidency {
     /// Which of those lights reach where, so a shading point walks a handful rather than all.
     light_grid: LightGrid,
     lighting: Lighting,
+    /// The newest cell's own lighting record, kept because the sky moves and the cell does not.
+    record: Option<Ambient>,
+    /// A sun the cell carries alongside its record, rather than the sky's.
+    ///
+    /// Nothing loaded from the game sets one: an interior has no sun and an exterior takes whatever
+    /// is above it. Test fixtures do, because a fixture describes its own lighting entire.
+    recorded_sun: Option<Sun>,
+    /// What lights an exterior right now.
+    sky: Sky,
 }
 
 // The GPU-side members hold `ash` function tables, which implement no `Debug`.
@@ -129,6 +137,9 @@ impl SceneResidency {
             lights,
             light_grid,
             lighting: Lighting::default(),
+            record: None,
+            recorded_sun: None,
+            sky: Sky::default(),
         })
     }
 
@@ -173,18 +184,38 @@ impl SceneResidency {
         // The newest cell's, because every exterior cell carries the same sky and a caller loading
         // an interior loads exactly one. Per-cell ambient is what a portal-aware lighting pass
         // would need, and nothing here is one yet.
-        self.lighting.ambient = scene.ambient.map_or(Vec3::ZERO, |ambient| ambient.colour);
-        self.lighting.sun = scene.sun;
+        self.record = scene.ambient;
+        self.recorded_sun = scene.sun;
         self.lighting.water_level = scene.water_level;
+        self.relight();
+        Ok(())
+    }
+
+    /// What lights the resident cell, from its own record if it has one and from the sky if not.
+    ///
+    /// **Separate from `add` because the sky moves and the cell does not.** An hour later the same
+    /// geometry is lit by a different sun, and reloading a cell to say so would be absurd — so what
+    /// the cell *recorded* is kept and this derives the rest from it whenever either changes.
+    fn relight(&mut self) {
+        // **A cell that records its own lighting is an interior.** Out of doors there is no `AMBI`
+        // to read: the ambient is the sky and the sun is in it, and both belong to the hour.
+        let (ambient, sun) = match self.record {
+            Some(record) => (record.colour, self.recorded_sun),
+            None => (self.sky.ambient, Some(self.sky.sun)),
+        };
+        self.lighting.ambient = ambient;
+        self.lighting.sun = sun;
+
         // **Only interiors carry fog in the record**, so a recorded density is what identifies one
         // and settles all three of these together. An exterior's fog belongs to the weather system —
         // per region and per weather, out of the original engine's ini fallbacks rather than the
         // ESM — and none of that is read yet. Until it is, the sky is the honest stand-in: fog is
-        // lit by it, so a fog the colour of the sky is what aerial perspective looks like anyway.
-        match scene.ambient {
-            Some(ambient) if ambient.fog_density > 0.0 => {
-                self.lighting.fog = ambient.fog;
-                self.lighting.fog_density = ambient.fog_density * INDOOR_FOG_SCALE;
+        // lit by it, so a fog the colour of the sky is what aerial perspective looks like anyway,
+        // and it now reddens at dusk for free.
+        match self.record {
+            Some(record) if record.fog_density > 0.0 => {
+                self.lighting.fog = record.fog;
+                self.lighting.fog_density = record.fog_density * INDOOR_FOG_SCALE;
                 self.lighting.fog_banked = false;
             }
             _ => {
@@ -193,7 +224,12 @@ impl SceneResidency {
                 self.lighting.fog_banked = true;
             }
         }
-        Ok(())
+    }
+
+    /// Moves the sky, which relights every resident exterior.
+    pub(crate) fn set_sky(&mut self, sky: Sky) {
+        self.sky = sky;
+        self.relight();
     }
 
     /// Drops a cell's placements, if it was resident. Takes effect at the next [`Self::commit`].
