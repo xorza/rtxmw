@@ -119,18 +119,15 @@ pub(crate) fn rings_from(centre: &CellId, id: &CellId) -> Option<i32> {
 /// The cell the engine opens in when the command line names none.
 pub(crate) const DEFAULT_CELL: &str = "Seyda Neen, Census and Excise Office";
 
-/// The cell a command-line argument names, or [`DEFAULT_CELL`] when there is none.
+/// The cell `argument` names.
 ///
 /// **A pair of integers is an exterior and anything else is an interior's name**, which is exactly
 /// how Morrowind addresses the two: outdoors has coordinates, indoors has a name. So `-2,-9` is
 /// Seyda Neen's shore and `"Balmora, Guild of Mages"` is a building, with no flag to say which.
 ///
-/// Takes the absent case too, because every caller has one and each writing out the default meant
-/// three copies of it.
-pub(crate) fn cell_argument(argument: Option<&str>) -> CellId {
-    let Some(argument) = argument else {
-        return CellId::Interior(DEFAULT_CELL.to_owned());
-    };
+/// The absent case is [`DEFAULT_CELL`], which the command line reaches through clap's own
+/// `default_value` rather than through a second branch here.
+pub(crate) fn cell_named(argument: &str) -> CellId {
     if let Some((x, y)) = argument.split_once(',')
         && let (Ok(x), Ok(y)) = (x.trim().parse(), y.trim().parse())
     {
@@ -227,14 +224,35 @@ impl Viewpoint {
     }
 }
 
+/// Reads `X,Y,Z`, for the two options below.
+fn vector(value: &str) -> Result<Vec3, String> {
+    let malformed = || format!("expected X,Y,Z, got {value:?}");
+    let [x, y, z] = value.split(',').collect::<Vec<_>>()[..] else {
+        return Err(malformed());
+    };
+    Ok(Vec3::new(
+        x.trim().parse().map_err(|_| malformed())?,
+        y.trim().parse().map_err(|_| malformed())?,
+        z.trim().parse().map_err(|_| malformed())?,
+    ))
+}
+
 /// A caller's say over where a camera stands, with whatever it does not say left to the cell.
 ///
 /// Two options rather than an optional [`Viewpoint`], so that asking only to turn on the spot is a
 /// thing that can be asked. A place without a direction and a direction without a place are both
 /// useful — the second is how you look at the wall behind the door you came in by.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+///
+/// Flagged rather than positional, and so allowed anywhere among the positional arguments: an
+/// interior's name can be any string, so a third positional could not be told from one. Hyphens are
+/// values here for the same reason they are on a cell — a coordinate is often negative.
+#[derive(clap::Args, Debug, Clone, Copy, PartialEq, Default)]
 pub(crate) struct ViewpointOverride {
+    /// Stand here instead of where the cell would put you, as X,Y,Z.
+    #[arg(long = "at", value_name = "X,Y,Z", value_parser = vector, allow_hyphen_values = true)]
     pub(crate) position: Option<Vec3>,
+    /// Face this way instead, as X,Y,Z.
+    #[arg(long = "look", value_name = "X,Y,Z", value_parser = vector, allow_hyphen_values = true)]
     pub(crate) forward: Option<Vec3>,
 }
 
@@ -353,7 +371,7 @@ mod tests {
 
     #[test]
     fn a_pair_of_integers_is_an_exterior_and_anything_else_is_a_name() {
-        let cell = |argument| cell_argument(Some(argument));
+        let cell = cell_named;
         assert_eq!(cell("-2,-9"), CellId::Exterior { x: -2, y: -9 });
         // Spaces around the comma are what a shell leaves behind after quoting.
         assert_eq!(cell(" 3 , 4 "), CellId::Exterior { x: 3, y: 4 });
@@ -374,7 +392,7 @@ mod tests {
 
         // No argument at all is the cell the engine opens in.
         assert_eq!(
-            cell_argument(None),
+            cell_named(DEFAULT_CELL),
             CellId::Interior(DEFAULT_CELL.to_owned())
         );
     }

@@ -16,7 +16,7 @@ use rtxmw_render::SceneRenderer;
 use rtxmw_render::dlss::Upscaler;
 use rtxmw_scene::{CellId, CellStreamer, LoadedCell};
 
-use crate::ScreenshotOptions;
+use crate::cli::ScreenshotOptions;
 use crate::scene_loader;
 
 /// Stands in for the upscaler where DLSS is not compiled in, so one code path serves both builds.
@@ -34,15 +34,14 @@ use crate::scene_loader::Viewpoint;
 pub(crate) fn screenshot(options: &ScreenshotOptions) -> Result<f32, Box<dyn std::error::Error>> {
     let ScreenshotOptions {
         path,
-        width,
-        height,
+        size,
         cell,
         viewpoint,
         frames,
         samples,
         denoise,
     } = options;
-    let (width, height) = (*width, *height);
+
     // No surface extensions and no swapchain: this device could not present if asked.
     let instance = Instance::new(c"rtxmw", &[], Validation::for_build())?;
     let physical = PhysicalDevice::select(&instance, Presentation::NotNeeded)?;
@@ -55,7 +54,7 @@ pub(crate) fn screenshot(options: &ScreenshotOptions) -> Result<f32, Box<dyn std
 
     // With an upscaler the size asked for is the *output* and DLSS says what to trace at, so it is
     // built before the renderer that has to be sized by its answer.
-    let output = vk::Extent2D { width, height };
+    let output = *size;
     let upscaler = build_upscaler(&instance, &physical, &device, &mut uploader, output)?;
     let extent = render_size(upscaler.as_ref(), output);
     let mut renderer = SceneRenderer::new(&device, &physical, &memory, extent)?;
@@ -93,7 +92,7 @@ pub(crate) fn screenshot(options: &ScreenshotOptions) -> Result<f32, Box<dyn std
     for _ in 0..*frames {
         let constants = renderer.frame_constants(
             camera.view(),
-            camera.projection(width as f32 / height as f32),
+            camera.projection(size.width as f32 / size.height as f32),
             camera.position(),
         );
         renderer.render_once(&mut uploader, &constants)?;
@@ -114,7 +113,7 @@ pub(crate) fn screenshot(options: &ScreenshotOptions) -> Result<f32, Box<dyn std
         vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
     )?;
 
-    readback::write_png_opaque(path, &pixels, width, height);
+    readback::write_png_opaque(path, &pixels, size.width, size.height);
 
     // **From the traced frame, not the written one.** Alpha carries the hit flag, and it survives
     // the tone curve only when nothing else writes the image — an upscaler produces its own alpha

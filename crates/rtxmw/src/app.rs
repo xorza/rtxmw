@@ -252,7 +252,7 @@ impl Default for App {
     fn default() -> Self {
         let now = Instant::now();
         Self {
-            cell: scene_loader::cell_argument(None),
+            cell: scene_loader::cell_named(scene_loader::DEFAULT_CELL),
             renderer: None,
             window: None,
             centre: None,
