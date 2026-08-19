@@ -90,7 +90,7 @@ vec3 sun_light(Surface surface, vec3 origin, uvec2 pixel, uint salt, uint sample
     uint taken = samples >= SHADOW_SAMPLES ? SUN_SAMPLES : samples;
     float visible = 0.0;
     for (uint s = 0u; s < taken; ++s) {
-        vec2 u = unit_pair(hash(uvec4(pixel, salt + STREAM_SUN, s)));
+        vec2 u = unit_pair(hash(uvec4(sample_stream(pixel), salt + STREAM_SUN, s)));
         vec3 towards = cone_direction(-frame.sun_direction, frame.sun_cos_radius, u);
         if (!occluded(origin, towards, RAY_MAX)) {
             visible += 1.0;
@@ -156,7 +156,7 @@ vec3 direct_light(Surface surface, uvec2 pixel, uint salt, uint samples) {
         float visible = 0.0;
         vec3 origin = leaving(surface, towards);
         for (uint s = 0u; s < samples; ++s) {
-            vec2 u = unit_pair(hash(uvec4(pixel, salt, i * samples + s)));
+            vec2 u = unit_pair(hash(uvec4(sample_stream(pixel), salt, i * samples + s)));
             vec3 offset = light.position + sphere_point(u) * light.source_radius - origin;
             float reach = length(offset);
             if (!occluded(origin, offset / reach, reach - SHADOW_BIAS)) {
@@ -239,7 +239,7 @@ vec3 gather_indirect(Surface surface, uvec2 pixel) {
     }
     vec3 total = vec3(0.0);
     for (uint b = 0u; b < frame.bounce_samples; ++b) {
-        vec2 u = unit_pair(hash(uvec4(pixel, STREAM_BOUNCE, b)));
+        vec2 u = unit_pair(hash(uvec4(sample_stream(pixel), STREAM_BOUNCE, b)));
         vec3 towards = cosine_direction(surface.normal, u);
         Surface bounce = trace(leaving(surface, towards), towards, surface.footprint,
                                BOUNCE_SPREAD, MASK_ANY);

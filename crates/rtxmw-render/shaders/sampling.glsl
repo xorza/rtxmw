@@ -1,9 +1,23 @@
 // Turning a pixel and a sample index into directions, without a random number in sight.
 //
-// **The hash is stable, not per-frame.** Reseeding every frame turns Monte Carlo noise into
-// crawling static, and without temporal accumulation there is nothing to average it away; a fixed
-// pattern dithers instead, and holds still. The stream constants keep one estimator's samples from
-// repeating another's.
+// **The hash moves every frame**, which it did not until a temporal filter arrived. A fixed seed
+// dithers and holds still, and with only an à-trous pass to smooth it that is the better trade —
+// reseeding turns the residual into crawling static with nothing to average it away. Ray
+// Reconstruction inverts the trade: it accumulates across frames, so a pattern that never changes
+// is not noise it can remove but detail it preserves.
+//
+// The cost to the path that does not use it is small and real. Consecutive frames of a still
+// camera, filtered, went from bit-identical to 0.7% RMSE apart. The stream constants keep one
+// estimator's samples from repeating another's, and `sample_stream` keeps this frame's from
+// repeating the last.
+
+// The hash stream a pixel draws from this frame.
+//
+// **Two pixels never collide within a frame**, because exclusive-or with a fixed word is a bijection
+// — the rotation changes which stream each pixel gets, not how many there are.
+uvec2 sample_stream(uvec2 pixel) {
+    return pixel ^ uvec2(frame.sequence * 0x9E3779B9u, frame.sequence * 0x85EBCA6Bu);
+}
 
 // The Lambertian BRDF's normalisation.
 //

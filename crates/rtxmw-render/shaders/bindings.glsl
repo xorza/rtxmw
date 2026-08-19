@@ -182,6 +182,9 @@ layout(set = 0, binding = 14, scalar) readonly buffer Frame {
     // Seconds since the engine started. Zero in a screenshot and in every test, so the water they
     // see is a definite shape rather than whenever they happened to run.
     float time;
+    // Which frame this is. It moves the hash streams every frame, so a still camera does not redraw
+    // the same noise — see `sample_stream` in `lighting.glsl`.
+    uint sequence;
     // The sinusoids the sea is summed from, built on the host from an empirical spectrum rather
     // than a series chosen by eye — see `wave_spectrum.rs`.
     Wave waves[WAVE_COUNT];

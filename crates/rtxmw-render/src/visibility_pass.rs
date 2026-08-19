@@ -124,12 +124,31 @@ pub struct FrameConstants {
     /// Zero unless a caller sets one, so a screenshot and a test are reproducible: the surface at
     /// time zero is a definite shape rather than whatever the clock happened to say.
     time: f32,
+    /// Which frame this is, counted from the renderer's first.
+    ///
+    /// **It moves the sampler's hash streams**, and without it a still camera redraws bit-identical
+    /// noise every frame — the estimator's error becomes a fixed pattern rather than something
+    /// averaging away. A spatial filter hides that; a temporal one reads it as detail and keeps it.
+    sequence: u32,
     /// The sinusoids the water surface is summed from — see [`crate::wave_spectrum`].
     ///
     /// Static for the life of a sea state, and carried here rather than in a buffer of its own
     /// because it is six hundred bytes beside a block that is already uploaded every frame, and a
     /// second binding would cost more to explain than the copy costs to make.
     waves: [GpuWave; WAVE_COUNT],
+}
+
+/// How one frame draws its samples.
+///
+/// The three travel together because they are one decision: where in the pixel this frame looks,
+/// how many bounce rays it casts from there, and which hash streams those rays draw from.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct Sampling {
+    /// Sub-pixel offset from the pixel centre, in pixels. Zero unless an upscaler asked for it.
+    pub(crate) jitter: Vec2,
+    pub(crate) bounce_samples: u32,
+    /// Which frame this is, counted from the renderer's first.
+    pub(crate) sequence: u32,
 }
 
 impl FrameConstants {
@@ -141,9 +160,8 @@ impl FrameConstants {
         now: Viewpoint,
         previous: Viewpoint,
         lighting: Lighting,
-        jitter: Vec2,
+        sampling: Sampling,
         cone_spread: f32,
-        bounce_samples: u32,
         time: f32,
     ) -> Self {
         // No sun is a black one: every term it feeds is a multiplication, so the shader needs no
@@ -158,7 +176,7 @@ impl FrameConstants {
             previous_clip_from_offset: previous.clip_from_offset().to_cols_array(),
             clip_from_offset: now.clip_from_offset().to_cols_array(),
             camera_position: now.position.to_array(),
-            jitter: jitter.to_array(),
+            jitter: sampling.jitter.to_array(),
             camera_motion: (now.position - previous.position).to_array(),
             light_grid_scale: lighting.light_grid.scale,
             light_grid_origin: lighting.light_grid.origin.to_array(),
@@ -168,9 +186,10 @@ impl FrameConstants {
             sun_direction: sun.direction.to_array(),
             sun_cos_radius: sun.angular_radius.cos(),
             sun_colour: sun.colour.to_array(),
-            bounce_samples,
+            bounce_samples: sampling.bounce_samples,
             water_level: lighting.water_level.unwrap_or(f32::NEG_INFINITY),
             time,
+            sequence: sampling.sequence,
             // Rebuilt each frame rather than cached: it is a few hundred floats of arithmetic once
             // per frame against a million rays that read it, and a cache would need invalidating
             // the moment the sea state becomes something a cell can set.
@@ -549,9 +568,10 @@ mod tests {
         assert_eq!(offset_of!(FrameConstants, bounce_samples), 296);
         assert_eq!(offset_of!(FrameConstants, water_level), 300);
         assert_eq!(offset_of!(FrameConstants, time), 304);
+        assert_eq!(offset_of!(FrameConstants, sequence), 308);
         // The wave table follows, twenty tightly packed bytes apiece.
-        assert_eq!(offset_of!(FrameConstants, waves), 308);
-        assert_eq!(size_of::<FrameConstants>(), 308 + 20 * WAVE_COUNT);
+        assert_eq!(offset_of!(FrameConstants, waves), 312);
+        assert_eq!(size_of::<FrameConstants>(), 312 + 20 * WAVE_COUNT);
     }
 
     #[test]
@@ -609,9 +629,8 @@ mod tests {
                 sun: None,
                 water_level: None,
             },
-            Vec2::ZERO,
+            Sampling::default(),
             0.0,
-            0,
             0.0,
         )
     }

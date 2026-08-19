@@ -102,16 +102,33 @@ void main() {
         albedo *= exp(-WATER_EXTINCTION * path);
     }
 
+    // **The sky is not a black surface, it is no surface**, and the two have to be told apart in the
+    // guides. A miss leaves nothing to demodulate by, so the natural thing to write is zero — but a
+    // zero albedo tells an upscaler "this pixel reflects nothing", and a zero normal is not a unit
+    // vector at all. Ray Reconstruction's integration guide asks for mid grey and calls the
+    // alternative a common integration error; the normal it wants normalized, so a miss faces the
+    // camera. Water is the same case for the same reason: it is shaded whole into `emitted`, with no
+    // albedo the composite could put back.
+    //
+    // **The frame does not change.** The composite adds `albedo * lighting`, and lighting is zero on
+    // both of these paths, so what is written here is read by the upscaler and by nothing else.
+    vec3 guide_albedo = albedo;
+    vec3 guide_normal = surface.normal;
+    if (!surface.hit || surface.water) {
+        guide_albedo = vec3(SKY_GUIDE_ALBEDO);
+        guide_normal = -direction;
+    }
+
     imageStore(motion_target, ivec2(pixel), vec4(motion_vector(surface, direction, ndc, size), 0.0, 0.0));
 
     // The specular distance rides in the alpha, which the composite does not read and which the
     // normal target already sets the precedent for by carrying depth in its own fourth channel.
-    imageStore(albedo_target, ivec2(pixel), vec4(albedo, guides.specular_distance));
+    imageStore(albedo_target, ivec2(pixel), vec4(guide_albedo, guides.specular_distance));
     // Roughness is not here: it rides in the normal target's fourth channel, which is where the
     // upscaler reads it from and so the only copy worth keeping.
     imageStore(material_target, ivec2(pixel), vec4(guides.specular_albedo, 0.0));
     imageStore(
-        normal_roughness_target, ivec2(pixel), vec4(surface.normal, guides.roughness));
+        normal_roughness_target, ivec2(pixel), vec4(guide_normal, guides.roughness));
     // Clip depth for the upscaler, and the distance from the eye the filter stops edges on. A miss
     // has neither, and zero is what the filter reads as "nothing here".
     float clip_depth = 0.0;

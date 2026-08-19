@@ -1887,3 +1887,74 @@ message.
 window, which reported a 0.65 ms upscale as 0.65 ms of compositing — the composite's real cost is
 0.01 ms. A stage that is the most expensive thing in the frame cannot be measured as part of the
 cheapest.
+
+### 8.25 The sampler redrew the same noise every frame
+
+A still camera produced **bit-identical frames**: 0 of 921,600 pixels differed between frame 1 and
+frame 8. The hash streams were seeded `hash(pixel, stream, sample)` with no frame term, so the
+estimator's error was a fixed pattern rather than something that averages away.
+
+**A spatial filter hides this and a temporal one cannot.** À-trous filters each frame on its own and
+never asks whether the noise moved, so the fault survived M6 unnoticed. Ray Reconstruction
+accumulates across frames, reads a pattern that never changes as scene detail, and preserves it —
+the frame came out covered in salt-and-pepper speckle that 64 frames of convergence did nothing to.
+`DLSS-RR Integration Guide` §3.5 states the requirement it violated: samples must have minimal
+correlation *temporally* as well as spatially.
+
+The fix is `sample_stream` in `sampling.glsl`, which exclusive-ors the pixel with a word derived
+from a new `sequence` field in the frame constants. Exclusive-or with a fixed word is a bijection, so
+pixels still never collide within a frame — the rotation changes which stream each pixel draws from,
+not how many there are.
+
+**It costs the path that does not need it.** `sampling.glsl` had argued the other way, and was right
+for the renderer it was written for: with only an à-trous pass, a fixed seed dithers and holds still
+while reseeding leaves crawling static nothing averages away. Consecutive filtered frames of a still
+camera went from bit-identical to 0.7% RMSE apart. The trade inverts under a temporal filter, which
+is why it flipped — but the old rationale was sound and is recorded here rather than deleted.
+
+### 8.26 The reference was rewarding aliasing
+
+Measured against a native-4K 1024-sample reference, the à-trous path scored 32.1 dB and Ray
+Reconstruction 24.3 — a 7.6 dB deficit for the far more sophisticated denoiser, which was reason to
+distrust the *measurement* rather than the denoiser.
+
+**The reference was aliased.** It renders one sample per pixel spatially with jitter off, as does the
+à-trous path; Ray Reconstruction resolves sub-pixel detail across jittered frames and antialiases.
+On a shore full of fences and railings, PSNR penalised RR for edges that are *more* correct than the
+reference's.
+
+Re-rendering the reference at 7680×4320 and box-filtering to 4K — four spatial samples per output
+pixel, 1024 indirect ones, 18.7 s of device time — moves both figures:
+
+| 1 spp, 3840×2160 out | vs aliased reference | vs supersampled reference | device |
+|---|---|---|---|
+| à-trous, 4 passes, native | 32.1 dB | **26.8 dB** | 23.5 ms |
+| RR DLAA, native | 24.3 dB | **24.9 dB** | 59.0 ms |
+| RR Performance, 1920×1080 in | 21.9 dB | **22.2 dB** | 10.4 ms |
+
+The gap that mattered was under 2 dB, not 7.6, and it moved in opposite directions for the two
+methods — which is the signature of a metric measuring the reference's own defect.
+
+**A reference has to be at least as correct as the thing it judges, on every axis at once.** This one
+was more converged and less antialiased, and only the first was being thought about.
+
+### 8.27 M7's performance gate is met
+
+3840×2160 output on the Seyda Neen shore, release build, RTX 4090 Laptop:
+
+| | device | trace | upscale |
+|---|---|---|---|
+| native 4K | 34.50 ms | 29.80 | — |
+| 1920×1080 → 4K, RR Performance | **10.76 ms** | 6.39 | 4.18 |
+
+29 fps against 93 fps, with about 6 ms of the 16.7 ms budget unspent — and this is an exterior, where
+§5.3's table was measured on an interior. Take the figures as a ratio rather than as absolutes: the
+laptop's clocks move with thermals, and repeated runs of the same frame during this session spanned
+10.4 to 21.7 ms.
+
+**The quality gate is not met.** 22.2 dB against a supersampled reference is not "comparable to a
+1024-sample reference" by any reading, and RR trails the à-trous filter it replaces by 1.9 dB at
+matched resolution while costing five times as much there. What is established is that it is not the
+frozen noise, not the sky guides, not exposure, and not the jitter sequence length; §3.5's other
+requirements — hash quality and sample correlation — and the hit-distance guides RR is never given
+are what remain.

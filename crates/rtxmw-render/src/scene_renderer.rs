@@ -21,7 +21,9 @@ use crate::gbuffer::GBuffer;
 use crate::light_grid::LightGridExtent;
 use crate::scene_residency::SceneResidency;
 use crate::tonemap::Tonemap;
-use crate::visibility_pass::{FrameConstants, Lighting, SceneBindings, Viewpoint, VisibilityPass};
+use crate::visibility_pass::{
+    FrameConstants, Lighting, Sampling, SceneBindings, Viewpoint, VisibilityPass,
+};
 
 /// Half-float rather than 8-bit: the trace writes linear radiance that tone mapping consumes at M8,
 /// and an 8-bit intermediate would clip highlights before anything got the chance to.
@@ -527,11 +529,14 @@ impl SceneRenderer {
             now,
             previous,
             lighting,
-            jitter,
+            Sampling {
+                jitter,
+                bounce_samples: self.bounce_samples,
+                sequence: self.frames,
+            },
             // From the renderer's own target height, so the mip a surface samples follows the
             // resolution it is being traced at.
             FrameConstants::cone_spread_from(projection, self.target.extent().height),
-            self.bounce_samples,
             self.time,
         )
     }

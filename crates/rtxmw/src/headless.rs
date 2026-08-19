@@ -4,7 +4,6 @@
 //! device that was never asked to present. Useful for looking at a cell without a window appearing,
 //! and for checking that the frame path is validation-clean in a script.
 
-use std::path::Path;
 use std::time::Instant;
 
 use ash::vk;
@@ -17,27 +16,33 @@ use rtxmw_render::SceneRenderer;
 use rtxmw_render::dlss::Upscaler;
 use rtxmw_scene::{CellId, CellStreamer, LoadedCell};
 
+use crate::ScreenshotOptions;
 use crate::scene_loader;
 
 /// Stands in for the upscaler where DLSS is not compiled in, so one code path serves both builds.
 #[cfg(not(feature = "dlss"))]
 type Upscaler = std::convert::Infallible;
-use crate::scene_loader::{Viewpoint, ViewpointOverride};
+use crate::scene_loader::Viewpoint;
 
-/// Renders the default cell once and writes it to `path` as a PNG.
+/// Renders a cell and writes the last frame to `options.path` as a PNG.
 ///
-/// Returns the fraction of pixels that hit geometry, which is enough to tell "the cell rendered"
-/// from "the camera was pointed at nothing" without opening the file.
+/// Returns the fraction of traced rays that hit geometry, which is enough to tell "the cell
+/// rendered" from "the camera was pointed at nothing" without opening the file.
 ///
-/// `viewpoint` says where the camera stands and which way it faces; whatever it leaves out is where
-/// a traveller entering the cell would stand and what they would be looking at.
-pub(crate) fn screenshot(
-    path: &Path,
-    width: u32,
-    height: u32,
-    cell: CellId,
-    viewpoint: ViewpointOverride,
-) -> Result<f32, Box<dyn std::error::Error>> {
+/// `options.viewpoint` says where the camera stands and which way it faces; whatever it leaves out
+/// is where a traveller entering the cell would stand and what they would be looking at.
+pub(crate) fn screenshot(options: &ScreenshotOptions) -> Result<f32, Box<dyn std::error::Error>> {
+    let ScreenshotOptions {
+        path,
+        width,
+        height,
+        cell,
+        viewpoint,
+        frames,
+        samples,
+        denoise,
+    } = options;
+    let (width, height) = (*width, *height);
     // No surface extensions and no swapchain: this device could not present if asked.
     let instance = Instance::new(c"rtxmw", &[], Validation::for_build())?;
     let physical = PhysicalDevice::select(&instance, Presentation::NotNeeded)?;
@@ -56,7 +61,14 @@ pub(crate) fn screenshot(
     let mut renderer = SceneRenderer::new(&device, &physical, &memory, extent)?;
     attach_upscaler(&memory, &mut renderer, upscaler)?;
 
-    let cell = LoadedCell::load_at(cell)?
+    if let Some(samples) = *samples {
+        renderer.set_bounce_samples(samples);
+    }
+    if let Some(passes) = *denoise {
+        renderer.set_denoise_passes(passes);
+    }
+
+    let cell = LoadedCell::load_at(cell.clone())?
         .ok_or("no game data configured — set MORROWIND_DATA_DIR, or put it in .env")?;
     renderer.load_scene(
         &device,
@@ -75,13 +87,17 @@ pub(crate) fn screenshot(
         &cell.id,
     )?;
 
-    let camera = viewpoint.over(Viewpoint::entering(&cell)).camera();
-    let constants = renderer.frame_constants(
-        camera.view(),
-        camera.projection(width as f32 / height as f32),
-        camera.position(),
-    );
-    renderer.render_once(&mut uploader, &constants)?;
+    let camera = viewpoint.clone().over(Viewpoint::entering(&cell)).camera();
+    // The same picture, rendered until whatever accumulates across frames has. The camera does not
+    // move, so every frame past the first differs only in its jitter and its history.
+    for _ in 0..*frames {
+        let constants = renderer.frame_constants(
+            camera.view(),
+            camera.projection(width as f32 / height as f32),
+            camera.position(),
+        );
+        renderer.render_once(&mut uploader, &constants)?;
+    }
 
     // Zero everywhere means the queue cannot write timestamps, which is worth saying nothing about
     // rather than reporting as a frame that took no time.
@@ -98,15 +114,25 @@ pub(crate) fn screenshot(
         vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
     )?;
 
-    // Alpha carries the hit flag rather than coverage, so the file gets it flattened — otherwise a
-    // viewer composites every missed ray as transparent and the image reads as blown out.
-    let hits = pixels.chunks_exact(4).filter(|p| p[3] > 128).count();
     readback::write_png_opaque(path, &pixels, width, height);
+
+    // **From the traced frame, not the written one.** Alpha carries the hit flag, and it survives
+    // the tone curve only when nothing else writes the image — an upscaler produces its own alpha
+    // and it is 1.0 everywhere, which would report every camera as looking at geometry. The trace's
+    // own target is also where the rays actually are: they are cast at the render resolution, so a
+    // fraction of them is a fraction of that image rather than of the upscaled one.
+    let traced = readback::image_to_rgba8(
+        &mut uploader,
+        renderer.target(),
+        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+    )?;
+    let hits = traced.chunks_exact(4).filter(|p| p[3] > 128).count();
+    let rays = traced.len() / 4;
 
     // Everything here is a local, so it drops in reverse declaration order — renderer, uploader,
     // memory, device — which is the order the device's allocations require. Worth knowing rather
     // than worth writing out: reordering the declarations would break it silently.
-    Ok(hits as f32 / (width * height) as f32)
+    Ok(hits as f32 / rays as f32)
 }
 
 /// Streams in the cells around `centre` and waits for them, so a screenshot shows what the engine
@@ -188,15 +214,21 @@ fn build_upscaler(
 ) -> Result<Option<Upscaler>, Box<dyn std::error::Error>> {
     #[cfg(feature = "dlss")]
     {
-        if std::env::var("RTXMW_DLSS").is_err() {
+        // The variable doubles as the quality selector: `1` is the §5.3 Performance mode the frame
+        // budget is written against, and a name picks another. An unrecognised value is a typo
+        // worth stopping for rather than silently rendering at a mode nobody asked for.
+        let Ok(asked) = std::env::var("RTXMW_DLSS") else {
             return Ok(None);
-        }
+        };
+        let preset = rtxmw_render::dlss::Preset::named(&asked)
+            .ok_or_else(|| format!("RTXMW_DLSS={asked:?} names no preset"))?;
         let upscaler = Upscaler::new(
             _instance,
             _physical,
             _device,
             _uploader,
             _output,
+            preset,
             upscaler_paths(),
         )
         .map_err(|e| format!("DLSS would not start: {e}"))?;

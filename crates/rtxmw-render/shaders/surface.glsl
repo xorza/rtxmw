@@ -162,6 +162,12 @@ struct Guides {
     float specular_distance;
 };
 
+// What the guides say a pixel reflects where nothing was hit.
+//
+// Mid grey rather than black: an upscaler demodulates by this, and zero would claim the sky absorbs
+// everything reaching it. `DLSS-RR Integration Guide` §3.4.2 names the value.
+#define SKY_GUIDE_ALBEDO 0.5
+
 // What every surface in a diffuse world says: nothing reflects, and nothing is reflected.
 Guides matte() {
     return Guides(vec3(0.0), 1.0, 0.0);

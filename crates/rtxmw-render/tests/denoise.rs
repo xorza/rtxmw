@@ -101,8 +101,11 @@ struct Rendered {
     timings: FrameTimings,
 }
 
-/// Renders with `passes` of filtering.
-fn trace(scene: &StaticScene, passes: u32) -> Rendered {
+/// Renders `frames` frames of `scene` with `passes` of filtering, and returns the last.
+///
+/// More than one frame matters because the sampler's hash streams move with the frame counter: a
+/// caller asking for two is asking what the *second* frame looks like, not for the first again.
+fn trace(scene: &StaticScene, passes: u32, frames: u32) -> Rendered {
     let gpu = TestGpu::shared();
     let mut renderer = SceneRenderer::new(
         gpu.device(),
@@ -132,10 +135,12 @@ fn trace(scene: &StaticScene, passes: u32) -> Rendered {
     let view = glam::camera::rh::view::look_to_mat4(eye, Vec3::X, Vec3::Z);
     let projection =
         glam::camera::rh::proj::vulkan::perspective_infinite_reverse(75f32.to_radians(), 1.0, 0.05);
-    let constants = renderer.frame_constants(view, projection, eye);
-    renderer
-        .render_once(&mut uploader, &constants)
-        .expect("trace should run");
+    for _ in 0..frames {
+        let constants = renderer.frame_constants(view, projection, eye);
+        renderer
+            .render_once(&mut uploader, &constants)
+            .expect("trace should run");
+    }
 
     let timings = renderer.timings().expect("timings should read back");
     let pixels = readback::image_to_rgba8(
@@ -170,10 +175,53 @@ fn roughness(pixels: &[u8], x: std::ops::Range<u32>, rows: std::ops::Range<u32>)
 }
 
 #[test]
+fn successive_frames_draw_different_samples_of_the_same_light() {
+    // **The estimator's error has to move.** Seeded by pixel alone it does not: a still camera then
+    // renders bit-identical frames, and the noise stops being something averaging removes and
+    // becomes a fixed pattern. À-trous never notices, since it filters each frame on its own — which
+    // is how this went unseen until a temporal filter read the pattern as detail and kept it.
+    let scene = split_wall();
+    let first = trace(&scene, 0, 1).pixels;
+    let second = trace(&scene, 0, 2).pixels;
+
+    // Over the band the roughness test uses, where the only variation is the indirect estimate.
+    fn band(pixels: &[u8]) -> Vec<f32> {
+        (60..200)
+            .flat_map(|y| (30..110).map(move |x| (x, y)))
+            .map(|(x, y)| red_at(pixels, x, y))
+            .collect()
+    }
+    let (first, second) = (band(&first), band(&second));
+    let changed = first.iter().zip(&second).filter(|(a, b)| a != b).count();
+    let total = first.len();
+    println!("{changed} of {total} pixels differ between consecutive frames");
+    // A third is a floor, not a target: four bounce rays over a coarse dither move most pixels, and
+    // demanding "most" would make this a measurement of the fixture rather than of the sampler.
+    // Zero is the failure being guarded against, and a frozen seed gives exactly zero.
+    assert!(
+        changed * 3 > total,
+        "only {changed} of {total} pixels changed between frames; the sampler is redrawing the \
+         same noise, so no amount of accumulation can average it away"
+    );
+
+    // **And it is noise, not drift.** Two frames of a moving seed have to agree on the light they
+    // are both estimating — if the mean moved with the seed, the samples would be biased and
+    // averaging them would converge on the wrong answer rather than a smoother one.
+    let mean = |band: &[f32]| band.iter().sum::<f32>() / total as f32;
+    let (before, after) = (mean(&first), mean(&second));
+    println!("band mean {before:.2} then {after:.2}");
+    assert!(
+        (before - after).abs() < 2.0,
+        "the band averaged {before} in one frame and {after} in the next; that is a different \
+         estimate rather than another sample of the same one"
+    );
+}
+
+#[test]
 fn filtering_smooths_the_light_and_leaves_the_albedo_edge_alone() {
     let scene = split_wall();
-    let unfiltered = trace(&scene, 0);
-    let refined = trace(&scene, 4);
+    let unfiltered = trace(&scene, 0, 1);
+    let refined = trace(&scene, 4, 1);
 
     // The device timings have to track the work actually recorded, which is the only claim about
     // them a test can make without measuring a wall clock: four à-trous passes cost something, no

@@ -103,6 +103,22 @@ pub(crate) struct ScreenshotOptions {
     /// report is rarely visible from the doorway — a canopy artefact needs the camera inside the
     /// tree. Without this the only way there is the windowed binary, by hand, unrepeatably.
     pub(crate) viewpoint: ViewpointOverride,
+    /// Frames to render before the last one is written, with the camera held still.
+    ///
+    /// **One is not a fair frame for a temporal upscaler.** Ray Reconstruction resolves detail
+    /// across frames and is told `reset` on the first, so a single frame is its worst case rather
+    /// than its output. Everything else renders the same picture however many times it is asked.
+    pub(crate) frames: u32,
+    /// Indirect samples per pixel, where the caller wants something other than the default.
+    ///
+    /// A reference render is this turned up far enough that the noise it is a reference for is gone.
+    pub(crate) samples: Option<u32>,
+    /// À-trous passes, where the caller wants something other than the default.
+    ///
+    /// **A filtered reference is not one.** The filter trades bias for variance, which is the right
+    /// trade at four samples and the wrong one at a thousand — anything measured against it would
+    /// be measured against the filter as much as against the light.
+    pub(crate) denoise: Option<u32>,
 }
 
 impl ScreenshotOptions {
@@ -115,6 +131,17 @@ impl ScreenshotOptions {
     /// `--at X,Y,Z` and `--look X,Y,Z` may follow, and are the one exception — an interior's name
     /// could be anything, so a viewpoint has to be flagged rather than counted.
     fn parse(arguments: &[String]) -> Result<Self, String> {
+        /// The whole number after a flag, named in its own error.
+        fn count<'a>(
+            rest: &mut impl Iterator<Item = &'a String>,
+            what: &str,
+        ) -> Result<u32, String> {
+            rest.next()
+                .ok_or_else(|| format!("{what} needs a count"))?
+                .parse()
+                .map_err(|_| format!("{what} needs a whole number"))
+        }
+
         let mut rest = arguments.iter();
         let path = PathBuf::from(
             rest.next()
@@ -123,6 +150,9 @@ impl ScreenshotOptions {
         let mut positional: Vec<&String> = Vec::new();
         let mut at = None;
         let mut look = None;
+        let mut frames = None;
+        let mut samples = None;
+        let mut denoise = None;
         while let Some(argument) = rest.next() {
             let mut vector = |what: &str| -> Result<Vec3, String> {
                 let value = rest
@@ -142,6 +172,14 @@ impl ScreenshotOptions {
             match argument.as_str() {
                 "--at" => at = Some(vector("--at")?),
                 "--look" => look = Some(vector("--look")?),
+                // Zero is rejected rather than clamped: it can only be a mistake, and rendering
+                // one frame for it would answer a question nobody asked.
+                "--frames" => match count(&mut rest, "--frames")? {
+                    0 => return Err("--frames needs at least one".to_owned()),
+                    n => frames = Some(n),
+                },
+                "--samples" => samples = Some(count(&mut rest, "--samples")?),
+                "--denoise" => denoise = Some(count(&mut rest, "--denoise")?),
                 _ => positional.push(argument),
             }
         }
@@ -168,6 +206,9 @@ impl ScreenshotOptions {
                 position: at,
                 forward: look,
             },
+            frames: frames.unwrap_or(1),
+            samples,
+            denoise,
         })
     }
 }
@@ -175,13 +216,7 @@ impl ScreenshotOptions {
 /// Renders one frame offscreen from the arguments after `--screenshot`.
 fn screenshot(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let options = ScreenshotOptions::parse(arguments)?;
-    let hit_fraction = headless::screenshot(
-        &options.path,
-        options.width,
-        options.height,
-        options.cell,
-        options.viewpoint,
-    )?;
+    let hit_fraction = headless::screenshot(&options)?;
     println!(
         "wrote {} ({:.0}% of rays hit geometry)",
         options.path.display(),
@@ -251,6 +286,9 @@ mod tests {
                     position: Some(Vec3::new(10.0, 20.0, 30.0)),
                     forward: Some(Vec3::NEG_Y),
                 },
+                frames: 1,
+                samples: None,
+                denoise: None,
             })
         );
         // Either half on its own: what is not said is left to the cell rather than made up here,
@@ -287,6 +325,11 @@ mod tests {
                 height: SCREENSHOT_SIZE.1,
                 cell: interior(scene_loader::DEFAULT_CELL),
                 viewpoint: ViewpointOverride::default(),
+                // One frame and the renderer's own sample count, so the short form is what it
+                // always was.
+                frames: 1,
+                samples: None,
+                denoise: None,
             })
         );
         assert_eq!(
@@ -297,8 +340,54 @@ mod tests {
                 height: 1080,
                 cell: CellId::Exterior { x: -2, y: -9 },
                 viewpoint: ViewpointOverride::default(),
+                frames: 1,
+                samples: None,
+                denoise: None,
             })
         );
+        // Flagged like the viewpoint, and for the same reason — an interior's name could be "512".
+        assert_eq!(
+            screenshot_options(&[
+                "out.png",
+                "--frames",
+                "64",
+                "3840x2160",
+                "--samples",
+                "1024",
+                "--denoise",
+                "0",
+                "-2,-9",
+            ]),
+            Ok(ScreenshotOptions {
+                path: PathBuf::from("out.png"),
+                width: 3840,
+                height: 2160,
+                cell: CellId::Exterior { x: -2, y: -9 },
+                viewpoint: ViewpointOverride::default(),
+                frames: 64,
+                samples: Some(1024),
+                denoise: Some(0),
+            })
+        );
+        for (arguments, expected) in [
+            (vec!["out.png", "--frames"], "--frames needs a count"),
+            (
+                vec!["out.png", "--frames", "soon"],
+                "--frames needs a whole number",
+            ),
+            (vec!["out.png", "--samples"], "--samples needs a count"),
+            (
+                vec!["out.png", "--samples", "lots"],
+                "--samples needs a whole number",
+            ),
+            (vec!["out.png", "--denoise"], "--denoise needs a count"),
+            (
+                vec!["out.png", "--frames", "0"],
+                "--frames needs at least one",
+            ),
+        ] {
+            assert_eq!(screenshot_options(&arguments), Err(expected.to_owned()));
+        }
 
         assert_eq!(
             screenshot_options(&[]),

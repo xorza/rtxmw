@@ -362,10 +362,15 @@ impl Ngx {
 /// §5.3 settles on **Performance** — 1920×1080 internal to 3840×2160 — which is the mode the whole
 /// frame budget is written against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Preset {
+pub enum Preset {
+    /// Half the output's width and height, so a quarter of its pixels.
     Performance,
     Balanced,
     Quality,
+    /// **No upscaling at all** — render and output are the same size, and Ray Reconstruction only
+    /// denoises and antialiases. What separates the two halves of what it does, when a frame comes
+    /// out softer than the reference and the question is which half softened it.
+    Dlaa,
 }
 
 impl Preset {
@@ -375,6 +380,20 @@ impl Preset {
             Self::Performance => 0,
             Self::Balanced => 1,
             Self::Quality => 2,
+            Self::Dlaa => 5,
+        }
+    }
+
+    /// The preset `name` selects, or `None` where it names none of them.
+    ///
+    /// `1` is Performance so that the plain switch means the mode §5.3 is written against.
+    pub fn named(name: &str) -> Option<Self> {
+        match name {
+            "1" | "performance" => Some(Self::Performance),
+            "balanced" => Some(Self::Balanced),
+            "quality" => Some(Self::Quality),
+            "dlaa" => Some(Self::Dlaa),
+            _ => None,
         }
     }
 }
@@ -507,6 +526,7 @@ impl Upscaler {
         device: &Device,
         uploader: &mut Uploader,
         output: vk::Extent2D,
+        preset: Preset,
         paths: Paths<'_>,
     ) -> Result<Self, crate::dlss::error::UpscalerError> {
         let ngx = Ngx::new(
@@ -516,7 +536,7 @@ impl Upscaler {
             paths.data,
             paths.feature_libraries,
         )?;
-        let settings = ngx.optimal_settings((output.width, output.height), Preset::Performance)?;
+        let settings = ngx.optimal_settings((output.width, output.height), preset)?;
         let render = vk::Extent2D {
             width: settings.render.0,
             height: settings.render.1,
@@ -533,12 +553,7 @@ impl Upscaler {
 
         let mut built = None;
         uploader.submit_and_wait(|_, cmd| {
-            built = Some(ngx.build(
-                cmd,
-                settings.render,
-                (output.width, output.height),
-                Preset::Performance,
-            ));
+            built = Some(ngx.build(cmd, settings.render, (output.width, output.height), preset));
         })?;
         let feature = built.expect("the recording ran")?;
 
@@ -1150,6 +1165,31 @@ mod tests {
         // and not the next one's — NGX keeps its state per device and a leaked feature outlives the
         // handle that owned it.
         drop(feature);
+    }
+
+    #[test]
+    fn a_preset_is_named_or_it_is_not_a_preset() {
+        // Every name the switch accepts, against the `NVSDK_NGX_PerfQuality_Value` it selects — the
+        // enum is an FFI integer, so a variant landing on the wrong number is a silent change of
+        // render resolution rather than a compile error.
+        for (name, value) in [
+            ("1", 0),
+            ("performance", 0),
+            ("balanced", 1),
+            ("quality", 2),
+            ("dlaa", 5),
+        ] {
+            let preset = Preset::named(name).unwrap_or_else(|| panic!("{name:?} should name one"));
+            assert_eq!(preset.value(), value, "{name:?} selected the wrong mode");
+        }
+        // **Unrecognised is `None`, not a default.** Silently rendering at a mode nobody asked for
+        // is how a typo becomes a performance measurement of the wrong thing.
+        for wrong in ["", "0", "Performance", "ultra", "true"] {
+            assert!(
+                Preset::named(wrong).is_none(),
+                "{wrong:?} named a preset, and it should not"
+            );
+        }
     }
 
     #[test]
