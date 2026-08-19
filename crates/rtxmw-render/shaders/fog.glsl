@@ -100,6 +100,32 @@ const float FOG_EVEN = 0.5;
 // indoors is a mood, not a measurement — so this is what turns one into the other.
 const float FOG_EXTINCTION = 5.0e-4;
 
+// How many shadow rays the sun gets in the fog, and so how many pieces the march is cut into.
+//
+// **Not one per step.** A ray costs about four march steps here, so shadowing every one of the
+// twenty-four would cost more than four times what the whole fog costs now. What the industry
+// spends on this is the calibration worth having: a froxel volume traces one ray per cell, and at
+// the grid NVIDIA ships in Remix that works out at about three quarters of a ray per output pixel.
+// Eight is over ten times that sample density, and at full screen resolution rather than an eighth
+// of it — which is where a shaft through a tree keeps its edges.
+//
+// **Eight rather than four because eight measured at 0.18 ms more**, which buys the step from a
+// smear off a hillside to a beam: against a ray-per-step reference the error runs 0.0155, 0.0134,
+// 0.0087, 0.0048 for one, two, four and eight. They are perfectly coherent — every one of them
+// points at the same sun — which is why the eighth costs so little.
+const uint FOG_SHADOW_RAYS = 8u;
+
+// How many march steps one of those rays answers for. `FOG_SHADOW_RAYS` must divide `FOG_STEPS`.
+const uint FOG_STEPS_PER_RAY = FOG_STEPS / FOG_SHADOW_RAYS;
+
+// Below this fraction of what the sky scatters into the fog, the sun does not get a shadow ray.
+//
+// **What makes the cost fall only where the shafts are.** Ninety degrees off the sun the phase
+// function is two thousandths of its forward value, so the sun puts less light into the air there
+// than the rounding on the sky's term — and a shaft cut out of light that faint is a shaft nobody
+// can see. Looking away from the sun, this is the whole of what fog costs.
+const float FOG_SHAFT_FLOOR = 0.02;
+
 // Where along the ray the step ending at `fraction` of the way through reaches.
 //
 // **Uniform steps spend their samples where nobody is looking.** A ray that runs thirty thousand
@@ -178,17 +204,111 @@ float fog_density_at(vec3 position) {
     return frame.fog_density * FOG_EXTINCTION * height * coverage;
 }
 
+// The mean diameter of the fog's water droplets, in micrometres.
+//
+// **The one dial on the shape of the sun's halo.** Radiation fog runs from a few micrometres to
+// about twenty, and the forward peak sharpens brutally with size: at five the fog scatters 1,300
+// times an isotropic one straight down the sun's line, at eight 4,300, at thirty 81,000. Eight is
+// a thick coastal fog, and it is the size the halo was chosen at rather than measured at.
+const float FOG_DROPLET = 8.0;
+
+// The solid angle of the whole sphere, inverted: what an isotropic phase function is worth.
+const float INV_FOUR_PI = INV_PI * 0.25;
+
+// The largest of a colour's three channels.
+float brightest(vec3 colour) {
+    return max(colour.x, max(colour.y, colour.z));
+}
+
+// Henyey-Greenstein, normalised so that it integrates to one over the sphere.
+float henyey_greenstein(float g, float cos_theta) {
+    float g2 = g * g;
+    float denominator = 1.0 + g2 - 2.0 * g * cos_theta;
+    return INV_FOUR_PI * (1.0 - g2) / (denominator * sqrt(denominator));
+}
+
+// What the fog sends toward the eye per steradian, `cos_theta` off the sun's line.
+//
+// **Mie, not Henyey-Greenstein.** A single HG lobe is the usual choice and it cannot do this shape:
+// real droplets throw a diffraction peak within a degree of the light that is orders of magnitude
+// above anything a lobe with a single `g` reaches, and they still send a sixth of isotropic
+// *backwards*. Both are what a fog looks like — the blaze around a low sun and the fact that fog is
+// not black when you turn away from it. Jendersie and d'Eon fit a HG peak blended with Draine's
+// function to tabulated Mie over droplet diameters of five to fifty micrometres, which is a pair of
+// lobes and four `exp`s rather than a table:
+// <https://research.nvidia.com/labs/rtr/approximate-mie/>.
+//
+// **Per steradian, and that is not a detail.** The sky's term needs no phase function at all — it
+// arrives from every direction, and a phase function integrates to one over the sphere, so the whole
+// of it scatters in whatever shape the fog has. The sun arrives from one direction, as irradiance,
+// and what comes back toward the eye is that irradiance times the phase function *per steradian*.
+// Normalising this to "isotropic is 1" instead — which is the convention the lamps below are
+// written in — makes the sun `4*pi` times too bright, which is a white-out with an exposure system
+// underneath it doing its best.
+//
+// One evaluation for a whole ray. The sun is directional, so the angle between the view ray and it
+// is the same at every point along the march — which is the only reason a phase function of this
+// shape is affordable.
+float fog_phase(float cos_theta) {
+    float peak_g = exp(-0.0990567 / (FOG_DROPLET - 1.67154));
+    float bulk_g = exp(-2.20679 / (FOG_DROPLET + 3.91029) - 0.428934);
+    float alpha = exp(3.62489 - 8.29288 / (FOG_DROPLET + 5.52825));
+    float bulk_share = exp(-0.599085 / (FOG_DROPLET - 0.641583) - 0.665888);
+
+    // Draine's function is Henyey-Greenstein with a `1 + alpha*cos^2` term over the normalisation
+    // that term costs.
+    float bulk = henyey_greenstein(bulk_g, cos_theta)
+               * (1.0 + alpha * cos_theta * cos_theta)
+               / (1.0 + alpha * (1.0 + 2.0 * bulk_g * bulk_g) / 3.0);
+    return mix(henyey_greenstein(peak_g, cos_theta), bulk, bulk_share);
+}
+
+// The sun's light as it scatters into a ray heading `direction`, before anything shadows it.
+//
+// Black for a cell with no sky, which is how an interior says it has no sun.
+vec3 fog_sunlight(vec3 direction) {
+    if (frame.sun_colour == vec3(0.0)) {
+        return vec3(0.0);
+    }
+    return frame.sun_colour * fog_phase(dot(direction, -frame.sun_direction));
+}
+
+// The optical depth between a point of the given `extinction` and the sky above it, along the line
+// to the sun.
+//
+// **Fog shadows itself, and leaving that out is what makes single scattering white out.** Light
+// arriving at a point deep in a bank has crossed the whole bank to get there; without the term, every
+// point in the fog is lit as though it were the first one the sun touched, and a phase function that
+// aims the sun's light at the eye then multiplies a quantity that was already several times too
+// large.
+//
+// Closed form rather than a second march. The density falls off exponentially with height, so the
+// column along a straight line out of it integrates to `sigma * H / cos(zenith)` — the same integral
+// an atmosphere's optical depth uses, and the one Golubev writes out for exponential media. Its
+// assumption is that the coverage a point sits in continues along that line, which is what a bank
+// looks like from inside it and is wrong only near a bank's edge, where the fog is thin and the term
+// is close to one anyway.
+float fog_sun_depth(float extinction) {
+    // A sun on the horizon lights an infinite column of fog; the floor is what keeps that finite.
+    float climb = max(-frame.sun_direction.z, 1e-3);
+    return extinction * FOG_HEIGHT / climb;
+}
+
 // The radiance scattering toward the eye from a point in the fog.
 //
 // **Every lamp that reaches it**, through the same grid a surface uses, so a lantern shows as a
 // halo in the murk rather than lighting only what it stands on. Unshadowed: a shaft needs a ray per
 // light per step, which is a different order of cost from this.
 //
-// No phase function. Isotropic scattering is the honest default for a fog with no measured one, and
-// the alternative is a lobe chosen to look right, which is a thing to tune once there is something
-// to tune it against.
-vec3 fog_light(vec3 position) {
-    vec3 total = frame.fog;
+// **No phase function on the lamps.** The sun has one because its angle to the view ray is fixed
+// along a whole march and so costs one evaluation; a lamp's changes at every step and with every
+// lamp, which is a different order of cost. Isotropic is the honest stand-in until there is
+// something to tune a lobe against.
+//
+// `sun` arrives with everything already taken out of it — the phase function, the shadow ray, the
+// fog's own column, the water overhead — so this is a sum and nothing more.
+vec3 fog_light(vec3 position, vec3 sun) {
+    vec3 total = frame.fog + sun;
     uvec2 near = lights_reaching(position);
     for (uint k = near.x; k < near.y; ++k) {
         Light light = lights[light_grid_indices[k]];
@@ -215,20 +335,49 @@ vec4 fog_along(vec3 origin, vec3 direction, float distance, uvec2 pixel) {
     // twenty-four visible shells becomes noise the filter and the upscaler both remove.
     float offset = unit_pair(hash(uvec4(sample_stream(pixel), STREAM_FOG, 0u))).x;
 
+    vec3 sun = fog_sunlight(direction);
+    bool shafts = brightest(sun) > FOG_SHAFT_FLOOR * brightest(frame.fog);
+
     float transmittance = 1.0;
     vec3 scattered = vec3(0.0);
     float behind = 0.0;
-    for (uint i = 0u; i < FOG_STEPS; ++i) {
-        float ahead = fog_depth(float(i + 1u) / float(FOG_STEPS)) * span;
-        float stride = ahead - behind;
-        vec3 position = origin + direction * (behind + stride * offset);
-        behind = ahead;
+    for (uint s = 0u; s < FOG_SHADOW_RAYS; ++s) {
+        float reach = fog_depth(float((s + 1u) * FOG_STEPS_PER_RAY) / float(FOG_STEPS)) * span;
+        // **One ray decides the whole stretch, from a point drawn anywhere along it.** Holding an
+        // answer across several steps is what a froxel does too, and the jitter is what keeps it
+        // from being a decision always taken at the same place: over frames the probe walks the
+        // stretch, so a shaft's edge lands between two neighbours as noise rather than as a step.
+        //
+        // Aimed at a point on the sun's disc rather than at its centre, which costs nothing and
+        // softens the edge. That matters more here than it does on a surface: the march samples
+        // visibility far more coarsely than the fog varies, and a gradient wider than the sampling
+        // is the only thing that keeps a hard edge from aliasing along the ray.
+        float visible = 1.0;
+        if (shafts) {
+            vec3 probe = origin + direction * mix(behind, reach, offset);
+            vec2 u = unit_pair(hash(uvec4(sample_stream(pixel), STREAM_FOG, 1u + s)));
+            vec3 towards = cone_direction(-frame.sun_direction, frame.sun_cos_radius, u);
+            visible = occluded(probe, towards, RAY_MAX) ? 0.0 : 1.0;
+        }
 
-        float extinction = fog_density_at(position);
-        // Absorbed over this step, and what scatters in is lit where it sits.
-        float absorbed = 1.0 - exp(-extinction * stride);
-        scattered += transmittance * absorbed * fog_light(position);
-        transmittance *= 1.0 - absorbed;
+        for (uint k = 0u; k < FOG_STEPS_PER_RAY; ++k) {
+            uint i = s * FOG_STEPS_PER_RAY + k + 1u;
+            float ahead = fog_depth(float(i) / float(FOG_STEPS)) * span;
+            float stride = ahead - behind;
+            vec3 position = origin + direction * (behind + stride * offset);
+            behind = ahead;
+
+            float extinction = fog_density_at(position);
+            // Absorbed over this step, and what scatters in is lit where it sits.
+            float absorbed = 1.0 - exp(-extinction * stride);
+            // Everything between the sun and this point: what the geometry stopped, what the fog
+            // itself absorbed on the way down, and what any water overhead took out of it.
+            vec3 reaching = sun * visible
+                          * exp(-fog_sun_depth(extinction))
+                          * daylight_reaching(position);
+            scattered += transmittance * absorbed * fog_light(position, reaching);
+            transmittance *= 1.0 - absorbed;
+        }
     }
 
     // The strength dial fades the whole effect rather than the density, so zero is the frame

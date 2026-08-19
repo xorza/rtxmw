@@ -2454,3 +2454,84 @@ The fog test caught the retune, which is the useful part: its fixture is an inte
 landed on it at once and its gradient fell under the threshold. Raising the fixture's recorded density
 to 140 — far above anything the game ships — is the honest fix, because what it tests is the integral
 over distance and an interior no longer buys enough of one at any density a cell actually has.
+
+### 8.43 The sun in the fog, and the two ways it was wrong before it was right
+
+Fog was lit by the sky and by lamps and not at all by the sun, which is five times the sky's radiance
+and the only reason anyone looks at fog. Standing on Seyda Neen's shore facing the sun rendered
+*identically* to standing there facing away from it — the away view was the brighter of the two.
+
+**The phase function is free, and that decides which one to use.** The sun is directional, so the
+angle between the view ray and it is the same at every point along a ray: one evaluation for a whole
+march rather than one per step. That takes the usual argument for a single Henyey-Greenstein lobe off
+the table, so this uses [Jendersie and d'Eon's HG-Draine
+blend](https://research.nvidia.com/labs/rtr/approximate-mie/) fitted to tabulated Mie, at a droplet
+diameter of eight micrometres. It is two lobes and four `exp`s, and it is the difference between a
+lobe that peaks at 45 times isotropic and real fog, which peaks at 4,337 and still sends a sixth of
+isotropic straight backwards. Both halves of that are what fog looks like: the blaze around a low sun,
+and the fact that fog does not go black when you turn around.
+
+**Wrong once, by exactly `4*pi`.** The first version normalised the phase so isotropic came out at
+1.0, matching the convention the lamps are written in. That is right for a source integrated over the
+sphere and wrong for a delta: the sky arrives from everywhere and a phase function integrates to one,
+so the whole of the sky scatters in whatever shape the fog has; the sun arrives from one direction as
+*irradiance*, and what comes back is that irradiance times the phase function **per steradian**. The
+frame was a white-out and auto-exposure spent the rest of it apologising.
+
+**Wrong twice, by leaving out the light's own path.** Single scattering that lights every point in a
+bank as though it were the first one the sun touched is several times too bright before the phase
+function multiplies it. The density falls off exponentially with height, so the column from a point to
+the sky along the line to the sun is closed form — `sigma * H / cos(zenith)`, the same integral an
+atmosphere's optical depth uses — and it costs one `exp` on an extinction the march already computed.
+That is what puts a gradient down through a bank instead of a flat glow, and what makes a sun on the
+horizon correctly light nothing.
+
+**Shadows: eight rays, and the count came from measuring, not from taste.** A shadow ray costs about
+four march steps, so one per step would cost more than four times what the whole fog costs. The march
+is cut into eight stretches with one ray apiece, drawn from a jittered point anywhere along its
+stretch and aimed at a point on the sun's disc rather than its centre — softening the edge is what
+keeps a binary visibility test from aliasing against a march that samples it far more coarsely than
+the fog varies. Against a 24-ray reference, RMSE falls 0.0155 / 0.0134 / 0.0087 / 0.0048 for 1 / 2 /
+4 / 8, and the shaft off a hillside goes from a smear to a beam somewhere between four and eight.
+
+Cost at 1920x1080 internal, whole frame, best of five (the laptop's clocks vary by 40% between runs,
+so a single sample says nothing):
+
+| | device time |
+|---|---|
+| no fog | 5.33 ms |
+| fog, 2 shadow rays | 6.69 ms |
+| fog, 4 | 7.35 ms |
+| **fog, 8** | **7.53 ms** |
+| fog, 24 | 9.69 ms |
+
+Eight rays cost 0.18 ms over four. They are perfectly coherent — every one of them points at the same
+sun — and a gate skips them wherever the sun's phase falls below a fiftieth of the sky's term, which
+is everything but the sunward part of the frame and all of every interior. Settled consecutive frames
+differ by 0.17% RMSE, against the 0.7% this renderer already accepts from reseeding every frame.
+
+**What the industry does, and why this does not.** Nothing shipped ray-marches volumetric transmittance
+per pixel: Wronski's froxel grid is universal, from Frostbite to id Tech 8 to Unreal to Unity, at about
+240x135x64 at 1080p. Where ray tracing enters it replaces the shadow *map* at roughly one ray per
+froxel — NVIDIA's default grid in RTX Remix works out at 0.75 rays per output pixel — and the stated
+reason is always decoupling cost from light count, never integration quality. Eight rays per pixel at
+full resolution is over ten times that sample density; it is affordable here because there is one sun
+rather than nine hundred lights, and it is worth it because a froxel grid at an eighth of screen
+resolution is where a shaft through a tree loses its edges. If this ever needs to survive a real light
+count, the froxel grid is the fallback and this is the reason it was not taken first.
+
+Ray Reconstruction sees the fog composited into the colour, which is also what NVIDIA ships:
+`rtx.rayreconstruction.compositeVolumetricLight` defaults to true in Remix, and the separate-layer
+path is documented there as flicker-prone.
+
+The test that pins this is a ratio rather than a value, because it is the only thing the fixture
+computes exactly. Two frames differ in nothing but which side of the camera the sun is on — same air,
+same distance, same climb out of the layer, so the self-shadowing is identical — and what is left is
+`p(16.7 deg) / p(163.3 deg)`. The readback patch spans nine to twenty-four degrees off the sun, so the
+answer must land between 21.3 and 59.5; it measures 31.97 against 31.3 for the centre ray. An
+isotropic fog gives exactly 1.0. The second test drops a lid over the march that the camera's own ray
+never reaches, and asserts the air beneath it scatters *exactly* what air with no sun scatters — not
+merely less than open air, which would pass while leaking.
+
+**Found on the way, not fixed here**: the lamps put light into fog as though their phase function were
+1 per steradian rather than `1/4*pi`.

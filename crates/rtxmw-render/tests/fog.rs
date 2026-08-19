@@ -8,7 +8,9 @@ use ash::vk;
 use glam::{Affine3A, Vec2, Vec3};
 use rtxmw_gpu::{TestGpu, readback};
 use rtxmw_render::SceneRenderer;
-use rtxmw_scene::{Ambient, CellId, Instance, Light, Material, Mesh, MeshId, StaticScene, Submesh};
+use rtxmw_scene::{
+    Ambient, CellId, Instance, Light, Material, Mesh, MeshId, StaticScene, Submesh, Sun,
+};
 
 mod common;
 
@@ -26,16 +28,14 @@ const FOG_COLOUR: Vec3 = Vec3::new(0.6, 0.05, 0.05);
 /// the integral over distance, and this buys enough of one to see.
 const FOG_DENSITY: f32 = 140.0;
 
-/// A white wall filling the view `distance` away, facing the camera.
-fn wall(distance: f32, lights: &[Light]) -> StaticScene {
-    let half = distance;
-    let mesh = Mesh {
-        positions: vec![
-            Vec3::new(distance, -half, -half),
-            Vec3::new(distance, half, -half),
-            Vec3::new(distance, half, half),
-            Vec3::new(distance, -half, half),
-        ],
+/// A flat quad from four corners, of the fixture's only material.
+///
+/// Its normals all face `-X` whatever the corners say, because the one quad here that is ever
+/// *shaded* is the wall, and the wall faces the camera. The rest are only ever hit by a shadow ray,
+/// which asks whether something is there and not which way it points.
+fn quad(corners: [Vec3; 4]) -> Mesh {
+    Mesh {
+        positions: corners.to_vec(),
         normals: vec![Vec3::NEG_X; 4],
         uvs: vec![Vec2::ZERO, Vec2::X, Vec2::ONE, Vec2::Y],
         indices: vec![0, 2, 1, 0, 3, 2],
@@ -45,7 +45,18 @@ fn wall(distance: f32, lights: &[Light]) -> StaticScene {
             material: 0,
             thin: false,
         }],
-    };
+    }
+}
+
+/// A white wall filling the view `distance` away, facing the camera.
+fn wall(distance: f32, lights: &[Light]) -> StaticScene {
+    let half = distance;
+    let mesh = quad([
+        Vec3::new(distance, -half, -half),
+        Vec3::new(distance, half, -half),
+        Vec3::new(distance, half, half),
+        Vec3::new(distance, -half, half),
+    ]);
     let mut scene = common::scene_of(
         &[mesh],
         &[Material {
@@ -171,6 +182,155 @@ fn fog_thickens_with_the_distance_it_is_seen_through() {
     assert!(
         near_fogged.y > 0.1,
         "even the near wall is lost in fog, so this fixture cannot show a gradient: {near_fogged:?}"
+    );
+}
+
+/// The fog the two sunlit tests below stand in: thin, and blue where the fixture above is red.
+///
+/// **Dim on purpose.** Both measure what the *sun* puts into the air, and the fog's own colour is
+/// the term they have to see past: against the red fixture's 0.6 the sun's backward scattering is
+/// lost in the rounding, and the ratio those tests are about collapses to nothing.
+const SUNLIT_FOG: Vec3 = Vec3::new(0.02, 0.02, 0.06);
+
+/// Which way the sun's light travels in those tests — from ahead of the camera, and from behind it.
+///
+/// **Never level with the horizon.** Fog shadows itself over the column between a point and the sky
+/// along the line to the sun, and for a sun exactly on the horizon that column never leaves the
+/// layer, so it is infinite and no sunlight arrives anywhere. A fixture wanting any sun in its air
+/// has to raise it. These two are 16.7 degrees up and 16.7 off the view ray, and they share that
+/// climb — so the self-shadowing is identical between them and the phase function is the only thing
+/// that differs.
+const SUN_AHEAD: Vec3 = Vec3::new(-1.0, 0.0, -0.3);
+const SUN_BEHIND: Vec3 = Vec3::new(1.0, 0.0, -0.3);
+
+/// The sun for those tests, travelling `heading`.
+fn sun(heading: Vec3) -> Sun {
+    Sun {
+        direction: heading.normalize(),
+        colour: Vec3::splat(8.0),
+        angular_radius: 0.004_654,
+    }
+}
+
+/// Open air under `sun`, with `blockers` standing between it and the sky.
+///
+/// **Nothing in front of the camera at all**, which took a wrong fixture to arrive at: a wall put
+/// there to bound the march also stands between the air and a sun ahead of the eye, so it shadowed
+/// every ray and the sunlit case measured exactly the sunless one. What bounds the march here is
+/// `FOG_REACH`, and the only geometry is an anchor behind the camera — the acceleration structure
+/// wants something, and back there it is in the way of neither the eye nor the sun.
+fn sunlit(sun: Sun, blockers: &[Mesh]) -> StaticScene {
+    let mut meshes = vec![quad([
+        Vec3::new(-3000.0, -100.0, -500.0),
+        Vec3::new(-2000.0, -100.0, -500.0),
+        Vec3::new(-2000.0, 100.0, 0.0),
+        Vec3::new(-3000.0, 100.0, 0.0),
+    ])];
+    meshes.extend_from_slice(blockers);
+    let instances: Vec<Instance> = (0..meshes.len())
+        .map(|i| Instance {
+            mesh: MeshId(i as u32),
+            transform: Affine3A::IDENTITY,
+        })
+        .collect();
+    let mut scene = common::scene_of(
+        &meshes,
+        &[Material {
+            diffuse: Vec3::ZERO,
+            ..Material::default()
+        }],
+        &instances,
+        &[],
+        Vec3::splat(0.02),
+    );
+    scene.sun = Some(sun);
+    scene.ambient = Some(Ambient {
+        colour: Vec3::splat(0.02),
+        fog: SUNLIT_FOG,
+        fog_density: FOG_DENSITY,
+        ..Ambient::default()
+    });
+    scene
+}
+
+/// A lid over the whole march, high enough that the camera's own ray never reaches it.
+///
+/// It sits at `z = 1500` while the camera looks flat along `+X`, so nothing the eye sees is touched.
+/// What it does cover is every line from the air to a sun 16.7 degrees up: those climb through
+/// `z = 1500` about five thousand units downrange, and the march never leaves this quad.
+fn lid() -> Mesh {
+    quad([
+        Vec3::new(-2000.0, -10000.0, 1500.0),
+        Vec3::new(60000.0, -10000.0, 1500.0),
+        Vec3::new(60000.0, 10000.0, 1500.0),
+        Vec3::new(-2000.0, 10000.0, 1500.0),
+    ])
+}
+
+/// The same air with no sun at all, which is what the fog's own colour scatters and nothing else.
+fn sunless() -> Vec3 {
+    let dark = Sun {
+        colour: Vec3::ZERO,
+        ..sun(SUN_AHEAD)
+    };
+    centre(&sunlit(dark, &[]), 1.0)
+}
+
+#[test]
+fn the_fog_throws_the_sun_forward_and_scatters_almost_none_of_it_back() {
+    // Nothing moves but the sun, from ahead of the eye to behind it. Same air, same distance, same
+    // climb out of the layer — so the *only* term that differs between these two frames is the
+    // angle the phase function is asked about.
+    let (into, away) = (
+        centre(&sunlit(sun(SUN_AHEAD), &[]), 1.0),
+        centre(&sunlit(sun(SUN_BEHIND), &[]), 1.0),
+    );
+    let none = sunless();
+    println!("facing the sun {into:?}, with it behind {away:?}, with no sun {none:?}");
+
+    // Hand-computed, and it is the one number this fixture pins exactly: the fog scatters in
+    // `1 - exp(-sigma * FOG_REACH)` of its own colour, where
+    //   sigma = 140 * 0.006 (indoor scale) * 5e-4 (extinction) * 0.5 (even coverage) = 2.1e-4
+    // so `0.02 * (1 - exp(-2.1e-4 * 30000))` = 0.01996 in red, against a sky the fog has all but
+    // swallowed by then.
+    assert!(
+        (none.x - 0.01996).abs() < 0.004,
+        "the fog's own inscatter should be 0.01996 with no sun in it, not {none:?}"
+    );
+
+    // **The ratio is the phase function and nothing else.** Everything that is not the phase
+    // function cancels between these two frames, so what is left is `p(16.7 deg) / p(163.3 deg)`.
+    // The readback averages sixteen pixels either side of the centre, which at this field of view
+    // asks the phase anywhere from 9 to 24.4 degrees off the sun — so the ratio is a weighted mean
+    // of pointwise ratios running from 21.3 to 59.5, and must land between them.
+    //
+    // **An isotropic fog would give exactly 1.0**, and a Henyey-Greenstein lobe at the g every
+    // engine defaults to would give single figures. This is what a real droplet does.
+    let ratio = (into.x - none.x) / (away.x - none.x);
+    assert!(
+        (21.3..=59.5).contains(&ratio),
+        "the fog threw {ratio:.1} times as much of the sun forward as back, outside the 21.3 to \
+         59.5 its own geometry allows: {into:?} against {away:?} over {none:?}"
+    );
+}
+
+#[test]
+fn what_stands_between_the_fog_and_the_sun_cuts_the_sun_out_of_it() {
+    let open = centre(&sunlit(sun(SUN_AHEAD), &[]), 1.0);
+    let shaded = centre(&sunlit(sun(SUN_AHEAD), &[lid()]), 1.0);
+    let none = sunless();
+    println!("open {open:?}, under the lid {shaded:?}, with no sun at all {none:?}");
+
+    assert!(
+        open.x > 10.0 * shaded.x,
+        "the lid let the sun through into the air beneath it: {shaded:?} against an open {open:?}"
+    );
+    // **Equal to air with no sun, not merely darker than open air.** Anything above this and some
+    // of the sun is leaking through the lid; anything below and the shadow has taken away some of
+    // the fog's own light along with the sun's.
+    assert!(
+        (shaded - none).abs().max_element() < 0.004,
+        "shadowed air should scatter exactly what sunless air does: {shaded:?} against {none:?}"
     );
 }
 
