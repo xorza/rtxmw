@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use rtxmw_gpu::{Buffer, Device, RayTracingLimits, Uploader};
 use rtxmw_scene::{
     Ambient, CellId, Clouds, Instance, Light, MaterialKind, MaterialTable, Mesh, MeshId, Moon, Sky,
-    SkyTextures, StaticScene, Sun, TerrainLayers, TextureId,
+    SkyTextures, StaticScene, Sun, TerrainLayers, TextureId, Veil,
 };
 use rtxmw_texture::Texture;
 
@@ -227,17 +227,20 @@ impl SceneResidency {
         };
         self.lighting.sky_scale = scale;
         self.lighting.sky_floor = floor;
-        // A room has no stars in it however late it is, no moons, and no weather.
-        let (stars, masser, secunda, clouds) = match self.record {
-            Some(_) => (0.0, Moon::NONE, Moon::NONE, Clouds::NONE),
+        // A room has no stars in it however late it is, no moons, no weather over it and none in
+        // front of its walls.
+        let (stars, veil, masser, secunda, clouds) = match self.record {
+            Some(_) => (0.0, Veil::NONE, Moon::NONE, Moon::NONE, Clouds::NONE),
             None => (
                 self.sky.stars,
+                self.sky.veil,
                 self.sky.masser,
                 self.sky.secunda,
                 self.sky.clouds,
             ),
         };
         self.lighting.sky_stars = stars;
+        self.lighting.sky_veil = veil;
         self.lighting.masser = masser;
         self.lighting.secunda = secunda;
         self.lighting.clouds = clouds;

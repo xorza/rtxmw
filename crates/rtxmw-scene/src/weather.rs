@@ -4,6 +4,7 @@ use glam::Vec3;
 
 use crate::game_data::GameData;
 use crate::ini::Ini;
+use crate::srgb;
 use crate::world_time::{SUNRISE, SUNSET, WorldTime};
 
 /// When one family of colours changes over, in hours either side of sunrise and sunset.
@@ -107,6 +108,35 @@ impl Crossover {
     }
 }
 
+/// `[Weather Clear]`'s own four sky colours, sunrise then day then sunset then night.
+///
+/// **What a schedule the ini does not name falls back to, and the game's numbers rather than
+/// white.** These are load-bearing now: [`crate::Sky`] solves a weather's veil out of its sky and
+/// fog schedules read against each other, and a schedule of white asserts *an opaque white medium
+/// fills the sky* rather than *no data*. Without the game installed the engine runs on
+/// [`Weather::clear`], and clear weather is this.
+///
+/// sRGB bytes, exactly as the file writes them, because that is what makes them checkable against
+/// it by eye. [`Schedule::read`] decodes them the same way [`crate::ini::Ini::colour`] decodes the
+/// real ones.
+const CLEAR_SKY: [[u8; 3]; 4] = [[117, 141, 164], [95, 135, 203], [56, 89, 129], [9, 10, 11]];
+/// `[Weather Clear]`'s own fog colours. See `CLEAR_SKY`.
+const CLEAR_FOG: [[u8; 3]; 4] = [
+    [255, 189, 157],
+    [206, 227, 255],
+    [255, 189, 157],
+    [9, 10, 11],
+];
+/// `[Weather Clear]`'s own ambient colours. See `CLEAR_SKY`.
+const CLEAR_AMBIENT: [[u8; 3]; 4] = [[47, 66, 96], [137, 140, 160], [68, 75, 96], [32, 35, 42]];
+/// `[Weather Clear]`'s own sun colours. See `CLEAR_SKY`.
+const CLEAR_SUN: [[u8; 3]; 4] = [
+    [242, 159, 119],
+    [255, 252, 238],
+    [255, 114, 79],
+    [59, 97, 176],
+];
+
 /// One family's colour at each of the four times of day the game names, and when it moves between.
 #[derive(Debug, Clone, Copy)]
 pub struct Schedule {
@@ -140,16 +170,19 @@ impl Schedule {
     }
 
     /// The four colours a weather names for `family`, with that family's own windows.
-    fn read(ini: &Ini, section: &str, family: &str) -> Self {
-        let colour = |which: &str| {
+    ///
+    /// `fallback` is what a key the ini does not name comes out as, in the order the four keys are
+    /// listed below — see `CLEAR_SKY` for why it is a weather's own colours rather than white.
+    fn read(ini: &Ini, section: &str, family: &str, fallback: [[u8; 3]; 4]) -> Self {
+        let colour = |which: &str, spare: [u8; 3]| {
             ini.colour(section, &format!("{family} {which} Color"))
-                .unwrap_or(Vec3::ONE)
+                .unwrap_or_else(|| Vec3::from(spare.map(srgb::channel_to_linear)))
         };
         Self {
-            sunrise: colour("Sunrise"),
-            day: colour("Day"),
-            sunset: colour("Sunset"),
-            night: colour("Night"),
+            sunrise: colour("Sunrise", fallback[0]),
+            day: colour("Day", fallback[1]),
+            sunset: colour("Sunset", fallback[2]),
+            night: colour("Night", fallback[3]),
             crossover: Crossover::read(ini, family),
         }
     }
@@ -164,31 +197,41 @@ impl Schedule {
 pub struct Weather {
     /// What the ini calls it — `Clear`, `Cloudy`, `Blight` and so on, lower-cased.
     pub name: String,
-    /// What the air scatters, which is the one of the four this renderer reads.
+    /// What the air scatters, which is the weather's own medium said as a colour.
+    ///
+    /// The fog on the ground and the veil over the sky are both this: one medium, one colour, two
+    /// places it is seen. [`crate::Sky`] carries it into `fog` at the dome's own level and into the
+    /// veil solved against [`Self::sky`].
     pub fog: Schedule,
-    /// The dome's own colour, what a surface receives, and the beam's.
+    /// What the whole sky averages to, air and cloud deck together.
     ///
-    /// **Parsed and read by nothing yet, and kept deliberately.** The sky here is still the physical
-    /// model's — Rayleigh depth, Kasten-Young air mass, a transmittance the sun's own colour falls
-    /// out of — and these four-colour keys are the game's answer to the same question. Putting one
-    /// over the other is a real argument about which wins where, not a wiring job, and it is
-    /// `docs/design.md` §8.59's "what is not done".
+    /// **Read against [`Self::fog`] rather than on its own**, which is the only way it means
+    /// anything: one number here is being asked to be two things — the blue air under clear, the
+    /// deck under overcast — and nothing in the file splits them. What *does* split them is that
+    /// six of the ten write this and their fog colour as the same number, which is the file
+    /// saying the medium reaches all the way up. [`crate::Sky`] solves how much of the sky the
+    /// medium has taken over out of the two, and where the answer does not explain this the
+    /// renderer keeps its own Rayleigh sky — see `Veil` there.
     ///
-    /// **One attempt at using them is already recorded rather than repeated.** The plan was to let
-    /// each weather's sky move the dome as a *departure* from clear's. On the dome that
-    /// double-counts — foggy's sky is 2.59 times clear's in the ini **because** of its deck, so
-    /// dimming by that deck as well made overcast brighter than clear. On the deck instead it turns
-    /// overcast orange, since the departure is (2.31, 1.13, 0.46) and dividing a grey by clear's
-    /// blue is a warm ratio however it is normalised. One number is being asked to be two things:
-    /// the ini's sky colour is the whole sky's average, the blue air under clear and the deck under
-    /// overcast, and nothing in the file splits them. `docs/design.md` §8.60 has it in full.
-    ///
-    /// They are parsed now because the parse is the part that can be *tested* against the file:
-    /// `every_weather_the_game_ships_is_read_with_its_own_numbers` asserts a clear day sky is blue
-    /// and an overcast one grey without either being written down here. Leaving them out would mean
-    /// landing that untested alongside the argument.
+    /// **Two earlier attempts are recorded rather than repeated.** The plan was to let each
+    /// weather's sky move the dome as a *departure* from clear's. On the dome that double-counts —
+    /// foggy's sky is 2.59 times clear's in the ini **because** of its deck, so dimming by that
+    /// deck as well made overcast brighter than clear. On the deck instead it turns overcast
+    /// orange, since the departure is (2.31, 1.13, 0.46) and dividing a grey by clear's blue is a
+    /// warm ratio however it is normalised. `docs/design.md` §8.60 has both in full.
     pub sky: Schedule,
+    /// What a surface receives, which this renderer derives and uses this to check.
+    ///
+    /// **Parsed and read by nothing, deliberately.** The ground's light here is the dome's own
+    /// average dimmed by however much of it the deck hides, with no authored figure anywhere;
+    /// `tests/weather_lighting.rs` is what holds that derivation against these four keys, and the
+    /// places the two part are more informative than closing the gap would be.
     pub ambient: Schedule,
+    /// What the beam is, which is still the physical model's.
+    ///
+    /// **Parsed and read by nothing.** The sun's colour falls out of the same Kasten-Young air mass
+    /// and Rayleigh depth the dome does, so what this would add is the extinction the *weather's*
+    /// medium puts on the beam — real, and a separate slice from the sky's own colour.
     pub sun: Schedule,
     /// Which painted sheet the cloud layer is cut out of — `tx_sky_clear` and its eight siblings.
     pub cloud_texture: String,
@@ -250,11 +293,12 @@ impl Weather {
 
     /// Clear weather as far as anything can know it without the ini.
     ///
-    /// **Every scalar here is the real one** — `Cloud Speed=1.25`, `Land Fog Depth=0.69`, full cloud
-    /// cover, the clear sheet — because those are what the reader falls back to and they are
-    /// `[Weather Clear]`'s own. **The colour schedules are not**: they come out white, which is
-    /// nothing the game would ever draw. Nothing reads them yet, and when something does it must
-    /// take the table rather than this.
+    /// **Every figure here is `[Weather Clear]`'s own** — `Cloud Speed=1.25`,
+    /// `Land Fog Depth=0.69`, full cloud cover, the clear sheet, and the four colours of each of
+    /// the four families — because those are what the reader falls back to when the ini names
+    /// nothing. The colour schedules used to come out white, which was nothing the game would ever
+    /// draw and safe only while nothing read them; `CLEAR_SKY` above is what that cost once something
+    /// did.
     pub fn clear() -> Self {
         Self::read(&Ini::default(), "clear")
     }
@@ -264,10 +308,10 @@ impl Weather {
         let number = |key: &str, fallback: f32| ini.number(&section, key).unwrap_or(fallback);
         Self {
             name: name.to_owned(),
-            sky: Schedule::read(ini, &section, "Sky"),
-            fog: Schedule::read(ini, &section, "Fog"),
-            ambient: Schedule::read(ini, &section, "Ambient"),
-            sun: Schedule::read(ini, &section, "Sun"),
+            sky: Schedule::read(ini, &section, "Sky", CLEAR_SKY),
+            fog: Schedule::read(ini, &section, "Fog", CLEAR_FOG),
+            ambient: Schedule::read(ini, &section, "Ambient", CLEAR_AMBIENT),
+            sun: Schedule::read(ini, &section, "Sun", CLEAR_SUN),
             cloud_texture: ini
                 .get(&section, "Cloud Texture")
                 .unwrap_or("Tx_Sky_Clear.tga")

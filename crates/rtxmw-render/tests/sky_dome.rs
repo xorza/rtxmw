@@ -9,7 +9,7 @@ use ash::vk;
 use glam::{Vec2, Vec3};
 use rtxmw_gpu::{TestGpu, readback};
 use rtxmw_render::SceneRenderer;
-use rtxmw_scene::{CellId, Moon, Sky, WorldTime};
+use rtxmw_scene::{CellId, Moon, Sky, Veil, WorldTime};
 
 mod common;
 
@@ -124,41 +124,105 @@ fn at(pixels: &[u8], index: usize) -> Vec3 {
 
 #[test]
 fn every_pixel_of_the_sky_is_what_the_scene_crate_says_it_is() {
+    // **Clear air and then a weather's own medium over it.** The veil is the second place one
+    // equation is written twice — `Veil::over` in Rust so the ambient can carry it, and the tail of
+    // `sky_seen_through` in GLSL so a pixel can — and it is applied to the whole composite rather
+    // than to the dome, so nothing but this holds the two together. The values are a blight-shaped
+    // red at three-quarters rather than a weather's, because a weather that veils also decks the
+    // sky over and there would be no dome left to compare.
+    let veils = [
+        Veil::NONE,
+        Veil {
+            hue: Vec3::new(1.0, 0.18, 0.16),
+            amount: 0.75,
+        },
+    ];
     // Three hours that exercise the whole dome: overhead, low enough to have a warm side, and under
     // the horizon where only the floor is left.
     for hour in [12.0, 17.5, 23.0] {
-        // **Stars off for the comparison**, because they are an addition on top of the dome rather
-        // than part of its shape — `Sky::shape` has no notion of them and the shader draws them from
-        // a hash. The test below is what says they are there at all; this one is about the dome.
-        let sky = Sky {
-            stars: 0.0,
-            ..Sky::at(WorldTime::hours(hour))
-        };
-        let to_sun = -sky.sun.direction;
-        // Facing across the sun rather than at it, so one edge of the frame is the sunward sky and
-        // the other is the sky opposite — the axis the dome varies most along.
-        let forward = to_sun.cross(Vec3::Z).normalize();
-        let (pixels, directions) = looking(sky, forward, WIDE);
+        for veil in veils {
+            // **Stars off for the comparison**, because they are an addition on top of the dome
+            // rather than part of its shape — `Sky::shape` has no notion of them and the shader
+            // draws them from a hash. The test below is what says they are there at all; this one
+            // is about the dome.
+            let sky = Sky {
+                stars: 0.0,
+                veil,
+                ..Sky::at(WorldTime::hours(hour))
+            };
+            let to_sun = -sky.sun.direction;
+            // Facing across the sun rather than at it, so one edge of the frame is the sunward sky
+            // and the other is the sky opposite — the axis the dome varies most along.
+            let forward = to_sun.cross(Vec3::Z).normalize();
+            let (pixels, directions) = looking(sky, forward, WIDE);
 
-        let (mut worst, mut worst_at) = (0.0f32, Vec3::ZERO);
-        for (index, direction) in directions.iter().enumerate() {
-            let wanted = sky.shape(*direction) + Sky::NIGHT_FLOOR;
-            // Only where nothing is clipped: the target is 8-bit, so a channel at one says "at
-            // least one" and cannot be compared against a number above it.
-            if wanted.max_element() > 0.97 {
-                continue;
+            let (mut worst, mut worst_at) = (0.0f32, Vec3::ZERO);
+            for (index, direction) in directions.iter().enumerate() {
+                let wanted = veil.over(sky.shape(*direction) + Sky::NIGHT_FLOOR);
+                // Only where nothing is clipped: the target is 8-bit, so a channel at one says "at
+                // least one" and cannot be compared against a number above it.
+                if wanted.max_element() > 0.97 {
+                    continue;
+                }
+                let error = (at(&pixels, index) - wanted).abs().max_element();
+                if error > worst {
+                    (worst, worst_at) = (error, *direction);
+                }
             }
-            let error = (at(&pixels, index) - wanted).abs().max_element();
-            if error > worst {
-                (worst, worst_at) = (error, *direction);
-            }
+            // A little over one part in 255, which is what an 8-bit target can carry.
+            assert!(
+                worst < 0.006,
+                "at {hour}:00 under {veil:?} the shader and `Sky::shape` disagree by {worst} \
+                 looking {worst_at:?}"
+            );
         }
-        // A little over one part in 255, which is what an 8-bit target can carry.
-        assert!(
-            worst < 0.006,
-            "at {hour}:00 the shader and `Sky::shape` disagree by {worst} looking {worst_at:?}"
-        );
     }
+}
+
+#[test]
+fn a_veil_takes_the_skys_colour_and_leaves_its_brightness() {
+    // What the veil claims to be — chromatic and nothing else — stated so the arithmetic cannot
+    // satisfy it by accident. At full strength every pixel of the dome comes out a multiple of the
+    // medium's own colour, however blue it started, and comes out at the brightness it had.
+    let hue = Vec3::new(1.0, 0.42, 0.36);
+    let hour = WorldTime::hours(17.5);
+    let bare = Sky {
+        stars: 0.0,
+        ..Sky::at(hour)
+    };
+    let veiled = Sky {
+        veil: Veil { hue, amount: 1.0 },
+        ..bare
+    };
+    let forward = (-bare.sun.direction).cross(Vec3::Z).normalize();
+    let (plain, _) = looking(bare, forward, WIDE);
+    let (through, _) = looking(veiled, forward, WIDE);
+
+    let luma = Vec3::new(0.2126, 0.7152, 0.0722);
+    let (mut worst_level, mut worst_hue) = (0.0f32, 0.0f32);
+    let mut counted = 0u32;
+    for index in 0..plain.len() / 4 {
+        let (was, now) = (at(&plain, index), at(&through, index));
+        // Only where nothing is clipped at either end, and only where there is enough signal for
+        // an 8-bit target to say anything about a ratio.
+        if was.max_element() > 0.97 || now.max_element() > 0.97 || now.max_element() < 0.1 {
+            continue;
+        }
+        counted += 1;
+        worst_level = worst_level.max((now.dot(luma) - was.dot(luma)).abs());
+        worst_hue = worst_hue.max((now / now.x - hue / hue.x).abs().max_element());
+    }
+    assert!(counted > 1000, "only {counted} pixels were worth comparing");
+    // A quarter of one part in 255 against a channel of 0.4, which is what the quantisation of a
+    // ratio between two 8-bit channels comes to.
+    assert!(
+        worst_hue < 0.02,
+        "a pixel kept {worst_hue} of its own colour"
+    );
+    assert!(
+        worst_level < 0.006,
+        "the veil moved a pixel's luminance by {worst_level}"
+    );
 }
 
 #[test]

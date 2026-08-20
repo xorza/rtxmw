@@ -502,7 +502,7 @@ vec3 cloud_layer(vec3 direction, float footprint, out float hiding) {
     // The painting's structure, as a ratio to its own mean rather than as a level — so the sheet
     // says where a cloud is thick and the light says how bright that is. Where the alpha carries no
     // shape, which is every overcast sheet, this is all the shape there is.
-    float luminance = dot(sheet.rgb, vec3(0.2126, 0.7152, 0.0722));
+    float luminance = dot(sheet.rgb, LUMA);
     float thickness = clamp(luminance / max(frame.cloud_mean, 1e-6), 0.0, 2.0);
 
     // How much sky the cloud hides: its own alpha, faded out toward the horizon where the shell is
@@ -603,6 +603,22 @@ vec3 sky_seen_through(vec3 direction, float lobe, bool looking) {
         // colour, so a sun under solid overcast was coming through at full strength with the cloud
         // deck drawn round it. Blended by the same coverage everything else in the sky is.
         colour = mix(disc, colour, hidden);
+    }
+
+    // **The weather's own medium, in front of all of it.** The fog on the ground and this are one
+    // thing seen twice — the same `Fog * Color` at the same level — so it goes over the dome, the
+    // deck, the moons, the stars and the sun's disc alike rather than over the dome alone: a
+    // half-veiled sky would show a red air with a white cloud sheet across it, and under every
+    // overcast weather the sheet is the whole sky.
+    //
+    // **Colour and not level.** The medium is scaled to the luminance of whatever it stands in
+    // front of, so each pixel keeps its own brightness and gives up only its hue. That is what
+    // leaves the deck's structure legible at full strength, and it is why nothing the level was
+    // fitted against moves — see `Veil` in `rtxmw-scene` for the half of the argument this is the
+    // other end of.
+    if (frame.sky_veiled > 0.0) {
+        float level = dot(colour, LUMA) / max(dot(frame.sky_veil, LUMA), 1e-4);
+        colour = mix(colour, frame.sky_veil * level, frame.sky_veiled);
     }
     return colour;
 }

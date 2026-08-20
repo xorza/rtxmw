@@ -101,6 +101,113 @@ const PALE_MASS: f32 = 6.0;
 /// side for the sun to be on.
 const AWAY_SHARE: f32 = 0.25;
 
+/// How far the ini's own sky colour may point away from the only direction the medium can move the
+/// sky, before the fit is refused.
+///
+/// The sine of the angle between the two, so it is scale-free: a fraction of the way the ini asks
+/// the sky to move that no amount of the weather's own medium can account for. One means the two
+/// are at right angles and the medium explains none of it.
+///
+/// **Measured rather than picked, and there is a gap to put it in.** Fitting all ten weathers at
+/// every hour of the day, the eight the medium explains land between 0.000 and 0.280 — six of them
+/// at exactly zero throughout, because they write their sky and their fog as the same colour — and
+/// the two it does not, clear and cloudy, never come in under 0.52. Anything between 0.29 and 0.52
+/// gives the same answers for all ten at every hour, so this sits in the middle of that, and a
+/// weather that ever lands near it is worth looking at rather than rounding.
+const AGREEMENT: f32 = 0.4;
+
+/// The weather's own medium, standing between the eye and everything the sky has in it.
+///
+/// **One medium, seen twice.** What pools on the ground is [`Sky::fog`] and what fills the column
+/// above it is this, and they are the same `Fog * Color` at the same level — a renderer that gave
+/// them different colours would be drawing two weathers at once. It goes in front of the dome, the
+/// cloud deck, the moons, the stars and the sun's disc alike, because it is in front of them.
+///
+/// **Chromatic only, and that is not a shortcut.** How much light a weather takes away is already
+/// derived and already checked: the deck hides a measured fraction of the dome and `SKYLIT` says
+/// what gets through, and `tests/weather_lighting.rs` holds that against the ini's own `Ambient`
+/// schedule — foggy to two decimal places. What is left for the medium to say is colour, so this
+/// says colour and nothing else. Preserving each pixel's own luminance is also what keeps the
+/// sheet's structure: a veil that replaced the sky with one flat colour would erase the clouds it
+/// is drawn over, and at full strength every overcast weather covers the whole dome.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Veil {
+    /// The medium's colour. Scale is nothing: [`Self::over`] gives it the brightness of whatever
+    /// it stands in front of.
+    pub hue: Vec3,
+    /// How much of the sky it has taken over, from none to all of it.
+    pub amount: f32,
+}
+
+impl Veil {
+    /// Clear air, which shows the sky as it is.
+    pub const NONE: Self = Self {
+        hue: Vec3::ONE,
+        amount: 0.0,
+    };
+
+    /// `colour` as it arrives through the medium.
+    ///
+    /// **Linear in `colour`**, which is what lets `Sky::dome_average` veil the average instead of
+    /// averaging the veiled: the medium's own radiance is scaled to whatever luminance it is given,
+    /// so both terms of the mix scale with the argument and the two orders agree exactly.
+    pub fn over(self, colour: Vec3) -> Vec3 {
+        let to_level = colour.dot(LUMA) / self.hue.dot(LUMA).max(1e-4);
+        colour.lerp(self.hue * to_level, self.amount)
+    }
+
+    /// How much of the weather's asserted sky its own medium explains, given a sky that would
+    /// otherwise be `bare`.
+    ///
+    /// `bare` is the sky this renderer draws — the dome averaged with whatever the deck puts over
+    /// it. The other two are the weather's: `Fog * Color` is the medium, `Sky * Color` is the
+    /// game's own claim about what the two come to together, and they arrive as the whole
+    /// [`Weather`] rather than as two schedules because a pair of same-typed arguments meaning
+    /// opposite things is a swap that would compile and fit backwards. All three are brought to one
+    /// luminance first: the level is settled elsewhere and dragging it in here is what made the
+    /// first two attempts at this fail.
+    ///
+    /// **How far up the medium reaches is the weather's, so it is read where the file distinguishes
+    /// the ten: their day colours.** All ten write their night sky and their night fog as the same
+    /// number — clear's is `009,010,011` twice over — so at night the fit is degenerate and reports
+    /// a full veil for every weather there is, which would put the ini's near-neutral grey over a
+    /// night floor this renderer deliberately makes blue. Nothing about a weather's dust changes
+    /// between noon and midnight anyway. The *colour* it wears is still the hour's, which is how
+    /// blight keeps its red at midnight and gives it up at nothing else.
+    ///
+    /// **A constrained least squares, and the constraint is the interesting half.** The unclamped
+    /// projection runs past one for clear and cloudy — their skies are *bluer* than either the
+    /// renderer's or their own fog — and clamping alone would then assert a full veil for exactly
+    /// the two weathers that should have none. So the fit has to answer for itself: at the clamped
+    /// amount, either the medium reproduces what the ini asserts or it does not, and where it does
+    /// not this returns [`Self::NONE`] and the renderer keeps its own sky. That is the right way
+    /// round — the ini's clear sky is one flat swatch and this renderer computes a Rayleigh dome —
+    /// and it is why blight's air goes red without clear's going pale.
+    fn solve(bare: Vec3, weather: &Weather, time: WorldTime) -> Self {
+        // **All three brought to one luminance**, which is the segment `Self::over` walks: it
+        // mixes a colour toward the medium scaled to that colour's own brightness, so a fit over
+        // any other normalisation returns an amount that means something else when applied.
+        // Against the brightest channel instead — the obvious choice, and what this did first —
+        // blight came out at 0.83 of a medium whose green and blue are 3% of its red, which under
+        // `over` is four times the red it was fitted to and a frame that is one hue from edge to
+        // edge.
+        let unit = |colour: Vec3| colour / colour.dot(LUMA).max(1e-4);
+        let (bare, day, claimed) = (unit(bare), unit(weather.fog.day), unit(weather.sky.day));
+        let (along, asked) = (day - bare, claimed - bare);
+        let amount = (asked.dot(along) / along.length_squared().max(1e-9)).clamp(0.0, 1.0);
+        // What the medium could not account for, against the whole of what was asked — the sine of
+        // the angle between them, which is the same number whatever the three are scaled by.
+        let missed = (bare.lerp(day, amount) - claimed).length() / asked.length().max(1e-6);
+        match missed < AGREEMENT {
+            true => Self {
+                hue: weather.fog.at(time),
+                amount,
+            },
+            false => Self::NONE,
+        }
+    }
+}
+
 /// The sun and the sky above an exterior cell at one moment, which together are all its light.
 ///
 /// **The dome has a direction now, and that is most of this type.** A sky is not one colour: it is
@@ -137,6 +244,13 @@ pub struct Sky {
     pub scale: f32,
     /// How much of the star field is out, from none to all of it — [`WorldTime::starlight`].
     pub stars: f32,
+    /// The weather's own medium, over everything the sky has in it. [`Veil::NONE`] under clear.
+    ///
+    /// Solved from the ini's `Sky * Color` against its `Fog * Color`, so what it draws is the
+    /// game's own answer wherever the game's own answer is one a medium can give — see
+    /// `Veil::solve`. [`Self::ambient`] arrives already seen through it; [`Self::shape`] does not,
+    /// because the shader veils the whole composite and the two have to agree on the order.
+    pub veil: Veil,
     /// What the exterior's fog scatters, and how thickly it sits.
     ///
     /// **The weather's hue on the dome's own level.** `Land Fog Day Depth` and the `Fog *Color*`
@@ -243,6 +357,7 @@ impl Sky {
             secunda: Moon::secunda(time, bare),
             ambient: Vec3::ZERO,
             clouds: Clouds::NONE,
+            veil: Veil::NONE,
             warm,
             warmth,
             scale: SKY_STRENGTH * lit,
@@ -282,7 +397,23 @@ impl Sky {
         // `SKYLIT` is what a cloud sends down of the sky that lit it, so the covered fraction of the
         // dome is worth that much of the open one. The ini agrees, and is the check rather than the
         // source — see `weather_dims_the_ground_the_way_the_game_says_it_does`.
+        //
+        // **Taken before that dimming**, because the ini's `Sky Color` is an assertion about the
+        // sky a ray sees rather than about what reaches the ground: the open dome as far as the
+        // deck lets it show, and the deck over the rest.
+        let seen = sky.ambient.lerp(sky.clouds.lit, sky.clouds.hidden_mean);
         sky.ambient *= 1.0 - (1.0 - SKYLIT) * sky.clouds.hidden_mean;
+        // **The medium in the column, out of the same two schedules read against each other.**
+        // Applied after the dimming above, so the medium answers for the colour and the deck for
+        // the level — which is the split the two attempts recorded in `Weather::sky` both failed
+        // to make.
+        //
+        // **What lights the ground has to be the sky behind it**, which is §8.49's rule and the
+        // reason it is here rather than only in the shader: a frame lit by a blue dome and drawn
+        // under a red one disagrees with itself. `Veil::over` is linear, so veiling the average is
+        // the average of the veiled.
+        sky.veil = Veil::solve(seen, weather, time);
+        sky.ambient = sky.veil.over(sky.ambient);
         sky.exposure_bias = sky.bias_from_dome();
         sky
     }
@@ -431,6 +562,44 @@ mod tests {
     /// What the eye makes of a colour, which is the only thing a "darker" claim can mean.
     fn luminance(colour: Vec3) -> f32 {
         colour.dot(LUMA)
+    }
+
+    /// A veil built by hand, since the solved ones need the game installed.
+    fn veil(hue: Vec3, amount: f32) -> Veil {
+        Veil { hue, amount }
+    }
+
+    #[test]
+    fn a_veil_recolours_what_it_stands_in_front_of_and_never_dims_it() {
+        let medium = Vec3::new(1.0, 0.18, 0.16);
+        let sky = Vec3::new(0.2, 0.3, 0.5);
+        // Nothing at all is the identity, whatever the colour it would have used.
+        assert_eq!(veil(medium, 0.0).over(sky), sky);
+
+        // At full strength the answer is the medium alone, at the brightness it was handed: the
+        // medium's luminance is 0.2126 + 0.7152*0.18 + 0.0722*0.16 = 0.3527, the sky's is
+        // 0.2126*0.2 + 0.7152*0.3 + 0.0722*0.5 = 0.2932, so every channel is scaled by 0.8313.
+        let full = veil(medium, 1.0).over(sky);
+        for (channel, wanted) in full.to_array().into_iter().zip([0.8313, 0.1496, 0.1330]) {
+            assert!((channel - wanted).abs() < 1e-3, "got {full:?}");
+        }
+        assert!((full.dot(LUMA) - sky.dot(LUMA)).abs() < 1e-6);
+
+        // **Linear in what it is given**, which is what lets the dome be averaged before it is
+        // veiled rather than after — `Sky::under` relies on the two orders agreeing exactly.
+        let (a, b) = (Vec3::new(0.4, 0.1, 0.05), Vec3::new(0.05, 0.2, 0.6));
+        let half = veil(medium, 0.6);
+        let apart = (half.over(a) + half.over(b)) * 0.5;
+        let together = half.over((a + b) * 0.5);
+        assert!((apart - together).abs().max_element() < 1e-6);
+
+        // And a partial one is on the line between the two, at the fraction it names.
+        assert!(
+            (half.over(sky) - sky.lerp(veil(medium, 1.0).over(sky), 0.6))
+                .abs()
+                .max_element()
+                < 1e-6
+        );
     }
 
     #[test]

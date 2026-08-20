@@ -3409,10 +3409,10 @@ than a refusal to start, since the list is the game's and a caller cannot be exp
 `Tx_BM_Sky_Blizzard` against the eight `Tx_Sky_*`. The test that every weather names a sheet asks
 the archives rather than assuming the shape, which is how that was found.
 
-**What is not done.** The sky, ambient and sun schedules are parsed and unused: the dome's colour is
-still the physical model's, and putting the game's four-colour interpolation over it is the next
-slice's argument to have. It shows most under blight, where the fog is red and the sky above it is
-not.
+**What is not done.** The ambient and sun schedules are parsed and unused — the first deliberately,
+as the check the derivation is held against, and the second because what it would add is the
+extinction a weather's medium puts on the beam. The sky schedule was the third and §8.61 is what
+became of it.
 
 ### 8.60 A deck is a lid, and the ini agrees
 
@@ -3457,6 +3457,77 @@ ratio however it is normalised.
 
 The mistake behind both is treating one number as two things. The ini's sky colour is *the whole
 sky's average* — the blue air under clear, the deck under overcast — and nothing in the file splits
-those apart. A renderer that derives the air and draws the deck separately needs them split. The
-schedules stay parsed and tested against the file; what to do with them is still open, and blight
-remains red fog under a pale sky until it is settled.
+those apart. A renderer that derives the air and draws the deck separately needs them split. What
+settled it was giving up on splitting it at all — see §8.61.
+
+### 8.61 The sky colour is a medium, and the file says so by writing it twice
+
+Blight was red fog under a pale white sky: the ground haze took `Fog Day Color` and the dome above
+it stayed the physical model's, so a frame had a blood-red middle distance and a bright pink zenith
+and read as a bug rather than as weather. Two attempts to fix it with the ini's `Sky * Color` are in
+§8.60, and both failed the same way — that number is the whole sky's average, air and deck together,
+and nothing in the file separates them.
+
+**The file does separate something, and it is not what was being looked for.** Laid out side by
+side, six of the ten weathers write their sky colour and their fog colour as *literally the same
+number*, in all four keys: overcast `143,146,149` twice over, ashstorm `124,073,058`, and the same
+for rain, thunderstorm, snow and blizzard. Only clear, cloudy, foggy and blight write two, and the
+first two of those are the weathers whose sky is actually blue. Twelve bytes agreeing exactly is an
+authoring decision, not a coincidence, and the decision is: **when the medium fills the air, the sky
+is the medium.**
+
+So the question stops being "what colour is the deck" and becomes "how far up does this weather's
+own medium reach". That has one answer per weather, and both numbers to derive it from are already
+here: the medium's colour is the fog's, and what the sky comes to under it is the sky's.
+
+**A `Veil`, which is the fog seen looking up.** The renderer already has the weather's medium on the
+ground — `Fog * Color` at the dome's own level, `Land Fog Depth` for thickness. The veil is that
+same medium in the column above it, and it goes in front of *everything* the sky has: the dome, the
+cloud deck, both moons, the stars and the sun's disc. That placement is the fix for the original
+defect — under blight the deck covers the whole dome, so a veil applied only to the air would have
+left a white sheet across a red sky, which is the same disagreement one step further up.
+
+**Chromatic and nothing else**, which is what keeps it from landing on work already done. How much
+light a weather takes away is derived and checked: the deck hides a measured fraction of the dome,
+`SKYLIT` says what gets through, and §8.60's table holds that against the ini's `Ambient` schedule
+with foggy exact. So the veil is a hue on each pixel at the luminance that pixel already had. Every
+figure in that table is byte-for-byte what it was, and a clear-weather frame is *pixel-identical* to
+the one before any of this. It is also what keeps the deck legible: at full strength a veil that
+replaced the sky with one flat colour would erase the sheet it is drawn over, and six of the ten
+cover the whole dome.
+
+**How much of it there is, as a constrained least squares that is allowed to refuse.** The sky the
+renderer would draw, the weather's fog, and the weather's asserted sky are compared as colours at
+one luminance, and the amount is the projection of the third onto the segment between the first two.
+Six weathers land on 1.000 at every hour by identity. Blight and foggy land between — 0.58 and 0.76
+at noon — because their two colours differ and the dome still shows through.
+
+Clear and cloudy are the interesting case: their skies are *bluer* than either the renderer's dome
+or their own fog, so the unclamped projection runs past one, and clamping alone would assert a full
+veil for exactly the two weathers that should have none. So the fit answers for itself. What the
+medium could not account for, over the whole of what was asked, is the sine of the angle between
+them — the sine of an angle, so a medium whose blue is a fortieth of its red is judged on the same
+footing as one that is grey.
+Across the whole day the eight it explains never exceed **0.280** and clear and cloudy never come in
+under **0.52**, so the cut sits at 0.4 and any value in that gap gives the same ten answers.
+
+That refusal is the right way round. The ini's clear sky is one flat swatch; this renderer computes
+a Rayleigh dome with an air mass and a twilight in it. Where the game has something the renderer
+cannot derive — dust — it wins; where the renderer has something the game never had, it keeps it.
+
+**What it comes to.** Against the ini's own `Ambient` schedule, which nothing here is fitted to, the
+summed hue error over the ten at noon falls from **2.64 to 1.46**. Ashstorm alone goes from 0.825 to
+0.149. Overcast stays grey — the §8.60 failure was a departure of (2.31, 1.13, 0.46) that turned it
+orange, and here its medium is the neutral grey the file wrote, so there is no ratio to be warm.
+
+**One trap had to be closed first.** `Weather::clear()` is the fallback for a machine with no game
+installed, and its colour schedules came out *white*, documented as safe only while nothing read
+them. The veil reads them: white sky against white fog fits perfectly and asserts an opaque white
+medium filling the sky. The schedules now fall back to `[Weather Clear]`'s own forty-eight bytes,
+which is what the scalars beside them already did.
+
+**Still not done.** `Sun * Color` remains parsed and unused. Blight's is `224,084,084` against
+clear's `255,252,238`, and the ratio between them is the extinction the weather's medium puts on the
+beam — real, unambiguous in a way the sky colour never was, and a slice of its own. Its *level*
+cannot be taken with it: under overcast the same ratio is 0.69, and that is the deck blocking the
+sun, which the layer already does.

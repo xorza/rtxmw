@@ -45,6 +45,10 @@ const uint KIND_TERRAIN = 2u;
 // why a cell's origin drops out of the blend below: it is always a whole number of tiles.
 const float TERRAIN_TILE = 512.0;
 
+// What the eye makes of a linear colour, which is the only sense in which one has a brightness.
+// Rec. 709, matching the primaries every texture is decoded to — `srgb::LUMA` in `rtxmw-scene`.
+const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
+
 // Instance mask bits. A ray asking for `MASK_SOLID` alone cannot see water; `MASK_ANY` sees all.
 const uint MASK_SOLID = 0x01u;
 const uint MASK_ANY = 0xFFu;
@@ -224,6 +228,11 @@ layout(set = 0, binding = 14, scalar) readonly buffer Frame {
     float sky_scale;
     vec3 sky_floor;
     float sky_stars;
+    // The weather's own medium, in front of everything the sky has in it: its colour, whose scale
+    // means nothing because it is given the brightness of whatever it stands over, and how much of
+    // the sky it has taken over. Zero under clear and indoors — see `Veil` in `rtxmw-scene`.
+    vec3 sky_veil;
+    float sky_veiled;
     // One where the fog should be an even haze rather than banks — indoors, where the air is still
     // and a room is smaller than a single bank would be.
     float fog_uniform;

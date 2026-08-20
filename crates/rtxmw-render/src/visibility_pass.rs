@@ -4,7 +4,7 @@ use ash::vk;
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec2, Vec3};
 use rtxmw_gpu::{Binding, Buffer, BufferMemory, ComputePipeline, Device, Image, Memory};
-use rtxmw_scene::{Clouds, Moon, Sun};
+use rtxmw_scene::{Clouds, Moon, Sun, Veil};
 
 use crate::acceleration_structure::AccelerationStructure;
 use crate::gbuffer::GBuffer;
@@ -43,6 +43,9 @@ pub(crate) struct Lighting {
     pub(crate) sky_floor: Vec3,
     /// How much of the star field is out. Zero by day and indoors.
     pub(crate) sky_stars: f32,
+    /// The weather's own medium, over everything the sky has. [`Veil::NONE`] under clear and
+    /// indoors.
+    pub(crate) sky_veil: Veil,
     /// Whether the fog forms banks. Weather does that to a landscape; a room's air is still.
     pub(crate) fog_banked: bool,
     /// The larger moon. [`Moon::NONE`] for a cell with no sky, which draws and lights nothing
@@ -85,6 +88,7 @@ impl Default for Lighting {
             sky_scale: 0.0,
             sky_floor: Vec3::ZERO,
             sky_stars: 0.0,
+            sky_veil: Veil::NONE,
             masser: Moon::NONE,
             secunda: Moon::NONE,
             masser_face: 0,
@@ -252,6 +256,9 @@ pub struct FrameConstants {
     sky_scale: f32,
     sky_floor: [f32; 3],
     sky_stars: f32,
+    /// The weather's medium and how much of the sky it has: [`rtxmw_scene::Veil`], flattened.
+    sky_veil: [f32; 3],
+    sky_veiled: f32,
     /// One where the fog is an even haze rather than banks, which is what a room wants.
     fog_uniform: f32,
     /// The two moons — see [`GpuMoon`].
@@ -346,6 +353,8 @@ impl FrameConstants {
             sky_scale: lighting.sky_scale,
             sky_floor: lighting.sky_floor.to_array(),
             sky_stars: lighting.sky_stars,
+            sky_veil: lighting.sky_veil.hue.to_array(),
+            sky_veiled: lighting.sky_veil.amount,
             fog_uniform: if lighting.fog_banked { 0.0 } else { 1.0 },
             masser: GpuMoon::new(lighting.masser, lighting.masser_face),
             secunda: GpuMoon::new(lighting.secunda, lighting.secunda_face),
@@ -746,16 +755,18 @@ mod tests {
         assert_eq!(offset_of!(FrameConstants, sky_scale), 352);
         assert_eq!(offset_of!(FrameConstants, sky_floor), 356);
         assert_eq!(offset_of!(FrameConstants, sky_stars), 368);
-        assert_eq!(offset_of!(FrameConstants, fog_uniform), 372);
+        assert_eq!(offset_of!(FrameConstants, sky_veil), 372);
+        assert_eq!(offset_of!(FrameConstants, sky_veiled), 384);
+        assert_eq!(offset_of!(FrameConstants, fog_uniform), 388);
         // Two moons of sixteen tightly packed floats apiece.
-        assert_eq!(offset_of!(FrameConstants, masser), 376);
-        assert_eq!(offset_of!(FrameConstants, secunda), 440);
+        assert_eq!(offset_of!(FrameConstants, masser), 392);
+        assert_eq!(offset_of!(FrameConstants, secunda), 456);
         // Then the cloud layer, fourteen floats of it.
-        assert_eq!(offset_of!(FrameConstants, cloud_altitude), 504);
-        assert_eq!(offset_of!(FrameConstants, cloud_sheet), 556);
+        assert_eq!(offset_of!(FrameConstants, cloud_altitude), 520);
+        assert_eq!(offset_of!(FrameConstants, cloud_sheet), 572);
         // The wave table follows, twenty tightly packed bytes apiece.
-        assert_eq!(offset_of!(FrameConstants, waves), 560);
-        assert_eq!(size_of::<FrameConstants>(), 560 + 20 * WAVE_COUNT);
+        assert_eq!(offset_of!(FrameConstants, waves), 576);
+        assert_eq!(size_of::<FrameConstants>(), 576 + 20 * WAVE_COUNT);
     }
 
     #[test]

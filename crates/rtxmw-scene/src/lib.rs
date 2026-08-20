@@ -38,7 +38,7 @@ pub use crate::material::{AlphaMode, Material, MaterialKind, TerrainLayers, Text
 pub use crate::material_table::MaterialTable;
 pub use crate::mesh::{Bounds, Mesh, Submesh};
 pub use crate::moon::Moon;
-pub use crate::sky::Sky;
+pub use crate::sky::{Sky, Veil};
 pub use crate::sky_textures::SkyTextures;
 pub use crate::srgb::to_linear;
 pub use crate::static_scene::{CellDetail, Instance, MeshId, ModelIndex, StaticScene};
