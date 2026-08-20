@@ -4,7 +4,7 @@ use ash::vk;
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec2, Vec3};
 use rtxmw_gpu::{Binding, Buffer, BufferMemory, ComputePipeline, Device, Image, Memory};
-use rtxmw_scene::{Clouds, Moon, Sun, Veil};
+use rtxmw_scene::{Clouds, Moon, Precipitation, Sun, Veil};
 
 use crate::acceleration_structure::AccelerationStructure;
 use crate::gbuffer::GBuffer;
@@ -14,6 +14,13 @@ use crate::material_buffers::MaterialBuffers;
 use crate::shaders;
 use crate::texture_array::TextureArray;
 use crate::wave_spectrum::{GpuWave, SeaState, WAVE_COUNT};
+
+/// What a `Wind Speed` of one blows a falling drop sideways at, in world units a second.
+///
+/// `FOG_GALE`'s own figure, which is what makes the rain slant with the same air that carries the
+/// fog: twenty metres a second at seventy units to the metre. A thunderstorm's 0.5 puts its drops
+/// over at ten metres a second against a fall of forty-one, which is the lean a storm has.
+const PRECIP_SLANT: f32 = 1400.0;
 
 /// Everything lighting a cell, which arrives together and goes stale together.
 #[derive(Debug, Clone, Copy)]
@@ -52,6 +59,9 @@ pub(crate) struct Lighting {
     pub(crate) fog_wind: Vec2,
     /// How deep the fog layer stands, against clear weather's in still air. One indoors.
     pub(crate) fog_lift: f32,
+    /// What falls out of the sky. [`Precipitation::NONE`] indoors and under the six that drop
+    /// nothing.
+    pub(crate) precipitation: Precipitation,
     /// The larger moon. [`Moon::NONE`] for a cell with no sky, which draws and lights nothing
     /// without a branch anywhere to say so.
     pub(crate) masser: Moon,
@@ -87,6 +97,7 @@ impl Default for Lighting {
             fog_banked: true,
             fog_wind: Vec2::ZERO,
             fog_lift: 1.0,
+            precipitation: Precipitation::NONE,
             // Unobservable at zero scale, the same as `fog_banked` is at zero density: with no
             // dome to shape there is nothing for a tint to tint.
             sky_warm: Vec3::ONE / 3.0,
@@ -272,6 +283,11 @@ pub struct FrameConstants {
     fog_wind: [f32; 2],
     /// How deep the layer stands — see [`rtxmw_scene::Sky::fog_lift`].
     fog_lift: f32,
+    /// What falls, flattened: [`rtxmw_scene::Precipitation`] and the velocity it falls at.
+    precip_spacing: f32,
+    precip_reach: f32,
+    precip_snow: f32,
+    precip_fall: [f32; 3],
     /// The two moons — see [`GpuMoon`].
     masser: GpuMoon,
     secunda: GpuMoon,
@@ -378,6 +394,18 @@ impl FrameConstants {
             },
             fog_wind: lighting.fog_wind.to_array(),
             fog_lift: lighting.fog_lift,
+            precip_spacing: lighting.precipitation.spacing(),
+            precip_reach: lighting.precipitation.reach(),
+            precip_snow: f32::from(u8::from(lighting.precipitation.snow)),
+            // **Down, and slanted by the wind that carries the fog**, which is the same air: a
+            // storm's rain comes at you rather than straight down, and the wind vector is already
+            // in world units a second where `Wind Speed` is a dial — see `FOG_GALE`.
+            precip_fall: Vec3::new(
+                lighting.fog_wind.x * PRECIP_SLANT,
+                lighting.fog_wind.y * PRECIP_SLANT,
+                -lighting.precipitation.fall,
+            )
+            .to_array(),
             masser: GpuMoon::new(lighting.masser, lighting.masser_face),
             secunda: GpuMoon::new(lighting.secunda, lighting.secunda_face),
             cloud_altitude: lighting.clouds.altitude,
@@ -548,10 +576,15 @@ impl VisibilityPass {
                     // The light grid: prefix offsets, then the light indices they address.
                     Binding::storage_buffer(15),
                     Binding::storage_buffer(16),
+                    // What falls out of the sky, kept out of the traced colour — see
+                    // `GBuffer::transparency`.
+                    Binding::storage_image(17),
+                    Binding::storage_image(18),
                     // Last, because Vulkan allows a variable descriptor count only on a set's final
                     // binding. Adding anything after this one moves it — validation rejects the set
-                    // outright, which is how this was caught.
-                    Binding::variable_samplers(17, max_textures),
+                    // outright, which is how this was caught, and which is why the two above went
+                    // in front of it rather than after.
+                    Binding::variable_samplers(19, max_textures),
                 ],
                 0,
                 shaders::primary_visibility(),
@@ -608,7 +641,7 @@ impl VisibilityPass {
         let texture_infos = scene.textures.descriptors();
         let texture_write = vk::WriteDescriptorSet::default()
             .dst_set(self.pipeline.set())
-            .dst_binding(17)
+            .dst_binding(19)
             .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
             .image_info(&texture_infos);
 
@@ -625,6 +658,10 @@ impl VisibilityPass {
                 gbuffer.material(),
                 gbuffer.depth(),
             ],
+        );
+        self.pipeline.bind_storage_images(
+            17,
+            &[gbuffer.transparency(), gbuffer.transparency_opacity()],
         );
 
         let position_info = [vk::DescriptorBufferInfo::default()
@@ -782,15 +819,18 @@ mod tests {
         assert_eq!(offset_of!(FrameConstants, fog_uniform), 388);
         assert_eq!(offset_of!(FrameConstants, fog_wind), 392);
         assert_eq!(offset_of!(FrameConstants, fog_lift), 400);
+        // What falls: four scalars and the velocity it falls at.
+        assert_eq!(offset_of!(FrameConstants, precip_spacing), 404);
+        assert_eq!(offset_of!(FrameConstants, precip_fall), 416);
         // Two moons of sixteen tightly packed floats apiece.
-        assert_eq!(offset_of!(FrameConstants, masser), 404);
-        assert_eq!(offset_of!(FrameConstants, secunda), 468);
+        assert_eq!(offset_of!(FrameConstants, masser), 428);
+        assert_eq!(offset_of!(FrameConstants, secunda), 492);
         // Then the cloud layer, fourteen floats of it.
-        assert_eq!(offset_of!(FrameConstants, cloud_altitude), 532);
-        assert_eq!(offset_of!(FrameConstants, cloud_sheet), 584);
+        assert_eq!(offset_of!(FrameConstants, cloud_altitude), 556);
+        assert_eq!(offset_of!(FrameConstants, cloud_sheet), 608);
         // The wave table follows, twenty tightly packed bytes apiece.
-        assert_eq!(offset_of!(FrameConstants, waves), 588);
-        assert_eq!(size_of::<FrameConstants>(), 588 + 20 * WAVE_COUNT);
+        assert_eq!(offset_of!(FrameConstants, waves), 612);
+        assert_eq!(size_of::<FrameConstants>(), 612 + 20 * WAVE_COUNT);
     }
 
     #[test]

@@ -596,6 +596,8 @@ impl Upscaler {
                 normal_roughness: gbuffer.normal_roughness(),
                 depth: gbuffer.depth(),
                 motion: gbuffer.motion(),
+                transparency: gbuffer.transparency(),
+                transparency_opacity: gbuffer.transparency_opacity(),
                 output: &self.output,
                 jitter,
                 reset,
@@ -710,6 +712,14 @@ struct Inputs<'a> {
     /// Clip depth in `r`.
     depth: &'a Image,
     motion: &'a Image,
+    /// What falls out of the sky, premultiplied, with its coverage beside it.
+    ///
+    /// **Handed over rather than composited**, which is what `DLSS.TransparencyLayer` is for: Ray
+    /// Reconstruction denoises the colour it is given, and rain in that colour is signal being
+    /// treated as noise — and accumulated against motion vectors describing the surface behind each
+    /// streak, since one vector a pixel cannot describe both.
+    transparency: &'a Image,
+    transparency_opacity: &'a Image,
     output: &'a Image,
     /// Where inside its pixel this frame sampled, in render pixels.
     jitter: glam::Vec2,
@@ -731,6 +741,8 @@ impl Feature {
         let mut normals = resource(inputs.normal_roughness);
         let mut depth = resource(inputs.depth);
         let mut motion = resource(inputs.motion);
+        let mut falling = resource(inputs.transparency);
+        let mut coverage = resource(inputs.transparency_opacity);
         let mut output = resource(inputs.output);
 
         let map = self.parameters;
@@ -742,6 +754,12 @@ impl Feature {
         set_resource(map, c"DLSS.Input.DiffuseAlbedo", &mut diffuse);
         set_resource(map, c"DLSS.Input.SpecularAlbedo", &mut specular);
         set_resource(map, c"GBuffer.Normals", &mut normals);
+        // **The particle layer, which is the whole reason rain is not in `Color`.** Both at render
+        // resolution, both optional as far as NGX is concerned — a build that never set them
+        // upscaled a frame with no rain in it at all rather than failing, which is exactly the kind
+        // of quiet the rest of this integration has been bitten by.
+        set_resource(map, c"DLSS.TransparencyLayer", &mut falling);
+        set_resource(map, c"DLSS.TransparencyLayerOpacity", &mut coverage);
 
         // **Negated, on both axes.** The trace adds the offset to the *sample coordinate* — it
         // shifts where inside its pixel a ray is fired — where NGX wants the offset as applied to
@@ -1024,6 +1042,15 @@ mod tests {
         let normals = image("normals", settings.render, half);
         let depth = image("depth", settings.render, ash::vk::Format::R32G32_SFLOAT);
         let motion = image("motion", settings.render, ash::vk::Format::R32G32_SFLOAT);
+        // The particle layer and its coverage, which NGX takes at render resolution beside the
+        // colour. Empty here — what this test asserts is that the feature evaluates, and rain has a
+        // test of its own that draws it.
+        let falling = image("transparency", settings.render, half);
+        let coverage = image(
+            "transparency opacity",
+            settings.render,
+            ash::vk::Format::R16_SFLOAT,
+        );
         let output = image("output", OUTPUT, half);
 
         // A frame with nothing in it to resolve: uniform radiance over a flat wall one unit deep,
@@ -1100,6 +1127,8 @@ mod tests {
                         normal_roughness: &normals,
                         depth: &depth,
                         motion: &motion,
+                        transparency: &falling,
+                        transparency_opacity: &coverage,
                         output: &output,
                         jitter: glam::Vec2::ZERO,
                         // The first frame has no history, which is exactly what a reset means.

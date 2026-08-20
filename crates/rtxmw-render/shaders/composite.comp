@@ -11,6 +11,15 @@ layout(local_size_x = 8, local_size_y = 8) in;
 layout(set = 0, binding = 0, rgba16f) uniform image2D target;
 layout(set = 0, binding = 1, rgba16f) uniform readonly image2D albedo_source;
 layout(set = 0, binding = 2, rgba16f) uniform readonly image2D illumination_source;
+// What falls out of the sky, premultiplied, with its coverage beside it — see `GBuffer`.
+layout(set = 0, binding = 3, rgba16f) uniform readonly image2D transparency_source;
+layout(set = 0, binding = 4, r16f) uniform readonly image2D transparency_opacity_source;
+
+layout(push_constant) uniform Overlay {
+    // One when what falls still has to be put in, which is exactly when there is no upscaler:
+    // Ray Reconstruction composites `DLSS.TransparencyLayer` itself.
+    float overlay;
+} falling;
 
 void main() {
     ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
@@ -21,10 +30,27 @@ void main() {
     // The target already holds what this pixel emits, and its alpha whether a ray hit anything at
     // all. A miss has no surface to light, and the G-buffer was never written there.
     vec4 emitted = imageLoad(target, pixel);
-    if (emitted.a == 0.0) {
-        return;
+    vec3 colour = emitted.rgb;
+    if (emitted.a != 0.0) {
+        vec3 albedo = imageLoad(albedo_source, pixel).rgb;
+        vec3 lighting = imageLoad(illumination_source, pixel).rgb;
+        colour += albedo * lighting;
     }
-    vec3 albedo = imageLoad(albedo_source, pixel).rgb;
-    vec3 lighting = imageLoad(illumination_source, pixel).rgb;
-    imageStore(target, pixel, vec4(emitted.rgb + albedo * lighting, emitted.a));
+
+    // **What falls, when nothing downstream will put it in.** The trace writes rain into a layer of
+    // its own so Ray Reconstruction composites it rather than denoising it as though it were the
+    // noise in a ray-traced colour; with no upscaler there is nothing to do that, and here is where
+    // it has to go — **before** the exposure pass meters the frame. Doing it after the curve
+    // instead, which is where this was first put, left auto-exposure metering a frame with rain in
+    // it under an upscaler and without under none, so the two paths chose different exposures for
+    // the same weather.
+    //
+    // A miss used to return early here. It cannot any more: a ray that hit nothing is every pixel
+    // of sky, which is exactly where rain shows most.
+    if (falling.overlay > 0.0) {
+        vec4 layer = imageLoad(transparency_source, pixel);
+        float covered = imageLoad(transparency_opacity_source, pixel).r;
+        colour = colour * (1.0 - covered) + layer.rgb;
+    }
+    imageStore(target, pixel, vec4(colour, emitted.a));
 }

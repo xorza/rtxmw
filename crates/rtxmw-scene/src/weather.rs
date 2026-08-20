@@ -3,6 +3,8 @@
 use glam::Vec3;
 use rtxmw_esm::{Cell, CellId, RegionRecord};
 
+use crate::precipitation::Precipitation;
+
 use crate::game_data::GameData;
 use crate::ini::Ini;
 use crate::world_time::{SUNRISE, SUNSET, WorldTime};
@@ -251,6 +253,9 @@ pub struct Weather {
     /// Distinct from `Cloud Speed`, which the game keeps separate and which scrolls the painted
     /// sheet rather than describing the air.
     pub wind: f32,
+    /// What falls out of the sky, and how much of it. [`Precipitation::NONE`] for the six that
+    /// carry none.
+    pub precipitation: Precipitation,
     /// How thick the air is by day and by night, out of `Land Fog Day/Night Depth`.
     pub fog_day_depth: f32,
     pub fog_night_depth: f32,
@@ -366,20 +371,23 @@ impl Weather {
     fn read(ini: &Ini, name: &str) -> Self {
         let section = format!("weather {name}");
         let number = |key: &str, fallback: f32| ini.number(&section, key).unwrap_or(fallback);
+        let cloud_texture = ini
+            .get(&section, "Cloud Texture")
+            .unwrap_or("Tx_Sky_Clear.tga")
+            .to_ascii_lowercase()
+            .replace(".tga", ".dds");
         Self {
             name: name.to_owned(),
+            precipitation: Precipitation::read(ini, &section, &cloud_texture),
             sky: Schedule::read(ini, &section, "Sky", CLEAR_SKY),
             fog: Schedule::read(ini, &section, "Fog", CLEAR_FOG),
             ambient: Schedule::read(ini, &section, "Ambient", CLEAR_AMBIENT),
             sun: Schedule::read(ini, &section, "Sun", CLEAR_SUN),
-            cloud_texture: ini
-                .get(&section, "Cloud Texture")
-                .unwrap_or("Tx_Sky_Clear.tga")
-                .to_ascii_lowercase()
-                .replace(".tga", ".dds"),
+            cloud_texture,
             cloud_cover: number("Clouds Maximum Percent", 1.0),
             cloud_speed: number("Cloud Speed", 1.25),
             wind: number("Wind Speed", 0.1),
+
             fog_day_depth: number("Land Fog Day Depth", 0.69),
             fog_night_depth: number("Land Fog Night Depth", 0.69),
         }

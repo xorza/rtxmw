@@ -20,6 +20,7 @@
 #include "waves.glsl"
 #include "water.glsl"
 #include "fog.glsl"
+#include "precipitation.glsl"
 
 // Where the surface at `ndc` was on the previous frame's screen, as a displacement in pixels.
 //
@@ -144,6 +145,21 @@ void main() {
                          surface.hit ? surface.t : FOG_REACH, pixel);
     emitted = emitted * fog.w + fog.xyz;
     lighting *= fog.w;
+
+    // **Into its own layer rather than into the frame.** What falls is signal and Ray Reconstruction
+    // cannot tell — composited here it would be denoised, and accumulated against motion vectors
+    // that describe the surface *behind* each streak. `DLSS.TransparencyLayer` is the way the SDK
+    // provides out of that: a layer at render resolution which the upscaler composites rather than
+    // filters. Premultiplied, with the coverage beside it, because NGX takes the two separately.
+    //
+    // **In front of the fog, because it is nearer than the fog is thick.** What falls is drawn
+    // within the weather's own `Diameter` of the eye — nine metres for rain — where even a
+    // thunderstorm's air has taken a sixth of a stop out of the frame, so leaving it out of the
+    // march costs nothing an eye could find.
+    vec4 falling = precipitation_along(frame.camera_position, direction,
+                                       surface.hit ? surface.t : FOG_REACH);
+    imageStore(transparency_target, ivec2(pixel), vec4(falling.xyz, 1.0 - falling.w));
+    imageStore(transparency_opacity_target, ivec2(pixel), vec4(1.0 - falling.w));
 
     imageStore(motion_target, ivec2(pixel), vec4(motion_vector(surface, direction, ndc, size), 0.0, 0.0));
 

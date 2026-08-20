@@ -24,8 +24,12 @@ impl Composite {
                     Binding::storage_image(0),
                     Binding::storage_image(1),
                     Binding::storage_image(2),
+                    // What falls out of the sky, added here only when there is no upscaler to do
+                    // it — see `Composite::record`.
+                    Binding::storage_image(3),
+                    Binding::storage_image(4),
                 ],
-                0,
+                size_of::<f32>() as u32,
                 shaders::composite(),
             )?,
         })
@@ -38,12 +42,23 @@ impl Composite {
     pub(crate) fn bind(&mut self, target: &Image, gbuffer: &GBuffer) {
         self.pass
             .bind_storage_images(0, &[target, gbuffer.albedo(), gbuffer.illumination()]);
+        self.pass
+            .bind_storage_images(3, &[gbuffer.transparency(), gbuffer.transparency_opacity()]);
     }
 
     /// # Safety
     /// `command_buffer` must be recording, [`Composite::bind`] must have run, and every image must
     /// be in `GENERAL`.
-    pub(crate) unsafe fn record(&self, command_buffer: vk::CommandBuffer, extent: vk::Extent2D) {
+    /// **`overlay` is whether what falls still has to be put in**, which is exactly when there is
+    /// no upscaler: Ray Reconstruction composites `DLSS.TransparencyLayer` itself, and doing it
+    /// again would draw every streak twice. It belongs here rather than after the tone curve
+    /// because the exposure pass meters what this leaves behind.
+    pub(crate) unsafe fn record(
+        &self,
+        command_buffer: vk::CommandBuffer,
+        extent: vk::Extent2D,
+        overlay: bool,
+    ) {
         // SAFETY: the caller guarantees the command buffer is recording and the set is written.
         unsafe {
             self.pass.dispatch(
@@ -53,7 +68,7 @@ impl Composite {
                     extent.height.div_ceil(WORKGROUP),
                     1,
                 ],
-                &[],
+                &f32::from(u8::from(overlay)).to_ne_bytes(),
             );
         }
     }

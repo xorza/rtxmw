@@ -15,6 +15,7 @@ mod material;
 mod material_table;
 mod mesh;
 mod moon;
+mod precipitation;
 mod sky;
 mod sky_textures;
 mod srgb;
@@ -38,6 +39,7 @@ pub use crate::material::{AlphaMode, Material, MaterialKind, TerrainLayers, Text
 pub use crate::material_table::MaterialTable;
 pub use crate::mesh::{Bounds, Mesh, Submesh};
 pub use crate::moon::Moon;
+pub use crate::precipitation::Precipitation;
 pub use crate::sky::{Sky, Veil};
 pub use crate::sky_textures::SkyTextures;
 pub use crate::srgb::{LUMA, to_linear};

@@ -742,7 +742,14 @@ impl SceneRenderer {
                 .record(device, command_buffer, extent, self.denoise_passes);
             self.timestamps.write(command_buffer, 2);
 
-            self.composite.record(command_buffer, extent);
+            // **Whether the composite still has to put the rain in**, which is exactly when there
+            // is no upscaler: Ray Reconstruction composites `DLSS.TransparencyLayer` itself. Here
+            // rather than after the tone curve because the exposure pass meters what this leaves.
+            #[cfg(feature = "dlss")]
+            let overlay = self.upscaler.is_none();
+            #[cfg(not(feature = "dlss"))]
+            let overlay = true;
+            self.composite.record(command_buffer, extent, overlay);
             // The composed frame is what the upscaler reads, so it has to have been written.
             memory_barrier::full(device, command_buffer);
             self.timestamps.write(command_buffer, 3);

@@ -4,6 +4,7 @@ use glam::{Vec2, Vec3};
 
 use crate::clouds::{BEARING, CloudSheet, Clouds, SKYLIT};
 use crate::moon::Moon;
+use crate::precipitation::Precipitation;
 use crate::srgb::LUMA;
 use crate::sun::Sun;
 use crate::weather::Weather;
@@ -323,6 +324,9 @@ pub struct Sky {
     /// A ratio, so the shader's `FOG_HEIGHT` stays the figure settled by eye and every weather
     /// hangs off it — the same shape `CLEAR_DENSITY` gives the density.
     pub fog_lift: f32,
+    /// What falls out of it, and how thickly. [`Precipitation::NONE`] under the six that drop
+    /// nothing, and under any cell with no weather over it.
+    pub precipitation: Precipitation,
     /// Which way the air is moving and how fast, out of the weather's `Wind Speed`.
     ///
     /// **One number doing three jobs**, because all three are turbulent mixing: it carries the fog
@@ -450,6 +454,7 @@ impl Sky {
             fog_density: CLEAR_DENSITY * thickness,
             fog_lift: thicker * (1.0 + weather.wind * WIND_LIFT),
             wind: Vec2::from_angle(BEARING) * weather.wind,
+            precipitation: weather.precipitation,
             exposure_bias: 1.0,
         };
         // **The open dome first**, which is what lights the cloud tops: a deck is lit from above by

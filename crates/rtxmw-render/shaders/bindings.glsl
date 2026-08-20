@@ -122,7 +122,14 @@ layout(set = 0, binding = 16, scalar) readonly buffer LightGridIndices {
     uint light_grid_indices[];
 };
 
-layout(set = 0, binding = 17) uniform sampler2D textures[];
+// What falls out of the sky, written here instead of into the frame so the upscaler composites it
+// rather than denoising it — see `GBuffer::transparency` for why rain and Ray Reconstruction do not
+// get on. Premultiplied colour, and the coverage beside it because NGX takes the two separately.
+layout(set = 0, binding = 17, rgba16f) uniform writeonly image2D transparency_target;
+layout(set = 0, binding = 18, r16f) uniform writeonly image2D transparency_opacity_target;
+
+// Last, because a variable descriptor count is only allowed on a set's final binding.
+layout(set = 0, binding = 19) uniform sampler2D textures[];
 
 // Stands in for a material with no base colour texture. Declared as `NO_TEXTURE` in
 // `material_buffers.rs` too, and pinned there by a test, because a shader cannot see a Rust
@@ -243,6 +250,13 @@ layout(set = 0, binding = 14, scalar) readonly buffer Frame {
     // How deep the layer stands, against clear weather's in still air: the weather's own
     // `Land Fog Depth` and its wind together — see `Sky::fog_lift` in `rtxmw-scene`.
     float fog_lift;
+    // What falls out of the sky: how far apart the streaks are, how far the volume reaches, how
+    // fast and which way they fall, and whether they are flakes rather than drops. Spacing is zero for the six weathers that drop nothing — see
+    // `Precipitation` in `rtxmw-scene`.
+    float precip_spacing;
+    float precip_reach;
+    float precip_snow;
+    vec3 precip_fall;
     // Masser and Secunda, which the sky draws as spheres and the surfaces are lit by — see `Moon`
     // above and `moon_disc` in `lighting.glsl`. Black and zero-width for a cell with no sky.
     Moon masser;

@@ -45,6 +45,23 @@ const MATERIAL_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 /// reuse cares most about getting right, and eight megabytes at 1080p is not the constraint.
 const MOTION_FORMAT: vk::Format = vk::Format::R32G32_SFLOAT;
 
+/// What falls out of the sky, kept out of the traced colour so the upscaler does not denoise it.
+///
+/// **Rain is signal, not noise, and Ray Reconstruction cannot tell.** Composited into the frame it
+/// reaches RR as part of the ray-traced colour, which denoises it — and accumulates it against
+/// motion vectors describing the surface *behind* each streak, because one vector a pixel cannot
+/// describe both. NVIDIA's own guidance says as much: RR "does struggle with fine particles, rain
+/// droplets ... causing them to either ghost, blur, or a bit of both". The way out is the one the
+/// SDK provides, `DLSS.TransparencyLayer` — a separate layer at render resolution that RR
+/// composites rather than filters.
+///
+/// Premultiplied, with the opacity beside it in [`GBuffer::transparency_opacity`], because NGX
+/// takes the two as separate resources.
+const TRANSPARENCY_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
+
+/// How much of each pixel that layer covers, which NGX wants as a resource of its own.
+const TRANSPARENCY_OPACITY_FORMAT: vk::Format = vk::Format::R16_SFLOAT;
+
 /// The trace's output, split into what a surface is and what light reaches it.
 ///
 /// **The split is what makes denoising possible.** All the noise is in the lighting — the albedo a
@@ -63,6 +80,8 @@ pub(crate) struct GBuffer {
     illumination: [Image; 2],
     motion: Image,
     material: Image,
+    transparency: Image,
+    transparency_opacity: Image,
 }
 
 impl GBuffer {
@@ -91,6 +110,12 @@ impl GBuffer {
             ],
             motion: image("gbuffer motion", MOTION_FORMAT, readable)?,
             material: image("gbuffer material", MATERIAL_FORMAT, readable)?,
+            transparency: image("transparency layer", TRANSPARENCY_FORMAT, readable)?,
+            transparency_opacity: image(
+                "transparency opacity",
+                TRANSPARENCY_OPACITY_FORMAT,
+                storage,
+            )?,
         })
     }
 
@@ -127,8 +152,18 @@ impl GBuffer {
         &self.illumination[1]
     }
 
+    /// What falls out of the sky, premultiplied — see [`TRANSPARENCY_FORMAT`].
+    pub(crate) fn transparency(&self) -> &Image {
+        &self.transparency
+    }
+
+    /// How much of each pixel that layer covers.
+    pub(crate) fn transparency_opacity(&self) -> &Image {
+        &self.transparency_opacity
+    }
+
     /// Every image, for a caller transitioning them together.
-    pub(crate) fn images(&self) -> [&Image; 7] {
+    pub(crate) fn images(&self) -> [&Image; 9] {
         [
             &self.albedo,
             &self.normal_roughness,
@@ -137,6 +172,8 @@ impl GBuffer {
             &self.illumination[1],
             &self.motion,
             &self.material,
+            &self.transparency,
+            &self.transparency_opacity,
         ]
     }
 }

@@ -3696,3 +3696,102 @@ ray is opaque before it reaches the water.
 
 The guard is `water_level - z > 0`, which is the idiom `primary_visibility.comp` already uses and
 which needs no flag: a dry cell carries negative infinity for its level, so it can never fire.
+
+### 8.64 Rain is signal, and Ray Reconstruction cannot tell
+
+The first rain reached the frame the way the fog does — composited inside the trace, into `emitted`
+— and came out of DLSS smeared. Two mechanisms, both unavoidable at that position. Ray
+Reconstruction **denoises what it is given**, and a rain streak is not noise in a ray-traced
+estimate; it is the answer. And it **accumulates temporally against motion vectors**, which describe
+the surface *behind* each streak, because one vector per pixel cannot describe both a drop falling
+at fifty-seven metres a second and the hillside it crosses. NVIDIA's own guidance says as much:
+Ray Reconstruction "does struggle with fine particles, rain droplets ... causing them to either
+ghost, blur, or a bit of both."
+
+**The SDK already had the way out, in the headers this project links.**
+`nvsdk_ngx_helpers_dlssd_vk.h` carries `pInTransparencyLayer`, commented *"optional input res
+particle layer"*, with `pInTransparencyLayerOpacity` beside it and the parameter strings
+`DLSS.TransparencyLayer` and `DLSS.TransparencyLayerOpacity` in `nvsdk_ngx_defs.h`. It is a layer at
+render resolution that Ray Reconstruction **composites rather than filters**. Since this integration
+already tags every resource by name — `set_resource(map, c"Color", ...)` — wiring it is two more
+calls rather than a rewrite.
+
+So the trace writes what falls into two images of its own, premultiplied colour and coverage, and
+never into the frame. What that cost elsewhere is worth writing down:
+
+- **The bindless texture array had to move.** Vulkan allows a variable descriptor count only on a
+  set's *final* binding, so the two new storage images could not go after it; the array is binding
+  19 now and they are 17 and 18. The comment beside it already warned that anything added after it
+  moves it, which is how that was caught the first time.
+- **Something has to composite the layer when there is no upscaler**, or rain never reaches the
+  frame at all. That belongs in the composite, and getting it there took two goes. The composite
+  returned early on a ray that hit nothing — every pixel of sky, which is where rain shows most — so
+  the tone curve looked like the place instead. It is not: **the exposure pass meters what the
+  composite leaves behind**, so putting the rain in after the curve left auto-exposure reading a
+  frame with rain in it under an upscaler and without under none, and the two paths chose different
+  exposures for the same weather. The early return is gone and the overlay is a push constant on the
+  composite; with an upscaler it is zero and the layer is never read.
+- **The rain tests had to read the finished image rather than the traced target**, because rain is
+  no longer in the target at all. That is a better test than it was: it now covers the compositing
+  as well as the drawing.
+
+**And with the blur gone, two defects the blur had been hiding were plain**: a horizontal band of
+long streaks across the horizon, and — looking down — a ring of disconnected blobs around the eye.
+Four attempts were made at the first before the second arrived and gave both away at once. Every one
+of the four treated a symptom.
+
+**What found it was painting the suspects.** Rendering `abs(dot(direction, fall))` as the frame puts
+a black line exactly through the middle of the band: it sits where the ray runs perpendicular to the
+fall, which for near-vertical rain is the horizon. Painting `reach` came out flat grey looking out
+to sea, which ruled out per-pixel depth *for that view* — and that was the near miss, because
+looking **down** it is not flat at all.
+
+**The root cause is that the lattice was derived from the ray.** The cell across the fall was the
+volume divided by the number of samples, and the volume is `min(surface distance, Rain Diameter)` —
+a per-pixel quantity. So the lattice changed size per pixel: a ray meeting a deck two metres away
+laid out one lattice and the ray beside it going on into the bay laid out another, and neighbouring
+pixels disagreed about where the drops *were*. That is incoherent on its face — a drop is a thing in
+the air, and how big it is cannot depend on which ray looks at it. It drew the ring, whose edge sat
+exactly where the floor's distance crossed the volume's; and it drew the band, which is the same
+incoherence read along a different contour, because the screen-space shape of an aliased lattice is
+set by how fast its coordinates move per pixel, a rate that peaks where the ray is perpendicular to
+the fall.
+
+So the lattice is a **world constant** now, and the march walks it **one cell at a time** — which is
+what keeps consecutive samples in adjacent cells rather than skipping across dozens of them, and is
+the difference between walking a lattice and aliasing it. **What does not move is how much rain
+there is**: the physical answer is what a ray crossing `n · 4r² · L` of real drop cross-section
+blocks, and what the shader solves for is the opacity a *drawn* streak needs so that however many a
+coarse lattice holds come to the same total. Appearance and quantity are separated, and only the
+first of them is a choice.
+
+The four that failed are worth naming, because each was a plausible reading of the symptom: more
+layers (over-counts — ten consecutive samples in one 122-unit cell charging for the same streak),
+closing the ray on the streak's axis (unbounded, so every cell any sample touches reports a hit),
+the same clamped to a sample's own span (the clamp bounds the approach but the *cell* is still
+picked at the midpoint), and holding the drops back from the lens (moves where the artefact is, not
+what it is).
+
+**Two more numbers had to give, and both for reasons already met elsewhere in this file.**
+
+**A streak's length is not the game's fall speed.** `Precip Gravity` times rain's entrance speed is
+4,025 units a second — *fifty-seven metres*, six times what a raindrop actually reaches, because the
+original draws long sprites and they have to move to read. Taking a streak's length from that made
+it a full metre, which at half a metre from the eye subtends fifty-six degrees: half the screen, and
+the whole of why the drops looked enormous however narrow they were drawn. Shrinking the lattice did
+nothing for it, and could not — a streak's size on screen is its radius over its distance, the radius
+is a fraction of the cell and the nearest sample sits half a cell out, so the two cancel and a finer
+lattice only ever made *more* drops the same size. The ini's speed still carries the field past,
+which is the game's look; how far one drop smears while the shutter is open is nine metres a second,
+which is physics.
+
+**And the counts are spread like the fog depths.** How much of a ray the rain covers goes as the
+count, and the file puts a thunderstorm at 650 drops against rain's 450 — a ratio of 1.44, which is
+not a change anyone watching a storm break would call one. §8.63's argument applies unaltered: a
+number tuned against a fixed sprite budget is not a rate. Rain stays exactly where the file puts it
+and a thunderstorm comes out two and a half times it.
+
+What it comes to is streaks that stay streaks, the same rain from every angle, and a storm you can
+tell from a shower. The same frame that came out of DLSS as a grey wash
+now shows every drop, and the two paths — upscaled and not — draw the same rain without either
+drawing it twice.
