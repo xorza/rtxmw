@@ -4,7 +4,7 @@ use ash::vk;
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec2, Vec3};
 use rtxmw_gpu::{Binding, Buffer, BufferMemory, ComputePipeline, Device, Image, Memory};
-use rtxmw_scene::{Moon, Sun};
+use rtxmw_scene::{Clouds, Moon, Sun};
 
 use crate::acceleration_structure::AccelerationStructure;
 use crate::gbuffer::GBuffer;
@@ -59,6 +59,11 @@ pub(crate) struct Lighting {
     pub(crate) masser_face: u32,
     /// Where Secunda's sits, on the same terms.
     pub(crate) secunda_face: u32,
+    /// The cloud layer over the cell. [`Clouds::NONE`] where there is no sky.
+    pub(crate) clouds: Clouds,
+    /// Where the weather's painted sky sheet sits in the bindless array, or zero for none — in
+    /// which case no layer is drawn at all, since its shape is the whole of what the sheet is for.
+    pub(crate) cloud_sheet: u32,
 }
 
 impl Default for Lighting {
@@ -84,6 +89,8 @@ impl Default for Lighting {
             secunda: Moon::NONE,
             masser_face: 0,
             secunda_face: 0,
+            clouds: Clouds::NONE,
+            cloud_sheet: 0,
         }
     }
 }
@@ -250,6 +257,22 @@ pub struct FrameConstants {
     /// The two moons — see [`GpuMoon`].
     masser: GpuMoon,
     secunda: GpuMoon,
+    /// The cloud layer: how high it sits, how far the world curves under it, how much of it one
+    /// tile of the sheet spans,
+    /// how far the wind has carried it, what a lit and a shadowed cloud radiate, the sheet's own
+    /// mean luminance, how much sky it covers, and where the sheet sits in the array.
+    ///
+    /// Zero cover or a zero slot is no layer, which is what an interior and a renderer nobody
+    /// handed a sheet to both get.
+    cloud_altitude: f32,
+    cloud_world_radius: f32,
+    cloud_tile: f32,
+    cloud_drift: [f32; 2],
+    cloud_lit: [f32; 3],
+    cloud_shadowed: [f32; 3],
+    cloud_mean: f32,
+    cloud_cover: f32,
+    cloud_sheet: u32,
     /// The sinusoids the water surface is summed from — see [`crate::wave_spectrum`].
     ///
     /// Static for the life of a sea state, and carried here rather than in a buffer of its own
@@ -326,6 +349,15 @@ impl FrameConstants {
             fog_uniform: if lighting.fog_banked { 0.0 } else { 1.0 },
             masser: GpuMoon::new(lighting.masser, lighting.masser_face),
             secunda: GpuMoon::new(lighting.secunda, lighting.secunda_face),
+            cloud_altitude: lighting.clouds.altitude,
+            cloud_world_radius: lighting.clouds.world_radius,
+            cloud_tile: lighting.clouds.tile,
+            cloud_drift: lighting.clouds.drift.to_array(),
+            cloud_lit: lighting.clouds.lit.to_array(),
+            cloud_shadowed: lighting.clouds.shadowed.to_array(),
+            cloud_mean: lighting.clouds.sheet_mean,
+            cloud_cover: lighting.clouds.cover,
+            cloud_sheet: lighting.cloud_sheet,
             // Rebuilt each frame rather than cached: it is a few hundred floats of arithmetic once
             // per frame against a million rays that read it, and a cache would need invalidating
             // the moment the sea state becomes something a cell can set.
@@ -718,9 +750,15 @@ mod tests {
         // Two moons of sixteen tightly packed floats apiece.
         assert_eq!(offset_of!(FrameConstants, masser), 376);
         assert_eq!(offset_of!(FrameConstants, secunda), 440);
+        // Then the cloud layer, fourteen floats of it.
+        assert_eq!(offset_of!(FrameConstants, cloud_altitude), 504);
+        assert_eq!(offset_of!(FrameConstants, cloud_drift), 516);
+        assert_eq!(offset_of!(FrameConstants, cloud_lit), 524);
+        assert_eq!(offset_of!(FrameConstants, cloud_shadowed), 536);
+        assert_eq!(offset_of!(FrameConstants, cloud_sheet), 556);
         // The wave table follows, twenty tightly packed bytes apiece.
-        assert_eq!(offset_of!(FrameConstants, waves), 504);
-        assert_eq!(size_of::<FrameConstants>(), 504 + 20 * WAVE_COUNT);
+        assert_eq!(offset_of!(FrameConstants, waves), 560);
+        assert_eq!(size_of::<FrameConstants>(), 560 + 20 * WAVE_COUNT);
     }
 
     #[test]

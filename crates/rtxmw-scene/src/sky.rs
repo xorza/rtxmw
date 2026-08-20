@@ -2,6 +2,7 @@
 
 use glam::Vec3;
 
+use crate::clouds::Clouds;
 use crate::moon::Moon;
 use crate::srgb::LUMA;
 use crate::sun::Sun;
@@ -107,6 +108,9 @@ pub struct Sky {
     pub masser: Moon,
     /// The smaller one, pale and grey, on an arc that crosses Masser's. Otherwise as above.
     pub secunda: Moon,
+    /// The cloud layer, lit by the same sun and the same dome. [`Clouds::NONE`] for a cell with no
+    /// sky, which draws none without a branch to say so.
+    pub clouds: Clouds,
     /// The dome's average radiance, which is what an unshadowed surface receives from all of it.
     ///
     /// Derived from [`Self::shape`] rather than beside it, so the light a surface is given and
@@ -209,6 +213,7 @@ impl Sky {
             masser: Moon::masser(time, bare),
             secunda: Moon::secunda(time, bare),
             ambient: Vec3::ZERO,
+            clouds: Clouds::NONE,
             warm,
             warmth,
             scale: SKY_STRENGTH * lit,
@@ -216,6 +221,10 @@ impl Sky {
             exposure_bias: 1.0,
         };
         sky.ambient = sky.dome_average();
+        // **After the dome's average, because the layer is lit by it.** The clouds are not part of
+        // the average in turn: they sit under the sky rather than being it, and a dome that counted
+        // them would light the ground by its own clouds.
+        sky.clouds = Clouds::at(time, sky.sun, sky.ambient);
         sky.exposure_bias = sky.bias_from_dome();
         sky
     }

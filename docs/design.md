@@ -3214,3 +3214,62 @@ step larger than a twentieth of a degree.
 read and discontinuous where it is not stays correct until something starts reading it there. The
 three constants the two branches share are named now, because the property the test asserts — that
 the night's ends meet the day's exactly — is only true while both read the same numbers.
+### 8.56 Clouds, which are a vanilla asset lit rather than shown
+
+The sky has been a bare gradient at every hour since it was built. Morrowind's own is nine painted
+sheets, one per weather — `tx_sky_clear.dds` through `tx_sky_blight.dds`, 512 square, BGRA —
+scrolled over a flat cap of radius 1000 by `Cloud Speed`.
+
+**Each sheet is a photograph of a sky with 2002's lighting in it**, which is the whole of how to use
+one. `tx_sky_clear`'s colour is a blue sky with white wisps painted on; `tx_sky_overcast`'s is a
+flat grey sheet. Compositing either over the dome puts the sky in twice and lights every cloud
+twice, which is §5.1's subject exactly. So the sheet supplies *shape* and the light supplies colour:
+the alpha its artist drew the clouds with, and — where that alpha carries nothing, which is every
+overcast weather, all of them at 255 — the texel's own luminance against the sheet's mean. The same
+split as the moons' portraits, and it pays off at dusk, where a cirrus deck goes gold because the
+light reaching it has crossed thirty atmospheres, not because anyone painted it that way.
+
+**A shell over a curved world, not a dome round the eye.** `sky_clouds_01.nif` is a cap of radius
+1000 rising 100 to 307 — flat enough that its own artist was drawing this picture — but a mesh
+centred on the viewer meets every ray at one distance, so the last few degrees above the horizon
+smear the whole sheet into radial streaks. Two kilometres up over the Earth's own radius gives a ray
+`h` overhead and `sqrt(2Rh)` — **160 km** — along the horizon, which is what a sky's depth is made
+of. One tile spans eight kilometres, which puts a cloud a kilometre or two across.
+
+**And that geometry is a precision trap.** The obvious root of the ray-shell quadratic is `-b +
+sqrt(b*b + c)`, where `b` is the world's radius times the ray's climb: 4.5e8 in game units, so `b*b`
+is 2e17 and `f32` has four digits left of it. Subtracting `b` from its own square root then throws
+away the answer — straight up it came out **17 units** from a distance that is exactly the altitude.
+The conjugate form `c / (b + sqrt(b*b + c))` is the same root, adds two positive numbers instead of
+cancelling two huge ones, and is exact there. The test that asks for the overhead distance is what
+found it, which is the second time this project has been bitten by differencing world-scale numbers
+— §8.7 was the first.
+
+**A cloud is darker than the sky it covers, which took the wrong reasoning to get wrong.** The
+sky-lit term was set at 0.9 of the dome's own radiance on the argument that a cloud is lit from the
+whole hemisphere rather than from one direction — true of the irradiance arriving and silent about
+what leaves. A thick cloud reflects most of that *upward*; plane-parallel theory puts a deck's
+transmission at 0.2 to 0.3. At 0.9 a night deck was 90% of the sky it hid, which is invisible, and a
+daylit cloud base was nearly as bright as the sky rather than the grey it is. At 0.3 a solid deck at
+night is a dark shape blotting out stars, which is what clouds are in a starry sky, and thin cloud
+is not dragged down with it because how much sky a wisp replaces at all is its own alpha.
+
+**And the clock is where the wind had to stop being physical.** Morrowind's `timescale` is 30, so a
+game hour passes in two minutes of watching and a real 19 km/h breeze carries a cloud across ten
+degrees of sky every two seconds — a conveyor belt, which is what it looked like. The drift is set
+against the clock the sky is actually watched on instead: about ten degrees a minute. It is the
+honest place to break from the physical figure, because the sun's hour is chronology and has to run
+at the game's rate, while a cloud's drift is ambience and only has to look right.
+
+Two things the first pass got plainly wrong and a review caught. The sun's disc is composited
+*after* the layer and **replaces** the colour, so a sun under solid overcast came through at full
+strength with the deck drawn around it; it is blended by the same coverage as everything else now.
+And the sheet was sampled with plain `texture`, which in a compute shader has no derivatives and so
+takes mip zero — while `reach` at the horizon is a hundred times what it is overhead, which is
+exactly where a tile is compressed past what its finest level can answer for. It picks a level off
+the ray cone now, the same argument `cone_lod` makes for a surface.
+
+What is not built yet is the weather system this is one sheet of: the ten `[Weather]` blocks, their
+sky, fog, ambient and sun colours at four times of day, `Land Fog Depth`, `Clouds Maximum Percent`,
+and the `Transition Delta` that blends between them. Clear weather's sheet and its `Cloud Speed` of
+1.25 are borrowed ahead of the rest.

@@ -4,6 +4,7 @@
 //! Vulkan, and nothing above it knows about ESM records or NIF blocks.
 
 mod cell_streamer;
+mod clouds;
 mod door;
 mod error;
 mod game_data;
@@ -14,6 +15,7 @@ mod material_table;
 mod mesh;
 mod moon;
 mod sky;
+mod sky_textures;
 mod srgb;
 mod static_scene;
 mod sun;
@@ -25,6 +27,7 @@ mod world_time;
 pub use rtxmw_esm::CellId;
 
 pub use crate::cell_streamer::{CellStreamer, StreamedCell};
+pub use crate::clouds::Clouds;
 pub use crate::door::Door;
 pub use crate::error::{Result, SceneError};
 pub use crate::light::{Ambient, Light};
@@ -32,8 +35,9 @@ pub use crate::loaded_cell::LoadedCell;
 pub use crate::material::{AlphaMode, Material, MaterialKind, TerrainLayers, TextureId};
 pub use crate::material_table::MaterialTable;
 pub use crate::mesh::{Bounds, Mesh, Submesh};
-pub use crate::moon::{Moon, MoonFaces};
+pub use crate::moon::Moon;
 pub use crate::sky::Sky;
+pub use crate::sky_textures::SkyTextures;
 pub use crate::srgb::to_linear;
 pub use crate::static_scene::{CellDetail, Instance, MeshId, ModelIndex, StaticScene};
 pub use crate::sun::Sun;

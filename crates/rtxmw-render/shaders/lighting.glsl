@@ -399,6 +399,66 @@ vec3 moon_disc(vec3 direction, Moon moon, float footprint) {
     return moon.colour * (shade * face);
 }
 
+// What the cloud layer puts in front of the sky along `direction`, and how much of it it hides.
+//
+// **A vanilla asset lit rather than shown.** `tx_sky_*.dds` is a painted photograph of a sky with
+// 2002's lighting in it, so what is taken from it is the *shape* — the alpha its artist drew the
+// clouds with, and the texel's own luminance against the sheet's mean where that alpha is flat, as
+// it is for every overcast weather. The colour comes from `cloud_lit` and `cloud_shadowed`, which
+// the host built from the sun and the dome. Compositing the painting itself would light every cloud
+// twice, which is `docs/design.md` §5.1's whole subject.
+//
+// Returns the layer's radiance; `hiding` comes back as how much of the sky behind it is covered.
+vec3 cloud_layer(vec3 direction, float footprint, out float hiding) {
+    hiding = 0.0;
+    if (frame.cloud_cover <= 0.0 || frame.cloud_sheet == 0u || direction.z <= 0.0) {
+        return vec3(0.0);
+    }
+
+    // **Where the ray meets a shell over a curved world**, which is the whole of why a sky has
+    // depth. With the eye on a world of radius `R` and the layer `h` above it, the shell is centred
+    // `R` below and the positive root of the quadratic is the distance to it: `h` looking straight
+    // up, and `sqrt(2Rh)` — a hundred and sixty kilometres — along the horizon. A shell centred on
+    // the *eye* instead is the same distance in every direction, which piles the whole sheet into a
+    // ring in the last few degrees.
+    //
+    // **Solved as `c / (b + sqrt(b*b + c))` rather than `-b + sqrt(b*b + c)`**, which is the same
+    // root without the cancellation. `b` is the world's radius times the ray's climb — 4.5e8 in
+    // game units — so `b*b` is 2e17 and subtracting `b` from its own square root throws away every
+    // digit that mattered: straight up it came out 17 units from an answer that is exactly the
+    // altitude. The conjugate form adds two positive numbers instead and is exact there.
+    float b = frame.cloud_world_radius * direction.z;
+    float c = frame.cloud_altitude * (2.0 * frame.cloud_world_radius + frame.cloud_altitude);
+    float reach = c / (b + sqrt(b * b + c));
+    vec2 where = direction.xy * (reach / frame.cloud_tile) + frame.cloud_drift;
+
+    // **The level the ray can actually resolve**, the same argument `cone_lod` makes for a surface:
+    // the cone is `footprint` wide per unit travelled and it has travelled `reach`, so it covers
+    // that much of the layer — and near the horizon `reach` is a hundred times what it is overhead,
+    // so a tile there is compressed past what its finest mip can answer for. Sampling with plain
+    // `texture` takes level zero, because a compute shader has no derivatives to pick one from, and
+    // the horizon crawls.
+    float texels = float(textureSize(textures[frame.cloud_sheet], 0).x) / frame.cloud_tile;
+    float lod = max(0.0, log2(max(footprint * reach * texels, 1e-6)));
+    vec4 sheet = textureLod(textures[frame.cloud_sheet], where, lod);
+
+    // The painting's structure, as a ratio to its own mean rather than as a level — so the sheet
+    // says where a cloud is thick and the light says how bright that is. Where the alpha carries no
+    // shape, which is every overcast sheet, this is all the shape there is.
+    float luminance = dot(sheet.rgb, vec3(0.2126, 0.7152, 0.0722));
+    float thickness = clamp(luminance / max(frame.cloud_mean, 1e-6), 0.0, 2.0);
+
+    // How much sky the cloud hides: its own alpha, faded out toward the horizon where the shell is
+    // seen so obliquely that a tile covers more sky than it has detail for.
+    hiding = sheet.a * frame.cloud_cover * smoothstep(0.0, 0.12, direction.z);
+
+    // **Thick where it is lit and thin where it is not.** A cloud's own body shadows it, so the
+    // dense parts of the sheet keep the sun and the wisps are lit through; that is the difference
+    // between the two colours the host handed over, and the sheet's structure is what picks between
+    // them.
+    return mix(frame.cloud_shadowed, frame.cloud_lit, clamp(thickness, 0.0, 1.0));
+}
+
 // How many atmospheres a beam crosses to something `climb` above the horizon — Kasten and Young.
 float air_mass(float climb) {
     float degrees = degrees(asin(clamp(climb, 0.0, 1.0)));
@@ -457,6 +517,17 @@ vec3 sky_seen_through(vec3 direction, float lobe, bool looking) {
                      * star_field(direction, frame.cone_spread + lobe));
     }
 
+    // **The clouds, over everything the sky itself has.** They hide the dome, the stars and the
+    // moons in proportion to their own alpha, because a cloud is opaque where it is thick — and they
+    // are drawn only for a ray being looked along, for the same reason the moons are: a bounce ray
+    // that found one would be sampling a light the layer's own contribution to `ambient` has already
+    // accounted for.
+    float hidden = 0.0;
+    if (looking) {
+        vec3 layer = cloud_layer(direction, frame.cone_spread + lobe, hidden);
+        colour = mix(colour, layer, hidden);
+    }
+
     // **`lobe` is how far a rough surface smears the sun**, in radians. Water too fine to resolve
     // is not flat — the slopes are still there, they are simply smaller than a pixel — and what
     // they do to a reflected sun is spread it. That spreading *is* the glitter path: a mirror shows
@@ -470,7 +541,11 @@ vec3 sky_seen_through(vec3 direction, float lobe, bool looking) {
         // The same flux over a larger cap, so a broader glitter is a dimmer one and the total light
         // the sun contributes does not grow with the wind.
         float spread = max(1.0 - widened, 1e-6);
-        colour = frame.sun_colour * min((1.0 - frame.sun_cos_radius) / spread, 1.0);
+        vec3 disc = frame.sun_colour * min((1.0 - frame.sun_cos_radius) / spread, 1.0);
+        // **Behind whatever cloud is in front of it**, which it was not: this block *replaces* the
+        // colour, so a sun under solid overcast was coming through at full strength with the cloud
+        // deck drawn round it. Blended by the same coverage everything else in the sky is.
+        colour = mix(disc, colour, hidden);
     }
     return colour;
 }

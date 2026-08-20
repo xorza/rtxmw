@@ -49,21 +49,21 @@ vec3 interpolate_normal(uvec3 verts, vec3 weights) {
 
 // Where a texture id's colour lands in the bindless array.
 //
-// Slot zero is the fallback a material with no texture takes, slots one and two are the moons'
-// portraits, and every texture after them is followed by the shading map estimated from it — one
-// array rather than two because Vulkan allows a variable descriptor count only on a set's final
-// binding.
+// Slot zero is the fallback a material with no texture takes, the next three are the sky's own
+// pictures — two moon portraits and the weather's cloud sheet — and every texture after them is
+// followed by the shading map estimated from it. One array rather than two because Vulkan allows a
+// variable descriptor count only on a set's final binding.
 //
-// The moons are reserved rather than appended because a material's id addresses a *fixed* pair of
+// The sky's are reserved rather than appended because a material's id addresses a *fixed* pair of
 // slots: anything inserted after the first cell had loaded would move every id behind it.
-const uint MOON_FACES = 2u;
+const uint SKY_SLOTS = 3u;
 
 uint colour_slot(uint id) {
-    return 1u + MOON_FACES + 2u * id;
+    return 1u + SKY_SLOTS + 2u * id;
 }
 
 uint shading_slot(uint id) {
-    return 2u + MOON_FACES + 2u * id;
+    return 2u + SKY_SLOTS + 2u * id;
 }
 
 // Mip level for a hit, from the width of the ray's cone where it landed.

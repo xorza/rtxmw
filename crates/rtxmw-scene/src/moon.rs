@@ -1,10 +1,7 @@
 //! Masser and Secunda: the two things in Morrowind's night sky that are worth looking at.
 
 use glam::Vec3;
-use rtxmw_texture::Texture;
 
-use crate::error::Result;
-use crate::game_data::GameData;
 use crate::sky::Sky;
 use crate::srgb::LUMA;
 use crate::sun::Sun;
@@ -149,43 +146,6 @@ const SECUNDA: Almanac = Almanac {
     epoch: 0.30,
     face: Vec3::new(0.04402, 0.03732, 0.02946),
 };
-
-/// The two moons' vanilla portraits, which are what a disc is drawn with.
-///
-/// **The `full` face of each and only that one.** The game ships eight per moon and switches
-/// between them; this renderer carves the terminator from where the sun actually is, so the phases
-/// it needs are the one face the sun has reached all of. Loading the other fourteen would be
-/// loading fourteen pictures of a shadow this already knows how to cast.
-#[derive(Debug)]
-pub struct MoonFaces {
-    /// `tx_masser_full.dds`, or `None` where it would not read or decode.
-    pub masser: Option<Texture>,
-    /// `tx_secunda_full.dds`, on the same terms.
-    pub secunda: Option<Texture>,
-}
-
-impl MoonFaces {
-    /// Reads both from the installed game, or `None` when none is configured.
-    ///
-    /// A face that fails to read or decode is `None` rather than an error, the same as any other
-    /// texture: a moon without its portrait is a flat disc of the right colour, which is worse and
-    /// not a reason to have no renderer.
-    pub fn load() -> Result<Option<Self>> {
-        let Some(game) = GameData::shared()? else {
-            return Ok(None);
-        };
-        let read = |path: &str| {
-            game.vfs()
-                .read(path)
-                .ok()
-                .and_then(|bytes| Texture::decode(&bytes).ok())
-        };
-        Ok(Some(Self {
-            masser: read(r"textures\tx_masser_full.dds"),
-            secunda: read(r"textures\tx_secunda_full.dds"),
-        }))
-    }
-}
 
 /// One of Morrowind's moons at an hour of one of its days.
 ///

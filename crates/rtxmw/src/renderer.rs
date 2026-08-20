@@ -9,7 +9,7 @@ use rtxmw_gpu::{
     Validation, image_blit,
 };
 use rtxmw_render::{FrameConstants, OUTPUT_FORMAT, SceneRenderer, TARGET_FORMAT};
-use rtxmw_scene::{CellId, MoonFaces, Sky, StaticScene};
+use rtxmw_scene::{CellId, Sky, SkyTextures, StaticScene};
 use rtxmw_texture::Texture;
 
 use crate::cli::Upscaling;
@@ -137,12 +137,12 @@ impl Renderer {
         }
         // **Before any cell, and it need not be** — the array reserves their slots either way. It
         // is here because this is where the archives are already open once.
-        match MoonFaces::load() {
-            Ok(Some(faces)) => {
-                scene.set_moon_faces(&device, &mut uploader, physical.limits(), &faces)?;
+        match SkyTextures::load() {
+            Ok(Some(textures)) => {
+                scene.set_sky_textures(&device, &mut uploader, physical.limits(), &textures)?;
             }
             Ok(None) => {}
-            Err(failed) => eprintln!("the moons keep their own colour: {failed}"),
+            Err(failed) => eprintln!("the sky keeps its own colours: {failed}"),
         }
 
         Ok(Self {

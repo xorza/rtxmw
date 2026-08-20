@@ -7,6 +7,19 @@ use glam::Vec3;
 /// Rec. 709, matching the primaries every texture in the game is decoded to.
 pub(crate) const LUMA: Vec3 = Vec3::new(0.2126, 0.7152, 0.0722);
 
+/// Converts one sRGB-encoded byte to linear.
+///
+/// What [`to_linear`] is built out of, and what anything holding loose bytes wants — a decoded
+/// texture is `[u8]` rather than packed words, and open-coding the curve beside it is a second copy
+/// of a formula with four constants in it.
+pub(crate) fn channel_to_linear(encoded: u8) -> f32 {
+    let value = encoded as f32 / 255.0;
+    match value <= 0.04045 {
+        true => value / 12.92,
+        false => ((value + 0.055) / 1.055).powf(2.4),
+    }
+}
+
 /// Converts a packed `0xAABBGGRR` colour to linear RGB.
 ///
 /// Everything the game stores as a colour — light tints, cell ambient, material colours — was
@@ -15,14 +28,7 @@ pub(crate) const LUMA: Vec3 = Vec3::new(0.2126, 0.7152, 0.0722);
 /// same error as sampling an albedo texture through a UNORM view. The difference is largest in the
 /// midtones and vanishes at both ends, which is why it reads as "a bit off" rather than as broken.
 pub fn to_linear(packed: u32) -> Vec3 {
-    let channel = |shift: u32| {
-        let encoded = ((packed >> shift) & 0xFF) as f32 / 255.0;
-        if encoded <= 0.04045 {
-            encoded / 12.92
-        } else {
-            ((encoded + 0.055) / 1.055).powf(2.4)
-        }
-    };
+    let channel = |shift: u32| channel_to_linear(((packed >> shift) & 0xFF) as u8);
     Vec3::new(channel(0), channel(8), channel(16))
 }
 

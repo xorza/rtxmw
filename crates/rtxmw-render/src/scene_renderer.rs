@@ -11,7 +11,7 @@ use rtxmw_gpu::{
     Device, Image, Memory, PhysicalDevice, RayTracingLimits, Timestamps, Uploader, image_barrier,
     memory_barrier,
 };
-use rtxmw_scene::{CellId, MoonFaces, Sky, StaticScene};
+use rtxmw_scene::{CellId, Sky, SkyTextures, StaticScene};
 use rtxmw_texture::Texture;
 
 use crate::auto_exposure::AutoExposure;
@@ -443,22 +443,22 @@ impl SceneRenderer {
         Ok(self.scene.as_mut().expect("just built if it was absent"))
     }
 
-    /// Hands the moons their vanilla portraits, which every later frame draws them with.
+    /// Hands the sky its own pictures — the moons' portraits and the weather's cloud sheet.
     ///
-    /// Idempotent and order-free: the two slots exist from the moment a residency does, so this may
-    /// be called before or after any cell. Without it the moons are flat discs of their own
-    /// measured colour, which is what the headless tests draw.
+    /// Order-free: their slots exist from the moment a residency does, so this may be called before
+    /// or after any cell. Without it the moons are flat discs of their measured colour and there is
+    /// no cloud layer, which is what the headless tests draw.
     ///
     /// The caller must have waited for device idle.
-    pub fn set_moon_faces(
+    pub fn set_sky_textures(
         &mut self,
         device: &Device,
         uploader: &mut Uploader,
         limits: RayTracingLimits,
-        faces: &MoonFaces,
+        textures: &SkyTextures,
     ) -> rtxmw_gpu::Result<()> {
         self.residency(device, uploader, limits)?
-            .set_moon_faces(uploader, faces)?;
+            .set_sky_textures(uploader, textures)?;
         self.bind_scene();
         Ok(())
     }

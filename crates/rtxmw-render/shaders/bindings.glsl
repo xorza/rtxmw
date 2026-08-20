@@ -231,6 +231,20 @@ layout(set = 0, binding = 14, scalar) readonly buffer Frame {
     // above and `moon_disc` in `lighting.glsl`. Black and zero-width for a cell with no sky.
     Moon masser;
     Moon secunda;
+    // The cloud layer: how high it sits, how far the world curves under it, how much of it one tile
+    // of the painted sheet spans, and how far the wind has carried that sheet across it.
+    float cloud_altitude;
+    float cloud_world_radius;
+    float cloud_tile;
+    vec2 cloud_drift;
+    // What a lit cloud and a shadowed one radiate — sun plus sky, and sky alone.
+    vec3 cloud_lit;
+    vec3 cloud_shadowed;
+    // The sheet's own mean luminance, which its texels are read as a ratio to, then how much sky
+    // the layer covers and where the sheet sits in `textures`. Either at zero is no layer at all.
+    float cloud_mean;
+    float cloud_cover;
+    uint cloud_sheet;
     // The sinusoids the sea is summed from, built on the host from an empirical spectrum rather
     // than a series chosen by eye — see `wave_spectrum.rs`.
     Wave waves[WAVE_COUNT];

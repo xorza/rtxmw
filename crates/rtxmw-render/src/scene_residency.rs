@@ -4,24 +4,26 @@ use std::collections::HashMap;
 
 use rtxmw_gpu::{Buffer, Device, RayTracingLimits, Uploader};
 use rtxmw_scene::{
-    Ambient, CellId, Instance, Light, MaterialKind, MaterialTable, Mesh, MeshId, Moon, MoonFaces,
-    Sky, StaticScene, Sun, TerrainLayers, TextureId,
+    Ambient, CellId, Clouds, Instance, Light, MaterialKind, MaterialTable, Mesh, MeshId, Moon, Sky,
+    SkyTextures, StaticScene, Sun, TerrainLayers, TextureId,
 };
 use rtxmw_texture::Texture;
 
-/// How many slots the bindless array reserves before any material's, matching `MOON_FACES` in
+/// How many slots the bindless array reserves before any material's, matching `SKY_SLOTS` in
 /// `surface.glsl` — where they disagree, every texture in the cell shifts, which
 /// `tests/terrain.rs` fails on.
-const MOON_FACES: u32 = 2;
+const SKY_SLOTS: u32 = 3;
 
-/// Which of those two slots each moon takes.
+/// Which of those slots each of the sky's own pictures takes.
 ///
 /// **Ids rather than descriptor indices**, which differ by one: slot zero of the descriptor array
-/// is the fallback, so `Lighting::masser_face` is this plus one — and zero there means no portrait,
+/// is the fallback, so `Lighting::masser_face` is this plus one — and zero there means no picture,
 /// which is why the fallback's own index is the one that can stand for "none".
 const MASSER_FACE: u32 = 0;
 /// Secunda's, immediately after Masser's.
 const SECUNDA_FACE: u32 = 1;
+/// And the weather's painted sky sheet, which the cloud layer is cut out of.
+const CLOUD_SHEET: u32 = 2;
 
 use crate::geometry_buffers::GeometryBuffers;
 use crate::gpu_light::GpuLight;
@@ -111,6 +113,9 @@ pub(crate) struct SceneResidency {
     recorded_sun: Option<Sun>,
     /// What lights an exterior right now.
     sky: Sky,
+    /// The mean luminance of the uploaded cloud sheet, which only the upload knows — see
+    /// [`Clouds::sheet_mean`]. One until one arrives, which is when a layer starts being drawn.
+    sheet_mean: f32,
 }
 
 // The GPU-side members hold `ash` function tables, which implement no `Debug`.
@@ -139,7 +144,7 @@ impl SceneResidency {
         // after the first cell had loaded would displace every texture behind it. They hold the
         // array's own fallback until someone hands over the portraits, which is what `masser_face`
         // staying zero says.
-        for _ in 0..MOON_FACES {
+        for _ in 0..SKY_SLOTS {
             textures.insert(uploader, None)?;
         }
         let acceleration = SceneAcceleration::new(device, uploader, limits)?;
@@ -162,6 +167,7 @@ impl SceneResidency {
             record: None,
             recorded_sun: None,
             sky: Sky::default(),
+            sheet_mean: 1.0,
         })
     }
 
@@ -238,14 +244,23 @@ impl SceneResidency {
         };
         self.lighting.sky_scale = scale;
         self.lighting.sky_floor = floor;
-        // A room has no stars in it however late it is, and no moons either.
-        let (stars, masser, secunda) = match self.record {
-            Some(_) => (0.0, Moon::NONE, Moon::NONE),
-            None => (self.sky.stars, self.sky.masser, self.sky.secunda),
+        // A room has no stars in it however late it is, no moons, and no weather.
+        let (stars, masser, secunda, clouds) = match self.record {
+            Some(_) => (0.0, Moon::NONE, Moon::NONE, Clouds::NONE),
+            None => (
+                self.sky.stars,
+                self.sky.masser,
+                self.sky.secunda,
+                self.sky.clouds,
+            ),
         };
         self.lighting.sky_stars = stars;
         self.lighting.masser = masser;
         self.lighting.secunda = secunda;
+        self.lighting.clouds = Clouds {
+            sheet_mean: self.sheet_mean,
+            ..clouds
+        };
 
         // **Only interiors carry fog in the record**, so a recorded density is what identifies one
         // and settles all three of these together. An exterior's fog belongs to the weather system —
@@ -359,28 +374,41 @@ impl SceneResidency {
     /// session where the files would not decode.
     ///
     /// The caller must have waited for device idle.
-    pub(crate) fn set_moon_faces(
-        &mut self,
-        uploader: &mut Uploader,
-        faces: &MoonFaces,
-    ) -> rtxmw_gpu::Result<()> {
-        if let Some(texture) = faces.masser.as_ref() {
-            self.textures.fill(uploader, MASSER_FACE, texture)?;
-            self.lighting.masser_face = MASSER_FACE + 1;
-        }
-        if let Some(texture) = faces.secunda.as_ref() {
-            self.textures.fill(uploader, SECUNDA_FACE, texture)?;
-            self.lighting.secunda_face = SECUNDA_FACE + 1;
-        }
-        Ok(())
-    }
-
     pub(crate) fn acceleration(&self) -> &SceneAcceleration {
         &self.acceleration
     }
 
     pub(crate) fn lighting(&self) -> Lighting {
         self.lighting
+    }
+
+    /// Fills the reserved slots with the sky's own pictures.
+    ///
+    /// Until this is called the moons are flat discs of their own measured colour and no cloud layer
+    /// is drawn at all — the sheet is the whole of the layer's shape. That is what a renderer nobody
+    /// handed them to gets, which is every test that does not need them.
+    ///
+    /// The caller must have waited for device idle.
+    pub(crate) fn set_sky_textures(
+        &mut self,
+        uploader: &mut Uploader,
+        textures: &SkyTextures,
+    ) -> rtxmw_gpu::Result<()> {
+        if let Some(texture) = textures.masser.as_ref() {
+            self.textures.fill(uploader, MASSER_FACE, texture)?;
+            self.lighting.masser_face = MASSER_FACE + 1;
+        }
+        if let Some(texture) = textures.secunda.as_ref() {
+            self.textures.fill(uploader, SECUNDA_FACE, texture)?;
+            self.lighting.secunda_face = SECUNDA_FACE + 1;
+        }
+        if let Some(texture) = textures.clouds.as_ref() {
+            self.textures.fill(uploader, CLOUD_SHEET, texture)?;
+            self.lighting.cloud_sheet = CLOUD_SHEET + 1;
+            self.sheet_mean = textures.cloud_mean;
+        }
+        self.relight();
+        Ok(())
     }
 
     /// Uploads whichever of the cell's textures are new, and maps its ids onto the shared ones.
@@ -414,8 +442,8 @@ impl SceneResidency {
                 let shading = self.textures.insert(uploader, Some(&map))?;
                 assert_eq!(
                     colour,
-                    MOON_FACES + shared * 2,
-                    "a texture id addresses its own pair, behind the moons' reserved slots"
+                    SKY_SLOTS + shared * 2,
+                    "a texture id addresses its own pair, behind the sky's reserved slots"
                 );
                 assert_eq!(
                     shading,
