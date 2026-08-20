@@ -1,5 +1,6 @@
 //! Estimating the lighting a vanilla texture was painted with.
 
+use crate::colour::{self, LUMA};
 use crate::texture::{Texture, TextureFormat};
 
 /// Side of the estimate, in texels.
@@ -17,9 +18,6 @@ const SIDE: u32 = 32;
 /// albedo past white. The clamp costs nothing on a surface whose shading is gentle, which is all of
 /// them that this is meant for.
 const RANGE: std::ops::RangeInclusive<f32> = 0.5..=2.0;
-
-/// Rec. 709, matching the primaries the textures are decoded to.
-const LUMA: [f32; 3] = [0.2126, 0.7152, 0.0722];
 
 /// The lighting `texture` appears to have been painted with, as a [`SIDE`]-square map whose mean is
 /// one. See [`Texture::shading_map`], which is how a caller reaches this.
@@ -42,9 +40,7 @@ pub(crate) fn estimate(texture: &Texture) -> Texture {
         // **Through the sRGB transfer, because the array binds these as an sRGB format.** The
         // hardware decodes every sample it takes, so a value written linearly would come back
         // gamma-corrected; encoding it here means the decode gives back exactly what was meant.
-        let byte = (to_srgb(shading / RANGE.end()) * 255.0)
-            .round()
-            .clamp(0.0, 255.0) as u8;
+        let byte = colour::channel_to_srgb(shading / RANGE.end());
         data.extend([byte, byte, byte, 255]);
     }
     Texture::from_pixels(TextureFormat::Rgba8, SIDE, SIDE, data)
@@ -128,7 +124,7 @@ fn coarse_luminance(texture: &Texture) -> Vec<f32> {
 /// show what a frame would draw, and the only way it can is by asking rather than by repeating the
 /// transfer function and the scale in a second place.
 pub(crate) fn multiplier(encoded: u8) -> f32 {
-    to_linear(f32::from(encoded) / 255.0) * RANGE.end()
+    colour::channel_to_linear(encoded) * RANGE.end()
 }
 
 /// A map that changes nothing, for a material whose texture is missing.
@@ -137,27 +133,8 @@ pub(crate) fn multiplier(encoded: u8) -> f32 {
 /// stand-in, whose red channel decodes to the top of the range — so every untextured surface would
 /// be divided by two.
 pub(crate) fn neutral() -> Texture {
-    let byte = (to_srgb(1.0 / RANGE.end()) * 255.0).round() as u8;
+    let byte = colour::channel_to_srgb(1.0 / RANGE.end());
     Texture::from_pixels(TextureFormat::Rgba8, 1, 1, vec![byte, byte, byte, 255])
-}
-
-/// The sRGB transfer function, as the IEC standard defines it.
-fn to_srgb(linear: f32) -> f32 {
-    let linear = linear.clamp(0.0, 1.0);
-    if linear <= 0.003_130_8 {
-        linear * 12.92
-    } else {
-        1.055 * linear.powf(1.0 / 2.4) - 0.055
-    }
-}
-
-/// Its inverse, which is what the sampler applies.
-fn to_linear(encoded: f32) -> f32 {
-    if encoded <= 0.040_45 {
-        encoded / 12.92
-    } else {
-        ((encoded + 0.055) / 1.055).powf(2.4)
-    }
 }
 
 fn luminance(r: u8, g: u8, b: u8) -> f32 {

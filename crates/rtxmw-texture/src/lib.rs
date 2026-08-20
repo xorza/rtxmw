@@ -5,6 +5,7 @@
 //! untouched. [`Texture::to_rgba8`] exists beside that for something that has to *look* at a
 //! texture rather than sample it, and is not on any path a frame takes.
 
+mod colour;
 mod dds;
 mod error;
 mod rgba8;
@@ -12,6 +13,7 @@ mod shading_map;
 mod texture;
 mod tga;
 
+pub use crate::colour::{LUMA, channel_to_linear};
 pub use crate::error::{Result, TextureError};
 pub use crate::texture::{MipLevel, Texture, TextureFormat};
 

@@ -9,7 +9,7 @@ use ash::vk;
 use glam::{Vec2, Vec3};
 use rtxmw_gpu::{TestGpu, readback};
 use rtxmw_render::SceneRenderer;
-use rtxmw_scene::{CellId, Moon, Sky, Veil, WorldTime};
+use rtxmw_scene::{CellId, LUMA, Moon, Sky, Veil, WorldTime};
 
 mod common;
 
@@ -184,6 +184,11 @@ fn a_veil_takes_the_skys_colour_and_leaves_its_brightness() {
     // What the veil claims to be — chromatic and nothing else — stated so the arithmetic cannot
     // satisfy it by accident. At full strength every pixel of the dome comes out a multiple of the
     // medium's own colour, however blue it started, and comes out at the brightness it had.
+    //
+    // **It is also what ties the two `LUMA`s together.** The shader preserves luminance by its own
+    // Rec. 709 weights in `shaders/colour.glsl`; this measures the result with the host's, out of
+    // `rtxmw_texture::LUMA`. No test can compare the two constants — one of them only exists inside
+    // a SPIR-V module — so what holds them is a picture that only looks right when they agree.
     let hue = Vec3::new(1.0, 0.42, 0.36);
     let hour = WorldTime::hours(17.5);
     let bare = Sky {
@@ -198,7 +203,6 @@ fn a_veil_takes_the_skys_colour_and_leaves_its_brightness() {
     let (plain, _) = looking(bare, forward, WIDE);
     let (through, _) = looking(veiled, forward, WIDE);
 
-    let luma = Vec3::new(0.2126, 0.7152, 0.0722);
     let (mut worst_level, mut worst_hue) = (0.0f32, 0.0f32);
     let mut counted = 0u32;
     for index in 0..plain.len() / 4 {
@@ -209,7 +213,7 @@ fn a_veil_takes_the_skys_colour_and_leaves_its_brightness() {
             continue;
         }
         counted += 1;
-        worst_level = worst_level.max((now.dot(luma) - was.dot(luma)).abs());
+        worst_level = worst_level.max((now.dot(LUMA) - was.dot(LUMA)).abs());
         worst_hue = worst_hue.max((now / now.x - hue / hue.x).abs().max_element());
     }
     assert!(counted > 1000, "only {counted} pixels were worth comparing");

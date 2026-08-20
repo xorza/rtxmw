@@ -5,7 +5,7 @@ use rtxmw_texture::Texture;
 use crate::clouds::CloudSheet;
 use crate::error::Result;
 use crate::game_data::GameData;
-use crate::srgb::{LUMA, channel_to_linear};
+use crate::srgb::LUMA;
 use crate::weather::Weather;
 
 /// Every vanilla picture the sky needs: the two moons' portraits and the weather's cloud sheet.
@@ -98,9 +98,9 @@ impl SkyTextures {
         for texel in rgba.chunks_exact(4) {
             let alpha = texel[3] as f32 / 255.0;
             let colour = glam::Vec3::new(
-                channel_to_linear(texel[0]),
-                channel_to_linear(texel[1]),
-                channel_to_linear(texel[2]),
+                rtxmw_texture::channel_to_linear(texel[0]),
+                rtxmw_texture::channel_to_linear(texel[1]),
+                rtxmw_texture::channel_to_linear(texel[2]),
             );
             total += colour.dot(LUMA) * alpha;
             weight += alpha;

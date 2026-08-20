@@ -277,6 +277,9 @@ impl ViewpointOverride {
 
 #[cfg(test)]
 mod tests {
+    use glam::{Affine3A, Vec2};
+    use rtxmw_scene::{CellId, Door, Instance, Mesh, MeshId, StaticScene, Submesh};
+
     use super::*;
 
     #[test]
@@ -402,8 +405,6 @@ mod tests {
         // No argument at all is the cell the engine opens in, which is Seyda Neen's shore.
         assert_eq!(cell_named(DEFAULT_CELL), CellId::Exterior { x: -2, y: -9 });
     }
-    use glam::{Affine3A, Vec2};
-    use rtxmw_scene::{CellId, Door, Instance, Mesh, MeshId, StaticScene, Submesh};
 
     /// A cell whose only geometry is a wide floor at `floor`, with `entrances` leading into it.
     fn cell_with(floor: f32, entrances: Vec<Door>) -> LoadedCell {

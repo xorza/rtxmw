@@ -1,26 +1,23 @@
 //! Decoding the colours Morrowind stores, and what the eye makes of them once decoded.
+//!
+//! The sRGB curve and the luminance weights are `rtxmw_texture`'s, one layer down, because a
+//! texture decoder needs both before a scene exists. What is here is the shapes Morrowind's records
+//! put them in.
 
 use glam::Vec3;
 
 /// What the eye makes of a linear colour, which is the only sense in which one has a brightness.
 ///
-/// Rec. 709, matching the primaries every texture in the game is decoded to.
-pub(crate) const LUMA: Vec3 = Vec3::new(0.2126, 0.7152, 0.0722);
-
-/// Converts one sRGB-encoded byte to linear.
-///
-/// What [`to_linear`] is built out of, and what anything holding loose bytes wants — a decoded
-/// texture is `[u8]` rather than packed words, and open-coding the curve beside it is a second copy
-/// of a formula with four constants in it.
-pub(crate) fn channel_to_linear(encoded: u8) -> f32 {
-    let value = encoded as f32 / 255.0;
-    match value <= 0.04045 {
-        true => value / 12.92,
-        false => ((value + 0.055) / 1.055).powf(2.4),
-    }
-}
+/// Rec. 709, matching the primaries every texture in the game is decoded to — and
+/// [`rtxmw_texture::LUMA`] widened, rather than a second copy of three numbers that are the same
+/// wherever they are written. Public because this crate hands out linear colours: [`crate::Sky`]'s
+/// ambient, fog and veil are all radiances, and weighing one needs this.
+pub const LUMA: Vec3 = Vec3::from_array(rtxmw_texture::LUMA);
 
 /// Converts a packed `0xAABBGGRR` colour to linear RGB.
+///
+/// **The packing is the only part of this that is Morrowind's**; the curve itself is
+/// [`rtxmw_texture::channel_to_linear`], where every other decoder in the tree reaches it too.
 ///
 /// Everything the game stores as a colour — light tints, cell ambient, material colours — was
 /// authored against a fixed-function renderer and is sRGB-encoded. Using those bytes directly in a
@@ -28,7 +25,7 @@ pub(crate) fn channel_to_linear(encoded: u8) -> f32 {
 /// same error as sampling an albedo texture through a UNORM view. The difference is largest in the
 /// midtones and vanishes at both ends, which is why it reads as "a bit off" rather than as broken.
 pub fn to_linear(packed: u32) -> Vec3 {
-    let channel = |shift: u32| channel_to_linear(((packed >> shift) & 0xFF) as u8);
+    let channel = |shift: u32| rtxmw_texture::channel_to_linear(((packed >> shift) & 0xFF) as u8);
     Vec3::new(channel(0), channel(8), channel(16))
 }
 

@@ -4,6 +4,10 @@
 // is the whole of what the host has to agree with. The structs are laid out for `scalar` block
 // layout and match their `repr(C)` counterparts field for field; the Rust side pins the sizes.
 
+// Pulled in here so every pass that reads this file has `LUMA` without asking for it — see the
+// note in `colour.glsl` for why one constant needs a file of its own.
+#include "colour.glsl"
+
 layout(set = 0, binding = 0) uniform accelerationStructureEXT scene;
 
 // Emissive surfaces and the sky, which the composite adds the lit result on top of. Keeping them
@@ -44,10 +48,6 @@ const uint KIND_TERRAIN = 2u;
 // The side of one terrain texture tile, in world units. A cell is sixteen of them across, which is
 // why a cell's origin drops out of the blend below: it is always a whole number of tiles.
 const float TERRAIN_TILE = 512.0;
-
-// What the eye makes of a linear colour, which is the only sense in which one has a brightness.
-// Rec. 709, matching the primaries every texture is decoded to — `srgb::LUMA` in `rtxmw-scene`.
-const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
 
 // Instance mask bits. A ray asking for `MASK_SOLID` alone cannot see water; `MASK_ANY` sees all.
 const uint MASK_SOLID = 0x01u;

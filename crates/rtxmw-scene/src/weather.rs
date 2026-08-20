@@ -5,7 +5,6 @@ use rtxmw_esm::{Cell, CellId, RegionRecord};
 
 use crate::game_data::GameData;
 use crate::ini::Ini;
-use crate::srgb;
 use crate::world_time::{SUNRISE, SUNSET, WorldTime};
 
 /// When one family of colours changes over, in hours either side of sunrise and sunset.
@@ -177,7 +176,7 @@ impl Schedule {
     fn read(ini: &Ini, section: &str, family: &str, fallback: [[u8; 3]; 4]) -> Self {
         let colour = |which: &str, spare: [u8; 3]| {
             ini.colour(section, &format!("{family} {which} Color"))
-                .unwrap_or_else(|| Vec3::from(spare.map(srgb::channel_to_linear)))
+                .unwrap_or_else(|| Vec3::from(spare.map(rtxmw_texture::channel_to_linear)))
         };
         Self {
             sunrise: colour("Sunrise", fallback[0]),

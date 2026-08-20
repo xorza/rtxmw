@@ -13,10 +13,10 @@
 //! holds the second honest.
 
 use glam::Vec3;
-use rtxmw_scene::{CloudSheet, Sky, SkyTextures, Weather, WorldTime};
+use rtxmw_scene::{CloudSheet, LUMA, Sky, SkyTextures, Weather, WorldTime};
 
 fn luminance(colour: Vec3) -> f32 {
-    colour.x * 0.2126 + colour.y * 0.7152 + colour.z * 0.0722
+    colour.dot(LUMA)
 }
 
 /// The hour every measurement here is taken at, so no two of them can drift apart.

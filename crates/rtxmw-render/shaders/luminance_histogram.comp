@@ -7,6 +7,10 @@
 // around by whichever of those two populations has more pixels; a histogram keeps them apart and
 // lets the reduction that follows decide what to expose for.
 
+// `LUMA` alone rather than `bindings.glsl`, for the reason `colour.glsl` sets out: this pass and
+// the tracer both bind at `set = 0, binding = 0`.
+#include "colour.glsl"
+
 layout(local_size_x = 16, local_size_y = 16) in;
 
 layout(set = 0, binding = 0, rgba16f) uniform readonly image2D source;
@@ -22,9 +26,6 @@ layout(push_constant) uniform Range {
 
 // Matches `BIN_COUNT` in `auto_exposure.rs`, which sizes the buffer this writes into.
 const uint BINS = 256u;
-
-// Rec. 709 luminance, matching the primaries the textures were decoded from.
-const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
 
 // Below this a pixel is counted as black rather than binned. Without it the vast dark areas of an
 // interior pile into the lowest bin and drag the average down to meet them, and the exposure opens

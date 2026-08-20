@@ -40,7 +40,7 @@ pub use crate::mesh::{Bounds, Mesh, Submesh};
 pub use crate::moon::Moon;
 pub use crate::sky::{Sky, Veil};
 pub use crate::sky_textures::SkyTextures;
-pub use crate::srgb::to_linear;
+pub use crate::srgb::{LUMA, to_linear};
 pub use crate::static_scene::{CellDetail, Instance, MeshId, ModelIndex, StaticScene};
 pub use crate::sun::Sun;
 pub use crate::weather::{Schedule, Weather};

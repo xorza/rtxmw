@@ -72,7 +72,7 @@ impl Ini {
     pub(crate) fn colour(&self, section: &str, key: &str) -> Option<glam::Vec3> {
         let raw = self.get(section, key)?;
         let mut parts = raw.split(',').map(|p| p.trim().parse::<u8>().ok());
-        let mut next = || parts.next().flatten().map(crate::srgb::channel_to_linear);
+        let mut next = || parts.next().flatten().map(rtxmw_texture::channel_to_linear);
         Some(glam::Vec3::new(next()?, next()?, next()?))
     }
 
