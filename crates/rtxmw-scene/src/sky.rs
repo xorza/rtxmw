@@ -416,12 +416,24 @@ impl Sky {
         // far up it reaches. They are the same `Land Fog Depth` and asking twice would let them
         // drift to different hours.
         let depth = weather.fog_depth(time);
-        // Against clear weather's, which is what both of the two below are a multiple of — how
-        // thick the air is where it sits, and how far up it reaches.
+        // Against clear weather's, which is what everything below is a multiple of.
         let thicker = depth / CLEAR_DEPTH;
+        // **The curve respaces the weathers, and must not touch the hour.** `Land Fog Day Depth` and
+        // its night twin are two figures for one weather, and raising the interpolated value to a
+        // power amplifies the gap between them exactly as hard as it amplifies the gap between
+        // weathers: foggy's night is half again its day in the ini, and a fourth power turned that
+        // into more than four times the air — pinned at `DEEPEST`, which is the whiteout a blizzard
+        // gets. Nothing at 4 a.m. is visible in a fog the game meant to be a little thicker than the
+        // one at noon.
+        //
+        // So the weather's *identity* is what the curve reads — its day depth, which is the figure
+        // the ten are ordered by — and the hour rides on top as the plain ratio the ini wrote.
+        let stands = weather.fog_day_depth / CLEAR_DEPTH;
+        // `stands * hour` is `thicker` exactly, so the split decides only where the power lands.
+        let hour = thicker / stands.max(1e-6);
         // **The cap is on the multiple, not on the density**, which the precedence says and an eye
         // reading it in one line might not.
-        let thickness = thicker.powf(DEPTH_CURVE).min(DEEPEST);
+        let thickness = (stands.powf(DEPTH_CURVE) * hour).min(DEEPEST);
         // The sun's direction travels downward, so its climb above the horizon is the negation —
         // and it is signed, because after sunset there is a good deal of sky left to light and how
         // far under the sun has gone is the only thing that says how much.
@@ -936,6 +948,48 @@ mod tests {
             luminance(night.ambient) < 2.0 * luminance(NIGHT_SKY),
             "{:?}",
             night.ambient
+        );
+    }
+
+    #[test]
+    fn the_hour_thickens_the_fog_as_the_ini_wrote_it_and_not_as_a_power_of_it() {
+        let Ok(all) = Weather::table() else { return };
+        let Some(foggy) = all.iter().find(|w| w.name == "foggy") else {
+            return;
+        };
+        // `[Weather Foggy]` asks for half again as much air at night as by day, and that is the
+        // whole of what a night should be: 1.90 against 1.00.
+        let asked = foggy.fog_night_depth / foggy.fog_day_depth;
+        assert!(
+            (asked - 1.9).abs() < 0.01,
+            "the fixture reads the game's own depths, not {asked}"
+        );
+
+        // **`DEPTH_CURVE` respaces the ten weathers and must not reach the hour.** Applied to the
+        // interpolated depth it raised that 1.9 to its own power as well — over four times the air
+        // at 4 a.m., pinned at `DEEPEST`, which is the whiteout a blizzard gets and not a fog.
+        let at =
+            |hour: f32| Sky::under(WorldTime::hours(hour), foggy, CloudSheet::NONE).fog_density;
+        let (day, night) = (at(12.0), at(0.0));
+        let got = night / day;
+        assert!(
+            (got - asked).abs() < 0.02,
+            "night should stand to day as {asked}, not {got} — {day} against {night}"
+        );
+        assert!(
+            night < DEEPEST * CLEAR_DENSITY,
+            "and it should not reach the cap a blizzard needs — {night}"
+        );
+
+        // The curve still does its own job: foggy stands well clear of rain, which is the spacing
+        // between weathers that the power is there for.
+        let Some(rain) = all.iter().find(|w| w.name == "rain") else {
+            return;
+        };
+        let wet = Sky::under(WorldTime::hours(12.0), rain, CloudSheet::NONE).fog_density;
+        assert!(
+            day > 2.0 * wet,
+            "a fog should be more than twice a rain's air — {day} against {wet}"
         );
     }
 }

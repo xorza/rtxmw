@@ -56,7 +56,11 @@ use crate::visibility_pass::Lighting;
 /// Settled by eye against the Guild of Mages and Abaelun Mine: below this the veil is barely there,
 /// and far above it the far wall of a room washes out and a cave turns to soup. `FOG_DENSITY` in
 /// `tests/fog.rs` is the other half of a product and moves with this.
-const INDOOR_FOG_SCALE: f32 = 0.03;
+///
+/// **And so is `FOG_EVEN`**, which a room's coverage simply *is* — indoors is never banked. It was
+/// corrected from a half to a third, so this rose by the same ratio to leave the rooms where they
+/// were looked at.
+const INDOOR_FOG_SCALE: f32 = 0.045;
 
 /// Placements only. Everything a cell *names* — its meshes, its textures, its materials — belongs
 /// to the renderer rather than to the cell, because the cell next door names most of the same

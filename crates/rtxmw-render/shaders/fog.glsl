@@ -141,9 +141,15 @@ const float FOG_WARP = 450.0;
 const float FOG_CLEARING = 0.44;
 const float FOG_SOLID = 0.66;
 
-// What the coverage is when the fog is even rather than banked. The band's own mean, so indoors and
-// out differ in character rather than in how much air there is.
-const float FOG_EVEN = 0.5;
+// What the coverage is when the fog is even rather than banked.
+//
+// **The band's own mean, so indoors and out differ in character rather than in how much air there
+// is** — which is what this is for and what it was not. Half is the midpoint of `FOG_CLEARING` to
+// `FOG_SOLID`, and those are thresholds on the *noise*: what the smoothstep between them produces
+// averages a third, because the noise sits mostly below the band's upper end. So every step toward
+// evenness was also a step toward more air, and giving a dead calm some evenness to stir it made a
+// foggy morning thicker rather than only smoother.
+const float FOG_EVEN = 0.33;
 
 // What the recorded density means as an extinction coefficient, per unit.
 //
@@ -416,10 +422,30 @@ const float FOG_MOONLIGHT = 0.15;
 // skirt and the face agree by construction. Measured to the limb rather than the centre, because
 // Draine's forward peak is a fraction of a degree and Masser is eighteen: read as a point, the peak
 // spent itself on the texel at the exact centre.
-vec3 fog_moon_source(Moon moon, vec3 direction) {
+vec3 fog_moon_source(Moon moon, vec3 direction, bool reaches_sky) {
     float along = dot(direction, -moon.direction);
-    if (along > moon.cos_radius) {
-        return moon_disc(direction, moon, frame.cone_spread);
+    // **The image only where the ray actually gets to the moon, and the ray's own hit says so.**
+    // Carrying the face is an argument about light that never left the moon's direction — and if a
+    // headland stands in that direction, none of it arrives. Drawn without the test, the march
+    // in-scattered a whole moon into the air in front of a cliff and painted one onto the stone,
+    // hard-edged where the disc crossed the skyline.
+    //
+    // No shadow ray is needed for it: the image term exists only where the ray points *at* the moon,
+    // so what the ray hit is the occlusion test already paid for. The skirt below keeps going,
+    // because that is the air lit from a direction the ray is not pointing along — a dim glow rather
+    // than a picture, and the one place this stays a single-scattering model with no moon shadows.
+    if (reaches_sky && along > moon.cos_radius) {
+        float covering;
+        // **Never less than the skirt just outside it, because the two have to meet.** The face
+        // darkens to nothing at the limb — that is the Lambertian half of the shading law and it is
+        // right for the disc — while a step outside it the whole disc contributes at once and the
+        // answer jumps back up. Left to disagree, the two drew a dark ring between a lit face and
+        // its own halo, which is not something in the sky, it is a seam between two formulas.
+        //
+        // The air over the limb is lit by all of the moon rather than by the darkened edge of it, so
+        // the average is the floor here as well as the answer beyond.
+        return max(moon_disc(direction, moon, frame.cone_spread, covering),
+                   moon.colour * FOG_MOONLIGHT);
     }
     float radius = acos(clamp(moon.cos_radius, -1.0, 1.0));
     float away = acos(clamp(along, -1.0, 1.0)) - radius;
@@ -464,7 +490,8 @@ vec3 fog_light(vec3 position, vec3 sun) {
 //
 // Returns the transmittance in `w`, which the caller multiplies its lighting by, and the light
 // scattered in along the way in `xyz`.
-vec4 fog_along(vec3 origin, vec3 direction, float distance, uvec2 pixel) {
+vec4 fog_along(vec3 origin, vec3 direction, float distance, uvec2 pixel,
+               bool reaches_sky) {
     if (frame.fog_density <= 0.0 || frame.fog_strength <= 0.0) {
         return vec4(0.0, 0.0, 0.0, 1.0);
     }
@@ -487,8 +514,21 @@ vec4 fog_along(vec3 origin, vec3 direction, float distance, uvec2 pixel) {
     // Hoisted out of the march because only the air in the way varies along it: the share is an
     // angle between two fixed directions, and it costs an `acos` that would otherwise be paid
     // twenty-four times a ray.
-    vec3 masser = fog_moon_source(frame.masser, direction);
-    vec3 secunda = fog_moon_source(frame.secunda, direction);
+    vec3 masser = fog_moon_source(frame.masser, direction, reaches_sky);
+    vec3 secunda = fog_moon_source(frame.secunda, direction, reaches_sky);
+    // **A moon casts a shaft too, and at night it is the only thing that can.** Its penumbra is
+    // thirty degrees wide, which is why nothing here tries to resolve its *edge* — but a headland is
+    // not a penumbra, and air standing behind one gets no moonlight at all. Without the test the
+    // march lit the mist in front of a cliff from a moon the cliff was covering.
+    //
+    // One ray for the pair, aimed at whichever is delivering more: Masser is the larger and the
+    // brighter almost always, and a second ray to place Secunda's shadow separately would cost as
+    // much again for a light a quarter its size. The sun's own ray is not traced at night, so this
+    // is spending what the day already spends.
+    bool moonlit = brightest(masser + secunda) > FOG_SHAFT_FLOOR * brightest(frame.fog);
+    vec3 moonward = brightest(masser) >= brightest(secunda)
+                  ? -frame.masser.direction
+                  : -frame.secunda.direction;
 
     float transmittance = 1.0;
     vec3 scattered = vec3(0.0);
@@ -505,11 +545,17 @@ vec4 fog_along(vec3 origin, vec3 direction, float distance, uvec2 pixel) {
         // visibility far more coarsely than the fog varies, and a gradient wider than the sampling
         // is the only thing that keeps a hard edge from aliasing along the ray.
         float visible = 1.0;
-        if (shafts) {
+        float lunar = 1.0;
+        if (shafts || moonlit) {
             vec3 probe = origin + direction * mix(behind, reach, offset);
-            vec2 u = unit_pair(hash(uvec4(sample_stream(pixel), STREAM_FOG, 1u + s)));
-            vec3 towards = cone_direction(-frame.sun_direction, frame.sun_cos_radius, u);
-            visible = occluded(probe, towards, RAY_MAX) ? 0.0 : 1.0;
+            if (shafts) {
+                vec2 u = unit_pair(hash(uvec4(sample_stream(pixel), STREAM_FOG, 1u + s)));
+                vec3 towards = cone_direction(-frame.sun_direction, frame.sun_cos_radius, u);
+                visible = occluded(probe, towards, RAY_MAX) ? 0.0 : 1.0;
+            }
+            if (moonlit) {
+                lunar = occluded(probe, moonward, RAY_MAX) ? 0.0 : 1.0;
+            }
         }
 
         for (uint k = 0u; k < FOG_STEPS_PER_RAY; ++k) {
@@ -524,14 +570,17 @@ vec4 fog_along(vec3 origin, vec3 direction, float distance, uvec2 pixel) {
             float absorbed = 1.0 - exp(-extinction * stride);
             // Everything between the sun and this point: what the geometry stopped, what the fog
             // itself absorbed on the way down, and what any water overhead took out of it.
-            // No shadow ray for the moons, unlike the sun: Masser subtends eighteen degrees and
-            // its penumbra spreads over thirty-odd, which is not what a shaft is. Their own slant
-            // depths, though — at night `-frame.sun_direction` points down, the floor in
-            // `fog_beam_depth` pins it at 1e-3, and the sun's comes back as nothing at all.
+            // Their own slant depths, not the sun's: at night `-frame.sun_direction` points down,
+            // the floor in `fog_beam_depth` pins it at 1e-3, and the sun's beam comes back as
+            // nothing at all.
             vec3 reaching = (sun * visible
                                  * exp(-fog_beam_depth(extinction, -frame.sun_direction))
-                           + masser * exp(-fog_beam_depth(extinction, -frame.masser.direction))
-                           + secunda * exp(-fog_beam_depth(extinction, -frame.secunda.direction)))
+                           + lunar * (masser
+                                          * exp(-fog_beam_depth(extinction,
+                                                                -frame.masser.direction))
+                                      + secunda
+                                          * exp(-fog_beam_depth(extinction,
+                                                                -frame.secunda.direction))))
                           * daylight_reaching(position);
             scattered += transmittance * absorbed * fog_light(position, reaching);
             transmittance *= 1.0 - absorbed;

@@ -31,7 +31,12 @@ const FOG_COLOUR: Vec3 = Vec3::new(0.6, 0.05, 0.05);
 /// at 140 against a scale of 0.006; when the scale rose — because the game fogs every one of its
 /// interiors and this renderer was showing none of it — the same number became several times the
 /// air, and two tests here reported a fog so opaque that forward and back came out identical, a
-/// ratio of NaN. Twenty-eight against 0.03 restores the product exactly.
+/// ratio of NaN.
+///
+/// **`FOG_EVEN` is in that product too**, because a room's coverage simply is it — indoors is never
+/// banked. The three came to 0.42 when the scale was 0.006 and the coverage a half, and they come to
+/// 0.4158 now that the scale is 0.045 and the coverage a third, which is why this number did not
+/// have to move a second time.
 const FOG_DENSITY: f32 = 28.0;
 
 /// A flat quad from four corners, of the fixture's only material.
@@ -710,5 +715,103 @@ fn a_room_the_game_ships_is_fogged_at_all() {
     assert!(
         shifted > 0.004,
         "an interior at the game's own {SHIPPED_INTERIOR_FOG} should carry a visible veil — {dry} against {veiled}"
+    );
+}
+
+/// The frame with Masser overhead, under `roof` if there is one, aimed `off` radians beside it.
+///
+/// **Beside it as well as at it, because the two are different terms.** Straight at the moon the air
+/// returns the disc's own image, and the ray's hit is what says whether that image can arrive.
+/// Beside it there is no image, only the skirt — the whole disc scattered toward the eye — and
+/// nothing about the ray says whether the moon is in view from the air along it. Only a shadow ray
+/// does.
+fn moonlight_under(weather: &rtxmw_scene::Weather, roof: bool, off: f32) -> Vec3 {
+    let sky = rtxmw_scene::Sky::under(
+        rtxmw_scene::WorldTime::hours(1.0),
+        weather,
+        rtxmw_scene::CloudSheet::NONE,
+    );
+    let mut scene = common::under_the_sky();
+    if roof {
+        // A lid overhead, so every ray that would have found the moon finds stone instead.
+        let reach = 40_000.0;
+        scene.meshes.push(quad([
+            Vec3::new(-reach, -reach, 4_000.0),
+            Vec3::new(reach, -reach, 4_000.0),
+            Vec3::new(reach, reach, 4_000.0),
+            Vec3::new(-reach, reach, 4_000.0),
+        ]));
+        scene
+            .mesh_sources
+            .push(format!("fixture:{}", scene.meshes.len() - 1));
+        scene.instances.push(Instance {
+            mesh: MeshId(scene.meshes.len() as u32 - 1),
+            transform: Affine3A::IDENTITY,
+        });
+    }
+    // Tilted within the plane the moon and the world's up span, so the aim stays above the horizon.
+    let toward = -sky.masser.direction;
+    let beside = toward.cross(Vec3::Z).cross(toward).normalize_or_zero();
+    let pixels = traced_from(
+        CellId::Exterior { x: 0, y: 0 },
+        &scene,
+        Vec3::ZERO,
+        (toward + beside * off.tan()).normalize(),
+        |renderer| {
+            renderer.set_fog(1.0);
+            renderer.set_sky(sky);
+        },
+    );
+    // The brightest patch rather than the whole frame: a moon is a small part of one, and what is
+    // under test is its own light and not the sky's.
+    let mut lit: Vec<[u8; 4]> = pixels.as_chunks::<4>().0.to_vec();
+    lit.sort_by_key(|p| std::cmp::Reverse(u32::from(p[0]) + u32::from(p[1]) + u32::from(p[2])));
+    let patch = &lit[..64];
+    let channel = |c: usize| patch.iter().map(|p| f32::from(p[c])).sum::<f32>() / 64.0 / 255.0;
+    Vec3::new(channel(0), channel(1), channel(2))
+}
+
+#[test]
+fn stone_between_the_eye_and_a_moon_stops_its_light() {
+    let Ok(clear) = rtxmw_scene::Weather::named("clear") else {
+        return;
+    };
+    if clear.name.is_empty() {
+        return;
+    }
+
+    // **A moon is sky, and sky stops at the first thing a ray hits.** Its disc already did — the
+    // trace zeroes `emitted` on a hit — but the fog march does not stop being lit, and what
+    // `fog_moon_source` returns on the face is the moon's own *image*. In-scattered in front of a
+    // cliff, that painted a whole moon onto the stone, hard-edged where the disc crossed the
+    // skyline. The image is light that never left the moon's direction, so if something stands in
+    // that direction none of it arrives.
+    //
+    // The skirt around it needed the same answer for the same reason, and got it from a shadow ray:
+    // air behind a headland is lit by no moon at all, however much of one is above the headland.
+    let open = moonlight_under(&clear, false, 0.0);
+    let under = moonlight_under(&clear, true, 0.0);
+    assert!(
+        open.x > 0.1 && open.x > 1.8 * open.y,
+        "the fixture should see a red moon with nothing in the way — {open}"
+    );
+    // **Read as a hue, because a leak is red and the sky is not.** What survives under stone is the
+    // dome's own blue-grey — 0.0039 of red against 0.0045 of green — while a moon getting through
+    // puts 0.024 of red against 0.008, which is the disc's colour arriving where the disc cannot.
+    // A brightness test does not see it: the open frame is the disc's blown core and swamps any
+    // in-scattered copy, so the leak hid an order of magnitude under the threshold.
+    assert!(
+        under.x < 1.3 * under.y,
+        "no moonlight should reach the air under a lid — {under} of red to green"
+    );
+
+    // **And beside it, where the image is not what leaks.** A quarter of a radian off the disc there
+    // is no face to draw, only the skirt, and the ray's own hit says nothing about it: it is not
+    // pointing at the moon. What answers there is the shadow ray, and without one the mist under a
+    // lid glowed with a moon the lid was covering.
+    let aside = moonlight_under(&clear, true, 0.25);
+    assert!(
+        aside.x < 1.3 * aside.y,
+        "nor beside it — {aside} of red to green"
     );
 }

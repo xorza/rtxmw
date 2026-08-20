@@ -334,18 +334,6 @@ float star_field(vec3 direction, float footprint) {
     return magnitude * (1.0 - smoothstep(0.0, radius, away));
 }
 
-// Whether a ray lands on a moon's disc at all.
-//
-// **What says the sky behind it is hidden**, which a moon that is merely *added* to the sky does
-// not: a moon is a rock, and the stars past it are past a rock. `Moon::NONE` has zero width, so its
-// cosine is one and nothing is ever more aligned than that — a cell with no sky needs no case here.
-bool moon_covers(vec3 direction, Moon moon) {
-    // The same two conditions `moon_disc` draws under, so nothing is ever hidden behind a moon that
-    // is not itself drawn — a moon faded out across the horizon would otherwise leave a disc of sky
-    // with neither stars nor moon in it.
-    return moon.colour != vec3(0.0) && dot(direction, -moon.direction) > moon.cos_radius;
-}
-
 // What a moon adds to the sky along `direction`, which is nothing unless the ray lands on its disc.
 //
 // **A lit sphere, not a sprite.** The disc is the orthographic silhouette of a ball eighteen degrees
@@ -359,7 +347,18 @@ bool moon_covers(vec3 direction, Moon moon) {
 // moon would read as a shaded ball; the real one reads as a flat disc, because a rough dusty surface
 // scatters back the way the light came. `mu0 / (mu0 + mu)` is exactly that — at full phase the two
 // cosines are equal everywhere and the disc comes out uniform, which is what the sky actually shows.
-vec3 moon_disc(vec3 direction, Moon moon, float footprint) {
+// `covering` comes back as how much of the sky behind it this moon actually hides, which is not the
+// same as whether the ray landed on its disc. A moon is a rock and the stars past it are past a
+// rock; `Moon::NONE` has zero width, so nothing is ever inside it and a cell with no sky needs no
+// case of its own.
+//
+// **The painted alpha is the silhouette, and everything behind has to agree with it.** The art ramps
+// that alpha to nothing over the disc's outermost texels — it is what antialiases the limb — so a
+// geometric yes-or-no cut the stars off across a band where the moon had already faded out, and the
+// starless sky there read as a dark ring inside every setting moon. One number for what is drawn and
+// what is hidden, and the two cannot come apart.
+vec3 moon_disc(vec3 direction, Moon moon, float footprint, out float covering) {
+    covering = 0.0;
     float along = dot(direction, -moon.direction);
     if (along <= moon.cos_radius || moon.colour == vec3(0.0)) {
         return vec3(0.0);
@@ -397,6 +396,8 @@ vec3 moon_disc(vec3 direction, Moon moon, float footprint) {
     float lommel = 2.0 * moon.lunar_lambert / max(mu0 + mu, 1e-4);
     float shade = mu0 * (lommel + 1.0 - moon.lunar_lambert);
 
+    // A moon with no portrait is a flat disc and hides what is behind all of it.
+    covering = 1.0;
     vec3 face = vec3(1.0);
     if (moon.face != 0u) {
         // **The vanilla portrait**, mapped across the disc as the game's own art has it: the texture
@@ -429,6 +430,7 @@ vec3 moon_disc(vec3 direction, Moon moon, float footprint) {
         // multiplies. Dividing by the texel instead flattens every part of the disc to one
         // brightness and leaves the maria as a hue shift, where a moon's are darker.
         face = portrait.rgb * portrait.a / max(moon.face_mean, 1e-6);
+        covering = clamp(portrait.a, 0.0, 1.0);
     }
     return moon.colour * (shade * face);
 }
@@ -623,6 +625,16 @@ vec3 flash_on_deck(vec3 direction, float footprint) {
          * (CLOUD_FLASH * deck.thickness * deck.covering * flash_through_air(deck.reach));
 }
 
+// How many e-foldings of a moon a full thickness of cloud takes, as an optical depth.
+//
+// **A coverage and a depth are different laws and a moon needs the second.** The layer's alpha
+// composites the sky behind it, which is what an alpha is for; run a moon through the same mix and
+// half a cloud leaves half a moon, which against a night sky is still the brightest thing in it. So
+// the deck read as ignoring the moons while plainly swallowing the stars — the same treatment, and
+// only the contrast telling them apart. What a cloud actually is is a depth of droplets, and what
+// crosses it goes as `exp(-depth)`.
+const float CLOUD_MOON_DEPTH = 8.0;
+
 // How many atmospheres a beam crosses to something `climb` above the horizon — Kasten and Young.
 float air_mass(float climb) {
     float degrees = degrees(asin(clamp(climb, 0.0, 1.0)));
@@ -665,20 +677,40 @@ vec3 sky_seen_through(vec3 direction, float lobe, bool looking) {
     // bounce ray finds one about once in a hundred — at three hundred times the night sky's own
     // floor, which is a firefly in every other tile. The light they actually contribute arrives as a
     // directional term in `direct_light`, where it is resolved rather than sampled.
-    bool eclipsed = looking && (moon_covers(direction, frame.masser)
-                             || moon_covers(direction, frame.secunda));
+    // **The layer is read before the moons are drawn, because it decides how they are drawn.** How
+    // much of one survives it is `CLOUD_MOON_DEPTH`'s question and needs the alpha in hand first.
+    // Composited last, as it always was.
+    float hidden = 0.0;
+    vec3 layer = vec3(0.0);
     if (looking) {
-        float footprint = frame.cone_spread + lobe;
-        colour += moon_disc(direction, frame.masser, footprint)
-                + moon_disc(direction, frame.secunda, footprint);
+        layer = cloud_layer(direction, frame.cone_spread + lobe, hidden);
     }
 
-    // **Not through a moon**, which is what `eclipsed` is for. The dome's own glow stays added
-    // because that is air *in front* of the moon and it really does sit on top; a star does not, and
-    // adding it anyway put the constellations across Masser's face.
-    if (looking && !eclipsed && frame.sky_stars > 0.0) {
+    // Held back rather than added here, because what the layer does to a moon is not what it does to
+    // the sky behind one — see `CLOUD_MOON_DEPTH`. `behind` is how much sky the pair hides between
+    // them, which everything drawn further out is scaled by.
+    vec3 moons = vec3(0.0);
+    float behind = 0.0;
+    if (looking) {
+        float footprint = frame.cone_spread + lobe;
+        float by_masser;
+        float by_secunda;
+        moons = moon_disc(direction, frame.masser, footprint, by_masser)
+              + moon_disc(direction, frame.secunda, footprint, by_secunda);
+        behind = max(by_masser, by_secunda);
+    }
+
+    // **Not through a moon**, which is what `behind` is for. The dome's own glow stays added because
+    // that is air *in front* of the moon and it really does sit on top; a star does not, and adding
+    // it anyway put the constellations across Masser's face.
+    //
+    // By how much of the sky the moon actually covers rather than by whether it is in the way at
+    // all: the two differ exactly over the limb, where the painted alpha has faded and a hard cut
+    // left a starless band that read as a dark ring.
+    if (looking && frame.sky_stars > 0.0) {
         colour += vec3(STAR_BRIGHTNESS * frame.sky_stars
-                     * star_field(direction, frame.cone_spread + lobe));
+                     * star_field(direction, frame.cone_spread + lobe))
+                * (1.0 - behind);
     }
 
     // **The clouds, over everything the sky itself has.** They hide the dome, the stars and the
@@ -686,10 +718,18 @@ vec3 sky_seen_through(vec3 direction, float lobe, bool looking) {
     // are drawn only for a ray being looked along, for the same reason the moons are: a bounce ray
     // that found one would be sampling a light the layer's own contribution to `ambient` has already
     // accounted for.
-    float hidden = 0.0;
+    //
+    // **The dome and the stars go under the layer's own coverage**, which is what an alpha is for.
+    //
+    // **A moon does not, because a coverage is the wrong law for one.** The mix leaves `1 - hidden`
+    // of whatever was there — a star at half strength is gone against the layer's glow, while a moon
+    // at half strength is still the brightest thing in the sky, which is why the clouds looked like
+    // they were ignoring the moons and obscuring everything else. They were treating both the same.
+    // A cloud is a depth of scattering droplets, so what passes through it falls off as `exp` of how
+    // much of it there is, not as one minus that.
     if (looking) {
-        vec3 layer = cloud_layer(direction, frame.cone_spread + lobe, hidden);
         colour = mix(colour, layer, hidden);
+        colour += moons * exp(-CLOUD_MOON_DEPTH * hidden);
     }
 
     // **`lobe` is how far a rough surface smears the sun**, in radians. Water too fine to resolve
@@ -701,11 +741,12 @@ vec3 sky_seen_through(vec3 direction, float lobe, bool looking) {
     // **And a moon in the way hides the sun too**, which is what an eclipse is. Rare, because the
     // two arcs are inclined to the sun's — but Masser is eighteen degrees across and the sun half of
     // one, so when it happens it is total.
-    if (!eclipsed && dot(direction, -frame.sun_direction) > widened) {
+    if (behind < 1.0 && dot(direction, -frame.sun_direction) > widened) {
         // The same flux over a larger cap, so a broader glitter is a dimmer one and the total light
         // the sun contributes does not grow with the wind.
         float spread = max(1.0 - widened, 1e-6);
-        vec3 disc = frame.sun_colour * min((1.0 - frame.sun_cos_radius) / spread, 1.0);
+        vec3 disc = frame.sun_colour * min((1.0 - frame.sun_cos_radius) / spread, 1.0)
+                  * (1.0 - behind);
         // **Behind whatever cloud is in front of it**, which it was not: this block *replaces* the
         // colour, so a sun under solid overcast was coming through at full strength with the cloud
         // deck drawn round it. Blended by the same coverage everything else in the sky is.
