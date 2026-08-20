@@ -9,6 +9,15 @@
 vec3 sun_through_water(vec3 position, float footprint);
 vec3 daylight_reaching(vec3 position);
 
+// Defined by `wetness.glsl`, which comes after this file for the same reason.
+//
+// **`shade` is the only place a bounce learns what it landed on**, so it is the only place the rain
+// can reach one. Left out, the film stopped at the primary hit and every second-hand view of the
+// world was of a world in a drought: the ground under a hand's depth of water was drawn dry against
+// a bank drawn wet, and the two met along the waterline as the hardest edge in the frame.
+float wetness(Surface surface, uvec2 pixel);
+vec3 soaked(vec3 albedo, float wet);
+
 // Defined below, beside the layer it reads: every light above the clouds is shadowed by them, and
 // `disc_light` is the first thing in the file that needs to say so.
 float cloud_shadow(vec3 position, vec3 towards);
@@ -213,8 +222,13 @@ vec3 direct_light(Surface surface, uvec2 pixel, uint salt, uint samples) {
 // a bounce hit differ only in where `incoming` comes from — a gathered hemisphere for the first, the
 // flat ambient that terminates the path for the second. Writing it twice is how the two would drift.
 vec3 shade(Surface surface, vec3 incoming, uvec2 pixel, uint salt, uint samples) {
-    return surface.emissive
-         + surface.albedo * (incoming + direct_light(surface, pixel, salt, samples));
+    // Wet where the rain reaches it, the same as any surface the eye meets head on — this is what a
+    // reflection in a wet street, the seabed through a shallow, and the fill light bouncing off a
+    // rained-on wall are all shaded by. It costs the sky-visibility ray `wetness` traces, once per
+    // hit rather than once per pixel; the sheen is left to the primary hit, where a cone narrow
+    // enough to carry one is worth tracing.
+    vec3 albedo = soaked(surface.albedo, wetness(surface, pixel));
+    return surface.emissive + albedo * (incoming + direct_light(surface, pixel, salt, samples));
 }
 
 // What a ray that hits nothing sees.

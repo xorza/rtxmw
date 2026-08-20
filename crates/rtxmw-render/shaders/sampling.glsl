@@ -43,6 +43,7 @@ const uint STREAM_FOG = 12288u;
 const uint STREAM_WATER_REFRACT = 8193u;
 const uint STREAM_MASSER = 16384u;
 const uint STREAM_SECUNDA = 20480u;
+const uint STREAM_FILM = 24576u;
 
 // A cheap, stable hash of four integers, for decorrelating one pixel's samples from its
 // neighbours'.

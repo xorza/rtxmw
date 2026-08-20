@@ -20,6 +20,7 @@
 #include "waves.glsl"
 #include "water.glsl"
 #include "fog.glsl"
+#include "wetness.glsl"
 #include "precipitation.glsl"
 
 // Where the surface at `ndc` was on the previous frame's screen, as a displacement in pixels.
@@ -91,8 +92,12 @@ void main() {
     // since a real hit is always at least `RAY_MIN` away.
     vec3 emitted = sky(direction);
     vec3 lighting = vec3(0.0);
-    // Nothing in vanilla Morrowind is specular but its water, so this is the answer everywhere else.
+    // Nothing in vanilla Morrowind is specular but its water — until it rains, and then everything
+    // the sky can see is, which is what `wetness.glsl` is for. Dry is still the answer for most of
+    // the world most of the time.
     Guides guides = matte();
+    float wet = 0.0;
+    Film film = Film(1.0, vec3(0.0));
     if (surface.water) {
         // Written whole to the output rather than through the G-buffer: there is no albedo to
         // demodulate by, and nothing noisy for the filter to improve.
@@ -109,12 +114,19 @@ void main() {
         lighting = surface.emissive * EMISSIVE_INTENSITY
                  + gather_indirect(surface, pixel)
                  + direct_light(surface, pixel, STREAM_DIRECT, SHADOW_SAMPLES);
+        // **The half of a shower that is not in the air.** What the rain lands on goes darker under
+        // the film it leaves and picks the sky up off the top of it, and the sheen belongs here
+        // rather than behind the albedo for the same reason the water's reflection does: it is
+        // light the surface returned without its colour ever touching it.
+        wet = wetness(surface, pixel);
+        film = filmed(surface, direction, wet, pixel, guides);
+        emitted += film.reflected;
     }
     // Under the surface, everything the ray crossed to get here was water. The albedo is dimmed
     // rather than the lighting, because the filter divides the lighting by it and multiplying both
     // would put the water back — and what the depth took is a property of the path, not of the
     // light that travelled it.
-    vec3 albedo = surface.albedo;
+    vec3 albedo = soaked(surface.albedo, wet) * film.kept;
     if (frame.water_level - frame.camera_position.z > 0.0) {
         float path = surface.hit ? surface.t : WATER_MAX_PATH;
         emitted = absorbed_by_water(emitted, path);
