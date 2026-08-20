@@ -18,6 +18,11 @@ use std::path::PathBuf;
 ///
 /// The failure is rendered to its message here because `clap::Error` is not comparable, and
 /// what a test has to say about a rejection is what it told the reader anyway.
+///
+/// **`dlss` is flattened away here and in `screenshot_options` below**, because it reads the
+/// process environment through clap: pinning it would fail every assertion in this file on a
+/// machine that has `RTXMW_DLSS` set, and none of them is about that setting. It has a test of its
+/// own at the end.
 fn parse(arguments: &[&str]) -> Result<WindowOptions, String> {
     WindowOptions::try_parse_from(std::iter::once("rtxmw").chain(arguments.iter().copied()))
         .map(|mut options| {
@@ -38,13 +43,6 @@ fn screenshot_options(arguments: &[&str]) -> Result<ScreenshotOptions, String> {
         options
     })
     .map_err(|failed| failed.to_string())
-}
-
-/// **`dlss` is flattened away by both helpers above**, because it reads the process environment
-/// through clap: pinning it would fail every assertion here on a machine that has `RTXMW_DLSS` set,
-/// and none of them is about that setting. It has a test of its own at the end.
-fn interior(name: &str) -> CellId {
-    CellId::Interior(name.to_owned())
 }
 
 /// Arguments as the shell hands them over, program name and all.
@@ -154,7 +152,7 @@ fn an_hour_reads_as_a_decimal_or_off_a_clock_face() {
 
 #[test]
 fn the_cell_and_the_frame_limit_go_in_either_order() {
-    let default = interior(scene_loader::DEFAULT_CELL);
+    let default = scene_loader::cell_named(scene_loader::DEFAULT_CELL);
     assert_eq!(
         parse(&[]),
         Ok(WindowOptions {
@@ -222,7 +220,7 @@ fn a_screenshot_can_be_told_where_to_stand_and_which_way_to_look() {
                 width: 640,
                 height: 480
             },
-            cell: interior(scene_loader::DEFAULT_CELL),
+            cell: scene_loader::cell_named(scene_loader::DEFAULT_CELL),
             viewpoint: ViewpointOverride {
                 position: Some(Vec3::new(10.0, 20.0, 30.0)),
                 forward: Some(Vec3::NEG_Y),
@@ -275,7 +273,7 @@ fn a_screenshot_takes_a_path_then_a_size_then_a_cell() {
             // Through the parser, which is also how clap reaches it: a default that this rejects
             // is a default that never renders.
             size: size(SCREENSHOT_SIZE).expect("the default is a size"),
-            cell: interior(scene_loader::DEFAULT_CELL),
+            cell: scene_loader::cell_named(scene_loader::DEFAULT_CELL),
             viewpoint: ViewpointOverride::default(),
             // One frame and the renderer's own sample count, so the short form is what it
             // always was.

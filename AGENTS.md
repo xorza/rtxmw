@@ -109,4 +109,5 @@ cargo run -- [CELL] --frames N                       # N frames, then a clean sh
 the fraction of rays that hit geometry — enough to tell "the cell rendered" from "the camera faced
 nothing" without opening the file. A trailing cell argument is addressed the way Morrowind does:
 **a pair of integers is an exterior, anything else is an interior's name** — `-2,-9` is Seyda Neen's
-shore, `"Balmora, Guild of Mages"` a building. Without one, the default interior.
+shore, `"Balmora, Guild of Mages"` a building. Without one it is `-2,-9`, which stands the camera on
+the deck of the ship the game itself starts on.

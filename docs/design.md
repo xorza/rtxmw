@@ -3531,3 +3531,48 @@ clear's `255,252,238`, and the ratio between them is the extinction the weather'
 beam — real, unambiguous in a way the sky colour never was, and a slice of its own. Its *level*
 cannot be taken with it: under overcast the same ratio is 0.69, and that is the deck blocking the
 sun, which the layer already does.
+
+### 8.62 A region is the only thing that says where a weather can happen
+
+The weather could be set from the command line and nothing could change it while the engine ran, so
+comparing two of them meant two sessions. A key that cycles them is the obvious fix and it raises a
+question the ini cannot answer: **which weathers belong here?** Standing on the Bitter Coast and
+cycling into a blizzard is not a feature.
+
+`Morrowind.ini` has nothing to say about it. What does is `REGN`: every exterior cell names a region
+by id, and every region gives each of the ten a percentage summing to a hundred. A zero is not
+"rare" — it is the file saying that weather does not happen here. Seyda Neen's shore comes out
+**clear, cloudy, foggy, rain, thunderstorm**, which is a swamp; the ash and the blight belong to the
+wastes on the other side of the island, and nothing on Vvardenfell snows because snow arrived with
+Bloodmoon's Solstheim.
+
+**Two orders, and they are not the same one.** `WEAT`'s bytes run clear, cloudy, foggy, overcast,
+rain, thunderstorm, ashstorm, blight, snow, blizzard — the game's own order, which reads like a
+forecast. The ini's sections come out **sorted by name**, because that is what indexing sections
+does, so `Weather::table` opens on ashstorm and puts clear fourth. Matching a chance to a weather by
+position would silently pair blight's percentage with blizzard's sky. `RegionRecord::ORDER` is
+written down for that reason and `Weather::in_cell` sorts by it, so cycling reads as weather rather
+than as an alphabet.
+
+**Where nothing narrows them, the answer is all ten.** An interior names no region, a handful of
+exteriors name none either, a region the file does not describe rules nothing out, and a region
+whose every chance is zero is bad data rather than a place with no weather. Offering a choice
+between none is worse than offering one the game would not have made.
+
+**It cost no extra pass over the file.** `CellIndex` already carries the `LTEX` palette on the
+argument that those records are scattered through the stream with no relation to the cells that use
+them, so a cell loaded alone would resolve against whatever happened to precede it. Regions are the
+same shape of problem and now ride the same walk.
+
+**What changes when the camera crosses a boundary is the list, not the sky.** A blight storm that
+blew in over the Ashlands does not stop at the coast — the region says what can *begin* here, and
+pressing the key is what begins one. So a weather standing outside the local list is normal, and the
+step enters the list at whichever end it came from rather than refusing to move.
+
+On the device, a weather change is one bindless slot written twice. Filling it drops the image that
+was in it, so it waits for the device to go idle first — a key press is not a frame path, and the
+alternative is a deferred-destroy queue for something that changes when a person asks. The failure
+that matters is invisible from the host: a slot whose memory changed but whose descriptor did not
+would keep drawing the first sheet while every number the host derives came from the second.
+`tests/sky_textures.rs` renders clear, then overcast, then clear again, and asserts the middle frame
+moved and the last one came back.

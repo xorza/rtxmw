@@ -8,6 +8,7 @@ use crate::esm_reader::EsmReader;
 use crate::land_record::LandRecord;
 use crate::land_texture::LandTexture;
 use crate::record_name::RecordName;
+use crate::region_record::RegionRecord;
 
 /// Where one cell's records start.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,11 +29,16 @@ pub struct CellOffsets {
 ///
 /// The palette has to be here for the same reason. `LTEX` records are spread through the file with
 /// no relation to the cells that use them, so a cell loaded on its own would resolve its ground
-/// textures against however much of the palette happened to precede it.
+/// textures against however much of the palette happened to precede it. **The regions are here on
+/// exactly that argument**: a cell names one by id, `REGN` records sit wherever the file put them,
+/// and a walk to find one is the pass this type exists to make unnecessary.
 #[derive(Debug, Default)]
 pub struct CellIndex {
     cells: HashMap<CellId, CellOffsets>,
     land_textures: Vec<String>,
+    /// Keyed by the region's id lower-cased, because a cell's `RGNN` and the record's `NAME` are
+    /// the same string written by different hands.
+    regions: HashMap<String, RegionRecord>,
 }
 
 impl CellIndex {
@@ -41,6 +47,7 @@ impl CellIndex {
         let cell_tag = RecordName::new(b"CELL");
         let land_tag = RecordName::new(b"LAND");
         let texture_tag = RecordName::new(b"LTEX");
+        let region_tag = RecordName::new(b"REGN");
 
         let mut index = Self::default();
         // `LAND` and `CELL` are not adjacent and either can come first, so terrain is matched up
@@ -79,6 +86,10 @@ impl CellIndex {
                 && let Some(id) = LandRecord::grid_of(&record)?
             {
                 lands.insert(id, record.offset());
+            } else if record.name() == region_tag
+                && let Some(region) = RegionRecord::parse(&record)?
+            {
+                index.regions.insert(region.id.to_ascii_lowercase(), region);
             }
         }
 
@@ -101,6 +112,14 @@ impl CellIndex {
     /// record ever claimed leaves one behind rather than shifting everything after it.
     pub fn land_textures(&self) -> &[String] {
         &self.land_textures
+    }
+
+    /// The region a cell's `RGNN` names, or `None` for one this file does not describe.
+    ///
+    /// Matched without regard to case, which the file needs: `Cell::region` and a `REGN` record's
+    /// own `NAME` are the same string entered twice by hand.
+    pub fn region(&self, id: &str) -> Option<&RegionRecord> {
+        self.regions.get(&id.to_ascii_lowercase())
     }
 
     /// How many cells the file holds.

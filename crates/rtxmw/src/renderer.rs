@@ -96,6 +96,35 @@ pub(crate) struct Conditions<'a> {
     pub(crate) weather: &'a Weather,
 }
 
+/// Puts `weather`'s moons and cloud sheet in the slots the texture array reserves for them, and
+/// says what the sheet came to.
+///
+/// `None` where there was nothing to read — no game data configured, or a sheet that would not
+/// decode. **Either leaves whatever is already in the slots standing**, which is the right call in
+/// both places this is used: a missing texture is a weather that looks wrong, not a window that
+/// fails to open or a session that ends.
+///
+/// A free function because its two callers cannot share one: [`Renderer::new`] holds the device,
+/// the uploader and the scene as locals it has not yet assembled into a `Self`.
+fn upload_sky(
+    scene: &mut SceneRenderer,
+    device: &Device,
+    physical: &PhysicalDevice,
+    uploader: &mut Uploader,
+    weather: &Weather,
+) -> rtxmw_gpu::Result<Option<CloudSheet>> {
+    let textures = match SkyTextures::load(weather) {
+        Ok(Some(textures)) => textures,
+        Ok(None) => return Ok(None),
+        Err(failed) => {
+            eprintln!("the sky keeps its own colours: {failed}");
+            return Ok(None);
+        }
+    };
+    scene.set_sky_textures(device, uploader, physical.limits(), &textures)?;
+    Ok(Some(textures.sheet()))
+}
+
 impl Renderer {
     /// Brings up Vulkan for `window` and allocates the frame ring.
     pub(crate) fn new<W>(
@@ -166,13 +195,8 @@ impl Renderer {
         }
         // **Before any cell, and it need not be** — the array reserves their slots either way. It
         // is here because this is where the archives are already open once.
-        match SkyTextures::load(weather) {
-            Ok(Some(textures)) => {
-                scene.set_sky_textures(&device, &mut uploader, physical.limits(), &textures)?;
-                sheet = textures.sheet();
-            }
-            Ok(None) => {}
-            Err(failed) => eprintln!("the sky keeps its own colours: {failed}"),
+        if let Some(read) = upload_sky(&mut scene, &device, &physical, &mut uploader, weather)? {
+            sheet = read;
         }
 
         Ok(Self {
@@ -194,6 +218,30 @@ impl Renderer {
     /// What the weather's cloud sheet came to — see [`Self::sheet`].
     pub(crate) fn cloud_sheet(&self) -> CloudSheet {
         self.sheet
+    }
+
+    /// Reads `weather`'s cloud sheet onto the device, over whichever one is there.
+    ///
+    /// What it comes to is then [`Self::cloud_sheet`], the same way it is after [`Self::new`] —
+    /// how much of the dome a deck hides is not known until the deck has been decoded, and the
+    /// caller needs it to build its next sky.
+    ///
+    /// **Waits for the device first.** Filling a bindless slot drops the image that was in it, and
+    /// a frame still in flight is still reading its view. This is a key press rather than a frame
+    /// path, so a stall of a few milliseconds is one nobody is looking at — and the alternative is
+    /// a deferred-destroy queue for a thing that changes when a person asks it to.
+    pub(crate) fn set_weather(&mut self, weather: &Weather) -> rtxmw_gpu::Result<()> {
+        unsafe { self.device.raw().device_wait_idle()? };
+        if let Some(read) = upload_sky(
+            &mut self.scene,
+            &self.device,
+            &self.physical,
+            &mut self.uploader,
+            weather,
+        )? {
+            self.sheet = read;
+        }
+        Ok(())
     }
 
     /// Uploads `scene` and makes it the only resident cell.

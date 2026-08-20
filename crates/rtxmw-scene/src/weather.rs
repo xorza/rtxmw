@@ -1,6 +1,7 @@
 //! Morrowind's ten weathers, as `Morrowind.ini` describes them.
 
 use glam::Vec3;
+use rtxmw_esm::{Cell, CellId, RegionRecord};
 
 use crate::game_data::GameData;
 use crate::ini::Ini;
@@ -193,7 +194,7 @@ impl Schedule {
 /// **Ten of them and every figure is the game's**, which is most of the point: the sky's own
 /// constants in this crate are tuned by eye and say so, while `Sky Night Color=009,010,011` and
 /// `Ambient Night Color=032,035,042` are Bethesda's answers to the same questions.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Weather {
     /// What the ini calls it — `Clear`, `Cloudy`, `Blight` and so on, lower-cased.
     pub name: String,
@@ -278,6 +279,54 @@ impl Weather {
         depth(between.from) + (depth(between.to) - depth(between.from)) * between.along
     }
 
+    /// The ones that can occur where `cell` is, out of the ten, in the game's own order.
+    ///
+    /// **A region is the only thing in the game that limits weather to a place**, and it does it by
+    /// giving each of the ten a percentage: Vvardenfell's ash wastes are the only place a blight
+    /// storm blows, and nowhere on the mainland snows. A zero is not "rare" — it is the file saying
+    /// that weather does not happen here.
+    ///
+    /// **The whole ten wherever nothing narrows them.** An interior names no region, a handful of
+    /// exteriors name none either, a region the file does not describe cannot rule anything out,
+    /// and a region whose every chance is zero is bad data rather than a place with no weather. In
+    /// each of those the answer is everything, because a caller offering a choice between none is
+    /// worse than one offering a choice the game would not have made.
+    ///
+    /// Ordered by [`RegionRecord::ORDER`] rather than by name, which is what makes cycling through
+    /// them read as a forecast rather than as an alphabet — clear, cloudy, foggy, overcast and on
+    /// into the storms. [`Self::table`] is sorted, because ini sections are.
+    pub fn in_cell(cell: &CellId) -> crate::Result<Vec<Self>> {
+        let mut table = Self::table()?;
+        // **Ordered before anything is dropped**, so the list reads the same however much a region
+        // narrows it — and so there is one sort rather than one per way out of this function.
+        table.sort_by_key(|weather| {
+            RegionRecord::ORDER
+                .iter()
+                .position(|named| *named == weather.name)
+                .unwrap_or(RegionRecord::WEATHERS)
+        });
+        let Some(game) = GameData::shared()? else {
+            return Ok(table);
+        };
+        // A cell this file does not hold narrows nothing. One it does hold is *read* rather than
+        // guessed at: a record the index found and the parser will not take is a broken file, and
+        // reporting that beats reporting a coast with no weather.
+        let Some(offsets) = game.cells().cell(cell) else {
+            return Ok(table);
+        };
+        let region = Cell::parse(&game.reader().record_at(offsets.cell)?)?
+            .region
+            .and_then(|named| game.cells().region(&named));
+        // Borrowed for the rest of the function rather than cloned, which the shared game allows:
+        // it is `&'static`, so anything reached through it outlives every caller.
+        if let Some(region) = region
+            && table.iter().any(|weather| region.allows(&weather.name))
+        {
+            table.retain(|weather| region.allows(&weather.name));
+        }
+        Ok(table)
+    }
+
     /// The weather the installed game calls `name`, or clear where it has none by that name.
     ///
     /// **The lookup rather than the table**, which is what a caller naming one on a command line
@@ -332,6 +381,50 @@ mod tests {
     /// The ten as the installed game describes them, or nothing where there is no game.
     fn table() -> Vec<Weather> {
         Weather::table().expect("the ini should read where the game is configured")
+    }
+
+    #[test]
+    fn a_region_is_what_says_the_bitter_coast_never_sees_an_ash_storm() {
+        let coast = Weather::in_cell(&CellId::Exterior { x: -2, y: -9 })
+            .expect("the region should read where the game is configured");
+        if coast.is_empty() {
+            return;
+        }
+        let named = |list: &[Weather]| -> Vec<String> {
+            list.iter().map(|weather| weather.name.clone()).collect()
+        };
+        println!("Seyda Neen's shore has {:?}", named(&coast));
+
+        // Seyda Neen stands in the Bitter Coast, which is swamp: it fogs and it rains, and the ash
+        // and the blight belong to the wastes on the other side of the island. Nowhere on
+        // Vvardenfell snows — that arrived with Bloodmoon's Solstheim.
+        for wet in ["clear", "cloudy", "foggy", "rain", "thunderstorm"] {
+            assert!(named(&coast).iter().any(|had| had == wet), "no {wet}");
+        }
+        for dry in ["ashstorm", "blight", "snow", "blizzard"] {
+            assert!(
+                !named(&coast).iter().any(|had| had == dry),
+                "the Bitter Coast should never see {dry}"
+            );
+        }
+
+        // **In the game's own order rather than the ini's.** Sections come out sorted, which would
+        // open the cycle on ashstorm and put clear fourth; `RegionRecord::ORDER` is what a forecast
+        // reads in.
+        assert_eq!(coast[0].name, "clear");
+        assert!(
+            coast
+                .iter()
+                .position(|w| w.name == "foggy")
+                .zip(coast.iter().position(|w| w.name == "rain"))
+                .is_some_and(|(fog, rain)| fog < rain)
+        );
+
+        // **An interior names no region, so nothing narrows it** — all ten, which is the right
+        // answer for a place the question does not apply to.
+        let inside = Weather::in_cell(&CellId::Interior("Balmora, Guild of Mages".into()))
+            .expect("an interior should read too");
+        assert_eq!(inside.len(), 10, "{:?}", named(&inside));
     }
 
     #[test]

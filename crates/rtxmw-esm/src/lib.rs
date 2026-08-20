@@ -12,6 +12,7 @@ mod light_record;
 mod object_record;
 mod position;
 mod record_name;
+mod region_record;
 
 pub use crate::cell::{CELL_SIZE, Cell, CellAmbient, CellId, CellRefIter};
 pub use crate::cell_index::{CellIndex, CellOffsets};
@@ -25,6 +26,7 @@ pub use crate::light_record::LightRecord;
 pub use crate::object_record::ObjectRecord;
 pub use crate::position::Position;
 pub use crate::record_name::RecordName;
+pub use crate::region_record::RegionRecord;
 
 // The gate must match the module's, or the module is `pub` yet unreachable under cfg(test).
 #[cfg(any(test, feature = "internals"))]

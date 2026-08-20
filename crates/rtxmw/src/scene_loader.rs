@@ -117,7 +117,16 @@ pub(crate) fn rings_from(centre: &CellId, id: &CellId) -> Option<i32> {
 }
 
 /// The cell the engine opens in when the command line names none.
-pub(crate) const DEFAULT_CELL: &str = "Seyda Neen, Census and Excise Office";
+///
+/// **Seyda Neen's shore, which puts the camera on the deck of the ship the game itself starts on.**
+/// The first door in file order is the one off that ship, and [`Viewpoint::entering`] stands a
+/// traveller where it arrives — so the opening frame is the one Morrowind opens on.
+///
+/// An exterior rather than the census office it used to be, because an exterior is what this
+/// renderer has the most of: terrain, cell streaming, distant statics, the sky dome, the sun and
+/// both moons, the cloud layer and its shadows, weather, water. A room exercises none of them, and
+/// the default is the frame that gets looked at most.
+pub(crate) const DEFAULT_CELL: &str = "-2,-9";
 
 /// The cell `argument` names.
 ///
@@ -390,11 +399,8 @@ mod tests {
         // Half a pair is a name too, not an error: there is a cell called that or there is not.
         assert_eq!(cell("-2,"), CellId::Interior("-2,".into()));
 
-        // No argument at all is the cell the engine opens in.
-        assert_eq!(
-            cell_named(DEFAULT_CELL),
-            CellId::Interior(DEFAULT_CELL.to_owned())
-        );
+        // No argument at all is the cell the engine opens in, which is Seyda Neen's shore.
+        assert_eq!(cell_named(DEFAULT_CELL), CellId::Exterior { x: -2, y: -9 });
     }
     use glam::{Affine3A, Vec2};
     use rtxmw_scene::{CellId, Door, Instance, Mesh, MeshId, StaticScene, Submesh};

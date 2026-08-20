@@ -27,7 +27,7 @@ use crate::world_clock::WorldClock;
 const KEYS: &str = concat!(
     "keys: WASD, space and ctrl to fly \u{b7} shift to hurry \u{b7} ",
     "[ ] time speed \u{b7} \\ pause time \u{b7} , . step the hour by half \u{b7} ",
-    "esc to release the mouse",
+    "; ' cycle the weather this region has \u{b7} esc to release the mouse",
 );
 
 /// Starting resolution — the internal render target from the design's performance budget.
@@ -91,8 +91,15 @@ pub(crate) struct App {
     fog: f32,
     /// How long the world has run and what hour it is there, which the keys below drive.
     clock: WorldClock,
-    /// Which of the game's ten weathers the world is under, out of `--weather`.
+    /// Which of the game's ten weathers the world is under, out of `--weather` and the keys.
     weather: Weather,
+    /// The ones the region the camera is standing in allows, in the game's own order.
+    ///
+    /// **Refilled when the camera crosses into another cell**, because which weathers a place can
+    /// have is a property of where you are: the Bitter Coast fogs and rains and never sees ash, and
+    /// walking east into the Ashlands changes the answer. Empty until the first cell is resident,
+    /// and the whole ten wherever nothing narrows them — see [`Weather::in_cell`].
+    allowed: Vec<Weather>,
     /// What that weather's cloud sheet comes to on average, once the renderer has read it.
     ///
     /// Every sky is built with it — how much of the dome the deck hides is what the ground under it
@@ -137,6 +144,20 @@ pub(crate) struct App {
     frames_since_title: u32,
 }
 
+/// Which of `count` entries lands `by` places from `standing`, wrapping at both ends.
+///
+/// `standing` is `None` for a weather that is not in the list at all — which is what `--weather`
+/// naming one the region never has leaves behind, and what walking out from under a storm does.
+/// Stepping then enters the list at whichever end the step came from rather than refusing to move.
+fn stepped(standing: Option<usize>, by: isize, count: usize) -> usize {
+    debug_assert!(count > 0, "there is no entry to step to");
+    match standing {
+        Some(at) => (at as isize + by).rem_euclid(count as isize) as usize,
+        None if by > 0 => 0,
+        None => count - 1,
+    }
+}
+
 impl App {
     /// Keeps the cells around the camera resident, loading and evicting one at a time.
     ///
@@ -170,6 +191,7 @@ impl App {
         if self.centre.as_ref() != Some(&centre) {
             changed |= self.evict_beyond(&centre);
             self.request_missing(&centre);
+            self.follow_region(&centre);
             self.centre = Some(centre);
         }
 
@@ -243,6 +265,59 @@ impl App {
         before != self.resident.len()
     }
 
+    /// Takes the weathers `cell`'s region allows, for the keys below to cycle through.
+    ///
+    /// **What the standing weather is does not change here**, however far the camera has walked. A
+    /// blight storm that blew in over the Ashlands does not stop when you reach the coast — the
+    /// region says what can *begin* here, and stepping the keys is what begins one.
+    ///
+    /// **Rebuilt per crossing rather than per region, which was measured rather than assumed.** The
+    /// ten come out of the ini every time at **66 us**, against a crossing that already loads a
+    /// cell, uploads it and rebuilds the top level — so remembering the last region to skip the
+    /// work would be a cache for a thousandth of what the frame it lands in already costs.
+    fn follow_region(&mut self, cell: &CellId) {
+        match Weather::in_cell(cell) {
+            Ok(allowed) => self.allowed = allowed,
+            // The list is what the keys offer, so failing to read it costs the keys and nothing
+            // else — the sky overhead is untouched and the session carries on.
+            Err(failed) => eprintln!("could not read what weather this region has: {failed}"),
+        }
+    }
+
+    /// Steps `by` places through the weathers this region allows, wrapping at either end.
+    ///
+    /// **From wherever the standing weather sits in that list, and from the end when it sits
+    /// nowhere in it** — which is what `--weather blight` in a region that never blights leaves
+    /// behind, and what walking out of the Ashlands under one does. Stepping then lands on the
+    /// list's own first or last entry rather than refusing to move.
+    fn cycle_weather(&mut self, by: isize) {
+        let count = self.allowed.len();
+        if count == 0 {
+            return;
+        }
+        // **By name rather than by identity**, because the standing weather need not be one of
+        // these at all — `--weather` can name one the region never has, and walking out from under
+        // a storm leaves one behind.
+        let standing = self
+            .allowed
+            .iter()
+            .position(|weather| weather.name == self.weather.name);
+        self.weather = self.allowed[stepped(standing, by, count)].clone();
+        // The deck is a texture on the device, so the sheet has to be read before the next sky can
+        // be built with it — and what it came to is asked for the same way `resumed` asks after the
+        // renderer is built, rather than handed back by a second route.
+        if let Some(renderer) = self.renderer.as_mut() {
+            if let Err(failed) = renderer.set_weather(&self.weather) {
+                eprintln!("could not put the weather's clouds on the device: {failed}");
+            }
+            self.sheet = renderer.cloud_sheet();
+        }
+        println!(
+            "weather: {} (of {count} this region has)",
+            self.weather.name
+        );
+    }
+
     /// Asks for whichever cells around `centre` are missing, or resident at the wrong tier.
     fn request_missing(&mut self, centre: &CellId) {
         scene_loader::wanted_cells(centre, &mut self.wanted);
@@ -293,6 +368,7 @@ impl Default for App {
             fog: 1.0,
             clock: WorldClock::starting_at(WorldTime::default()),
             weather: Weather::clear(),
+            allowed: Vec::new(),
             sheet: CloudSheet::NONE,
             renderer: None,
             window: None,
@@ -426,6 +502,10 @@ impl ApplicationHandler for App {
                 // The cell the camera opens in is resident; outdoors, the rest of the window
                 // streams in around it over the following frames. `centre` stays unset so the
                 // first of those frames sees the camera's cell as a change and asks for the rest.
+                //
+                // **Which is also what makes this call the interior's**: nothing streams around a
+                // room, so the crossing that fills this outdoors never happens in one.
+                self.follow_region(&cell.id);
                 self.resident.insert(cell.id, CellDetail::Full);
             }
             Ok(None) => eprintln!(
@@ -499,6 +579,15 @@ impl ApplicationHandler for App {
                     KeyCode::Backslash if pressed && !event.repeat => self.clock.toggle_pause(),
                     KeyCode::Period if pressed => self.clock.nudge(1.0),
                     KeyCode::Comma if pressed => self.clock.nudge(-1.0),
+                    // **Weather**, in the same punctuation row as the two time pairs because it is
+                    // the same kind of thing: state of the world rather than of the camera.
+                    //
+                    // The repeat is dropped, which the time keys keep. Each step reads a cloud
+                    // sheet onto the device and waits for the device to go idle to do it, so a held
+                    // key would stall the frame thirty times a second to cycle past weathers
+                    // nobody saw.
+                    KeyCode::Quote if pressed && !event.repeat => self.cycle_weather(1),
+                    KeyCode::Semicolon if pressed && !event.repeat => self.cycle_weather(-1),
                     KeyCode::Escape if pressed => {
                         if self.mouse_captured {
                             self.set_capture(false);
@@ -564,5 +653,32 @@ impl ApplicationHandler for App {
         if let Some(window) = &self.window {
             window.request_redraw();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stepping_through_a_regions_weathers_wraps_at_both_ends() {
+        // The Bitter Coast's five, which is the list the keys actually cycle.
+        const FIVE: usize = 5;
+        assert_eq!(stepped(Some(0), 1, FIVE), 1);
+        assert_eq!(stepped(Some(3), 1, FIVE), 4);
+        // Off the top comes back to the bottom, and off the bottom to the top — `rem_euclid` rather
+        // than `%`, which for a negative step would give a negative index.
+        assert_eq!(stepped(Some(4), 1, FIVE), 0);
+        assert_eq!(stepped(Some(0), -1, FIVE), 4);
+        assert_eq!(stepped(Some(2), -1, FIVE), 1);
+
+        // **A weather the region does not have is not in the list**, so a step enters at the end it
+        // came from: forwards lands on the first, backwards on the last.
+        assert_eq!(stepped(None, 1, FIVE), 0);
+        assert_eq!(stepped(None, -1, FIVE), FIVE - 1);
+
+        // A region with one weather goes nowhere, which beats going out of bounds.
+        assert_eq!(stepped(Some(0), 1, 1), 0);
+        assert_eq!(stepped(Some(0), -1, 1), 0);
     }
 }
