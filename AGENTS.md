@@ -18,6 +18,10 @@ Priorities, in order:
 1. **How it looks.** Trading image quality for simplicity or convenience is the wrong trade.
 2. **Performance.** 1920×1080 internal → 3840×2160 at 60 fps (`docs/design.md` §5.3).
 
+**In that order, and in that sequence: features first, optimisation once the set is complete.** The
+bar above is recorded so it cannot be forgotten, not so it can be worked on — do not open performance
+work unasked, and do not trade a feature's quality for frame time before it is asked for.
+
 Nothing else ranks: no mod compatibility, no configurability for its own sake, no portability layer,
 no abstraction over hardware this does not target.
 
