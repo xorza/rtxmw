@@ -1,12 +1,7 @@
 [
   {
-    "label": "run rtxmw customs",
-    "command": "cargo",
-    "args": [
-      "run",
-      "-p",
-      "rtxmw"
-    ],
+    "label": "run \u00b7 default (the ship at Seyda Neen)",
+    "command": "cargo run -p rtxmw",
     "env": {
       "RUST_BACKTRACE": "1"
     },
@@ -16,13 +11,195 @@
     "reveal": "always"
   },
   {
-    "label": "run rtxmw seyda neen",
-    "command": "cargo",
-    "args": [
-      "run",
-      "-p",
-      "rtxmw"
-    ],
+    "label": "run \u00b7 Seyda Neen (bitter coast swamp)",
+    "command": "cargo run -p rtxmw -- \"-2,-9\"",
+    "env": {
+      "RUST_BACKTRACE": "1"
+    },
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "use_new_terminal": false,
+    "allow_concurrent_runs": false,
+    "reveal": "always"
+  },
+  {
+    "label": "run \u00b7 Balmora (west gash river)",
+    "command": "cargo run -p rtxmw -- \"-3,-2\"",
+    "env": {
+      "RUST_BACKTRACE": "1"
+    },
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "use_new_terminal": false,
+    "allow_concurrent_runs": false,
+    "reveal": "always"
+  },
+  {
+    "label": "run \u00b7 Caldera (west gash highland)",
+    "command": "cargo run -p rtxmw -- \"-2,2\"",
+    "env": {
+      "RUST_BACKTRACE": "1"
+    },
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "use_new_terminal": false,
+    "allow_concurrent_runs": false,
+    "reveal": "always"
+  },
+  {
+    "label": "run \u00b7 Ald-ruhn (ashlands, under the shell)",
+    "command": "cargo run -p rtxmw -- \"-2,6\"",
+    "env": {
+      "RUST_BACKTRACE": "1"
+    },
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "use_new_terminal": false,
+    "allow_concurrent_runs": false,
+    "reveal": "always"
+  },
+  {
+    "label": "run \u00b7 Ghostgate (blight, red mountain)",
+    "command": "cargo run -p rtxmw -- \"2,4\"",
+    "env": {
+      "RUST_BACKTRACE": "1"
+    },
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "use_new_terminal": false,
+    "allow_concurrent_runs": false,
+    "reveal": "always"
+  },
+  {
+    "label": "run \u00b7 Vivec (ascadian isles, the city)",
+    "command": "cargo run -p rtxmw -- \"3,-9\"",
+    "env": {
+      "RUST_BACKTRACE": "1"
+    },
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "use_new_terminal": false,
+    "allow_concurrent_runs": false,
+    "reveal": "always"
+  },
+  {
+    "label": "run \u00b7 Molag Mar (molag amur lava)",
+    "command": "cargo run -p rtxmw -- \"13,-8\"",
+    "env": {
+      "RUST_BACKTRACE": "1"
+    },
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "use_new_terminal": false,
+    "allow_concurrent_runs": false,
+    "reveal": "always"
+  },
+  {
+    "label": "run \u00b7 Sadrith Mora (azura's coast mushroom)",
+    "command": "cargo run -p rtxmw -- \"17,4\"",
+    "env": {
+      "RUST_BACKTRACE": "1"
+    },
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "use_new_terminal": false,
+    "allow_concurrent_runs": false,
+    "reveal": "always"
+  },
+  {
+    "label": "run \u00b7 Khuul (northern ashlands coast)",
+    "command": "cargo run -p rtxmw -- \"-9,17\"",
+    "env": {
+      "RUST_BACKTRACE": "1"
+    },
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "use_new_terminal": false,
+    "allow_concurrent_runs": false,
+    "reveal": "always"
+  },
+  {
+    "label": "run \u00b7 Dagon Fel (sheogorad, the far north)",
+    "command": "cargo run -p rtxmw -- \"7,22\"",
+    "env": {
+      "RUST_BACKTRACE": "1"
+    },
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "use_new_terminal": false,
+    "allow_concurrent_runs": false,
+    "reveal": "always"
+  },
+  {
+    "label": "run \u00b7 Gnisis (west gash, the river gorge)",
+    "command": "cargo run -p rtxmw -- \"-11,11\"",
+    "env": {
+      "RUST_BACKTRACE": "1"
+    },
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "use_new_terminal": false,
+    "allow_concurrent_runs": false,
+    "reveal": "always"
+  },
+  {
+    "label": "run \u00b7 Tel Branora (azura's coast, the tower)",
+    "command": "cargo run -p rtxmw -- \"15,-13\"",
+    "env": {
+      "RUST_BACKTRACE": "1"
+    },
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "use_new_terminal": false,
+    "allow_concurrent_runs": false,
+    "reveal": "always"
+  },
+  {
+    "label": "run \u00b7 interior: Balmora, Guild of Mages",
+    "command": "cargo run -p rtxmw -- \"Balmora, Guild of Mages\"",
+    "env": {
+      "RUST_BACKTRACE": "1"
+    },
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "use_new_terminal": false,
+    "allow_concurrent_runs": false,
+    "reveal": "always"
+  },
+  {
+    "label": "run \u00b7 interior: Ald-ruhn, Ald Skar Inn",
+    "command": "cargo run -p rtxmw -- \"Ald-ruhn, Ald Skar Inn\"",
+    "env": {
+      "RUST_BACKTRACE": "1"
+    },
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "use_new_terminal": false,
+    "allow_concurrent_runs": false,
+    "reveal": "always"
+  },
+  {
+    "label": "run \u00b7 interior: Ald-ruhn, Council Club",
+    "command": "cargo run -p rtxmw -- \"Ald-ruhn, Council Club\"",
+    "env": {
+      "RUST_BACKTRACE": "1"
+    },
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "use_new_terminal": false,
+    "allow_concurrent_runs": false,
+    "reveal": "always"
+  },
+  {
+    "label": "run \u00b7 interior: Ald Daedroth, Inner Shrine",
+    "command": "cargo run -p rtxmw -- \"Ald Daedroth, Inner Shrine\"",
+    "env": {
+      "RUST_BACKTRACE": "1"
+    },
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "use_new_terminal": false,
+    "allow_concurrent_runs": false,
+    "reveal": "always"
+  },
+  {
+    "label": "run \u00b7 interior: Alas Ancestral Tomb",
+    "command": "cargo run -p rtxmw -- \"Alas Ancestral Tomb\"",
+    "env": {
+      "RUST_BACKTRACE": "1"
+    },
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "use_new_terminal": false,
+    "allow_concurrent_runs": false,
+    "reveal": "always"
+  },
+  {
+    "label": "run \u00b7 interior: Seyda Neen, Census and Excise Office",
+    "command": "cargo run -p rtxmw -- \"Seyda Neen, Census and Excise Office\"",
     "env": {
       "RUST_BACKTRACE": "1"
     },
