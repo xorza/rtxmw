@@ -1,5 +1,5 @@
 # Open issues
 
-- `moved()` in `crates/rtxmw-render/tests/precipitation.rs` counts any pixel whose bytes differ at
-  all. Auto-exposure follows the frame's overall brightness, so a change that shifts it nudges every
-  pixel by a level and the count saturates at the whole frame rather than measuring what moved.
+- The coverage solve in `precipitation.glsl` saturates for the two rain weathers: `alpha` comes out
+  at 1.8 for rain and 4.6 for thunderstorm and is clamped to 1, so neither reaches the physical
+  coverage the solve is written to match. Snow, at 0.68, is the only weather the clamp does not bind.

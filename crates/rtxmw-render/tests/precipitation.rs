@@ -5,6 +5,16 @@
 //! drop in a column shared one sideways offset, and a streak a metre long where the drops are
 //! centimetres apart fused the column into an unbroken rod. A rod of rain falling through itself
 //! looks exactly like a rod of rain standing still.
+//!
+//! **The second version measured the exposure instead of the rain**, and every test here passed on
+//! it. Counting pixels that differ at all sounds like the neutral thing to do and is not: metering
+//! follows the frame's overall brightness, so putting rain in the air pulls every pixel down three
+//! levels and putting snow in it pulls them down twenty. All 16,384 differed; 572 had a drop on
+//! them. Every threshold in the file was written against the wrong one of those — one assertion
+//! cleared its bar by seven pixels of rounding, and another compared two saturated counts and would
+//! have *reversed* on the honest measure. `lit_by` is the answer: precipitation only ever adds
+//! light, so the exposure it provokes can only subtract it, and a pixel that came out brighter than
+//! the dry frame had something drawn on it.
 
 use ash::vk;
 use glam::{Affine3A, Vec2, Vec3};
@@ -119,8 +129,50 @@ fn falling_in(scene: &StaticScene, precipitation: Precipitation, seconds: f32) -
     pixels
 }
 
-/// How many of two frames' pixels differ at all.
-fn moved(before: &[u8], after: &[u8]) -> usize {
+/// How many levels brighter a pixel has to be before it counts as a streak.
+///
+/// **The exposure is the reason there is a threshold at all.** Metering follows the frame's overall
+/// brightness, so putting rain in the air pulls the whole picture down a few levels and putting snow
+/// in it pulls it down twenty — every pixel differs from the dry frame, whether a flake landed on it
+/// or not. Four is above that drift and far below a streak: against a wall of 0.05 albedo the lit
+/// ones clear twenty.
+///
+/// Only ever *downward*, which is what makes one constant enough. Precipitation adds light, so the
+/// exposure it provokes can only darken; a pixel that came out brighter than the dry frame did so
+/// because something was drawn on it.
+const STREAK_LEVELS: u8 = 4;
+
+/// Which pixels a weather lit, against the same frame with nothing falling.
+fn lit_by(dry: &[u8], wet: &[u8]) -> Vec<bool> {
+    dry.chunks_exact(4)
+        .zip(wet.chunks_exact(4))
+        .map(|(was, now)| (0..3).any(|c| now[c].saturating_sub(was[c]) > STREAK_LEVELS))
+        .collect()
+}
+
+/// How many pixels a mask holds.
+fn count(mask: &[bool]) -> usize {
+    mask.iter().filter(|lit| **lit).count()
+}
+
+/// How many pixels are lit in one frame and not the other — what turned over between them.
+///
+/// A pattern that moved somewhere else entirely scores twice what it covers, since every pixel it
+/// left went dark and every one it arrived at lit up. One that barely moved scores near nothing. So
+/// the number worth reading is this over [`count`] of either frame, and it runs from 0 to 2.
+fn turnover(before: &[bool], after: &[bool]) -> usize {
+    before
+        .iter()
+        .zip(after)
+        .filter(|(was, now)| was != now)
+        .count()
+}
+
+/// How many of two frames' pixels differ at all, in any direction and by any amount.
+///
+/// **Only ever asked where the answer should be none.** Anything else and the exposure answers for
+/// it: see `STREAK_LEVELS`.
+fn differing(before: &[u8], after: &[u8]) -> usize {
     before
         .chunks_exact(4)
         .zip(after.chunks_exact(4))
@@ -139,66 +191,166 @@ fn rain() -> Precipitation {
     }
 }
 
-#[test]
-fn rain_falls_and_a_weather_with_none_drops_nothing() {
-    let dry = falling(Precipitation::NONE, 0.0);
-    let wet = falling(rain(), 0.0);
-    let pixels = (WIDTH * HEIGHT) as usize;
-
-    // **Present.** Against a wall this dark a streak is the only bright thing there is, so what
-    // moves between the two frames is the rain and nothing else.
-    let struck = moved(&dry, &wet);
-    assert!(
-        struck > pixels / 100,
-        "rain should reach more than a hundredth of the frame, not {struck} of {pixels}"
-    );
-
-    // **And a weather that drops nothing draws nothing**, which is six of the ten and every
-    // interior — the shader leaves on the first line rather than marching an empty lattice.
-    assert_eq!(moved(&dry, &falling(Precipitation::NONE, 4.0)), 0);
-}
-
-#[test]
-fn the_drops_fall_rather_than_hanging_in_the_air() {
-    // **A tenth of a second**, over which rain at 4,025 units a second travels 400 — six times the
-    // metre-long streak it smears into, so every drop has left where it was.
-    let start = falling(rain(), 0.0);
-    let later = falling(rain(), 0.1);
-    let pixels = (WIDTH * HEIGHT) as usize;
-
-    let struck = moved(&falling(Precipitation::NONE, 0.0), &start);
-    let carried = moved(&start, &later);
-    assert!(
-        carried > struck / 2,
-        "the drops should have moved on — {carried} pixels changed against {struck} the rain \
-         covers at all"
-    );
-    assert!(carried < pixels, "the whole frame should not be rain");
-}
-
-#[test]
-fn snow_falls_slower_and_wider_than_rain() {
-    // The two differ by the keys the ini gives them and by nothing written here: `Snow Gravity
-    // Scale` makes a flake a tenth the weight of a drop for its area, so it drifts where rain
-    // falls, and a flake is drawn wider because loose crystal is.
-    let flakes = Precipitation {
+/// Snow as `[Weather Snow]` describes it, for the comparisons rain is the other half of.
+fn snow() -> Precipitation {
+    Precipitation {
         count: 750.0,
         diameter: 800.0,
         height: 300.0,
         fall: 345.0,
         snow: true,
-    };
-    let still = falling(Precipitation::NONE, 0.0);
-    let snowing = moved(&still, &falling(flakes, 0.0));
-    assert!(snowing > 0, "snow should reach the frame at all");
+    }
+}
 
-    // **Slower, measured over a window rain crosses six times.** In a tenth of a second a flake
-    // travels 34 units against a drop's 400, so far less of the frame turns over.
-    let snow_carried = moved(&falling(flakes, 0.0), &falling(flakes, 0.1));
-    let rain_carried = moved(&falling(rain(), 0.0), &falling(rain(), 0.1));
+#[test]
+fn rain_falls_and_a_weather_with_none_drops_nothing() {
+    let dry = falling(Precipitation::NONE, 0.0);
+    let pixels = (WIDTH * HEIGHT) as usize;
+
+    // **Present.** Against a wall this dark a streak is the only bright thing there is, so a pixel
+    // the rain brightened is a pixel a drop was drawn on.
+    let struck = count(&lit_by(&dry, &falling(rain(), 0.0)));
     assert!(
-        snow_carried < rain_carried,
-        "snow should drift where rain falls — {snow_carried} against {rain_carried}"
+        struck > pixels / 100,
+        "rain should reach more than a hundredth of the frame, not {struck} of {pixels}"
+    );
+
+    // **And it is rain rather than a wall of water.** Coverage is what a lattice gets wrong quietly:
+    // the count above cannot tell more rain from drops drawn too wide or packed too close, and both
+    // read as fog with edges rather than as weather. A tenth of the frame is the ceiling — three
+    // times what a shower actually comes to here, and tripped by drawing a drop twice its width.
+    assert!(
+        struck < pixels / 10,
+        "rain should not cover the frame — {struck} of {pixels}"
+    );
+
+    // **And a weather that drops nothing draws nothing**, which is six of the ten and every
+    // interior — the shader leaves on the first line rather than marching an empty lattice. Byte for
+    // byte, which is the one comparison the exposure cannot get into: it has nothing to shift.
+    assert_eq!(differing(&dry, &falling(Precipitation::NONE, 4.0)), 0);
+}
+
+#[test]
+fn the_drops_fall_rather_than_hanging_in_the_air() {
+    // **A tenth of a second**, over which rain at 4,025 units a second travels 400 — thirty-eight
+    // times the ten-unit streak it smears into, so no drop is within reach of where it was.
+    let dry = falling(Precipitation::NONE, 0.0);
+    let start = lit_by(&dry, &falling(rain(), 0.0));
+    let later = lit_by(&dry, &falling(rain(), 0.1));
+    let struck = count(&start);
+    let carried = turnover(&start, &later);
+
+    // More pixels changed hands than were ever lit, which is the whole pattern being somewhere else
+    // rather than the same one nudged: every drop's pixels went dark and as many others lit up.
+    assert!(
+        carried > struck,
+        "the drops should have moved on — {carried} pixels turned over against {struck} lit"
+    );
+
+    // And not more than a complete turnover, which is what says the two frames disagree about the
+    // rain and nothing besides it. Twice the coverage is the ceiling; three times is slack.
+    assert!(
+        carried < struck * 3,
+        "only the rain should have changed — {carried} against {struck} lit"
+    );
+}
+
+/// How many lit pixels have a lit neighbour beside them, counted along each axis.
+#[derive(Debug)]
+struct Runs {
+    down: usize,
+    across: usize,
+}
+
+impl Runs {
+    /// How far past round the shape sits: one where the two axes agree, higher the taller it is.
+    fn elongation(&self) -> f32 {
+        self.down as f32 / self.across.max(1) as f32
+    }
+}
+
+/// Which way `mask`'s lit pixels run.
+///
+/// **What tells a streak from a blob.** The fall is straight down in these frames, so a drop smeared
+/// over the shutter is tall and sub-pixel wide while a flake that barely moved is as wide as it is
+/// high. Runs rather than extents, because at this size a streak is seven pixels and a flake is
+/// one — there is nothing to fit a shape to, only neighbours to count.
+fn runs(mask: &[bool]) -> Runs {
+    let at = |x: u32, y: u32| mask[(y * WIDTH + x) as usize];
+    let mut runs = Runs { down: 0, across: 0 };
+    for y in 0..HEIGHT {
+        for x in 0..WIDTH {
+            if !at(x, y) {
+                continue;
+            }
+            runs.down += usize::from(y + 1 < HEIGHT && at(x, y + 1));
+            runs.across += usize::from(x + 1 < WIDTH && at(x + 1, y));
+        }
+    }
+    runs
+}
+
+#[test]
+fn snow_is_drawn_round_and_slow_where_rain_is_drawn_as_a_streak() {
+    // The two differ by the keys the ini gives them and by nothing written here: `Snow Gravity
+    // Scale` makes a flake a tenth the weight of a drop for its area, so it drifts where rain falls,
+    // and a flake is drawn wider because loose crystal is.
+    let dry = falling(Precipitation::NONE, 0.0);
+    let snowing = lit_by(&dry, &falling(snow(), 0.0));
+    let raining = lit_by(&dry, &falling(rain(), 0.0));
+
+    // **Wider**, and by a lot: more flakes, a wider cylinder, and each drawn three times the radius
+    // of a drop.
+    assert!(
+        count(&snowing) > count(&raining) * 4,
+        "snow should cover far more of the frame than rain — {} against {}",
+        count(&snowing),
+        count(&raining)
+    );
+
+    // **And round rather than streaked, which is the whole of what a fall speed does to a shape.** A
+    // streak is how far the drop travelled while the shutter was open, so rain at nine metres a
+    // second smears fifteen centimetres and is drawn a hundredth of that across — tall and
+    // sub-pixel wide — while a flake at three quarters of a metre a second moves less than its own
+    // width and comes out as the disc it is. Measured down the screen against across it, because
+    // the fall is straight down here.
+    // **Bounded on the excess over round, not on the ratio itself.** Snow covers a third of the
+    // frame, so flakes touch and the neighbours that fusing adds land in both directions equally —
+    // which pulls any ratio measured here toward one whatever the flakes are shaped like. What
+    // survives that is how far *past* one it sits: a sixth of the way with a flake drawn round,
+    // and a hundred times that with rain's own streak length handed to it.
+    let streaked = runs(&raining);
+    let round = runs(&snowing);
+    assert!(
+        streaked.elongation() > 4.0,
+        "a drop should be drawn as a streak — {streaked:?} is {} past round",
+        streaked.elongation()
+    );
+    assert!(
+        round.elongation() < 1.15,
+        "a flake should be drawn round — {round:?} is {} past round",
+        round.elongation()
+    );
+
+    // **Slower, over a window short enough to tell the two apart.** Two thousandths of a second
+    // carries a drop 8 units, three quarters of the streak it is drawn as, so nearly all of it has
+    // gone; a flake goes 0.7 against the 2.1 it is drawn as, so most of it is still there.
+    //
+    // Read as a fraction of what each covers, because the absolute counts cannot be compared: snow
+    // lights ten times as many pixels, so it turns more of them over while moving a tenth as far.
+    // That is the trap the first version of this test fell into, before the exposure hid it.
+    let turned = |precipitation, lit: &[bool]| {
+        turnover(lit, &lit_by(&dry, &falling(precipitation, 0.002))) as f32 / count(lit) as f32
+    };
+    let drifted = turned(snow(), &snowing);
+    let fell = turned(rain(), &raining);
+    assert!(
+        fell > 1.5,
+        "rain should have turned over completely — {fell} of what it covers"
+    );
+    assert!(
+        drifted < 1.0,
+        "snow should still be most of where it was — {drifted} of what it covers"
     );
 }
 
@@ -209,7 +361,7 @@ fn nothing_falls_under_the_water_and_a_surface_below_the_eye_cuts_it_off() {
     // the bay beside the eye, lit by a sun the water had already taken most of.
     let mut under = backdrop();
     under.water_level = Some(20_000.0);
-    let poured = moved(
+    let poured = differing(
         &falling_in(&under, Precipitation::NONE, 0.0),
         &falling_in(&under, rain(), 0.0),
     );
@@ -225,20 +377,14 @@ fn nothing_falls_under_the_water_and_a_surface_below_the_eye_cuts_it_off() {
     let mut bay = backdrop();
     bay.water_level = Some(-50.0);
 
-    // **Each against its own dry frame, and counting streaks rather than differences.** A water
-    // level is not free of the rest of the picture — the backdrop runs on below it, and a wall the
-    // sun has to reach through water is darker, which the exposure then follows across every pixel
-    // of the frame. So does the rain itself, by a level or two. What survives both is a pixel the
-    // rain made *brighter* by more than that, which against a wall of 0.05 albedo is a streak and
-    // nothing else. The darker wall biases this the wrong way for the test, since a streak stands
-    // out further against it.
+    // **Each against its own dry frame**, because a water level is not free of the rest of the
+    // picture: the backdrop runs on below it, a wall the sun has to reach through water is darker,
+    // and the exposure follows that across every pixel — which is what `lit_by` is proof against and
+    // a plain difference is not. What is left of the bias runs the wrong way for this test, since a
+    // streak stands out further against the darker wall.
     let lower = |dry: &[u8], wet: &[u8]| {
         let half = (HEIGHT / 2 * WIDTH) as usize * 4;
-        dry[half..]
-            .chunks_exact(4)
-            .zip(wet[half..].chunks_exact(4))
-            .filter(|(was, now)| (0..3).any(|c| now[c].saturating_sub(was[c]) > 8))
-            .count()
+        count(&lit_by(&dry[half..], &wet[half..]))
     };
     let over_water = lower(
         &falling_in(&bay, Precipitation::NONE, 0.0),

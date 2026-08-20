@@ -82,10 +82,11 @@ const float PRECIP_WIDTH = 0.035;
 
 // How long the shutter is that a streak is smeared over, in seconds.
 //
-// **What makes a streak a streak rather than a dot**: a drop falling fifty-seven metres a second
-// crosses a metre while the shutter is open, and that metre is the shape drawn. A sixtieth is the
-// exposure Garg and Nayar rendered their streak database at, and it is what a camera showing rain
-// as streaks rather than as dots uses.
+// **What makes a streak a streak rather than a dot**: a drop crosses fifteen centimetres while the
+// shutter is open, and that is the shape drawn. A sixtieth is the exposure Garg and Nayar rendered
+// their streak database at, and it is what a camera showing rain as streaks rather than as dots
+// uses. What speed it multiplies is `PRECIP_REAL`'s business — the ini's own fifty-seven metres a
+// second would put a whole metre on the screen, which is the thing that constant exists to refuse.
 //
 // Their closed form for a streak's *opacity* — `2r / (vT)`, the drop's diameter over the distance
 // it smeared into, which comes to two tenths of a percent — is no longer what this shader applies,
@@ -96,7 +97,7 @@ const float PRECIP_WIDTH = 0.035;
 // gets.
 const float PRECIP_SHUTTER = 1.0 / 60.0;
 
-// How fast a drop really falls, in world units a second.
+// How much of the speed the ini writes down a drop really falls at.
 //
 // **What a streak's *length* is measured from, where the ini's own speed carries the drops.** A
 // raindrop reaches about nine metres a second and goes no faster whatever the storm; Morrowind's
@@ -105,10 +106,17 @@ const float PRECIP_SHUTTER = 1.0 / 60.0;
 // a streak a full metre — which at half a metre from the eye subtends fifty-six degrees, half the
 // screen, and is why the drops looked enormous however narrow they were drawn.
 //
-// So the ini's speed still says how fast the field is carried past, which is the game's look, and
-// this says how far one drop smears while the shutter is open, which is physics. Seventy units to
-// the metre puts it at 630, and a sixtieth of a second of it is fifteen centimetres.
-const float PRECIP_TERMINAL = 630.0;
+// **A ratio and not a speed, because every weather falls at its own.** Written as one it was rain's
+// alone, and a flake drifting at 345 units a second came out smeared over the same fifteen
+// centimetres as a drop doing 4,025 — a needle ten times longer than it was drawn wide, where a
+// flake over a sixtieth of a second barely moves its own width. Nine metres a second is 630 units,
+// against the 4,025 the file gives rain; everything it writes is that much too fast, and the ratios
+// *between* weathers are close enough to keep — snow's 345 comes out at 0.77 m/s against a real
+// flake's one to one and a half.
+//
+// The ini's speed still says how fast the field is carried past, which is the game's look; this says
+// how far one of them smears while the shutter is open, which is physics.
+const float PRECIP_REAL = 630.0 / 4025.0;
 
 // What a drop shows of the world it is lit by, against that world's own radiance.
 //
@@ -196,14 +204,13 @@ vec4 precipitation_along(vec3 origin, vec3 direction, float span) {
     if (direction.z < 0.0) {
         reach = min(reach, head / -direction.z);
     }
-    vec3 fall = normalize(frame.precip_fall);
+    // Both halves of the same vector, taken once: the direction the lattice is built on and the
+    // speed a streak's length comes from.
+    float falling = length(frame.precip_fall);
+    vec3 fall = frame.precip_fall / max(falling, 1e-6);
     vec3 across, along;
     precip_basis(fall, across, along);
 
-    // Long enough to be a streak, which is what a drop moving this fast smears into.
-    float streak = PRECIP_TERMINAL * PRECIP_SHUTTER;
-    // One streak to a cell, the cell as tall along the fall as the streak plus the gap behind it.
-    float column = streak / PRECIP_DUTY;
     // The lattice falls, so the field is static in its own frame and a drop's motion is exact.
     vec3 drift = frame.precip_fall * frame.time;
     // **The lattice is the world's, and the march walks it a cell at a time.**
@@ -215,6 +222,20 @@ vec4 precipitation_along(vec3 origin, vec3 direction, float span) {
     uint steps = uint(max(walked / PRECIP_CELL, 1.0));
     // Wide enough to be seen against a cell that size and narrow enough to leave air between them.
     float radius = across_side * PRECIP_WIDTH * (frame.precip_snow > 0.0 ? PRECIP_FLAKE : 1.0);
+
+    // How far this weather's own drop travels while the shutter is open — and never less than it is
+    // drawn across, because below that a shape is not short, it is *pointed the wrong way*. `down`
+    // runs from the head of the streak and `distance` from its axis, so a round one is twice the
+    // radius long. A drop smears ten units and is drawn two thirds of one across, so it is a
+    // streak; a flake barely moves its own width and comes out round, which is what a flake is.
+    float streak = max(falling * PRECIP_REAL * PRECIP_SHUTTER, 2.0 * radius);
+    // One streak to a cell, the cell as tall along the fall as the streak plus the gap behind it.
+    //
+    // **Tied to the streak so that shortening one costs no coverage.** The share of a column a
+    // streak fills is `PRECIP_DUTY` whatever its length, and `chance` below is the disc it presents
+    // across the fall — so a weather whose drops smear less gets more of them stacked in the same
+    // air rather than a thinner shower.
+    float column = streak / PRECIP_DUTY;
 
     // **And the coverage stays the air's, which is what keeps the picture honest.** A lattice this
     // coarse holds far fewer drops than the air does, so each has to carry more: the *physical*
