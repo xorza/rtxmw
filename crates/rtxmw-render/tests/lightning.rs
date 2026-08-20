@@ -722,3 +722,102 @@ fn the_deck_lights_up_where_the_discharge_is() {
         "the glow should follow the deck the channel is in, not lift the far sky by {from} against {toward}"
     );
 }
+
+/// The sea gives back the cloud a discharge lit, and not only the channel.
+///
+/// **A ratio inside one frame, because exposure is per frame.** Adding light darkens the tone curve
+/// the whole picture is read through, so the absolute lift on the water *falls* when the reflection
+/// gains the deck — measured at 29 against 37, which is the wrong sign and no way to test at all.
+/// What the water owes the sky above it is a ratio, and that survives the curve.
+#[test]
+fn the_sea_reflects_the_cloud_the_flash_lit() {
+    let (Ok(thunderstorm), storm) = (rtxmw_scene::Weather::named("thunderstorm"), storm()) else {
+        return;
+    };
+    let Ok(Some(textures)) = rtxmw_scene::SkyTextures::load(&thunderstorm) else {
+        return;
+    };
+    let gpu = TestGpu::shared();
+    let mut renderer = SceneRenderer::new(
+        gpu.device(),
+        gpu.physical(),
+        gpu.memory(),
+        vk::Extent2D {
+            width: WIDTH,
+            height: HEIGHT,
+        },
+    )
+    .expect("renderer should build");
+    renderer.set_bounce_samples(0);
+    renderer.set_denoise_passes(0);
+    renderer.set_fog(0.0);
+    let mut uploader = gpu.uploader();
+    renderer
+        .set_sky_textures(
+            gpu.device(),
+            &mut uploader,
+            gpu.physical().limits(),
+            &textures,
+        )
+        .expect("sheet should upload");
+    let under = Sky::under(WorldTime::hours(0.0), &thunderstorm, textures.sheet());
+    let altitude = under.clouds.altitude;
+    renderer.set_sky(Sky {
+        lightning: storm,
+        ..under
+    });
+    renderer
+        .load_scene(
+            gpu.device(),
+            &mut uploader,
+            gpu.physical().limits(),
+            CellId::Exterior { x: 0, y: 0 },
+            &sea(),
+            &[],
+        )
+        .expect("scene should load");
+    let eye = Vec3::new(0.0, 0.0, 2_000.0);
+    let flash = storm.flash(0.0, eye, altitude);
+    let middle = (flash.source + flash.ground) * 0.5;
+    let target = Vec3::new(middle.x, middle.y, 0.0);
+    let mut shot = |seconds: f32| {
+        renderer.set_storm(seconds);
+        let view = glam::camera::rh::view::look_to_mat4(eye, (target - eye).normalize(), Vec3::Z);
+        let projection = glam::camera::rh::proj::vulkan::perspective_infinite_reverse(
+            75f32.to_radians(),
+            1.0,
+            0.05,
+        );
+        let constants = renderer.frame_constants(view, projection, eye);
+        renderer
+            .render_once(&mut uploader, &constants)
+            .expect("trace should run");
+        readback::image_to_rgba8(
+            &mut uploader,
+            renderer.output(),
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+        )
+        .expect("readback should succeed")
+    };
+    let (dark, burning) = (shot(0.7), shot(0.0));
+    let lift = |rows: std::ops::Range<usize>| -> f32 {
+        let mut total = 0.0;
+        for y in rows.clone() {
+            for x in 0..WIDTH as usize {
+                let at = (y * WIDTH as usize + x) * 4;
+                total += f32::from(burning[at + 1]) - f32::from(dark[at + 1]);
+            }
+        }
+        total / ((rows.end - rows.start) * WIDTH as usize) as f32
+    };
+    let sky = lift(4..(HEIGHT as usize / 2 - 8));
+    let water = lift((HEIGHT as usize / 2 + 8)..HEIGHT as usize - 4);
+    // The deck's glow is added in front of the fog rather than composited into the sky, so a
+    // reflection that only asks `sky_seen_through` never sees it: 0.183 of the sky's own lift
+    // against 0.419 with it. Half of what a bay under a bolt gives back is the cloud, not the bolt.
+    let ratio = water / sky;
+    assert!(
+        ratio > 0.30,
+        "the water should carry the lit deck as well as the channel — {water} on it against {sky} in the sky above"
+    );
+}

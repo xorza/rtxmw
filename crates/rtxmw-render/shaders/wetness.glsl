@@ -313,8 +313,11 @@ Film filmed(Surface surface, vec3 direction, float wet, uvec2 pixel, out Guides 
     // falling on it. Shading it properly, which is what `water_ray` does, costs a shadow ray per
     // light and measured at more than twice the whole trace — 16.7 ms against 7.9. What is drawn
     // instead is emissive raw over a flat ambient, which is `shade`'s own answer for a bounce.
+    // The lit deck rides along with the sky for the same reason it does off water — see the note in
+    // `water_ray`. A wet street under a flash reflects the cloud that lit it.
     vec3 seen = hit.hit ? hit.emissive + hit.albedo * frame.ambient
-                        : sky_seen_through(mirrored, lobe, true);
+                        : sky_seen_through(mirrored, lobe, true)
+                              + flash_on_deck(mirrored, frame.cone_spread + lobe);
     guides = Guides(vec3(fresnel), lobe, travelled);
     return Film(1.0 - fresnel, seen * fresnel);
 }

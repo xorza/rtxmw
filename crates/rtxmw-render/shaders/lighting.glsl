@@ -519,6 +519,52 @@ const float CLOUD_FLASH = 6.0e-3;
 // order light actually diffuses through a cloud before it comes back out.
 const float CLOUD_FLASH_SPREAD = 2.0;
 
+// One reading of the cloud sheet where `direction` crosses the shell: how much water is there, how
+// much sky it stands in front of, and how far off it is.
+//
+// **Shared, because two things read the same sheet for the same two numbers.** The layer's own colour
+// and the flash lighting it were each sampling it — the same intersection, the same mip arithmetic,
+// the same thickness ratio, the same alpha fade — and the pair had already drifted once over which
+// footprint to use.
+struct Deck {
+    // The painting's structure, as a ratio to its own mean rather than as a level — so the sheet
+    // says where a cloud is thick and the light says how bright that is. Where the alpha carries no
+    // shape, which is every overcast sheet, this is all the shape there is.
+    float thickness;
+    // How much sky the cloud hides: its own alpha, faded out toward the horizon where the shell is
+    // seen so obliquely that a tile covers more sky than it has detail for.
+    float covering;
+    // How far along the ray the shell is. Zero is the sentinel for no deck at all — the shell is
+    // always in front of a ray that reaches it, so nothing real lands here.
+    float reach;
+};
+
+// `coarser` reads the sheet that many mip levels below what the cone resolves — see
+// `CLOUD_FLASH_SPREAD`, which is the only caller that wants any.
+Deck deck_at(vec3 direction, float footprint, float coarser) {
+    Deck deck = Deck(0.0, 0.0, 0.0);
+    if (frame.cloud_cover <= 0.0 || frame.cloud_sheet == 0u || direction.z <= 0.0) {
+        return deck;
+    }
+    float reach;
+    vec2 where = cloud_uv(frame.camera_position, direction, reach);
+
+    // **The level the ray can actually resolve**, the same argument `cone_lod` makes for a surface:
+    // the cone is `footprint` wide per unit travelled and it has travelled `reach`, so it covers
+    // that much of the layer — and near the horizon `reach` is a hundred times what it is overhead,
+    // so a tile there is compressed past what its finest mip can answer for. Sampling with plain
+    // `texture` takes level zero, because a compute shader has no derivatives to pick one from, and
+    // the horizon crawls.
+    float texels = float(textureSize(textures[frame.cloud_sheet], 0).x) / frame.cloud_tile;
+    float lod = max(0.0, log2(max(footprint * reach * texels, 1e-6))) + coarser;
+    vec4 sheet = textureLod(textures[frame.cloud_sheet], where, lod);
+
+    deck.thickness = clamp(dot(sheet.rgb, LUMA) / max(frame.cloud_mean, 1e-6), 0.0, 2.0);
+    deck.covering = sheet.a * frame.cloud_cover * smoothstep(0.0, 0.12, direction.z);
+    deck.reach = reach;
+    return deck;
+}
+
 // What the cloud layer puts in front of the sky along `direction`, and how much of it it hides.
 //
 // **A vanilla asset lit rather than shown.** `tx_sky_*.dds` is a painted photograph of a sky with
@@ -530,41 +576,16 @@ const float CLOUD_FLASH_SPREAD = 2.0;
 //
 // Returns the layer's radiance; `hiding` comes back as how much of the sky behind it is covered.
 vec3 cloud_layer(vec3 direction, float footprint, out float hiding) {
-    hiding = 0.0;
-    if (frame.cloud_cover <= 0.0 || frame.cloud_sheet == 0u || direction.z <= 0.0) {
+    Deck deck = deck_at(direction, footprint, 0.0);
+    hiding = deck.covering;
+    if (deck.reach <= 0.0) {
         return vec3(0.0);
     }
-
-    float reach;
-    vec2 where = cloud_uv(frame.camera_position, direction, reach);
-
-    // **The level the ray can actually resolve**, the same argument `cone_lod` makes for a surface:
-    // the cone is `footprint` wide per unit travelled and it has travelled `reach`, so it covers
-    // that much of the layer — and near the horizon `reach` is a hundred times what it is overhead,
-    // so a tile there is compressed past what its finest mip can answer for. Sampling with plain
-    // `texture` takes level zero, because a compute shader has no derivatives to pick one from, and
-    // the horizon crawls.
-    float texels = float(textureSize(textures[frame.cloud_sheet], 0).x) / frame.cloud_tile;
-    float lod = max(0.0, log2(max(footprint * reach * texels, 1e-6)));
-    vec4 sheet = textureLod(textures[frame.cloud_sheet], where, lod);
-
-    // The painting's structure, as a ratio to its own mean rather than as a level — so the sheet
-    // says where a cloud is thick and the light says how bright that is. Where the alpha carries no
-    // shape, which is every overcast sheet, this is all the shape there is.
-    float luminance = dot(sheet.rgb, LUMA);
-    float thickness = clamp(luminance / max(frame.cloud_mean, 1e-6), 0.0, 2.0);
-
-    // How much sky the cloud hides: its own alpha, faded out toward the horizon where the shell is
-    // seen so obliquely that a tile covers more sky than it has detail for.
-    hiding = sheet.a * frame.cloud_cover * smoothstep(0.0, 0.12, direction.z);
-
     // **Thick where it is lit and thin where it is not.** A cloud's own body shadows it, so the
     // dense parts of the sheet keep the sun and the wisps are lit through; that is the difference
     // between the two colours the host handed over, and the sheet's structure is what picks between
     // them.
-    vec3 lit = mix(frame.cloud_shadowed, frame.cloud_lit, clamp(thickness, 0.0, 1.0));
-
-    return lit;
+    return mix(frame.cloud_shadowed, frame.cloud_lit, clamp(deck.thickness, 0.0, 1.0));
 }
 
 // What a flash puts on the cloud deck, for the caller to add *in front of* the fog.
@@ -587,25 +608,19 @@ vec3 cloud_layer(vec3 direction, float footprint, out float hiding) {
 // level instead handed the glow the painting's hard alpha edge, which is a cloud's silhouette and
 // not a glow's.
 vec3 flash_on_deck(vec3 direction, float footprint) {
-    if (frame.cloud_cover <= 0.0 || frame.cloud_sheet == 0u || direction.z <= 0.0
-        || frame.flash_radiance == vec3(0.0)) {
+    if (frame.flash_radiance == vec3(0.0)) {
         return vec3(0.0);
     }
-    float reach;
-    vec2 where = cloud_uv(frame.camera_position, direction, reach);
-    float texels = float(textureSize(textures[frame.cloud_sheet], 0).x) / frame.cloud_tile;
-    float lod = max(0.0, log2(max(footprint * reach * texels, 1e-6))) + CLOUD_FLASH_SPREAD;
-    vec4 sheet = textureLod(textures[frame.cloud_sheet], where, lod);
-
-    // How much water there is here to light, and how much of the sky it stands in front of — the
-    // same two the layer itself is built from, read off the blurred sample so the glow carries the
-    // cloud's shape without carrying its edge.
-    float thickness = clamp(dot(sheet.rgb, LUMA) / max(frame.cloud_mean, 1e-6), 0.0, 2.0);
-    float covering = sheet.a * frame.cloud_cover * smoothstep(0.0, 0.12, direction.z);
-
-    float away;
-    vec3 arriving = flash_irradiance(frame.camera_position + direction * reach, away);
-    return arriving * (CLOUD_FLASH * thickness * covering * flash_through_air(reach));
+    Deck deck = deck_at(direction, footprint, CLOUD_FLASH_SPREAD);
+    if (deck.reach <= 0.0) {
+        return vec3(0.0);
+    }
+    // The distance to the channel is what `flash_irradiance` reports; what stands between the eye
+    // and the *cloud* is what dims it, and that is the shell's own reach.
+    float ignored;
+    vec3 arriving = flash_irradiance(frame.camera_position + direction * deck.reach, ignored);
+    return arriving
+         * (CLOUD_FLASH * deck.thickness * deck.covering * flash_through_air(deck.reach));
 }
 
 // How many atmospheres a beam crosses to something `climb` above the horizon — Kasten and Young.

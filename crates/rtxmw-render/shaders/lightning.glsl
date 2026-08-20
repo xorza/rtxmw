@@ -1,16 +1,21 @@
-// What a flash does to the sky it happens in.
+// What a flash does to the sky it happens in, and to everything it can reach.
 //
-// **The light is not here.** A flash reaches the frame constants already folded into the ambient —
-// see `FLASH_AMBIENT` — so the rain in the air, the film on the ground, the fog and the indirect
-// bounce are all lit by it without one of them knowing lightning exists. What is left for this file
-// is the flash being *seen*: the deck it happens in going bright, and the channel where one shows.
+// **A discharge is a place, not an ambient.** It arrived folded into `frame.ambient` once, which is
+// light from everywhere at once: it lit every face of every object equally, cast nothing, and put a
+// white bay beside a dark shore. What is here instead is a *line source* — `flash_irradiance`
+// integrates the inverse square along the arc in closed form — feeding the two things that read it.
+// `flash_light` shades a surface with it and `fog_light` scatters it through the air.
+//
+// The rest of the file is the flash being *seen*: the deck it happens in going bright, which is over
+// half of all discharges, and the channel itself where one leaves the cloud.
 
-// How much of the flash the cloud deck scatters back out toward the eye.
+// How much the whole dome brightens toward a discharge, whatever is or is not in front of it.
 //
-// **A discharge inside a cloud is a lamp inside a paper lantern.** Almost none of the channel's light
-// leaves in a straight line; it is scattered by the water it is buried in and comes back out over an
-// enormous area, which is why a sheet flash lights a whole quarter of the sky rather than drawing a
-// bright spot in it. Well over half of all discharges never leave the cloud at all.
+// **The part of the glow with no shape in it.** A storm cell is kilometres across and its light
+// reaches far more of the sky than the deck this ray happens to cross, so some of what an eye sees
+// is simply the air over a quarter of the hemisphere going pale. The part *with* shape — the cloud
+// the discharge is actually inside — is `CLOUD_FLASH` in `lighting.glsl`, and it is the one that
+// grew when this shrank.
 //
 // **Kept low because the bay is a mirror.** Water reflects a lit dome one for one where a diffuse
 // surface returns its albedo's share of it, so every unit added here arrives on the sea at several
@@ -96,6 +101,12 @@ const float FLASH_HAZE = 2.0;
 // a scene asked for no fog at all still charged the cell's own density against every flash. Which
 // showed up as the corona sitting at its storm height in clear air, the two conditions it exists to
 // tell apart collapsed into one.
+// **Uniform, where `fog_density_at` is not.** The march reads a layer that thins with height and
+// clumps into banks; this reads the cell's figure flat, so it charges a ray climbing toward the deck
+// for more air than it crosses. What makes that affordable is the cap it feeds: past two nepers the
+// answer stops moving, and at a storm's density that arrives within a couple of thousand units of
+// anything. Integrating the layer properly would change the result only for a flash close enough
+// that the cap has not bound yet.
 float fog_optical_depth(float span) {
     return frame.fog_density * frame.fog_strength * FOG_EXTINCTION * span;
 }
@@ -425,8 +436,13 @@ float bolt_near(vec3 origin, vec3 direction, vec3 a, vec3 b, float span, out flo
     float along = dot(ab, direction);
     float spread = dot(ab, ab) - along * along;
     float toward = dot(direction, ao);
-    // A segment end-on to the ray has no unique nearest point; either end will do.
-    float at = spread > 1e-4 ? clamp((toward * along - dot(ab, ao)) / spread, 0.0, 1.0) : 0.0;
+    // A segment end-on to the ray has no unique nearest point; either end will do. **Against its own
+    // length**, because `spread` is `|ab|^2 sin^2` and a crawler's segments run thousands of units:
+    // an absolute floor there is a test on how long the channel is rather than on how end-on it is,
+    // and at 1e-4 it could never fire for anything this file draws.
+    float at = spread > 1e-6 * dot(ab, ab)
+             ? clamp((toward * along - dot(ab, ao)) / spread, 0.0, 1.0)
+             : 0.0;
     depth = toward + at * along;
     if (depth <= 0.0 || depth >= span) {
         return 1e9;

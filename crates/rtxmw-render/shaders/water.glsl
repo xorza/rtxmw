@@ -8,6 +8,10 @@
 // Defined by `lightning.glsl`, which needs `Surface` and so comes after this file.
 vec3 bolt_along(vec3 origin, vec3 direction, float span);
 
+// Defined by `lighting.glsl`, which comes before this file — the sky it lights is added in front of
+// the fog, so a reflection of it has to be added here rather than found in `sky_seen_through`.
+vec3 flash_on_deck(vec3 direction, float footprint);
+
 // Water's index of refraction, and the reflectance it gives at normal incidence: `((1.33 - 1) /
 // (1.33 + 1))^2`, which is why water is a window head-on and a mirror at a glancing angle.
 const float WATER_IOR = 1.333;
@@ -233,7 +237,23 @@ vec3 water_ray(vec3 origin, vec3 direction, float footprint, float lobe, uvec2 p
     if (!hit.hit) {
         // Stars kept: a reflection is something looked *at*, so the sea shows them the way it
         // shows the sun. It is the lighting path that leaves them out.
-        return arc + sky_seen_through(direction, lobe, true);
+        // **The lit deck as well as the channel.** The cloud a discharge is inside is added in
+        // front of the fog rather than composited into the sky — see `flash_on_deck` — so a
+        // reflection that only asks `sky_seen_through` gets the cloud's fair-weather colour and
+        // none of the light in it. A bay under a bolt was giving back the bolt and not the cloud it
+        // came out of, which is the brighter half of the two.
+        // **The lit deck as well as the channel.** The cloud a discharge is inside is added in
+        // front of the fog rather than composited into the sky — see `flash_on_deck` — so a
+        // reflection that only asks `sky_seen_through` gets the cloud's fair-weather colour and
+        // none of the light in it. A bay under a bolt was giving back the bolt and not the cloud it
+        // came out of, which is the brighter half of the two.
+        // **The lit deck as well as the channel.** The cloud a discharge is inside is added in
+        // front of the fog rather than composited into the sky — see `flash_on_deck` — so a
+        // reflection that only asks `sky_seen_through` gets the cloud's fair-weather colour and
+        // none of the light in it. A bay under a bolt was giving back the bolt and not the cloud it
+        // came out of, which is the brighter half of the two.
+        return arc + flash_on_deck(direction, frame.cone_spread + lobe)
+             + sky_seen_through(direction, lobe, true);
     }
     return arc + shade(hit, frame.ambient * daylight_reaching(hit.position), pixel, salt,
                        BOUNCE_SHADOW_SAMPLES);
