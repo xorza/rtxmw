@@ -89,6 +89,20 @@ fn wall(distance: f32, lights: &[Light], diffuse: Vec3) -> StaticScene {
 /// same setup three tests were each carrying their own copy of. No bounce and no filter in any of
 /// them: what is measured is the fog, and both would stir it into the rest.
 fn traced(cell: CellId, scene: &StaticScene, dials: impl FnOnce(&mut SceneRenderer)) -> Vec<u8> {
+    traced_from(cell, scene, Vec3::ZERO, Vec3::X, dials)
+}
+
+/// The same, from `eye` looking down `forward`.
+///
+/// Every fixture here but one stands at the origin facing a wall, which is why the camera was not a
+/// parameter until something wanted to look at a moon.
+fn traced_from(
+    cell: CellId,
+    scene: &StaticScene,
+    eye: Vec3,
+    forward: Vec3,
+    dials: impl FnOnce(&mut SceneRenderer),
+) -> Vec<u8> {
     let gpu = TestGpu::shared();
     let mut renderer = SceneRenderer::new(
         gpu.device(),
@@ -116,8 +130,7 @@ fn traced(cell: CellId, scene: &StaticScene, dials: impl FnOnce(&mut SceneRender
         )
         .expect("scene should load");
 
-    let eye = Vec3::ZERO;
-    let view = glam::camera::rh::view::look_to_mat4(eye, Vec3::X, Vec3::Z);
+    let view = glam::camera::rh::view::look_to_mat4(eye, forward.normalize(), Vec3::Z);
     let projection =
         glam::camera::rh::proj::vulkan::perspective_infinite_reverse(75f32.to_radians(), 1.0, 0.05);
     let constants = renderer.frame_constants(view, projection, eye);
@@ -591,5 +604,63 @@ fn there_is_no_fog_under_the_water() {
     assert!(
         parched > 0.01,
         "without water the same cell should still fog, and it moved by {parched}"
+    );
+}
+
+/// How red the brightest thing in the frame is, which with the camera on Masser is Masser.
+fn moon_hue(weather: &rtxmw_scene::Weather) -> f32 {
+    let sky = rtxmw_scene::Sky::under(
+        rtxmw_scene::WorldTime::hours(1.0),
+        weather,
+        rtxmw_scene::CloudSheet::NONE,
+    );
+    // `Moon::direction` is the way the light travels, so the moon is the other way.
+    let pixels = traced_from(
+        CellId::Exterior { x: 0, y: 0 },
+        &common::under_the_sky(),
+        Vec3::new(0.0, 0.0, 2_000.0),
+        -sky.masser.direction,
+        |renderer| {
+            renderer.set_fog(1.0);
+            renderer.set_sky(sky);
+        },
+    );
+
+    let mut discs: Vec<[u8; 4]> = pixels.as_chunks::<4>().0.to_vec();
+    discs.sort_by_key(|p| std::cmp::Reverse(u32::from(p[0]) + u32::from(p[1]) + u32::from(p[2])));
+    let bright = &discs[..64];
+    let channel = |c: usize| bright.iter().map(|p| f32::from(p[c])).sum::<f32>();
+    channel(0) / channel(1).max(1e-6)
+}
+
+#[test]
+fn the_fog_scatters_the_moons_own_colour_and_not_the_domes() {
+    let (Ok(clear), Ok(rain)) = (
+        rtxmw_scene::Weather::named("clear"),
+        rtxmw_scene::Weather::named("rain"),
+    ) else {
+        return;
+    };
+    if clear.name.is_empty() {
+        return;
+    }
+
+    // **Masser is red — 0.148 against 0.041 in green — and rain must not take that away.** The air
+    // between is what a weather changes, and `fog_light` carried the sun, the lamps and the flash
+    // but not the moons: at night the only thing lighting the haze was `frame.fog`, the dome's own
+    // blue-grey. So the disc was extinguished by the rain in front of it and replaced by the fog's
+    // colour, which came out **bluer than it was red** rather than merely washed out.
+    // Clear air barely moves on this — 1.955 to 2.136 — because there the disc supplies its own
+    // light and the haze has little to add. Rain is where it decides the picture: 0.907 without the
+    // moons in `fog_light` against 1.458 with them, which is the difference between a grey moon and
+    // a red one washed by weather.
+    let (dry, wet) = (moon_hue(&clear), moon_hue(&rain));
+    assert!(
+        dry > 1.5,
+        "a clear night should show Masser red — {dry} of red to green"
+    );
+    assert!(
+        wet > 1.2,
+        "rain should wash the red moon, not turn it grey — {wet} against {dry} in clear air"
     );
 }

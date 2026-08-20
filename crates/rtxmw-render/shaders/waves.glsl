@@ -5,9 +5,6 @@
 // sampled a field of its own. `wave_spectrum.rs` decides which waves are in the sum; this decides
 // what they look like at a point.
 
-// A whole turn, which is how a wavelength becomes a wavenumber.
-const float TAU = 6.2831853;
-
 // How far a wave draws the water toward its own crest, as a fraction of its height.
 //
 // Gerstner's waves move each particle in a circle rather than up and down, so the surface gathers

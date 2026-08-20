@@ -58,11 +58,18 @@ const CLEAR_DEPTH: f32 = 0.69;
 /// halving the absolute and quartering it leaves foggy the same sixth clearer, which was measured
 /// before this was reached for.
 ///
-/// So the *order* stays the game's and the *spacing* does not. A fourth power leaves clear where it
-/// was by construction, moves cloudy and overcast by a tenth, doubles rain, and puts foggy at four
-/// and a half times a clear day — which is the difference between seeing the far shore of the bay
-/// and not.
-const DEPTH_CURVE: f32 = 4.0;
+/// So the *order* stays the game's and the *spacing* does not. The power leaves clear where it was
+/// by construction and moves every other weather by how far from clear it already stood, which is
+/// what makes it one dial for the whole set: at three and a half, cloudy and overcast shift by a
+/// twentieth, rain by a fourteenth, and foggy comes down about a sixth — from four and a half times
+/// a clear day to three and two thirds. The fourth power it was put foggy at the far edge of what a
+/// bay can be looked across at all.
+///
+/// Measured across the ten: clear is fixed, overcast and cloudy move by a fiftieth, rain by a
+/// fourteenth, foggy, snow and thunderstorm by a sixth, ashstorm and blight by a fifth — and a
+/// blizzard not at all, because its raw figure is 134 either way and `DEEPEST` was always what
+/// decided it.
+const DEPTH_CURVE: f32 = 3.5;
 
 /// The thickest any weather's air gets, as a multiple of a clear day's.
 ///

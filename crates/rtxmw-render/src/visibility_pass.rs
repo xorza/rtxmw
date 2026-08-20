@@ -119,6 +119,19 @@ impl Default for Lighting {
     }
 }
 
+/// How even the fog is before the wind has stirred anything, from banked to uniform.
+///
+/// **A dead calm is not a still photograph of one bank.** `Weather` gives foggy and snow a wind of
+/// exactly nought, so the coverage came back as the raw threshold on the noise: banks with clear
+/// gaps between them and nothing in between. Real air is never that settled — a layer sitting in a
+/// valley still drifts and mixes — and on screen the hard version read as blotches rather than as
+/// weather.
+///
+/// It lifts the whole set rather than only the still end, which is the point of putting it here: a
+/// rain at 0.3 comes out near a half and an ashstorm at 0.8 barely moves, so what changes most is
+/// exactly where the banking was most extreme.
+const FOG_STIRRED: f32 = 0.25;
+
 /// One moon as the shader reads it — see `struct Moon` in `bindings.glsl`.
 ///
 /// Sixteen floats packed tightly, which under `scalar` layout is exactly what the shader expects.
@@ -419,7 +432,7 @@ impl FrameConstants {
             // shader because it is one number for the whole frame and the march would recompute it
             // at every one of twenty-four steps a ray.
             fog_uniform: match lighting.fog_banked {
-                true => lighting.fog_wind.length().min(1.0),
+                true => FOG_STIRRED + (1.0 - FOG_STIRRED) * lighting.fog_wind.length().min(1.0),
                 false => 1.0,
             },
             fog_wind: lighting.fog_wind.to_array(),

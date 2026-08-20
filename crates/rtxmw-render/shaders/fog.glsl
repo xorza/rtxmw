@@ -367,10 +367,40 @@ vec3 fog_sunlight(vec3 direction) {
 // assumption is that the coverage a point sits in continues along that line, which is what a bank
 // looks like from inside it and is wrong only near a bank's edge, where the fog is thin and the term
 // is close to one anyway.
-float fog_sun_depth(float extinction) {
-    // A sun on the horizon lights an infinite column of fog; the floor is what keeps that finite.
-    float climb = max(-frame.sun_direction.z, 1e-3);
-    return extinction * FOG_HEIGHT / climb;
+float fog_beam_depth(float extinction, vec3 towards) {
+    // A light on the horizon shines down an infinite column of fog; the floor keeps that finite.
+    float climb = max(towards.z, 1e-3);
+    // **The layer's own scale height, which this did not use.** `fog_density_at` thins the fog over
+    // `FOG_HEIGHT * fog_lift` and this measured the beam's slant across a bare `FOG_HEIGHT`, so the
+    // two disagreed about how deep the air is by whatever the weather's lift was — a factor of
+    // eighteen in a blizzard. A beam and the medium it crosses cannot be reading different layers.
+    return extinction * FOG_HEIGHT * frame.fog_lift / climb;
+}
+
+// The share of a moon's own radiance the air returns toward `direction`, before the fog in the way.
+//
+// **Built from the disc as it is drawn, not from `light`.** `Moon::FULL_RADIANCE` is set by where
+// the tone curve stops keeping colour — a moon any brighter comes out white whatever tint it was
+// given — while `light` is what a surface should receive, and at Masser the second is thirty-two
+// times the first. Lighting the haze from `light` while drawing the disc from `colour` put a halo
+// several times brighter than the moon inside it and turned the whole night sky pink.
+//
+// **Capped at one, because scattering cannot send more toward the eye than the source is bright.**
+// A disc of radiance `L` subtending `solid` delivers `L * solid` head-on, so the returned radiance
+// is at most `L` — and the moon's own `colour` is that `L`, which is what makes the halo and the
+// face agree by construction.
+//
+// **Measured to the moon's edge rather than its centre.** Draine's forward peak is a fraction of a
+// degree across and Masser is eighteen, so convolving the two flattens everything inside the face
+// and moves the falloff out by the disc's radius — which is what subtracting the radius from the
+// angle does. Read as a point, the peak spent itself on the texel at the exact centre and drew a
+// red spark inside a grey moon; clamped to the edge's own angle instead of shifted by it, the peak
+// was thrown away and the moon went grey again.
+float fog_moon_share(Moon moon, vec3 direction) {
+    float solid = TAU * (1.0 - moon.cos_radius);
+    float away = max(acos(clamp(dot(direction, -moon.direction), -1.0, 1.0))
+                     - acos(clamp(moon.cos_radius, -1.0, 1.0)), 0.0);
+    return min(solid * fog_phase(cos(away)), 1.0);
 }
 
 // The radiance scattering toward the eye from a point in the fog.
@@ -423,6 +453,19 @@ vec4 fog_along(vec3 origin, vec3 direction, float distance, uvec2 pixel) {
     vec3 sun = fog_sunlight(direction);
     bool shafts = brightest(sun) > FOG_SHAFT_FLOOR * brightest(frame.fog);
 
+    // **The moons light the air too, and nothing was saying so.** `fog_light` carried the sun, the
+    // lamps and the flash; at night the only thing lighting the haze was `frame.fog`, the dome's own
+    // colour. So the air around a moon came back blue-grey however red the moon — and since the disc
+    // itself is extinguished by the weather in front of it, a rainy night drew the fog's colour and
+    // none of Masser's, at R/G 0.945 against 2.34 in clear air. That is not washed out, it is a
+    // different colour.
+    //
+    // Hoisted out of the march because only the air in the way varies along it: the share is an
+    // angle between two fixed directions, and it costs an `acos` that would otherwise be paid
+    // twenty-four times a ray.
+    vec3 masser = frame.masser.colour * fog_moon_share(frame.masser, direction);
+    vec3 secunda = frame.secunda.colour * fog_moon_share(frame.secunda, direction);
+
     float transmittance = 1.0;
     vec3 scattered = vec3(0.0);
     float behind = 0.0;
@@ -457,8 +500,14 @@ vec4 fog_along(vec3 origin, vec3 direction, float distance, uvec2 pixel) {
             float absorbed = 1.0 - exp(-extinction * stride);
             // Everything between the sun and this point: what the geometry stopped, what the fog
             // itself absorbed on the way down, and what any water overhead took out of it.
-            vec3 reaching = sun * visible
-                          * exp(-fog_sun_depth(extinction))
+            // No shadow ray for the moons, unlike the sun: Masser subtends eighteen degrees and
+            // its penumbra spreads over thirty-odd, which is not what a shaft is. Their own slant
+            // depths, though — at night `-frame.sun_direction` points down, the floor in
+            // `fog_beam_depth` pins it at 1e-3, and the sun's comes back as nothing at all.
+            vec3 reaching = (sun * visible
+                                 * exp(-fog_beam_depth(extinction, -frame.sun_direction))
+                           + masser * exp(-fog_beam_depth(extinction, -frame.masser.direction))
+                           + secunda * exp(-fog_beam_depth(extinction, -frame.secunda.direction)))
                           * daylight_reaching(position);
             scattered += transmittance * absorbed * fog_light(position, reaching);
             transmittance *= 1.0 - absorbed;

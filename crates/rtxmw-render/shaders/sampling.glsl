@@ -33,6 +33,13 @@ uvec2 sample_stream(uvec2 pixel) {
 // direct and indirect light is only right when this sits where it belongs.
 const float INV_PI = 0.318309886;
 
+// A whole turn — how a wavelength becomes a wavenumber, and how a radius becomes a solid angle.
+//
+// **Here rather than beside either caller.** It lived in `waves.glsl`, and when the fog came to need
+// it for a moon's disc the only thing making that compile was the order two unrelated files happen
+// to be included in. A number this general has one home, which is the one `INV_PI` already had.
+const float TAU = 6.2831853;
+
 // Distinct hash streams, so the direction a bounce takes and the shadow rays it then casts are not
 // drawn from the same numbers. Bounce `b`'s shadow rays use `STREAM_INDIRECT + b`, which is why
 // this is the last one.

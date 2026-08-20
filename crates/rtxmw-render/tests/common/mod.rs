@@ -5,8 +5,8 @@
 
 use glam::Vec3;
 use rtxmw_scene::{
-    Ambient, Instance, Light, Material, MaterialKind, MaterialTable, Mesh, StaticScene,
-    TerrainLayers,
+    Ambient, Instance, Light, Material, MaterialKind, MaterialTable, Mesh, MeshId, StaticScene,
+    Submesh, TerrainLayers,
 };
 
 /// Assembles a scene from loose parts, so a test can describe one without a content file.
@@ -64,4 +64,50 @@ pub(crate) fn scene_of(
         water_level: None,
         without_model: Vec::new(),
     }
+}
+
+/// A cell holding nothing but a dark floor far enough below to be out of the way.
+///
+/// **Silenced deliberately**: this module is compiled into every integration binary in the
+/// directory, and two of them want this. `scene_of` beside it is wanted by all of them and so needs
+/// no such note.
+///
+/// **What every test of the sky stands under.** Two of them had built their own copy — the same
+/// slab, the same near-black material, the same `ambient = None` so the dome supplies all of it —
+/// and the pair is a fixture rather than a subject: what is being measured in both is what is
+/// *above* it.
+#[allow(dead_code)]
+pub(crate) fn under_the_sky() -> StaticScene {
+    let far = 200_000.0;
+    let mut scene = scene_of(
+        &[Mesh {
+            positions: vec![
+                Vec3::new(-far, -far, -50_000.0),
+                Vec3::new(far, -far, -50_000.0),
+                Vec3::new(far, far, -50_000.0),
+                Vec3::new(-far, far, -50_000.0),
+            ],
+            normals: vec![Vec3::Z; 4],
+            uvs: vec![glam::Vec2::ZERO; 4],
+            indices: vec![0, 1, 2, 0, 2, 3],
+            submeshes: vec![Submesh {
+                first_index: 0,
+                index_count: 6,
+                material: 0,
+                thin: false,
+            }],
+        }],
+        &[Material {
+            diffuse: Vec3::splat(0.02),
+            ..Material::default()
+        }],
+        &[Instance {
+            mesh: MeshId(0),
+            transform: glam::Affine3A::IDENTITY,
+        }],
+        &[],
+        Vec3::splat(0.02),
+    );
+    scene.ambient = None;
+    scene
 }

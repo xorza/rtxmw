@@ -51,26 +51,6 @@ fn slab(z: f32, material: u32) -> Mesh {
     }
 }
 
-/// Nothing but a floor far below, so what is measured is the sky and what is in it.
-fn empty() -> StaticScene {
-    let mesh = slab(-50_000.0, 0);
-    let mut scene = common::scene_of(
-        &[mesh],
-        &[Material {
-            diffuse: Vec3::splat(0.02),
-            ..Material::default()
-        }],
-        &[Instance {
-            mesh: MeshId(0),
-            transform: Affine3A::IDENTITY,
-        }],
-        &[],
-        Vec3::splat(0.02),
-    );
-    scene.ambient = None;
-    scene
-}
-
 /// The same sky over a sea at `z = 0`, for what the water gives back rather than what the air does.
 fn sea() -> StaticScene {
     let mut scene = common::scene_of(
@@ -105,7 +85,7 @@ fn sea() -> StaticScene {
 
 /// The traced frame at `seconds`, looking from the origin toward `at`.
 fn looking(lightning: Lightning, seconds: f32, at: Vec3) -> Vec<u8> {
-    looking_over(&empty(), lightning, seconds, Vec3::ZERO, at)
+    looking_over(&common::under_the_sky(), lightning, seconds, Vec3::ZERO, at)
 }
 
 /// The traced frame at `seconds`, from `eye` toward `at` over whatever `scene` puts under it.
@@ -386,7 +366,7 @@ fn the_same_bolt_can_be_sent_again_and_a_new_one_lands_elsewhere() {
             &mut uploader,
             gpu.physical().limits(),
             CellId::Exterior { x: 0, y: 0 },
-            &empty(),
+            &common::under_the_sky(),
             &[],
         )
         .expect("scene should load");
@@ -657,7 +637,7 @@ fn the_deck_lights_up_where_the_discharge_is() {
             &mut uploader,
             gpu.physical().limits(),
             CellId::Exterior { x: 0, y: 0 },
-            &empty(),
+            &common::under_the_sky(),
             &[],
         )
         .expect("scene should load");
