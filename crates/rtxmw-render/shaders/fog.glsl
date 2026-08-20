@@ -377,6 +377,32 @@ float fog_beam_depth(float extinction, vec3 towards) {
     return extinction * FOG_HEIGHT * frame.fog_lift / climb;
 }
 
+// How much of the *skirt* around a moon the air hands back, and over how much of the moon's own
+// radius past the limb it gives way to that.
+//
+// **The only two figures in `fog_moon_share` that are a look rather than a derivation, and they
+// reach only half of it.** Taken whole, single scattering draws a forward lobe around a moon at
+// nearly half the moon's own brightness — which is what a bright source in water haze really does,
+// and on a night sky it read as a lamp behind frosted glass rather than as a moon.
+//
+// **It cannot simply be scaled down**, because the same term is the whole of why a red moon stays
+// red in rain: dimming it everywhere took the hue to 0.98, against 0.91 with no moonlight in the air
+// at all and 1.33 as it stands. So the face and the skirt are separated, and the separation is the
+// more correct of the two rather than a compromise — **light scattered by less than the source's own
+// angular width still arrives from the moon's direction.** It never leaves the disc, so it is part
+// of the image and keeps its full weight. What is drawn down is only what scatters far enough to
+// land outside the face, which single scattering overstates anyway: that light is itself attenuated
+// and spread again, and this model follows it no further.
+//
+// The second figure is what makes that a face-and-skirt split rather than a slow fade: at a seventh
+// of the radius the whole of the drop happens just outside the limb, so the disc is untouched and
+// what surrounded it is not. Measured on the radial profile out from Masser's centre in twenty-pixel
+// rings, against a sky of 39: whole, the glow runs 51 at eighty pixels and 43 at a hundred and does
+// not rejoin the sky until a hundred and twenty. Here it is 46 and 39 — gone by a hundred, with the
+// face itself unchanged at 131, which dimming everywhere would have taken to 124.
+const float FOG_MOONLIGHT = 0.15;
+const float FOG_MOON_LIMB = 0.15;
+
 // The share of a moon's own radiance the air returns toward `direction`, before the fog in the way.
 //
 // **Built from the disc as it is drawn, not from `light`.** `Moon::FULL_RADIANCE` is set by where
@@ -398,9 +424,13 @@ float fog_beam_depth(float extinction, vec3 towards) {
 // was thrown away and the moon went grey again.
 float fog_moon_share(Moon moon, vec3 direction) {
     float solid = TAU * (1.0 - moon.cos_radius);
-    float away = max(acos(clamp(dot(direction, -moon.direction), -1.0, 1.0))
-                     - acos(clamp(moon.cos_radius, -1.0, 1.0)), 0.0);
-    return min(solid * fog_phase(cos(away)), 1.0);
+    float radius = acos(clamp(moon.cos_radius, -1.0, 1.0));
+    float away = max(acos(clamp(dot(direction, -moon.direction), -1.0, 1.0)) - radius, 0.0);
+    // Whole across the face, where `away` is nought and the scattered light never left the disc,
+    // falling to `FOG_MOONLIGHT`'s share within a fraction of a radius outside it — see the pair for
+    // why the two halves differ.
+    float skirt = mix(1.0, FOG_MOONLIGHT, smoothstep(0.0, radius * FOG_MOON_LIMB, away));
+    return skirt * min(solid * fog_phase(cos(away)), 1.0);
 }
 
 // The radiance scattering toward the eye from a point in the fog.

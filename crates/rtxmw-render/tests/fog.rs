@@ -650,10 +650,13 @@ fn the_fog_scatters_the_moons_own_colour_and_not_the_domes() {
     // but not the moons: at night the only thing lighting the haze was `frame.fog`, the dome's own
     // blue-grey. So the disc was extinguished by the rain in front of it and replaced by the fog's
     // colour, which came out **bluer than it was red** rather than merely washed out.
-    // Clear air barely moves on this — 1.955 to 2.136 — because there the disc supplies its own
+    // Clear air barely moves on this — 1.955 to 2.128 — because there the disc supplies its own
     // light and the haze has little to add. Rain is where it decides the picture: 0.907 without the
-    // moons in `fog_light` against 1.458 with them, which is the difference between a grey moon and
+    // moons in `fog_light` against 1.326 with them, which is the difference between a grey moon and
     // a red one washed by weather.
+    //
+    // **This is the other end of `FOG_MOONLIGHT`**, which dims the skirt around a moon and must not
+    // reach the face doing it: a flat 0.15 across both takes this to 0.98, back inside the bug.
     let (dry, wet) = (moon_hue(&clear), moon_hue(&rain));
     assert!(
         dry > 1.5,
