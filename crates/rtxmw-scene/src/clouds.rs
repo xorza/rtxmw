@@ -11,7 +11,7 @@ use crate::world_time::WorldTime;
 ///
 /// The game uses 64 units per yard; OpenMW carries the conversion as `69.99125109`, which is beyond
 /// `f32` and rounds to this.
-const UNITS_PER_METRE: f32 = 69.991_25;
+pub(crate) const UNITS_PER_METRE: f32 = 69.991_25;
 
 /// How fast the air thins with height — the atmosphere's scale height.
 ///

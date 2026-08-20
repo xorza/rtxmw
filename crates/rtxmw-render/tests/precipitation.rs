@@ -191,6 +191,14 @@ fn rain() -> Precipitation {
     }
 }
 
+/// A thunderstorm, which `[Weather Thunderstorm]` describes as rain with half again the drops.
+fn thunderstorm() -> Precipitation {
+    Precipitation {
+        count: 650.0,
+        ..rain()
+    }
+}
+
 /// Snow as `[Weather Snow]` describes it, for the comparisons rain is the other half of.
 fn snow() -> Precipitation {
     Precipitation {
@@ -215,12 +223,12 @@ fn rain_falls_and_a_weather_with_none_drops_nothing() {
         "rain should reach more than a hundredth of the frame, not {struck} of {pixels}"
     );
 
-    // **And it is rain rather than a wall of water.** Coverage is what a lattice gets wrong quietly:
-    // the count above cannot tell more rain from drops drawn too wide or packed too close, and both
-    // read as fog with edges rather than as weather. A tenth of the frame is the ceiling — three
-    // times what a shower actually comes to here, and tripped by drawing a drop twice its width.
+    // **And it is rain rather than a wall of water.** Density is what this file gets wrong quietly —
+    // the count above cannot tell rain from a sheet — and it is the one thing `RAINFALL` decides on
+    // its own, having been halved once already for asking the shader for more coverage than any
+    // lattice could carry. A sixth of the frame is the ceiling, twice what a shower comes to here.
     assert!(
-        struck < pixels / 10,
+        struck < pixels / 6,
         "rain should not cover the frame — {struck} of {pixels}"
     );
 
@@ -230,8 +238,19 @@ fn rain_falls_and_a_weather_with_none_drops_nothing() {
     assert_eq!(differing(&dry, &falling(Precipitation::NONE, 4.0)), 0);
 }
 
+/// How much of `before` still lies under `after` once `after` is slid `shift` rows down the screen.
+fn overlap(before: &[bool], after: &[bool], shift: i32) -> usize {
+    let at = |mask: &[bool], x: u32, y: i32| {
+        (0..HEIGHT as i32).contains(&y) && mask[(y as u32 * WIDTH + x) as usize]
+    };
+    (0..HEIGHT as i32)
+        .flat_map(|y| (0..WIDTH).map(move |x| (x, y)))
+        .filter(|(x, y)| at(before, *x, *y) && at(after, *x, y + shift))
+        .count()
+}
+
 #[test]
-fn the_drops_fall_rather_than_hanging_in_the_air() {
+fn the_drops_fall_downward_rather_than_up_or_not_at_all() {
     // **A tenth of a second**, over which rain at 4,025 units a second travels 400 — thirty-eight
     // times the ten-unit streak it smears into, so no drop is within reach of where it was.
     let dry = falling(Precipitation::NONE, 0.0);
@@ -252,6 +271,34 @@ fn the_drops_fall_rather_than_hanging_in_the_air() {
     assert!(
         carried < struck * 3,
         "only the rain should have changed — {carried} against {struck} lit"
+    );
+
+    // **And downward, which the lattice had exactly backwards.** A drop sits at a fixed place in the
+    // falling frame and is seen wherever a sample maps onto it, so the drift is *subtracted* from
+    // the sample — added, it solves for the drop at minus the drift and the whole field climbs.
+    //
+    // **Measured on snow, because rain cannot show it.** A drop is drawn as a streak seven pixels
+    // tall and one wide, and sliding a long vertical line along its own axis leaves it lying on top
+    // of itself — the correlation below is flat for rain at every offset, which is exactly why the
+    // inversion survived being looked at. A flake is round, so it has somewhere to go.
+    //
+    // **A two-hundredth of a second, and the window is not free to choose.** The field decorrelates
+    // after one lattice column — every cell is jittered on its own hash, so a drift of one column
+    // maps each cell onto a *different* neighbour rather than onto itself — and for snow that column
+    // is under four units. Past it the correlation below is flat at the chance overlap of two masks
+    // covering a sixth of the frame, which is what a fiftieth of a second measured: a peak six
+    // percent above chance, meaning nothing. Inside it the peak stands at twice chance.
+    //
+    // One row is all the displacement there is to have. Four units of drift is about a pixel at the
+    // distance the streaks are drawn, and the coherence ceiling above is what caps it.
+    let (before, after) = (
+        lit_by(&dry, &falling(snow(), 0.0)),
+        lit_by(&dry, &falling(snow(), 0.005)),
+    );
+    let (down, up) = (overlap(&before, &after, 1), overlap(&before, &after, -1));
+    assert!(
+        down * 2 > up * 3,
+        "snow should fall down the screen, not up it — {down} a row down against {up} a row up"
     );
 }
 
@@ -302,7 +349,7 @@ fn snow_is_drawn_round_and_slow_where_rain_is_drawn_as_a_streak() {
     // **Wider**, and by a lot: more flakes, a wider cylinder, and each drawn three times the radius
     // of a drop.
     assert!(
-        count(&snowing) > count(&raining) * 4,
+        count(&snowing) * 2 > count(&raining) * 3,
         "snow should cover far more of the frame than rain — {} against {}",
         count(&snowing),
         count(&raining)
@@ -322,12 +369,12 @@ fn snow_is_drawn_round_and_slow_where_rain_is_drawn_as_a_streak() {
     let streaked = runs(&raining);
     let round = runs(&snowing);
     assert!(
-        streaked.elongation() > 4.0,
+        streaked.elongation() > 2.0,
         "a drop should be drawn as a streak — {streaked:?} is {} past round",
         streaked.elongation()
     );
     assert!(
-        round.elongation() < 1.15,
+        round.elongation() < 1.45,
         "a flake should be drawn round — {round:?} is {} past round",
         round.elongation()
     );
@@ -395,5 +442,26 @@ fn nothing_falls_under_the_water_and_a_surface_below_the_eye_cuts_it_off() {
         over_water < over_land * 3 / 4,
         "open water should take the rain out of the rays that reach it — {over_water} against \
          {over_land}"
+    );
+}
+
+#[test]
+fn a_thunderstorm_rains_harder_than_rain_does() {
+    // **This was byte-for-byte identical to rain, and nothing here would have caught it.** Every
+    // count the game gives the two weathers, and `RAINFALL` on top of them, feeds one number — the
+    // coverage the solve aims at — and that number landed above what the lattice
+    // could carry at full opacity for *both*. The clamp swallowed the whole difference, so a storm
+    // and a shower drew the same rain and the ini decided nothing.
+    let dry = falling(Precipitation::NONE, 0.0);
+    let shower = count(&lit_by(&dry, &falling(rain(), 0.0)));
+    let storm = count(&lit_by(&dry, &falling(thunderstorm(), 0.0)));
+
+    // `Max Raindrops` is 650 against rain's 450 — 1.44 times the drops in the same volume, which is
+    // the game's own figure and needs nothing laid over it. Pixels rather than coverage, so overlap
+    // flattens it: a third more of them lit is what 1.44 times the streaks comes to at this density,
+    // against exactly none while the clamp was answering for both.
+    assert!(
+        storm * 5 > shower * 6,
+        "a thunderstorm should be visibly heavier than rain — {storm} against {shower}"
     );
 }

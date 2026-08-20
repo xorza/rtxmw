@@ -23,9 +23,37 @@
 // floor's distance crossed the volume's, and it is why the horizon band survived every other fix —
 // the same incoherence, seen along a different contour.
 //
-// Twenty units is twenty-eight centimetres: coarse enough for a march to resolve, fine enough that
-// a streak is a streak rather than a lozenge.
-const float PRECIP_CELL = 10.0;
+// How solid a drawn streak is, from which the lattice that carries it is solved.
+//
+// **The cell is derived and this is the knob, which is the other way round from how it began.** A
+// fixed cell fixes how many streaks a ray meets, and the opacity each needs to reach the physical
+// coverage then falls where it falls — which for both rain weathers was above one, so the clamp took
+// the difference and they drew the same rain. Every count the game writes, and `RAINFALL` over them,
+// decided nothing at all.
+//
+// Turned around it cannot happen. Coverage is `steps * pi r^2 / cell^2 * duty` with `steps` as
+// `walked / cell`, so `alpha = wanted * cell^3 / (walked * pi r^2 * duty)`; `wanted` carries
+// `walked` too, and it cancels. What is left solves for the cell in closed form:
+//
+//     cell = spacing * cbrt(PRECIP_OPACITY * r^2 * duty / (PRECIP_SPREAD * PRECIP_RADIUS^2))
+//
+// So the cell tracks the weather's own drop spacing — more drops in the air, a finer lattice, more
+// streaks across a ray, which is the whole of how `Max Raindrops` reaches the picture — and it
+// tracks the drawn radius as its two-thirds power, which is what holds a flake drawn three times a
+// drop's width to the same opacity instead of a ninth of it. Four fifths for every weather, by
+// construction, with the clamp a guard that cannot bind.
+//
+// **Per weather is not per pixel**, which is the distinction the horizon band turned on: `spacing`
+// is one number for the whole frame, so every ray still agrees about where the drops are. What was
+// incoherent was deriving the lattice from the *ray*.
+const float PRECIP_OPACITY = 0.8;
+
+// What the cell may not fall outside, in world units, whatever spacing it is handed.
+//
+// A guard on data rather than a tuning knob: a weather with an absurd count would otherwise divide
+// the world into cells finer than the march can walk, or coarser than the volume it is drawn in.
+const float PRECIP_CELL_MIN = 2.0;
+const float PRECIP_CELL_MAX = 40.0;
 
 // The most cells a ray walks before it stops asking.
 //
@@ -36,17 +64,20 @@ const float PRECIP_CELL = 10.0;
 // exactly where the ray runs perpendicular to the fall. Painting `abs(dot(direction, fall))` puts a
 // black line straight through the middle of that band.
 //
-// Twenty-four covers four hundred and eighty units, comfortably past the volume, and a ray that
-// meets a surface sooner simply stops.
-const uint PRECIP_STEPS = 32u;
+// The cell is the weather's now, so this is a ceiling rather than a count: sixty-four of the finest
+// any weather asks for — a thunderstorm's seven units — covers four hundred, past the deepest volume
+// the game names, and a ray that meets a surface sooner simply stops. What they actually walk is
+// twenty-six for rain, twenty-nine for a thunderstorm, and twenty-two for snow, whose flakes are
+// drawn three times as wide and so sit in a lattice twice as coarse.
+const uint PRECIP_STEPS = 64u;
 
 // How near the eye the march starts, in world units.
 //
 // **This, and not the cell size, is what sets how big a drop looks.** A streak's size on screen is
-// its radius over its distance, and the radius is a fraction of the cell while the nearest sample
-// sits half a cell out — so the two cancel and shrinking the lattice only ever made *more* drops the
-// same size. What is left is where the march begins: at half a cell it began five units from the
-// eye, where a streak subtends four degrees and covers seventy pixels.
+// its radius over its distance; `PRECIP_DRAWN` fixes the first in world units, so all the lattice
+// decides is the second — and the nearest sample sits half a cell past this. At half a cell and
+// nothing else the march began five units from the eye, where a streak subtends four degrees and
+// covers seventy pixels.
 //
 // A hundred units is a metre and a half, and it is also honest: a drop that close is far outside
 // the depth of field of any lens focused on a landscape, which is why Garg and Nayar photograph and
@@ -57,15 +88,43 @@ const float PRECIP_NEAR = 100.0;
 // How wide a real drop is, in world units.
 //
 // **The physical radius, which is what fixes how much of the air the rain blocks** — not what is
-// drawn, which is `PRECIP_WIDTH` of a cell. Together with the host's spacing it says what fraction
-// of a ray real drops would cover, and the shader solves the drawn streaks' opacity to match.
+// drawn, which is `PRECIP_DRAWN`. Together with the host's spacing it says what fraction of a ray
+// real drops would cover, and the shader solves the drawn streaks' opacity to match.
 //
-// A millimetre and a half of radius, which is a real raindrop: — Garg and Nayar measured a mean
-// of 2 mm across the drops they photographed and rendered their streak database at 1.6, and
-// Marshall-Palmer's distribution puts the mean diameter of moderate rain near half a millimetre
-// with the large drops that carry the visible streaks well above it. Seventy units to the metre
-// makes 1.5 mm a tenth of a unit.
-const float PRECIP_RADIUS = 0.105;
+// **One radius for a whole distribution, and there is only one that is right.** A millimetre and a
+// half stood here, which is a large drop — the kind Garg and Nayar photographed and rendered their
+// streak database at. But what a ray meets is every drop in the air, most of them far smaller, and
+// what decides how much of it they block is the *mean cross-section*, not the biggest one.
+//
+// Marshall and Palmer give the distribution in closed form and it comes out in one line. For
+// `N(D) = N0 exp(-ΛD)` the mean square diameter is `2 / Λ^2`, so the mean cross-section per drop is
+// `(π/4)<D^2> = π / (2Λ^2)`, and the radius of a disc with that area is
+//
+//     r = 1 / (Λ sqrt 2)
+//
+// At `Λ = 4.1 R^-0.21` for moderate rain — ten millimetres an hour — that is 2.528 per millimetre
+// and `r` is 0.280 mm, a fifth of what stood here and a twenty-ninth of the area. Seventy units to
+// the metre makes it a fiftieth of a unit.
+const float PRECIP_RADIUS = 0.019577;
+
+// How much more of a ray the drawn streaks cover than real drops block.
+//
+// **The one number here that physics does not give, and it is honest about which one it is.** Run
+// the line above out and moderate rain blocks about two parts in a thousand of a three-metre ray:
+// real rain is nearly transparent, and a photograph of it shows streaks anyway because a drop is a
+// *lens* — see `PRECIP_LIT` — that gathers a hundred and sixty degrees of the world into a small
+// solid angle and comes back many times brighter than what is behind it. Rain is a radiance, not an
+// occlusion.
+//
+// A renderer cannot have that shape. Two parts in a thousand at fifty times the background is a
+// scattering of sub-pixel specks, which alias into crawling static and which Ray Reconstruction then
+// eats — §8.64 is the whole account of losing that argument. So the same signal is spread: more of
+// the ray covered, each streak dimmer, and `coverage * radiance` is what is held.
+//
+// Thirty-five is the factor that holds it, and the check on it is that `PRECIP_SPREAD * PRECIP_LIT`
+// comes to a lens gain near fifty — which is the order Garg and Nayar and Wang both put a drop's at,
+// arrived at from the other end.
+const float PRECIP_SPREAD = 35.0;
 
 // How much wider a flake is drawn than a drop.
 //
@@ -73,12 +132,21 @@ const float PRECIP_RADIUS = 0.105;
 // is what makes a flake read as a flake where a drop reads as a smear.
 const float PRECIP_FLAKE = 3.0;
 
-// How wide a drawn streak is, as a fraction of the cell it sits in.
+// How wide a drawn streak is, in world units.
 //
 // **A drawing width, not the drop's own** — that is `PRECIP_RADIUS`, which still sets how much of
-// the air the rain blocks. This only decides how a streak is spread across the cell the sampling
-// can resolve: wide enough to be seen, narrow enough to leave air between one and the next.
-const float PRECIP_WIDTH = 0.035;
+// the air the rain blocks. This only decides how a streak is spread across what the sampling can
+// resolve: wide enough to be seen, narrow enough to leave air between one and the next.
+//
+// **In the world rather than in the cell**, which it was, and that was the whole of why the coverage
+// solve saturated. A drop is a thing in the air and how wide it is drawn cannot depend on how finely
+// the ray is sampled — the same argument the lattice below makes about where the drops *are*, which
+// took four failed attempts at the horizon band to arrive at. It also made the cell useless as a
+// knob: coverage goes as `r^2 / cell^2`, so a cell that set `r` could not move it at all.
+//
+// Five millimetres, and the same five millimetres a drop was always drawn at — what the change moved
+// is how many of them a ray meets, not how big one is.
+const float PRECIP_DRAWN = 0.35;
 
 // How long the shutter is that a streak is smeared over, in seconds.
 //
@@ -126,6 +194,12 @@ const float PRECIP_REAL = 630.0 / 4025.0;
 // background and around a lamp. Wang and colleagues compute the whole transfer with precomputed
 // radiance transfer over an environment map; this takes the dome in the drop's mirror direction and
 // scales it, which is that averaged down to one sample.
+//
+// **Coupled to `PRECIP_SPREAD`, and moving one alone breaks the other's argument.** A real drop's
+// gain is tens, not 1.4; the rest of it was traded there for coverage, because a scattering of very
+// bright sub-pixel specks is what the upscaler destroys. What the two hold between them is the
+// product, so `PRECIP_SPREAD * PRECIP_LIT` is the gain actually being claimed — near fifty, which is
+// the order the literature puts a drop's at, and the only check either number has.
 const float PRECIP_LIT = 1.4;
 
 // Two axes across the fall, so a drop can be placed in the plane it falls through.
@@ -212,16 +286,17 @@ vec4 precipitation_along(vec3 origin, vec3 direction, float span) {
     precip_basis(fall, across, along);
 
     // The lattice falls, so the field is static in its own frame and a drop's motion is exact.
+    //
+    // **Subtracted from the sample, not added to it**, and the difference is which way the rain
+    // goes. A drop sits at a fixed place `L` in the falling frame and is seen wherever the sample
+    // point maps to it, so adding the drift solves `p + d = L` and puts the drop at `L - d` — which
+    // climbs, because `d` points down. Rain hid it: its streaks are long and near vertical and turn
+    // over completely between frames, so up and down look alike. Snow drawn as a round flake
+    // drifting slowly does not hide anything.
     vec3 drift = frame.precip_fall * frame.time;
-    // **The lattice is the world's, and the march walks it a cell at a time.**
-    float across_side = PRECIP_CELL;
-    float walked = min(reach - PRECIP_NEAR, PRECIP_CELL * float(PRECIP_STEPS));
-    if (walked <= 0.0) {
-        return vec4(0.0, 0.0, 0.0, 1.0);
-    }
-    uint steps = uint(max(walked / PRECIP_CELL, 1.0));
-    // Wide enough to be seen against a cell that size and narrow enough to leave air between them.
-    float radius = across_side * PRECIP_WIDTH * (frame.precip_snow > 0.0 ? PRECIP_FLAKE : 1.0);
+    // Wide enough to be seen against the cell it sits in and narrow enough to leave air between one
+    // streak and the next — and the cell is solved from it below, not the other way round.
+    float radius = PRECIP_DRAWN * (frame.precip_snow > 0.0 ? PRECIP_FLAKE : 1.0);
 
     // How far this weather's own drop travels while the shutter is open — and never less than it is
     // drawn across, because below that a shape is not short, it is *pointed the wrong way*. `down`
@@ -237,18 +312,47 @@ vec4 precipitation_along(vec3 origin, vec3 direction, float span) {
     // air rather than a thinner shower.
     float column = streak / PRECIP_DUTY;
 
+    // **The lattice is the weather's, and the march walks it a cell at a time.** Solved so a drawn
+    // streak comes out at `PRECIP_OPACITY` — see that constant, which carries the whole derivation.
+    // Both cross-sections are discs now, so the pi divides out and the cell is a ratio of radii.
+    float cells_cubed = PRECIP_OPACITY * radius * radius * PRECIP_DUTY
+                      / (PRECIP_SPREAD * PRECIP_RADIUS * PRECIP_RADIUS);
+    float across_side = clamp(frame.precip_spacing * pow(cells_cubed, 1.0 / 3.0),
+                              PRECIP_CELL_MIN, PRECIP_CELL_MAX);
+    float walked = min(reach - PRECIP_NEAR, across_side * float(PRECIP_STEPS));
+    if (walked <= 0.0) {
+        return vec4(0.0, 0.0, 0.0, 1.0);
+    }
+    uint steps = uint(max(walked / across_side, 1.0));
+
     // **And the coverage stays the air's, which is what keeps the picture honest.** A lattice this
-    // coarse holds far fewer drops than the air does, so each has to carry more: the *physical*
-    // answer is what a ray crossing `n * 4r^2 * L` of real drop cross-section blocks, with `n` and
-    // `r` the ones the host's spacing and `PRECIP_RADIUS` give, and what is solved for here is the
-    // opacity a drawn streak needs for this many cells of a coarse lattice to come to the same
-    // total. Nothing about how it looks moves how much of it there is.
+    // coarse holds far fewer drops than the air does, so each has to carry more: the physical answer
+    // is what a ray crossing `n * pi r^2 * L` of real drop cross-section blocks — a disc, which is
+    // what a sphere presents to a ray, where this squared the diameter instead and ran a quarter
+    // over — with `n` and `r` the ones the host's spacing and `PRECIP_RADIUS` give. `PRECIP_SPREAD`
+    // then says how much more of the ray is drawn than blocked, and what is solved for below is the
+    // opacity a drawn streak needs for this many cells of a coarse lattice to come to that total.
+    // Nothing about how it looks moves how much of it there is.
     float density = 1.0 / max(frame.precip_spacing * frame.precip_spacing
                               * frame.precip_spacing, 1e-6);
-    float wanted = 4.0 * PRECIP_RADIUS * PRECIP_RADIUS * walked * density;
-    // The disc a streak presents against the cell it sits in — `pi r^2 / s^2`, with the reciprocal
-    // because `sampling.glsl` carries `INV_PI` and no `PI`.
-    float chance = (radius * radius / INV_PI) / max(across_side * across_side, 1e-6);
+    float wanted = PRECIP_SPREAD * (PRECIP_RADIUS * PRECIP_RADIUS / INV_PI) * walked * density;
+    // The odds a sample lands on a streak: the disc one presents against the cell it sits in —
+    // `pi r^2 / s^2`, with the reciprocal because `sampling.glsl` carries `INV_PI` and no `PI` —
+    // times the share of the column it fills along the fall.
+    //
+    // **The duty belongs here and was missing**, which quietly overstated the odds by nearly two and
+    // sent `alpha` to the clamp that much sooner. A sample inside the drop's radius but in the gap
+    // behind the streak is thrown away by `lengthways` below, and a solve that does not know that is
+    // not solving for what gets drawn.
+    float chance = (radius * radius / INV_PI) / max(across_side * across_side, 1e-6)
+                 * min(streak / column, 1.0);
+    // **A guard rather than a limit, which it had quietly become.** An opacity above one is not a
+    // thing, so it is clamped — but for both rain weathers `wanted` used to land above what this
+    // lattice could carry at full opacity, and the clamp swallowed the difference. Rain and
+    // thunderstorm came out of it byte for byte identical, which meant the ini's counts, `RAINFALL`
+    // both decided nothing at all for the two weathers they were written for. With `PRECIP_DRAWN`
+    // off the cell and the cell solved from the opacity, this cannot come out above one at all, and
+    // the counts drive the picture again.
     float alpha = min(wanted / max(float(steps) * chance, 1e-6), 1.0);
 
     float through = 1.0;
@@ -257,8 +361,8 @@ vec4 precipitation_along(vec3 origin, vec3 direction, float span) {
         if (layer >= steps) {
             break;
         }
-        float at = PRECIP_NEAR + PRECIP_CELL * (float(layer) + 0.5);
-        vec3 position = origin + direction * at + drift;
+        float at = PRECIP_NEAR + across_side * (float(layer) + 0.5);
+        vec3 position = origin + direction * at - drift;
         vec3 latticed = vec3(dot(position, across), dot(position, along), dot(position, fall));
         float down;
         float phase;

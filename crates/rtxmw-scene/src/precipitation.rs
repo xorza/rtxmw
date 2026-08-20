@@ -13,36 +13,25 @@ const GRAVITY: f32 = 575.0;
 
 /// How many real drops there are for every one the game counts.
 ///
-/// **Morrowind's counts are a sprite-era budget, not a rain rate.** Four hundred and fifty drops in
-/// a cylinder nine metres across and thirteen tall is 0.6 to the cubic metre. Marshall and Palmer's
-/// distribution — the standard one, `N(D) = N0 exp(-ΛD)` with `N0 = 8000 m^-3 mm^-1` and
-/// `Λ = 4.1 R^-0.21` — puts moderate rain at about **three thousand** to the cubic metre, five
-/// thousand times as many. Six hundred sprites was all a 2002 renderer could draw; a ray does not
-/// have that problem.
+/// **Morrowind's counts are a sprite-era budget, not a rain rate**, and this is the whole of the
+/// conversion — derived, not chosen. Rain's cylinder is `Rain Diameter` across and the gap between
+/// its two `Height` keys tall: 600 by 500 units is 412 cubic metres, and the 450 drops
+/// `Max Raindrops` allows it are **1.09 to the cubic metre**. Marshall and Palmer's distribution —
+/// the standard one, `N(D) = N0 exp(-ΛD)` with `N0 = 8000 m^-3 mm^-1` and `Λ = 4.1 R^-0.21` — holds
+/// `N0 / Λ` drops, which for moderate rain at ten millimetres an hour is **3,165**. The ratio is
+/// 2,900 and nothing here picked it.
 ///
-/// The *ratios* stay the game's: thunderstorm's 650 against rain's 450 is still the heavier rain,
-/// and snow's 750 flakes still outnumber both.
-const RAINFALL: f32 = 5000.0;
-
-/// The lightest count any weather names, which the spread below is measured from.
+/// Six hundred sprites was all a 2002 renderer could draw; a ray does not have that problem.
 ///
-/// `[Weather Rain]`'s `Max Raindrops`. Rain is the weather that stays exactly where the file puts
-/// it, and every other one is a ratio to it.
-const LIGHTEST: f32 = 450.0;
-
-/// How much steeper the counts are in this renderer than the ini writes them.
+/// **It read 0.6 and five thousand before, and both were wrong.** The density was computed while
+/// `height` still added the two keys instead of subtracting them — see that field — and five
+/// thousand was the ratio that followed from it. The figure then went to 2,750 by eye, tuned against
+/// screenshots until rain stopped burying the scene, which landed within five percent of the number
+/// the distribution gives. That agreement is the reason to take the derivation and drop the tuning.
 ///
-/// **The second place the game's own ratio is not obeyed, and for the same reason as the first.**
-/// How much of a ray the rain covers goes as the count, and the file puts a thunderstorm at 650
-/// drops against rain's 450 — a ratio of 1.44, which is a change nobody watching a storm break
-/// would call one. `DEPTH_CURVE` in `sky.rs` has the whole argument: a number Bethesda tuned against
-/// a fixed sprite budget is not a rate, and no rescaling that leaves rain where it is can pull 1.44
-/// apart.
-///
-/// So the order stays the game's and the spacing does not. Two and a half leaves rain untouched by
-/// construction and puts a thunderstorm at two and a half times it, which is the difference between
-/// weather and weather to get out of.
-const COUNT_CURVE: f32 = 2.5;
+/// The *ratios* stay the game's, and they show: thunderstorm's 650 against rain's 450 is the heavier
+/// rain, and snow's 750 flakes outnumber both.
+const RAINFALL: f32 = 2900.0;
 
 /// What a weather drops, and how thickly.
 ///
@@ -146,18 +135,23 @@ impl Precipitation {
     ///
     /// **Derived from the count rather than named**, because the count is what the game gives: so
     /// many in the air at once inside a cylinder `diameter` across and `height` tall. One drop to a
-    /// cube of this side puts the same number in the same volume, and the lattice the shader tests
-    /// against is that cube — a square across the fall, repeating along it. At a real rain rate — see
-    /// `RAINFALL` — that comes to about five units, seven centimetres, which is what three
-    /// thousand drops to the cubic metre means.
+    /// cube of this side puts the same number in the same volume, and the shader sizes its lattice
+    /// from this — finer where the air holds more, which is the whole of how `Max Raindrops` reaches
+    /// the picture.
+    ///
+    /// **The game's own ratios, with nothing laid over them.** A curve used to steepen the counts
+    /// here, on the reasoning that thunderstorm's 650 against rain's 450 was a ratio nobody watching
+    /// a storm break would call a change. The reasoning was wrong about its evidence: the two looked
+    /// identical because the shader clamped them both to the same coverage, not because 1.44 is too
+    /// small to see. Once the clamp could not bind, 1.44 was plainly a storm — and the same curve had
+    /// meanwhile turned snow's 750 flakes into a whiteout.
     pub fn spacing(&self) -> f32 {
         if !self.falls() {
             return 0.0;
         }
         let radius = self.diameter * 0.5;
         let volume = std::f32::consts::PI * radius * radius * self.height;
-        let counted = LIGHTEST * (self.count / LIGHTEST).powf(COUNT_CURVE);
-        (volume / (counted * RAINFALL)).cbrt()
+        (volume / (self.count * RAINFALL)).cbrt()
     }
 
     /// How far from the eye they are drawn, in world units.
@@ -167,5 +161,57 @@ impl Precipitation {
     /// rain weather carries nearly twice clear's `Land Fog Depth` to be that haze with.
     pub fn reach(&self) -> f32 {
         self.diameter * 0.5
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::clouds::UNITS_PER_METRE;
+
+    #[test]
+    fn the_lattice_holds_the_number_of_drops_marshall_and_palmer_give_the_air() {
+        // **Run out here rather than written down**, so the figure `RAINFALL` is derived from is the
+        // distribution rather than a number transcribed from it. `Λ = 4.1 R^-0.21` at ten
+        // millimetres an hour, and `N0 / Λ` with `N0 = 8000 m^-3 mm^-1`.
+        let slope = 4.1 * 10f32.powf(-0.21);
+        let expected = 8_000.0 / slope;
+        assert!(
+            (slope - 2.528).abs() < 1e-3 && (expected - 3_164.7).abs() < 1.0,
+            "the slope should put moderate rain near 3,165 drops a cubic metre, not {expected}"
+        );
+
+        let rain = Precipitation {
+            count: 450.0,
+            diameter: 600.0,
+            height: 500.0,
+            fall: 4_025.0,
+            snow: false,
+        };
+        // One drop to a cube of `spacing`, so the density is its reciprocal — carried from cubic
+        // units to cubic metres, which is what the figure above is in.
+        let per_cubic_metre = UNITS_PER_METRE.powi(3) / rain.spacing().powi(3);
+        assert!(
+            (per_cubic_metre / expected - 1.0).abs() < 0.01,
+            "rain should hold Marshall-Palmer's density, not {per_cubic_metre} against {expected}"
+        );
+
+        // **And the count is what moves it**, which is the only way the ini reaches the picture: a
+        // thunderstorm's 650 raindrops in the same cylinder is 650/450 of the density, so its
+        // spacing is the cube root of 450/650 of rain's. Exactly, not approximately — nothing curves
+        // the counts on the way through any more.
+        let storm = Precipitation {
+            count: 650.0,
+            ..rain
+        };
+        let ratio = storm.spacing() / rain.spacing();
+        let exact = (450.0f32 / 650.0).cbrt();
+        assert!(
+            (ratio - exact).abs() < 1e-5,
+            "a thunderstorm should stand {exact} of rain's spacing apart, not {ratio}"
+        );
+
+        // A weather with nothing falling has no lattice at all, which is what the shader leaves on.
+        assert_eq!(Precipitation::NONE.spacing(), 0.0);
     }
 }
