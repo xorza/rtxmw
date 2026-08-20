@@ -45,8 +45,18 @@ use crate::visibility_pass::Lighting;
 /// **Retuned when the outdoor extinction moved and not before**, which is how the census office
 /// turned into a steam room: this was chosen against an extinction of 1.2e-4 and left alone while
 /// that went to 5e-4, so every interior was silently four times as thick as it had been looked at.
-/// The rest of the drop below that factor is by eye, indoors reading better as a veil than as air.
-const INDOOR_FOG_SCALE: f32 = 0.006;
+///
+/// **Then it was cut too far the other way.** At 0.006 the game's median interior came out at a
+/// sixty-seventh of a clear day's air across a room, which measures as *nothing*: a fixture at that
+/// setting renders byte-identical with the fog on and off. And the game fogs every interior it
+/// ships — 1,134 of them carry a density in `Morrowind.esm`, not one is zero, the range is 0.25 to
+/// 1.5 and the mean 0.87. A renderer showing none of that is discarding the record rather than
+/// reading it.
+///
+/// Settled by eye against the Guild of Mages and Abaelun Mine: below this the veil is barely there,
+/// and far above it the far wall of a room washes out and a cave turns to soup. `FOG_DENSITY` in
+/// `tests/fog.rs` is the other half of a product and moves with this.
+const INDOOR_FOG_SCALE: f32 = 0.03;
 
 /// Placements only. Everything a cell *names* — its meshes, its textures, its materials — belongs
 /// to the renderer rather than to the cell, because the cell next door names most of the same

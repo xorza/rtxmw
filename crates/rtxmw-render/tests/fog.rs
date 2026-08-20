@@ -23,10 +23,16 @@ const FOG_COLOUR: Vec3 = Vec3::new(0.6, 0.05, 0.05);
 
 /// How thickly, which is far above anything an interior ships.
 ///
-/// An interior's recorded density is scaled down hard before it reaches the march — a room is meant
-/// to hold a veil, and a veil across a fixture this small measures as noise. What is under test is
-/// the integral over distance, and this buys enough of one to see.
-const FOG_DENSITY: f32 = 140.0;
+/// An interior's recorded density is scaled down before it reaches the march — a room is meant to
+/// hold a veil, and a veil across a fixture this small measures as noise. What is under test is the
+/// integral over distance, and this buys enough of one to see.
+///
+/// **It is the product with `INDOOR_FOG_SCALE` that matters, so the two move together.** This stood
+/// at 140 against a scale of 0.006; when the scale rose — because the game fogs every one of its
+/// interiors and this renderer was showing none of it — the same number became several times the
+/// air, and two tests here reported a fog so opaque that forward and back came out identical, a
+/// ratio of NaN. Twenty-eight against 0.03 restores the product exactly.
+const FOG_DENSITY: f32 = 28.0;
 
 /// A flat quad from four corners, of the fixture's only material.
 ///
@@ -667,5 +673,42 @@ fn the_fog_scatters_the_moons_own_colour_and_not_the_domes() {
     assert!(
         wet > 1.2,
         "rain should wash the red moon, not turn it grey — {wet} against {dry} in clear air"
+    );
+}
+
+/// What the game's own interiors record, out of 1,134 of them in `Morrowind.esm`.
+///
+/// Every one carries a density and not one is zero: the range is 0.25 to 1.5, the mean 0.87. The
+/// median is what a room here stands under.
+const SHIPPED_INTERIOR_FOG: f32 = 0.75;
+
+#[test]
+fn a_room_the_game_ships_is_fogged_at_all() {
+    // **The scale between the record and the march had made this nothing.** The original engine set
+    // fog by a start and an end distance against the view range, so the same dial means a different
+    // amount of air indoors and out and the conversion has to be explicit — but at the figure it
+    // was left on, the median interior came out at a sixty-seventh of a clear day's air across a
+    // room, which is to say the game fogs all eleven hundred of its interiors and this rendered
+    // none of them.
+    //
+    // Across a hall's depth rather than a closet's, because the veil is an integral over distance
+    // and the shortest fixture here resolves it to a single 8-bit level — a true reading and far too
+    // fine a margin to hold a test on.
+    let mut room = wall(4_000.0, &[], Vec3::splat(0.6));
+    room.ambient = Some(Ambient {
+        colour: Vec3::splat(0.4),
+        fog: FOG_COLOUR,
+        fog_density: SHIPPED_INTERIOR_FOG,
+        ..Ambient::default()
+    });
+
+    let dry = centre(&room, 0.0);
+    let veiled = centre(&room, 1.0);
+    // `FOG_COLOUR` is bright and red, so a wall of flat grey moves toward red where the air reaches
+    // it — measured on the channel the fog has and the wall does not.
+    let shifted = (veiled.x - veiled.z) - (dry.x - dry.z);
+    assert!(
+        shifted > 0.004,
+        "an interior at the game's own {SHIPPED_INTERIOR_FOG} should carry a visible veil — {dry} against {veiled}"
     );
 }
