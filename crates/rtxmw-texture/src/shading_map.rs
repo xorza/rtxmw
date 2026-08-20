@@ -82,7 +82,7 @@ fn coarse_luminance(texture: &Texture) -> Vec<f32> {
             } else {
                 (0, 2)
             };
-            for (index, texel) in level.chunks_exact(4).enumerate() {
+            for (index, texel) in level.as_chunks::<4>().0.iter().enumerate() {
                 let (x, y) = (index as u32 % width, index as u32 / width);
                 if y >= height {
                     break;
@@ -225,7 +225,9 @@ mod tests {
     /// The map's values as the multipliers they encode, decoded the way the sampler will.
     fn shading(map: &Texture) -> Vec<f32> {
         map.data()
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|texel| multiplier(texel[0]))
             .collect()
     }

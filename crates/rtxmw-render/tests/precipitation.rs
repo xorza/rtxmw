@@ -144,8 +144,10 @@ const STREAK_LEVELS: u8 = 4;
 
 /// Which pixels a weather lit, against the same frame with nothing falling.
 fn lit_by(dry: &[u8], wet: &[u8]) -> Vec<bool> {
-    dry.chunks_exact(4)
-        .zip(wet.chunks_exact(4))
+    dry.as_chunks::<4>()
+        .0
+        .iter()
+        .zip(wet.as_chunks::<4>().0.iter())
         .map(|(was, now)| (0..3).any(|c| now[c].saturating_sub(was[c]) > STREAK_LEVELS))
         .collect()
 }
@@ -174,8 +176,10 @@ fn turnover(before: &[bool], after: &[bool]) -> usize {
 /// it: see `STREAK_LEVELS`.
 fn differing(before: &[u8], after: &[u8]) -> usize {
     before
-        .chunks_exact(4)
-        .zip(after.chunks_exact(4))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(after.as_chunks::<4>().0.iter())
         .filter(|(was, now)| was[..3] != now[..3])
         .count()
 }

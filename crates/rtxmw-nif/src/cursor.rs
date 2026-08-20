@@ -179,8 +179,10 @@ impl<'a> Cursor<'a> {
     pub fn u16s(&mut self, count: usize) -> Result<Vec<u16>> {
         let bytes = self.take(count * 2)?;
         Ok(bytes
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes(c.try_into().unwrap()))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u16::from_le_bytes(*pair))
             .collect())
     }
 

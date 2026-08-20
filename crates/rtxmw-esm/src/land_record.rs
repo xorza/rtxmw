@@ -163,7 +163,9 @@ fn decode_normals(data: &[u8]) -> Vec<[f32; 3]> {
         return Vec::new();
     }
     data[..VERTICES * 3]
-        .chunks_exact(3)
+        .as_chunks::<3>()
+        .0
+        .iter()
         .map(|n| {
             let v = [n[0] as i8 as f32, n[1] as i8 as f32, n[2] as i8 as f32];
             let length = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();

@@ -136,7 +136,12 @@ pub(crate) fn screenshot(options: &ScreenshotOptions) -> Result<f32, Box<dyn std
         renderer.target(),
         vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
     )?;
-    let hits = traced.chunks_exact(4).filter(|p| p[3] > 128).count();
+    let hits = traced
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|p| p[3] > 128)
+        .count();
     let rays = traced.len() / 4;
 
     // Everything here is a local, so it drops in reverse declaration order — renderer, uploader,

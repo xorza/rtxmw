@@ -877,7 +877,7 @@ fn the_shipped_meshes_wind_their_triangles_to_agree_with_their_normals() {
     for cell in [CellId::Interior(CELL.into()), SHORE] {
         let scene = content.cell(&cell);
         for mesh in &scene.meshes {
-            for triangle in mesh.indices.chunks_exact(3) {
+            for triangle in mesh.indices.as_chunks::<3>().0 {
                 let corner = |at: usize| mesh.positions[triangle[at] as usize];
                 let plane = (corner(1) - corner(0)).cross(corner(2) - corner(0));
                 let authored: glam::Vec3 =

@@ -57,12 +57,16 @@ pub fn image_to_f32(
     let bytes = copy_to_host(uploader, image, current_layout, bytes_per_pixel(format))?;
     Ok(if half {
         bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| f16::from_le_bytes([c[0], c[1]]).to_f32())
             .collect()
     } else {
         bytes
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect()
     })
@@ -171,12 +175,12 @@ impl PixelFormat {
         match self {
             Self::Rgba8 => out.extend_from_slice(bytes),
             Self::Bgra8 => {
-                for chunk in bytes.chunks_exact(4) {
+                for chunk in bytes.as_chunks::<4>().0 {
                     out.extend_from_slice(&[chunk[2], chunk[1], chunk[0], chunk[3]]);
                 }
             }
             Self::Rgba16Float => {
-                for chunk in bytes.chunks_exact(2) {
+                for chunk in bytes.as_chunks::<2>().0 {
                     let value = f16::from_le_bytes([chunk[0], chunk[1]]).to_f32();
                     out.push((value.clamp(0.0, 1.0) * 255.0 + 0.5) as u8);
                 }
@@ -211,7 +215,7 @@ pub fn write_png(path: &Path, pixels: &[u8], width: u32, height: u32) {
 /// For images whose alpha is data rather than coverage.
 pub fn write_png_opaque(path: &Path, pixels: &[u8], width: u32, height: u32) {
     let mut opaque = pixels.to_vec();
-    for pixel in opaque.chunks_exact_mut(4) {
+    for pixel in opaque.as_chunks_mut::<4>().0 {
         pixel[3] = 0xFF;
     }
     write_png(path, &opaque, width, height);

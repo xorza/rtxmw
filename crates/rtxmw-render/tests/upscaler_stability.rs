@@ -41,7 +41,7 @@ fn rms(a: &[u8], b: &[u8]) -> f32 {
     assert_eq!(a.len(), b.len(), "two renders of the same size");
     let mut total = 0.0f64;
     let mut count = 0usize;
-    for (x, y) in a.chunks_exact(4).zip(b.chunks_exact(4)) {
+    for (x, y) in a.as_chunks::<4>().0.iter().zip(b.as_chunks::<4>().0.iter()) {
         for channel in 0..3 {
             let difference = (f64::from(x[channel]) - f64::from(y[channel])) / 255.0;
             total += difference * difference;
@@ -178,7 +178,7 @@ fn a_still_camera_gives_ray_reconstruction_a_still_image() {
          applied — see docs/design.md §8.30, where the sign was wrong on both axes"
     );
     // And it has to be a real picture: a black frame is perfectly stable.
-    let lit = after.chunks_exact(4).filter(|p| p[0] > 8).count();
+    let lit = after.as_chunks::<4>().0.iter().filter(|p| p[0] > 8).count();
     assert!(
         lit * 4 > after.len() / 4,
         "only {lit} pixels of the frame are lit, so stability here means nothing"

@@ -29,8 +29,10 @@ fn empty() -> rtxmw_scene::StaticScene {
 /// How many of two frames' bytes differ.
 fn differing(before: &[u8], after: &[u8]) -> usize {
     before
-        .chunks_exact(4)
-        .zip(after.chunks_exact(4))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(after.as_chunks::<4>().0.iter())
         .filter(|(was, now)| was[..3] != now[..3])
         .count()
 }

@@ -149,7 +149,7 @@ impl Mesh {
 
         let mut volume = 0.0;
         let mut area = 0.0;
-        for triangle in indices.chunks_exact(3) {
+        for triangle in indices.as_chunks::<3>().0 {
             let a = self.positions[triangle[0] as usize] - centre;
             let b = self.positions[triangle[1] as usize] - centre;
             let c = self.positions[triangle[2] as usize] - centre;
@@ -172,7 +172,7 @@ impl Mesh {
     /// [`BORDER_SHARE`] is where the line falls.
     fn has_border(&self) -> bool {
         let mut edges: HashMap<(EdgeKey, EdgeKey), u32> = HashMap::new();
-        for triangle in self.indices.chunks_exact(3) {
+        for triangle in self.indices.as_chunks::<3>().0 {
             for corner in 0..3 {
                 let a = self.quantised(triangle[corner]);
                 let b = self.quantised(triangle[(corner + 1) % 3]);

@@ -106,8 +106,8 @@ mod tests {
         drop(uploader);
 
         assert_eq!(pixels.len(), 8 * 4 * 4);
-        for (index, pixel) in pixels.chunks_exact(4).enumerate() {
-            assert_eq!(pixel, CLEAR_RGBA8, "pixel {index} differs");
+        for (index, pixel) in pixels.as_chunks::<4>().0.iter().enumerate() {
+            assert_eq!(*pixel, CLEAR_RGBA8, "pixel {index} differs");
         }
         gpu.assert_no_validation_errors();
     }
@@ -146,8 +146,8 @@ mod tests {
 
         // The clear is specified in RGBA regardless of storage order, so readback must agree with
         // the R8G8B8A8 case rather than coming back swapped.
-        for pixel in pixels.chunks_exact(4) {
-            assert_eq!(pixel, CLEAR_RGBA8);
+        for pixel in pixels.as_chunks::<4>().0 {
+            assert_eq!(*pixel, CLEAR_RGBA8);
         }
         gpu.assert_no_validation_errors();
     }
@@ -167,7 +167,7 @@ mod tests {
         drop(uploader);
 
         // Half-float cannot hold 0.2 or 0.6 exactly, so allow one 8-bit step of slack.
-        for pixel in pixels.chunks_exact(4) {
+        for pixel in pixels.as_chunks::<4>().0 {
             for (actual, expected) in pixel.iter().zip(CLEAR_RGBA8) {
                 assert!(
                     actual.abs_diff(expected) <= 1,

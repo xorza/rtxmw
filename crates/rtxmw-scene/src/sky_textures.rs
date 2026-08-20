@@ -88,14 +88,19 @@ impl SkyTextures {
     /// The mean of the sheet's alpha, which is the fraction of sky it hides.
     fn cover_of(texture: &Texture) -> f32 {
         let rgba = texture.to_rgba8();
-        let total: f32 = rgba.chunks_exact(4).map(|t| t[3] as f32 / 255.0).sum();
+        let total: f32 = rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|t| t[3] as f32 / 255.0)
+            .sum();
         total / (rgba.len() / 4).max(1) as f32
     }
 
     fn mean_of(texture: &Texture) -> f32 {
         let rgba = texture.to_rgba8();
         let (mut total, mut weight) = (0.0f32, 0.0f32);
-        for texel in rgba.chunks_exact(4) {
+        for texel in rgba.as_chunks::<4>().0 {
             let alpha = texel[3] as f32 / 255.0;
             let colour = glam::Vec3::new(
                 rtxmw_texture::channel_to_linear(texel[0]),

@@ -121,7 +121,12 @@ pub fn compare(expected: &[u8], actual: &[u8]) -> Difference {
     let mut max_channel_delta = 0u8;
     let mut total_delta = 0u64;
 
-    for (a, b) in expected.chunks_exact(4).zip(actual.chunks_exact(4)) {
+    for (a, b) in expected
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(actual.as_chunks::<4>().0.iter())
+    {
         let mut differs = false;
         for (x, y) in a.iter().zip(b) {
             let delta = x.abs_diff(*y);

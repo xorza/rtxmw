@@ -386,7 +386,7 @@ fn the_sun_reaches_the_bottom_through_water() {
 /// A mean rather than a pixel, because caustics move light *around*: any one point on a seabed sits
 /// on a bright line or between two, and only the average says how much light arrived.
 fn mean_green(pixels: &[u8]) -> f32 {
-    let total: f32 = pixels.chunks_exact(4).map(|p| p[1] as f32).sum();
+    let total: f32 = pixels.as_chunks::<4>().0.iter().map(|p| p[1] as f32).sum();
     total / (pixels.len() / 4) as f32 / 255.0
 }
 
@@ -395,7 +395,9 @@ fn mean_green(pixels: &[u8]) -> f32 {
 /// The measure of a caustic pattern: light gathered into lines rather than spread evenly.
 fn relative_spread(pixels: &[u8]) -> f32 {
     let values: Vec<f32> = pixels
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|p| p[1] as f32 / 255.0)
         .collect();
     let mean = values.iter().sum::<f32>() / values.len() as f32;
@@ -457,8 +459,10 @@ fn caustics_gather_the_sunlight_without_creating_any() {
     let second = frame_at(&scene, eye, Vec3::NEG_Z, 1.7);
 
     let moved: f32 = first
-        .chunks_exact(4)
-        .zip(second.chunks_exact(4))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(second.as_chunks::<4>().0.iter())
         .map(|(a, b)| (a[1] as f32 - b[1] as f32).abs())
         .sum::<f32>()
         / (first.len() / 4) as f32
@@ -723,8 +727,10 @@ fn rain_rings_the_water_and_snow_lands_on_it_without_a_sound() {
     // Which pixels two frames of the same water disagree about, by more than the tonemap's own
     // rounding.
     let apart = |was: &[u8], now: &[u8]| -> Vec<bool> {
-        was.chunks_exact(4)
-            .zip(now.chunks_exact(4))
+        was.as_chunks::<4>()
+            .0
+            .iter()
+            .zip(now.as_chunks::<4>().0.iter())
             .map(|(was, now)| (0..3).any(|c| was[c].abs_diff(now[c]) > 2))
             .collect()
     };

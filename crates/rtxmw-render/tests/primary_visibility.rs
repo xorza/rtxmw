@@ -27,7 +27,7 @@ const FOV_Y: f32 = 75.0;
 ///
 /// Read from alpha rather than inferred from the colour: material colours can be arbitrarily dark,
 /// so brightness stopped being evidence of a hit the moment the output stopped being barycentric.
-fn is_hit(pixel: &[u8]) -> bool {
+fn is_hit(pixel: &[u8; 4]) -> bool {
     pixel[3] > 128
 }
 
@@ -186,14 +186,21 @@ enum Read {
 }
 
 /// The pixel at `(x, y)`, row-major from the top.
-fn at(pixels: &[u8], x: u32, y: u32) -> &[u8] {
+fn at(pixels: &[u8], x: u32, y: u32) -> &[u8; 4] {
     let index = ((y * WIDTH + x) * 4) as usize;
-    &pixels[index..index + 4]
+    pixels[index..index + 4]
+        .try_into()
+        .expect("four bytes is four bytes")
 }
 
 /// How many pixels in the image are hits.
 fn hit_count(pixels: &[u8]) -> usize {
-    pixels.chunks_exact(4).filter(|p| is_hit(p)).count()
+    pixels
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|p| is_hit(p))
+        .count()
 }
 
 #[test]
@@ -564,7 +571,7 @@ fn an_opaque_material_ignores_its_texture_alpha() {
 fn mean_brightness(pixels: &[u8]) -> f32 {
     let mut total = 0.0;
     let mut count = 0.0;
-    for pixel in pixels.chunks_exact(4).filter(|p| is_hit(p)) {
+    for pixel in pixels.as_chunks::<4>().0.iter().filter(|p| is_hit(p)) {
         total += (pixel[0] as f32 + pixel[1] as f32 + pixel[2] as f32) / 3.0;
         count += 1.0;
     }
@@ -820,7 +827,7 @@ fn a_real_interior_traces_to_a_recognisable_image() {
     // One would mean every hit resolved to the same table entry, which is exactly what a constant
     // geometry index or a misread custom index produces — and it would still fill the screen.
     let mut shades: std::collections::HashSet<[u8; 3]> = std::collections::HashSet::new();
-    for pixel in pixels.chunks_exact(4).filter(|p| is_hit(p)) {
+    for pixel in pixels.as_chunks::<4>().0.iter().filter(|p| is_hit(p)) {
         shades.insert(shade(pixel));
     }
 
@@ -1204,7 +1211,14 @@ fn a_scene_far_from_the_origin_renders_as_it_does_at_the_origin() {
     );
 
     // Both have to be pictures of something, or agreeing is easy.
-    let covered = |image: &[u8]| image.chunks_exact(4).filter(|p| is_hit(p)).count();
+    let covered = |image: &[u8]| {
+        image
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|p| is_hit(p))
+            .count()
+    };
     assert!(
         covered(&here) > (WIDTH * HEIGHT / 4) as usize,
         "the fixture fills only {} pixels at the origin",
@@ -1232,7 +1246,12 @@ fn a_scene_far_from_the_origin_renders_as_it_does_at_the_origin() {
 fn rmse(image: &[u8], reference: &[u8]) -> f32 {
     let mut sum = 0.0f64;
     let mut count = 0usize;
-    for (a, b) in image.chunks_exact(4).zip(reference.chunks_exact(4)) {
+    for (a, b) in image
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(reference.as_chunks::<4>().0.iter())
+    {
         if !is_hit(a) || !is_hit(b) {
             continue;
         }

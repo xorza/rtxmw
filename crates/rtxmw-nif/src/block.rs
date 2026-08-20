@@ -283,7 +283,9 @@ impl GeometryData {
         let index_count = cursor.u32()? as usize;
         let indices = cursor.u16s(index_count)?;
         data.triangles = indices
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .map(|c| [c[0], c[1], c[2]])
             .collect();
 

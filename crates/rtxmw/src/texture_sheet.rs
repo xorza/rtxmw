@@ -41,7 +41,7 @@ pub(crate) fn write(options: &TextureSheetOptions) -> Result<(), Box<dyn std::er
     // Mid grey, so that a thumbnail going pale from over-correction reads against the ground rather
     // than into it.
     let mut sheet = vec![0x40u8; (width * height * 4) as usize];
-    for pixel in sheet.chunks_exact_mut(4) {
+    for pixel in sheet.as_chunks_mut::<4>().0 {
         pixel[3] = 255;
     }
 
@@ -93,7 +93,7 @@ fn delit(texture: &Texture, rgba: &[u8]) -> Vec<u8> {
     let (width, height) = (texture.width().max(1), texture.height().max(1));
 
     let mut out = rgba.to_vec();
-    for (index, texel) in out.chunks_exact_mut(4).enumerate() {
+    for (index, texel) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
         let (x, y) = (index as u32 % width, index as u32 / width);
         // Nearest rather than bilinear: the map is smooth enough that the difference is invisible,
         // and a sheet is not where filtering deserves its own implementation.

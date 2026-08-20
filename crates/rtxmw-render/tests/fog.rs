@@ -405,8 +405,10 @@ fn drifting(sky: rtxmw_scene::Sky, seconds: f32) -> Vec<u8> {
 /// Mean absolute difference between two frames, per channel, in 0..255.
 fn apart(before: &[u8], after: &[u8]) -> f32 {
     let total: u32 = before
-        .chunks_exact(4)
-        .zip(after.chunks_exact(4))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(after.as_chunks::<4>().0.iter())
         .map(|(was, now)| {
             (0..3)
                 .map(|c| u32::from(was[c].abs_diff(now[c])))
@@ -424,7 +426,9 @@ fn band(pixels: &[u8], y0: u32, y1: u32) -> &[u8] {
 /// How far a frame varies across itself, which is what banks are and a flat wall of dust is not.
 fn spread(pixels: &[u8]) -> f32 {
     let values: Vec<f32> = pixels
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|p| 0.2126 * f32::from(p[0]) + 0.7152 * f32::from(p[1]) + 0.0722 * f32::from(p[2]))
         .collect();
     let mean = values.iter().sum::<f32>() / values.len() as f32;

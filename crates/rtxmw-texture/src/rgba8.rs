@@ -92,7 +92,7 @@ pub(crate) fn expand(texture: &Texture) -> Vec<u8> {
             } else {
                 (0, 2)
             };
-            for (index, texel) in level.chunks_exact(4).enumerate() {
+            for (index, texel) in level.as_chunks::<4>().0.iter().enumerate() {
                 let (x, y) = (index as u32 % width, index as u32 / width);
                 put(x, y, [texel[r], texel[1], texel[b]], texel[3]);
             }
@@ -130,7 +130,7 @@ mod tests {
             "the palette should run white, black, two thirds, one third"
         );
         assert!(
-            rgba.chunks_exact(4).all(|t| t[3] == 255),
+            rgba.as_chunks::<4>().0.iter().all(|t| t[3] == 255),
             "the four-colour mode has no transparent entry"
         );
         // Every row of the block chose the same indices, so every row expands the same way.

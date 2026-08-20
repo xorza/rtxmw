@@ -427,7 +427,7 @@ impl StaticScene {
         let mut highest: Option<f32> = None;
         for instance in &self.instances {
             let mesh = &self.meshes[instance.mesh.0 as usize];
-            for triangle in mesh.indices.chunks_exact(3) {
+            for triangle in mesh.indices.as_chunks::<3>().0 {
                 let [a, b, c] = [0, 1, 2].map(|corner| {
                     instance
                         .transform

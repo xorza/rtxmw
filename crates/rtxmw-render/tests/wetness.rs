@@ -221,7 +221,9 @@ fn film(scene: &StaticScene, precipitation: Precipitation, view: View) -> Pooled
         let specular = read(renderer.material());
         let roughness = read(renderer.normal_roughness());
         let at = specular
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .enumerate()
             .max_by(|(_, one), (_, two)| one[0].total_cmp(&two[0]))
             .expect("the frame should have pixels");
