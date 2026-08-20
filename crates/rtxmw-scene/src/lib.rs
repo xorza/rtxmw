@@ -8,6 +8,7 @@ mod clouds;
 mod door;
 mod error;
 mod game_data;
+mod ini;
 mod light;
 mod loaded_cell;
 mod material;
@@ -19,6 +20,7 @@ mod sky_textures;
 mod srgb;
 mod static_scene;
 mod sun;
+mod weather;
 mod world_time;
 
 // Re-exported because `Door` carries one and `Door::leading_to` takes one, so a crate above this
@@ -41,4 +43,5 @@ pub use crate::sky_textures::SkyTextures;
 pub use crate::srgb::to_linear;
 pub use crate::static_scene::{CellDetail, Instance, MeshId, ModelIndex, StaticScene};
 pub use crate::sun::Sun;
+pub use crate::weather::{Schedule, Weather};
 pub use crate::world_time::WorldTime;

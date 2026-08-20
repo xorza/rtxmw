@@ -12,7 +12,7 @@ use rtxmw_gpu::{
     readback,
 };
 use rtxmw_render::SceneRenderer;
-use rtxmw_scene::{CellId, CellStreamer, LoadedCell, Sky, SkyTextures};
+use rtxmw_scene::{CellId, CellStreamer, LoadedCell, Sky, SkyTextures, Weather};
 
 use crate::cli::ScreenshotOptions;
 use crate::scene_loader;
@@ -39,6 +39,7 @@ pub(crate) fn screenshot(options: &ScreenshotOptions) -> Result<f32, Box<dyn std
         delight,
         fog,
         time,
+        weather,
     } = options;
 
     // No surface extensions and no swapchain: this device could not present if asked.
@@ -67,8 +68,9 @@ pub(crate) fn screenshot(options: &ScreenshotOptions) -> Result<f32, Box<dyn std
     }
     renderer.set_delight(*delight);
     renderer.set_fog(*fog);
-    renderer.set_sky(Sky::at(*time));
-    if let Some(textures) = SkyTextures::load()? {
+    let weather = &Weather::named(weather)?;
+    renderer.set_sky(Sky::under(*time, weather));
+    if let Some(textures) = SkyTextures::load(weather)? {
         renderer.set_sky_textures(&device, &mut uploader, physical.limits(), &textures)?;
     }
 

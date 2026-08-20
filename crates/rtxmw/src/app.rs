@@ -10,11 +10,13 @@ use winit::event_loop::ActiveEventLoop;
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowId};
 
-use rtxmw_scene::{CellDetail, CellId, CellStreamer, LoadedCell, SceneError, Sky, WorldTime};
+use rtxmw_scene::{
+    CellDetail, CellId, CellStreamer, LoadedCell, SceneError, Sky, Weather, WorldTime,
+};
 
 use crate::camera::{Camera, Movement};
 use crate::cli::{Upscaling, WindowOptions};
-use crate::renderer::Renderer;
+use crate::renderer::{Conditions, Renderer};
 use crate::scene_loader::{self, WantedCell};
 use crate::world_clock::WorldClock;
 
@@ -89,6 +91,8 @@ pub(crate) struct App {
     fog: f32,
     /// How long the world has run and what hour it is there, which the keys below drive.
     clock: WorldClock,
+    /// Which of the game's ten weathers the world is under, out of `--weather`.
+    weather: Weather,
     /// Which cell to open in, from the command line.
     cell: CellId,
     /// **Before `window`, and that is load-bearing.** Fields drop in declaration order, and the
@@ -259,6 +263,9 @@ impl App {
     /// clean exit, which nothing but a person pressing a key could reach.
     pub(crate) fn opening_in(options: WindowOptions) -> Self {
         Self {
+            // An unrecognised name is clear rather than a refusal to start — `Weather::named` says
+            // so, and a missing install cannot name anything at all.
+            weather: Weather::named(&options.weather).unwrap_or_else(|_| Weather::clear()),
             cell: options.cell,
             dlss: options.dlss,
             delight: options.delight,
@@ -279,6 +286,7 @@ impl Default for App {
             delight: 1.0,
             fog: 1.0,
             clock: WorldClock::starting_at(WorldTime::default()),
+            weather: Weather::clear(),
             renderer: None,
             window: None,
             centre: None,
@@ -373,9 +381,12 @@ impl ApplicationHandler for App {
             size.width,
             size.height,
             self.dlss,
-            self.delight,
-            self.fog,
-            Sky::at(self.clock.time()),
+            Conditions {
+                delight: self.delight,
+                fog: self.fog,
+                sky: Sky::under(self.clock.time(), &self.weather),
+                weather: &self.weather,
+            },
         ) {
             Ok(renderer) => {
                 println!("{}", renderer.capability_report());
@@ -501,7 +512,7 @@ impl ApplicationHandler for App {
                 if let (Some(renderer), Some(window)) = (&mut self.renderer, &self.window) {
                     let size = window.inner_size();
                     renderer.set_time(self.clock.seconds());
-                    renderer.set_sky(Sky::at(self.clock.time()));
+                    renderer.set_sky(Sky::under(self.clock.time(), &self.weather));
                     let constants = renderer.frame_constants(
                         self.camera.view(),
                         self.camera.projection(renderer.aspect_ratio()),

@@ -9,7 +9,7 @@ use rtxmw_gpu::{
     Validation, image_blit,
 };
 use rtxmw_render::{FrameConstants, OUTPUT_FORMAT, SceneRenderer, TARGET_FORMAT};
-use rtxmw_scene::{CellId, Sky, SkyTextures, StaticScene};
+use rtxmw_scene::{CellId, Sky, SkyTextures, StaticScene, Weather};
 use rtxmw_texture::Texture;
 
 use crate::cli::Upscaling;
@@ -74,6 +74,23 @@ pub(crate) struct Renderer {
     needs_recreate: bool,
 }
 
+/// How the world is lit and drawn, as against the window it goes in and the device it goes through.
+///
+/// A bundle because the four travel together and always have: they are what a caller chose about the
+/// *scene*, where the window's size and the upscaler are what it chose about the picture. It became
+/// one when the weather made the argument list too long to read, which was the right moment.
+#[derive(Debug)]
+pub(crate) struct Conditions<'a> {
+    /// How much of the lighting painted into a texture to divide back out.
+    pub(crate) delight: f32,
+    /// How much of the cell's own fog to apply.
+    pub(crate) fog: f32,
+    /// The hour's light, already built under `weather`.
+    pub(crate) sky: Sky,
+    /// Which of the game's ten the world is standing in.
+    pub(crate) weather: &'a Weather,
+}
+
 impl Renderer {
     /// Brings up Vulkan for `window` and allocates the frame ring.
     pub(crate) fn new<W>(
@@ -81,13 +98,17 @@ impl Renderer {
         width: u32,
         height: u32,
         dlss: Upscaling,
-        delight: f32,
-        fog: f32,
-        sky: Sky,
+        conditions: Conditions<'_>,
     ) -> rtxmw_gpu::Result<Self>
     where
         W: HasDisplayHandle + HasWindowHandle,
     {
+        let Conditions {
+            delight,
+            fog,
+            sky,
+            weather,
+        } = conditions;
         let extensions = Surface::required_extensions(window)?;
         let instance = Instance::new(c"rtxmw", extensions, Validation::for_build())?;
         let physical = PhysicalDevice::select(&instance, Presentation::Required)?;
@@ -137,7 +158,7 @@ impl Renderer {
         }
         // **Before any cell, and it need not be** — the array reserves their slots either way. It
         // is here because this is where the archives are already open once.
-        match SkyTextures::load() {
+        match SkyTextures::load(weather) {
             Ok(Some(textures)) => {
                 scene.set_sky_textures(&device, &mut uploader, physical.limits(), &textures)?;
             }

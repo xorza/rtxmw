@@ -6,6 +6,7 @@ use rtxmw_esm::{CellIndex, EsmReader};
 use rtxmw_vfs::{Vfs, morrowind_data_dir};
 
 use crate::error::{Result, SceneError};
+use crate::ini::Ini;
 use crate::static_scene::ModelIndex;
 
 /// Everything the installed game is: the master file, the archives, and the two indices over it.
@@ -33,6 +34,7 @@ pub(crate) struct GameData {
     vfs: Vfs,
     cells: CellIndex,
     models: ModelIndex,
+    ini: Ini,
 }
 
 impl GameData {
@@ -80,6 +82,11 @@ impl GameData {
         &self.vfs
     }
 
+    /// `Morrowind.ini`, which is where the game keeps its weathers, its moons and its day length.
+    pub(crate) fn ini(&self) -> &Ini {
+        &self.ini
+    }
+
     /// Reads and indexes the whole installation.
     fn open() -> Result<Option<Self>> {
         let Some(directory) = morrowind_data_dir() else {
@@ -91,6 +98,14 @@ impl GameData {
             ))
         })?;
         let esm = std::fs::read(directory.join("Morrowind.esm")).map_err(SceneError::Io)?;
+        // **Beside `Data Files` rather than in it**, which is where an install puts it. Missing is
+        // not an error: the ini is the game's tuning and every reader of it has a fallback, so an
+        // install without one renders with the figures written down in this crate.
+        let ini = directory
+            .parent()
+            .map(|game| game.join("Morrowind.ini"))
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .map_or_else(Ini::default, |text| Ini::parse(&text));
         // Built here rather than by each caller, which is most of the point: walking the file for
         // its cells and its models is 11 ms that two callers were each paying. Scoped, because the
         // reader borrows `esm` and `esm` is moved into the struct below.
@@ -103,6 +118,7 @@ impl GameData {
             vfs,
             cells,
             models,
+            ini,
         }))
     }
 }
@@ -134,6 +150,10 @@ mod tests {
         assert!(first.cells().len() > 100, "{}", first.cells().len());
         assert!(first.models().len() > 100, "{}", first.models().len());
         assert!(!first.vfs().is_empty());
+
+        // And the ini came with it — the day length every other reading here depends on.
+        assert_eq!(first.ini().number("Weather", "Sunset Time"), Some(18.0));
+        assert_eq!(first.ini().sections_under("weather ").len(), 10);
 
         // The reader is handed out rather than stored, so taking two is legal and neither borrows
         // the other — which is the property that let the indices be shared at all.

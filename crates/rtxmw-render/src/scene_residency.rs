@@ -33,19 +33,6 @@ use crate::scene_acceleration::SceneAcceleration;
 use crate::texture_array::TextureArray;
 use crate::visibility_pass::Lighting;
 
-/// How thick an exterior's fog is, until the weather system says.
-///
-/// The record carries fog only for interiors; an exterior's belongs to the weather, which is per
-/// region and per weather out of the original engine's ini fallbacks rather than the ESM. This is
-/// the number to replace when that arrives rather than one to tune for its own sake.
-///
-/// **Down from 0.75, which was a soup.** Half the light from a surface survived fifty-three metres
-/// at that figure and the far shore of Seyda Neen's bay was gone; at this one it survives a hundred
-/// and thirty. The bank structure is untouched by the change — the coverage field says where the fog
-/// *is*, and this only says how thick it is there — so the layer over the water and the shafts
-/// through it both survive being able to see past them.
-const OUTDOOR_FOG_DENSITY: f32 = 0.30;
-
 /// What an interior's recorded density is worth against an exterior's.
 ///
 /// **The same dial does not mean the same thing indoors.** The original engine set fog by a start
@@ -263,11 +250,8 @@ impl SceneResidency {
         };
 
         // **Only interiors carry fog in the record**, so a recorded density is what identifies one
-        // and settles all three of these together. An exterior's fog belongs to the weather system —
-        // per region and per weather, out of the original engine's ini fallbacks rather than the
-        // ESM — and none of that is read yet. Until it is, the sky is the honest stand-in: fog is
-        // lit by it, so a fog the colour of the sky is what aerial perspective looks like anyway,
-        // and it now reddens at dusk for free.
+        // and settles all three of these together. An exterior's belongs to the weather, and now
+        // comes from it.
         match self.record {
             Some(record) if record.fog_density > 0.0 => {
                 self.lighting.fog = record.fog;
@@ -275,8 +259,11 @@ impl SceneResidency {
                 self.lighting.fog_banked = false;
             }
             _ => {
-                self.lighting.fog = self.lighting.ambient;
-                self.lighting.fog_density = OUTDOOR_FOG_DENSITY;
+                // **The weather's, out of the ini**, rather than the dome standing in for it: the
+                // hue is `Fog * Color`'s schedule and the thickness `Land Fog Depth`'s, both varying
+                // by weather and by hour — see `Sky::fog`.
+                self.lighting.fog = self.sky.fog;
+                self.lighting.fog_density = self.sky.fog_density;
                 self.lighting.fog_banked = true;
             }
         }

@@ -1,0 +1,404 @@
+//! Morrowind's ten weathers, as `Morrowind.ini` describes them.
+
+use glam::Vec3;
+
+use crate::game_data::GameData;
+use crate::ini::Ini;
+use crate::world_time::{SUNRISE, SUNSET, WorldTime};
+
+/// When one family of colours changes over, in hours either side of sunrise and sunset.
+///
+/// **Every family has its own**, which is why a Morrowind dusk does not change all at once: the sky
+/// begins turning an hour and a half before the sun goes down and has finished half an hour after,
+/// while the ambient starts an hour before and takes until an hour and a quarter after. Out of the
+/// general `[Weather]` section — `Sky Pre-Sunset Time` and its eleven siblings.
+#[derive(Debug, Clone, Copy)]
+struct Crossover {
+    pre_sunrise: f32,
+    post_sunrise: f32,
+    pre_sunset: f32,
+    post_sunset: f32,
+}
+
+/// Which two of a family's four values an hour falls between, and how far.
+///
+/// The answer to the only question a schedule ever asks, so that a schedule of *colours* and a
+/// schedule of *depths* can ask it in the same words — `fog_depth` was building a `Schedule` of
+/// `Vec3::splat` to borrow the arithmetic before this existed.
+#[derive(Debug, Clone, Copy)]
+struct Between {
+    /// Which of `sunrise`, `day`, `sunset`, `night` the hour is coming from and going to.
+    from: Key,
+    to: Key,
+    /// How far along, from nought at `from` to one at `to`.
+    along: f32,
+}
+
+/// One of the four times of day a weather names a colour for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Key {
+    Sunrise,
+    Day,
+    Sunset,
+    Night,
+}
+
+impl Crossover {
+    /// Where `time` sits among the four, on this family's own windows.
+    ///
+    /// Night until the window opens before sunrise, then night to sunrise to day across it; day
+    /// until the window opens before sunset, then day to sunset to night across that. Both windows
+    /// are the family's own, so the sky and the ground change at different moments — which is what
+    /// the twelve `Pre-` and `Post-` figures in the general section are for.
+    fn between(self, time: WorldTime) -> Between {
+        let hour = time.hour();
+        let ramp = |from: f32, to: f32| ((hour - from) / (to - from)).clamp(0.0, 1.0);
+        let held = |key: Key| Between {
+            from: key,
+            to: key,
+            along: 0.0,
+        };
+        if hour < SUNRISE - self.pre_sunrise || hour > SUNSET + self.post_sunset {
+            return held(Key::Night);
+        }
+        if hour < SUNRISE {
+            return Between {
+                from: Key::Night,
+                to: Key::Sunrise,
+                along: ramp(SUNRISE - self.pre_sunrise, SUNRISE),
+            };
+        }
+        if hour < SUNRISE + self.post_sunrise {
+            return Between {
+                from: Key::Sunrise,
+                to: Key::Day,
+                along: ramp(SUNRISE, SUNRISE + self.post_sunrise),
+            };
+        }
+        if hour < SUNSET - self.pre_sunset {
+            return held(Key::Day);
+        }
+        if hour < SUNSET {
+            return Between {
+                from: Key::Day,
+                to: Key::Sunset,
+                along: ramp(SUNSET - self.pre_sunset, SUNSET),
+            };
+        }
+        Between {
+            from: Key::Sunset,
+            to: Key::Night,
+            along: ramp(SUNSET, SUNSET + self.post_sunset),
+        }
+    }
+
+    /// The four windows named for `family` — `Sky`, `Fog`, `Ambient` or `Sun`.
+    fn read(ini: &Ini, family: &str) -> Self {
+        let hours = |which: &str| {
+            ini.number("Weather", &format!("{family} {which} Time"))
+                .unwrap_or(1.0)
+        };
+        Self {
+            pre_sunrise: hours("Pre-Sunrise"),
+            post_sunrise: hours("Post-Sunrise"),
+            pre_sunset: hours("Pre-Sunset"),
+            post_sunset: hours("Post-Sunset"),
+        }
+    }
+}
+
+/// One family's colour at each of the four times of day the game names, and when it moves between.
+#[derive(Debug, Clone, Copy)]
+pub struct Schedule {
+    pub sunrise: Vec3,
+    pub day: Vec3,
+    pub sunset: Vec3,
+    pub night: Vec3,
+    crossover: Crossover,
+}
+
+impl Schedule {
+    /// The colour at `time`, on this family's own crossing.
+    ///
+    /// Night until the window opens before sunrise, then night to sunrise to day across it; day
+    /// until the window opens before sunset, then day to sunset to night across that. Both windows
+    /// are the family's own, so the sky and the ground change at different moments.
+    pub fn at(self, time: WorldTime) -> Vec3 {
+        let between = self.crossover.between(time);
+        self.key(between.from)
+            .lerp(self.key(between.to), between.along)
+    }
+
+    /// Whichever of the four `key` names.
+    fn key(self, key: Key) -> Vec3 {
+        match key {
+            Key::Sunrise => self.sunrise,
+            Key::Day => self.day,
+            Key::Sunset => self.sunset,
+            Key::Night => self.night,
+        }
+    }
+
+    /// The four colours a weather names for `family`, with that family's own windows.
+    fn read(ini: &Ini, section: &str, family: &str) -> Self {
+        let colour = |which: &str| {
+            ini.colour(section, &format!("{family} {which} Color"))
+                .unwrap_or(Vec3::ONE)
+        };
+        Self {
+            sunrise: colour("Sunrise"),
+            day: colour("Day"),
+            sunset: colour("Sunset"),
+            night: colour("Night"),
+            crossover: Crossover::read(ini, family),
+        }
+    }
+}
+
+/// One of Morrowind's weathers: its colours through the day, its clouds, and how thick its air is.
+///
+/// **Ten of them and every figure is the game's**, which is most of the point: the sky's own
+/// constants in this crate are tuned by eye and say so, while `Sky Night Color=009,010,011` and
+/// `Ambient Night Color=032,035,042` are Bethesda's answers to the same questions.
+#[derive(Debug)]
+pub struct Weather {
+    /// What the ini calls it — `Clear`, `Cloudy`, `Blight` and so on, lower-cased.
+    pub name: String,
+    /// What the air scatters, which is the one of the four this renderer reads.
+    pub fog: Schedule,
+    /// The dome's own colour, what a surface receives, and the beam's.
+    ///
+    /// **Parsed and read by nothing yet, and kept deliberately.** The sky here is still the physical
+    /// model's — Rayleigh depth, Kasten-Young air mass, a transmittance the sun's own colour falls
+    /// out of — and these four-colour keys are the game's answer to the same question. Putting one
+    /// over the other is a real argument about which wins where, not a wiring job, and it is
+    /// `docs/design.md` §8.59's "what is not done".
+    ///
+    /// They are parsed now because the parse is the part that can be *tested* against the file:
+    /// `every_weather_the_game_ships_is_read_with_its_own_numbers` asserts a clear day sky is blue
+    /// and an overcast one grey without either being written down here. Leaving them out would mean
+    /// landing that untested alongside the argument.
+    pub sky: Schedule,
+    pub ambient: Schedule,
+    pub sun: Schedule,
+    /// Which painted sheet the cloud layer is cut out of — `tx_sky_clear` and its eight siblings.
+    pub cloud_texture: String,
+    /// How much sky the layer may cover, out of `Clouds Maximum Percent`.
+    pub cloud_cover: f32,
+    /// How fast the wind carries it, out of `Cloud Speed`.
+    pub cloud_speed: f32,
+    /// How thick the air is by day and by night, out of `Land Fog Day/Night Depth`.
+    pub fog_day_depth: f32,
+    pub fog_night_depth: f32,
+}
+
+impl Weather {
+    /// Every weather the installed game describes, named in the order the ini lists them.
+    ///
+    /// Empty without game data, which is a state the engine runs in: a caller with no weather falls
+    /// back to what it did before there were any.
+    pub fn table() -> crate::Result<Vec<Self>> {
+        let Some(game) = GameData::shared()? else {
+            return Ok(Vec::new());
+        };
+        Ok(Self::from_ini(game.ini()))
+    }
+
+    /// The same, from an ini a caller already holds — which is only ever a test's.
+    pub(crate) fn from_ini(ini: &Ini) -> Vec<Self> {
+        ini.sections_under("weather ")
+            .into_iter()
+            .map(|name| Self::read(ini, name))
+            .collect()
+    }
+
+    /// How thick the air is at `time`, between the day's figure and the night's.
+    ///
+    /// **The same crossing the fog's *colour* takes**, so the two move together — air that thinned
+    /// on one schedule and paled on another would read as two effects rather than one. The ini gives
+    /// a depth only for day and for night, so the two twilights take the night's.
+    pub fn fog_depth(&self, time: WorldTime) -> f32 {
+        let depth = |key: Key| match key {
+            Key::Day => self.fog_day_depth,
+            _ => self.fog_night_depth,
+        };
+        let between = self.fog.crossover.between(time);
+        depth(between.from) + (depth(between.to) - depth(between.from)) * between.along
+    }
+
+    /// The weather the installed game calls `name`, or clear where it has none by that name.
+    ///
+    /// **The lookup rather than the table**, which is what a caller naming one on a command line
+    /// wants. An unknown name is clear rather than an error: the ten are the game's own list and a
+    /// caller cannot be expected to have it, so the fallback names itself in what it returns.
+    pub fn named(name: &str) -> crate::Result<Self> {
+        let wanted = name.trim().to_ascii_lowercase();
+        Ok(Self::table()?
+            .into_iter()
+            .find(|weather| weather.name == wanted)
+            .unwrap_or_else(Self::clear))
+    }
+
+    /// Clear weather as far as anything can know it without the ini.
+    ///
+    /// **Every scalar here is the real one** — `Cloud Speed=1.25`, `Land Fog Depth=0.69`, full cloud
+    /// cover, the clear sheet — because those are what the reader falls back to and they are
+    /// `[Weather Clear]`'s own. **The colour schedules are not**: they come out white, which is
+    /// nothing the game would ever draw. Nothing reads them yet, and when something does it must
+    /// take the table rather than this.
+    pub fn clear() -> Self {
+        Self::read(&Ini::default(), "clear")
+    }
+
+    fn read(ini: &Ini, name: &str) -> Self {
+        let section = format!("weather {name}");
+        let number = |key: &str, fallback: f32| ini.number(&section, key).unwrap_or(fallback);
+        Self {
+            name: name.to_owned(),
+            sky: Schedule::read(ini, &section, "Sky"),
+            fog: Schedule::read(ini, &section, "Fog"),
+            ambient: Schedule::read(ini, &section, "Ambient"),
+            sun: Schedule::read(ini, &section, "Sun"),
+            cloud_texture: ini
+                .get(&section, "Cloud Texture")
+                .unwrap_or("Tx_Sky_Clear.tga")
+                .to_ascii_lowercase()
+                .replace(".tga", ".dds"),
+            cloud_cover: number("Clouds Maximum Percent", 1.0),
+            cloud_speed: number("Cloud Speed", 1.25),
+            fog_day_depth: number("Land Fog Day Depth", 0.69),
+            fog_night_depth: number("Land Fog Night Depth", 0.69),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The ten as the installed game describes them, or nothing where there is no game.
+    fn table() -> Vec<Weather> {
+        Weather::table().expect("the ini should read where the game is configured")
+    }
+
+    #[test]
+    fn every_weather_the_game_ships_is_read_with_its_own_numbers() {
+        let table = table();
+        if table.is_empty() {
+            return;
+        }
+        assert_eq!(table.len(), 10, "the game ships ten");
+
+        let of = |name: &str| {
+            table
+                .iter()
+                .find(|w| w.name == name)
+                .unwrap_or_else(|| panic!("no {name}"))
+        };
+        // Straight out of `[Weather Clear]` and `[Weather Overcast]`, which is the point of reading
+        // the file rather than writing these down: a clear day sky is blue and an overcast one is
+        // grey, and nothing here had to be told so.
+        let clear = of("clear");
+        assert_eq!(clear.cloud_texture, "tx_sky_clear.dds");
+        assert!((clear.cloud_speed - 1.25).abs() < 1e-6);
+        assert!((clear.fog_day_depth - 0.69).abs() < 1e-6);
+        assert!(clear.sky.day.z > clear.sky.day.x, "{:?}", clear.sky.day);
+
+        let overcast = of("overcast");
+        assert_eq!(overcast.cloud_texture, "tx_sky_overcast.dds");
+        let grey = overcast.sky.day;
+        assert!(
+            (grey.z - grey.x).abs() < 0.1 * grey.x,
+            "an overcast sky is grey: {grey:?}"
+        );
+        // And it is darker than a clear one, which is what overcast means.
+        assert!(grey.length() < clear.sky.day.length());
+
+        // Blight is the one weather whose fog is red, and it is red in the file rather than here.
+        let blight = of("blight");
+        assert!(
+            blight.fog.day.x > 2.0 * blight.fog.day.z,
+            "{:?}",
+            blight.fog.day
+        );
+
+        // **Every one names a sheet that is really in the archives**, which is the only thing tying
+        // these strings to anything. Two of the ten are Bloodmoon's and carry its own prefix —
+        // `tx_bm_sky_snow` and `tx_bm_sky_blizzard` — which is why this asks the file system rather
+        // than assuming a shape.
+        let vfs = rtxmw_vfs::morrowind_archives().expect("the game is available");
+        for weather in &table {
+            let path = format!("textures\\{}", weather.cloud_texture);
+            assert!(vfs.contains(&path), "{}: no {path}", weather.name);
+        }
+    }
+
+    #[test]
+    fn a_colour_holds_by_day_and_crosses_over_on_its_own_family_s_schedule() {
+        // A synthetic weather, so the numbers under test are the ones written here.
+        let ini = Ini::parse(
+            "[Weather]\n\
+             Sky Pre-Sunset Time=1.5\n\
+             Sky Post-Sunset Time=.5\n\
+             Sky Pre-Sunrise Time=.5\n\
+             Sky Post-Sunrise Time=1\n\
+             Ambient Pre-Sunset Time=1\n\
+             Ambient Post-Sunset Time=1.25\n\
+             Ambient Pre-Sunrise Time=.5\n\
+             Ambient Post-Sunrise Time=2\n\
+             [Weather Test]\n\
+             Sky Sunrise Color=255,0,0\n\
+             Sky Day Color=0,255,0\n\
+             Sky Sunset Color=0,0,255\n\
+             Sky Night Color=0,0,0\n\
+             Ambient Sunrise Color=255,0,0\n\
+             Ambient Day Color=0,255,0\n\
+             Ambient Sunset Color=0,0,255\n\
+             Ambient Night Color=0,0,0\n",
+        );
+        let test = &Weather::from_ini(&ini)[0];
+        let sky = |h: f32| test.sky.at(WorldTime::hours(h));
+        let day = sky(12.0);
+
+        // Flat through the middle of the day, right up to where the window opens.
+        assert_eq!(sky(10.0), day);
+        assert_eq!(sky(16.4), day, "the sky's window opens at 16:30");
+        // Then day toward sunset across an hour and a half, half way at 17:15.
+        let half = sky(17.25);
+        assert!(
+            (half - day.lerp(test.sky.sunset, 0.5)).length() < 1e-5,
+            "{half:?}"
+        );
+        // Sunset exactly at eighteen, and out to night half an hour later.
+        assert!((sky(18.0) - test.sky.sunset).length() < 1e-5);
+        assert_eq!(sky(18.5), test.sky.night);
+        assert_eq!(sky(23.0), test.sky.night);
+
+        // **And the ambient is somewhere else at the same moment**, which is the whole reason each
+        // family carries its own windows. At 17:15 the sky is half way to its sunset colour, having
+        // set off at 16:30 with an hour and a half to go; the ambient set off at 17:00 with one
+        // hour, so it is only a quarter of the way.
+        let ambient = test.ambient.at(WorldTime::hours(17.25));
+        let quarter = test.ambient.day.lerp(test.ambient.sunset, 0.25);
+        assert!((ambient - quarter).length() < 1e-5, "{ambient:?}");
+        // And at half past six the sky has finished while the ambient has not.
+        assert_eq!(test.sky.at(WorldTime::hours(18.5)), test.sky.night);
+        assert!(test.ambient.at(WorldTime::hours(18.5)) != test.ambient.night);
+    }
+
+    #[test]
+    fn the_air_thickens_at_night_on_the_fog_s_own_schedule() {
+        let table = table();
+        if table.is_empty() {
+            return;
+        }
+        // Foggy is the weather that differs between day and night — 1.0 against 1.9 — and every
+        // other ships the same figure for both.
+        let foggy = table.iter().find(|w| w.name == "foggy").unwrap();
+        assert!((foggy.fog_depth(WorldTime::hours(12.0)) - 1.0).abs() < 1e-5);
+        assert!((foggy.fog_depth(WorldTime::hours(0.0)) - 1.9).abs() < 1e-5);
+        // And it crosses between them rather than stepping.
+        let dusk = foggy.fog_depth(WorldTime::hours(17.5));
+        assert!(dusk > 1.0 && dusk < 1.9, "{dusk}");
+    }
+}

@@ -4,6 +4,7 @@ use glam::{Vec2, Vec3};
 
 use crate::sky::Sky;
 use crate::sun::Sun;
+use crate::weather::Weather;
 use crate::world_time::WorldTime;
 
 /// Morrowind world units per metre, which the cloud layer is the first thing in this crate to need.
@@ -70,12 +71,6 @@ const DRIFT: f32 = 1.8;
 /// repeat obvious.
 const BEARING: f32 = 0.6;
 
-/// `Cloud Speed` for clear weather, out of `Morrowind.ini`'s `[Weather Clear]`.
-///
-/// One number of the weather system, borrowed ahead of the rest of it so the layer moves at the rate
-/// the game says rather than at one invented here.
-const CLEAR_SPEED: f32 = 1.25;
-
 /// What a cloud's lit face radiates against the sun that lights it.
 ///
 /// **A cloud is not a surface and this is not an albedo.** Water droplets scatter almost all of
@@ -133,8 +128,8 @@ pub struct Clouds {
     pub sheet_mean: f32,
     /// How much of the sky the layer covers at all, from none to all of it.
     ///
-    /// `Clouds Maximum Percent`, which is 1 for every weather but a few. Zero is a cell with no
-    /// sky, which draws no layer without a branch to say so.
+    /// The weather's own `Clouds Maximum Percent`, which is 1 for most of the ten and 0.66 for rain.
+    /// Zero is a cell with no sky, which draws no layer without a branch to say so.
     pub cover: f32,
 }
 
@@ -182,10 +177,10 @@ impl Clouds {
     ///
     /// The drift is taken off the *date* rather than the hour, because it has to accumulate: the
     /// hour wraps at midnight and a layer carried by it would snap back with it.
-    pub fn at(time: WorldTime, sun: Sun, ambient: Vec3) -> Self {
+    pub fn at(time: WorldTime, sun: Sun, ambient: Vec3, weather: &Weather) -> Self {
         // Carried on a steady bearing, in tiles, from the hour the world has run.
         let (sin, cos) = BEARING.sin_cos();
-        let travelled = time.day() * DRIFT * CLEAR_SPEED;
+        let travelled = time.day() * DRIFT * weather.cloud_speed;
 
         // **The layer's own sunset, which is later and slower than the ground's.** Full sun while
         // the sun is up at all, then out over twice the dip: a cloud straight overhead loses it at
@@ -224,7 +219,7 @@ impl Clouds {
             shadowed: skyward,
             // Stood in for until a sheet is uploaded, which is the only thing that knows it.
             sheet_mean: 1.0,
-            cover: 1.0,
+            cover: weather.cloud_cover,
         }
     }
 }
@@ -238,7 +233,7 @@ mod tests {
     fn at(hour: f32) -> Clouds {
         let time = WorldTime::hours(hour);
         let sky = crate::Sky::at(time);
-        Clouds::at(time, sky.sun, sky.ambient)
+        Clouds::at(time, sky.sun, sky.ambient, &Weather::clear())
     }
 
     #[test]

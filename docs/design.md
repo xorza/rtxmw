@@ -3371,3 +3371,45 @@ degrees of elevation `warmth` is near one and the dome's warm tint reaches the t
 weakness in spreading warmth by `sunward` alone — the zenith looks through one air mass and should
 stay blue at any hour — but the new curve exposed it rather than caused it, and it is recorded here
 rather than papered over.
+
+### 8.59 Weather, read out of the ini rather than written down here
+
+Morrowind keeps its weather in `Morrowind.ini` rather than in the content files: ten `[Weather X]`
+blocks of 49 fields apiece, and a general `[Weather]` section that says when each of them changes.
+Three of its figures had already been copied into this crate by hand — the day's length, the star
+schedule, the moons' sizes — because there was nothing to parse the file with. Ten weathers are too
+many to do that with, so `GameData` now owns a parsed `Ini` beside the master file and the archives.
+
+**Each family of colours changes over on its own schedule, which is why a Morrowind dusk does not
+happen all at once.** `Sky Pre-Sunset Time=1.5` and `Sky Post-Sunset Time=.5` against the ambient's
+1 and 1.25: the sky begins turning ninety minutes before the sun goes down and has finished thirty
+after, while the ground starts sixty before and takes until seventy-five after. Twelve such figures,
+four families, and nothing had to be invented to blend between the four times of day each weather
+names.
+
+**What the game supplies and what stays this renderer's.** The hues are Bethesda's and the levels
+are not: the ini's `Land Fog Day Depth` is in the original engine's units, so `FOG_SCALE` ties clear
+weather's 0.69 to the 0.30 that was settled by eye and every other weather follows the ini's *ratio*
+to it — foggy's air nearly doubles overnight, blight's is 60% thicker than clear's. The same split
+applies to colour: the fog takes the weather's hue at the dome's own brightness.
+
+**Normalised by its brightest channel, not by its luminance**, and the difference is the whole of
+whether blight works. Its `Fog Day Color` is (128, 19, 19), whose luminance is a twentieth of its
+red — so dividing by that gave a multiplier of 4.0 in red and the fog came out *brighter* than the
+light that lit it. What this quantity is is a scattering albedo, and an albedo cannot exceed one.
+Against the maximum, blight is a deep red darker than a clear day's.
+
+Three placeholders are retired. `OUTDOOR_FOG_DENSITY` is gone, and its own doc had said it was "the
+number to replace when that arrives". `CLEAR_SPEED` is gone — the layer drifts at the weather's
+`Cloud Speed`. And the cloud layer's hard-coded full cover is the weather's `Clouds Maximum
+Percent`, which is 0.66 for rain. `--weather` names one of the ten; an unknown name is clear rather
+than a refusal to start, since the list is the game's and a caller cannot be expected to have it.
+
+**Two of the ten are Bloodmoon's and carry its own prefix** — `Tx_BM_Sky_Snow` and
+`Tx_BM_Sky_Blizzard` against the eight `Tx_Sky_*`. The test that every weather names a sheet asks
+the archives rather than assuming the shape, which is how that was found.
+
+**What is not done.** The sky, ambient and sun schedules are parsed and unused: the dome's colour is
+still the physical model's, and putting the game's four-colour interpolation over it is the next
+slice's argument to have. It shows most under blight, where the fog is red and the sky above it is
+not.

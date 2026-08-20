@@ -164,6 +164,7 @@ fn the_cell_and_the_frame_limit_go_in_either_order() {
             fog: 1.0,
             time: WorldTime::default(),
             dlss: Upscaling(None),
+            weather: "clear".to_owned(),
         })
     );
     // A flag on its own must not be mistaken for a cell name, which is exactly what happened
@@ -177,6 +178,7 @@ fn the_cell_and_the_frame_limit_go_in_either_order() {
             fog: 1.0,
             time: WorldTime::default(),
             dlss: Upscaling(None),
+            weather: "clear".to_owned(),
         })
     );
 
@@ -187,6 +189,7 @@ fn the_cell_and_the_frame_limit_go_in_either_order() {
         fog: 1.0,
         time: WorldTime::default(),
         dlss: Upscaling(None),
+        weather: "clear".to_owned(),
     };
     assert_eq!(parse(&["-2,-9", "--frames", "3"]), Ok(outdoors.clone()));
     assert_eq!(parse(&["--frames", "3", "-2,-9"]), Ok(outdoors));
@@ -231,6 +234,7 @@ fn a_screenshot_can_be_told_where_to_stand_and_which_way_to_look() {
             fog: 1.0,
             time: WorldTime::default(),
             dlss: Upscaling(None),
+            weather: "clear".to_owned(),
         })
     );
     // Either half on its own: what is not said is left to the cell rather than made up here,
@@ -282,6 +286,7 @@ fn a_screenshot_takes_a_path_then_a_size_then_a_cell() {
             fog: 1.0,
             time: WorldTime::default(),
             dlss: Upscaling(None),
+            weather: "clear".to_owned(),
         })
     );
     assert_eq!(
@@ -301,6 +306,7 @@ fn a_screenshot_takes_a_path_then_a_size_then_a_cell() {
             fog: 1.0,
             time: WorldTime::default(),
             dlss: Upscaling(None),
+            weather: "clear".to_owned(),
         })
     );
     // Flagged like the viewpoint, and for the same reason.
@@ -331,6 +337,7 @@ fn a_screenshot_takes_a_path_then_a_size_then_a_cell() {
             fog: 1.0,
             time: WorldTime::default(),
             dlss: Upscaling(None),
+            weather: "clear".to_owned(),
         })
     );
 

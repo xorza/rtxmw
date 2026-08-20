@@ -5,6 +5,7 @@ use rtxmw_texture::Texture;
 use crate::error::Result;
 use crate::game_data::GameData;
 use crate::srgb::{LUMA, channel_to_linear};
+use crate::weather::Weather;
 
 /// Every vanilla picture the sky needs: the two moons' portraits and the weather's cloud sheet.
 ///
@@ -23,9 +24,10 @@ pub struct SkyTextures {
     pub masser: Option<Texture>,
     /// `tx_secunda_full.dds` — the smaller one's.
     pub secunda: Option<Texture>,
-    /// `tx_sky_clear.dds` — the painted sheet the cloud layer is cut out of.
+    /// The painted sheet the cloud layer is cut out of — the weather's own.
     ///
-    /// Clear weather's, until there is a weather system to choose between the nine.
+    /// `Weather::cloud_texture` names it, which for eight of the ten is `tx_sky_*` and for
+    /// Bloodmoon's snow and blizzard is `tx_bm_sky_*`.
     pub clouds: Option<Texture>,
     /// Mean luminance of the cloud sheet, weighted by its own alpha and decoded to linear.
     ///
@@ -35,8 +37,11 @@ pub struct SkyTextures {
 }
 
 impl SkyTextures {
-    /// Reads all of them from the installed game, or `None` where none is configured.
-    pub fn load() -> Result<Option<Self>> {
+    /// Reads all of them from the installed game, with `weather`'s cloud sheet.
+    ///
+    /// `None` where no game data is configured. A sheet that will not read leaves the layer undrawn
+    /// rather than failing, the same as a moon without its portrait is a flat disc.
+    pub fn load(weather: &Weather) -> Result<Option<Self>> {
         let Some(game) = GameData::shared()? else {
             return Ok(None);
         };
@@ -50,7 +55,7 @@ impl SkyTextures {
         // layer repeats its tile some forty times across the last degrees above the horizon — a
         // minifying lookup with nothing to fall back to. The moons' portraits ship their own chains
         // and are magnified rather than minified, so they are left as they are.
-        let clouds = read(r"textures\tx_sky_clear.dds").map(Texture::with_mips);
+        let clouds = read(&format!(r"textures\{}", weather.cloud_texture)).map(Texture::with_mips);
         Ok(Some(Self {
             masser: read(r"textures\tx_masser_full.dds"),
             secunda: read(r"textures\tx_secunda_full.dds"),

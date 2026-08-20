@@ -284,6 +284,10 @@ pub(crate) struct WindowOptions {
         value_parser = upscaling,
     )]
     pub(crate) dlss: Upscaling,
+    /// Which of the game's ten weathers to stand under: clear, cloudy, foggy, overcast, rain,
+    /// thunderstorm, ashstorm, blight, snow or blizzard
+    #[arg(long = "weather", value_name = "NAME", default_value = "clear")]
+    pub(crate) weather: String,
 }
 
 /// What an offscreen render was asked for.
@@ -360,6 +364,10 @@ pub(crate) struct ScreenshotOptions {
         value_parser = upscaling,
     )]
     pub(crate) dlss: Upscaling,
+    /// Which of the game's ten weathers to stand under: clear, cloudy, foggy, overcast, rain,
+    /// thunderstorm, ashstorm, blight, snow or blizzard
+    #[arg(long = "weather", value_name = "NAME", default_value = "clear")]
+    pub(crate) weather: String,
 }
 
 /// What a texture sheet was asked for.

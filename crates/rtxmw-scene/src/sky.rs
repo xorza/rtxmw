@@ -6,6 +6,7 @@ use crate::clouds::Clouds;
 use crate::moon::Moon;
 use crate::srgb::LUMA;
 use crate::sun::Sun;
+use crate::weather::Weather;
 use crate::world_time::WorldTime;
 
 /// Optical depth of the whole atmosphere looking straight up, per channel.
@@ -29,6 +30,15 @@ const ZENITH_DEPTH: Vec3 = Vec3::new(0.0464, 0.1080, 0.2648);
 /// `ZENITH_DEPTH` is the only constant in this file that came from anywhere but an eye; this, the
 /// greying, the twilight width and the night floor are all tuned, and say so.
 const SKY_STRENGTH: f32 = 1.7000;
+
+/// What one unit of the ini's `Land Fog Depth` is worth in this renderer's own fog.
+///
+/// Clear weather's 0.69 comes to 0.30, which is the density that was settled by eye before there was
+/// a weather system — half the light from a surface surviving a hundred and thirty metres, where the
+/// 0.75 before it lost the far shore of Seyda Neen's bay at fifty-three. So the absolute is still
+/// this renderer's and the *ratios* between the ten weathers, and between a weather's day and its
+/// night, are the game's.
+const FOG_SCALE: f32 = 0.30 / 0.69;
 
 /// What the sky radiates once the sun is properly down.
 ///
@@ -127,6 +137,16 @@ pub struct Sky {
     pub scale: f32,
     /// How much of the star field is out, from none to all of it — [`WorldTime::starlight`].
     pub stars: f32,
+    /// What the exterior's fog scatters, and how thickly it sits.
+    ///
+    /// **The weather's hue on the dome's own level.** `Land Fog Day Depth` and the `Fog *Color*`
+    /// schedule are the game's, and both vary by weather and by hour — blight's fog is red where
+    /// clear's is a pale blue, and foggy's air nearly doubles in thickness overnight. What is *not*
+    /// the game's is the scale: its depths are in the original engine's units and this renderer's
+    /// fog is tuned in its own, so `FOG_SCALE` ties clear weather to the figure that was settled by
+    /// eye and every other weather follows the ini's ratio to it.
+    pub fog: Vec3,
+    pub fog_density: f32,
     /// What the hour multiplies the metered exposure by — a bias on it, never the exposure itself.
     ///
     /// **Keyed to the sky rather than to the frame.** Metering says how bright the picture is; this
@@ -178,6 +198,14 @@ impl Sky {
 
     /// The light above an exterior at `time`.
     pub fn at(time: WorldTime) -> Self {
+        Self::under(time, &Weather::clear())
+    }
+
+    /// The light above an exterior at `time`, under `weather`.
+    ///
+    /// [`Self::at`] is this under clear weather, which is what every test wants and what the engine
+    /// runs in until something chooses otherwise.
+    pub fn under(time: WorldTime, weather: &Weather) -> Self {
         let bare = Sun::at(time.orbit());
         // The sun's direction travels downward, so its climb above the horizon is the negation —
         // and it is signed, because after sunset there is a good deal of sky left to light and how
@@ -219,16 +247,31 @@ impl Sky {
             warmth,
             scale: SKY_STRENGTH * lit,
             stars: time.starlight(),
+            fog: Vec3::ZERO,
+            fog_density: weather.fog_depth(time) * FOG_SCALE,
             exposure_bias: 1.0,
         };
         sky.ambient = sky.dome_average();
+        // **The weather's hue on the dome's own light.** Fog is lit by the sky, so its level belongs
+        // to the dome — which is what made the sky an honest stand-in for it — and its colour
+        // belongs to the weather, which is the half the stand-in could not give: nothing about a sky
+        // says that blight's air is red.
+        //
+        // **Normalised by its brightest channel, not by its luminance**, because what this is is a
+        // scattering albedo and an albedo cannot exceed one. Blight's `Fog Day Color` is
+        // (128, 19, 19), whose luminance is a twentieth of its red — so dividing by that gave a
+        // multiplier of 4.0 in red and the fog came out brighter than the light that lit it, which
+        // drowned the whole landscape. Against the maximum it is a deep red that is darker than a
+        // clear day's, which is what a blight storm looks like.
+        let hue = weather.fog.at(time);
+        sky.fog = sky.ambient * (hue / hue.max_element().max(1e-4));
         // **After the dome's average, because the layer is lit by it.** The clouds are not part of
         // the average in turn: they sit under the sky rather than being it, and a dome that counted
         // them would light the ground by its own clouds.
         // **The beam before any air at all**, because the layer crosses different air from the
         // ground: less of it, and at a different angle. `Clouds` applies its own extinction and its
         // own horizon fade — see the notes there.
-        sky.clouds = Clouds::at(time, bare, sky.ambient);
+        sky.clouds = Clouds::at(time, bare, sky.ambient, weather);
         sky.exposure_bias = sky.bias_from_dome();
         sky
     }

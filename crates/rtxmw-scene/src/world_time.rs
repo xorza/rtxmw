@@ -11,9 +11,9 @@
 /// to go with it. The default hour moved from 9.5 to 9 at the same time, which is what keeps
 /// `orbit()` at the 0.5 every image in this project has been made at: the same sun, reached over a
 /// shorter day.
-const SUNRISE: f32 = 6.0;
+pub(crate) const SUNRISE: f32 = 6.0;
 /// And when it returns to it, out of the same section.
-const SUNSET: f32 = 18.0;
+pub(crate) const SUNSET: f32 = 18.0;
 
 /// When the stars come out and when they go in, all out of the same `[Weather]` section.
 ///
