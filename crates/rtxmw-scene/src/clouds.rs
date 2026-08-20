@@ -2,6 +2,7 @@
 
 use glam::{Vec2, Vec3};
 
+use crate::sky::Sky;
 use crate::sun::Sun;
 use crate::world_time::WorldTime;
 
@@ -11,6 +12,11 @@ use crate::world_time::WorldTime;
 /// `f32` and rounds to this.
 const UNITS_PER_METRE: f32 = 69.991_25;
 
+/// How fast the air thins with height — the atmosphere's scale height.
+///
+/// Eight kilometres, the same figure `ZENITH_DEPTH` in `sky.rs` is a whole atmosphere's worth of.
+const SCALE_HEIGHT: f32 = 8_000.0 * UNITS_PER_METRE;
+
 /// How high the layer sits, and how far round the world curves under it.
 ///
 /// **A shell over a curved world rather than a dome around the eye**, which is the difference
@@ -19,21 +25,29 @@ const UNITS_PER_METRE: f32 = 69.991_25;
 /// picture — but a mesh centred on the viewer saturates: every direction meets it at one distance,
 /// so the last few degrees above the horizon smear the whole sheet into streaks.
 ///
-/// Two kilometres up, which is where a fair-weather deck sits.
-const ALTITUDE: f32 = 2_000.0 * UNITS_PER_METRE;
+/// How high the layer sits — five hundred metres, a stratocumulus base.
+///
+/// **Set by the shadows rather than by the sky.** A cloud's shadow is the size of the cloud, so
+/// making one small enough to read across a landscape means making the other small too — and at a
+/// fixed altitude that shrinks it in the sky as well. Dropping the base in step keeps the angle a
+/// cloud subtends and so keeps the sky's own look. Two kilometres with eight-kilometre tiles put a
+/// cloud feature at 780 m against a visible landscape of about 300, so the whole view sat under one
+/// cloud and dimmed as a body; two kilometres with two-kilometre tiles fixed the shadows and turned
+/// the sky into a mackerel plaid. This is the pair that gives both.
+const ALTITUDE: f32 = 500.0 * UNITS_PER_METRE;
 
 /// How far the world curves under that layer — the Earth's own radius.
 ///
 /// It is the whole of what gives the sky depth: a ray meets the layer at [`ALTITUDE`] overhead and
-/// at `sqrt(2 R h)`, 160 km, along the horizon.
+/// at `sqrt(2 R h)`, 80 km, along the horizon.
 const WORLD_RADIUS: f32 = 6_371_000.0 * UNITS_PER_METRE;
 
 /// How far one tile of the sheet spans across the layer.
 ///
-/// **Not from the game**, which scrolls one quad's worth over its dome and states no distance. Eight
-/// kilometres is the width of a decent field of cumulus, which is what the sheet holds a few of —
-/// so a cloud comes out a kilometre or two across, which is what a cloud is.
-const TILE: f32 = 8_000.0 * UNITS_PER_METRE;
+/// **Not from the game**, which scrolls one quad's worth over its dome and states no distance. Two
+/// kilometres, which puts a cloud feature at about 200 metres — small enough that a shadow of one
+/// reads across a view of Seyda Neen, which is only three hundred metres wide.
+const TILE: f32 = 2_000.0 * UNITS_PER_METRE;
 
 /// How fast the wind carries the layer, in tiles per game day, against `Cloud Speed`.
 ///
@@ -101,7 +115,7 @@ const SKYLIT: f32 = 0.3;
 pub struct Clouds {
     /// How high the layer sits over the eye.
     pub altitude: f32,
-    /// How far the world curves under it, which is what puts the layer's own horizon 160 km out.
+    /// How far the world curves under it, which is what puts the layer's own horizon 80 km out.
     pub world_radius: f32,
     /// How far one tile of the sheet spans across the layer.
     pub tile: f32,
@@ -137,7 +151,34 @@ impl Clouds {
         cover: 0.0,
     };
 
+    /// How far the layer's own horizon dips below the ground's, in radians.
+    ///
+    /// **Why a cloud is still lit after the sun has set**, and the whole of why a sunset glows. A
+    /// cloud at height `h` over a world of radius `R` sees the sun until it is `sqrt(2h/R)` under
+    /// the horizon *below the cloud* — 0.72 degrees at five hundred metres, which is three and a
+    /// half minutes of the game's own clock after the ground has gone dark, and seven before the
+    /// far side of the layer loses it too.
+    fn sunset_dip() -> f32 {
+        (2.0 * ALTITUDE / WORLD_RADIUS).sqrt()
+    }
+
+    /// How much of the atmosphere's mass is still above the layer.
+    ///
+    /// Air thins by `exp(-h/H)`, so five hundred metres up leaves 94% of it overhead — and a beam
+    /// reaching the deck is extinguished by that much less than one reaching the ground. Derived
+    /// from the altitude beside it rather than written down as the figure it comes to, which would
+    /// be a second thing to move if the layer ever rises — and it has already moved once.
+    fn above_layer() -> f32 {
+        (-ALTITUDE / SCALE_HEIGHT).exp()
+    }
+
     /// The layer at `time`, lit by `sun` under a sky of average radiance `ambient`.
+    ///
+    /// **`sun` is the beam as the layer meets it, not as the ground does** — attenuated by the air
+    /// it crossed but with no horizon fade on it, because the layer's horizon is not the ground's.
+    /// Handing over [`crate::Sky`]'s own faded sun instead is what made the clouds change colour in
+    /// a single step at six o'clock: they were losing the sun over its own half-degree diameter,
+    /// which at sunset this world crosses in half a minute.
     ///
     /// The drift is taken off the *date* rather than the hour, because it has to accumulate: the
     /// hour wraps at midnight and a layer carried by it would snap back with it.
@@ -146,11 +187,33 @@ impl Clouds {
         let (sin, cos) = BEARING.sin_cos();
         let travelled = time.day() * DRIFT * CLEAR_SPEED;
 
-        // **What reaches the top of the layer**, which is the sun's beam plus the whole dome. The
-        // sun's own colour already has the air it crossed taken out of it, and a cloud sits under
-        // most of that air rather than above it — near enough at this scale that the difference is
-        // smaller than `SUNLIT` is uncertain.
-        let sunward = sun.colour * SUNLIT;
+        // **The layer's own sunset, which is later and slower than the ground's.** Full sun while
+        // the sun is up at all, then out over twice the dip: a cloud straight overhead loses it at
+        // the dip itself, and the layer reaches its own horizon 80 km away whose clouds keep it
+        // about that much longer again.
+        //
+        // **Measured in how far the sun is *under*, not in the sine of where it is.** Morrowind's
+        // path is `sqrt(1 - orbit^2)`, whose derivative at the horizon is infinite — the sun drops
+        // from 0.57 degrees to nothing in the last eighteen seconds of the day — so anything keyed
+        // to elevation steps there however smooth its own curve is. That was a 30% jump in the
+        // clouds' colour at exactly six o'clock. Below the horizon the sun descends at a steady
+        // `NIGHT_DESCENT` per unit of orbit and orbit is linear in time, so this is too.
+        let dip = Self::sunset_dip();
+        let under = (-sun.direction.z).min(0.0).abs().asin();
+        // The same shaping the sun's own disc sets by, read the other way round: `showing` fades in
+        // as its argument rises through a window of half-width `dip`, and `dip - under` walks that
+        // window backwards as the sun goes down. Identical to `1 - smoothstep(under / 2 dip)`,
+        // because `smoothstep(1 - x)` is `1 - smoothstep(x)`.
+        let showing = Sky::showing(dip - under, dip);
+
+        // **The air the beam crossed to reach the *layer*, which is not the air it would cross to
+        // reach the ground.** The deck stands above a twentieth of the atmosphere and sees the sun
+        // 0.72 degrees higher than the ground does, so at the moment of sunset its beam has crossed
+        // twenty-seven air masses against the ground's thirty-eight. That is the whole of why a
+        // sunset cloud is gold: it is lit by light the ground has already lost.
+        let elevation = (-sun.direction.z).clamp(-1.0, 1.0).asin() + dip;
+        let air = Sky::transmittance_above(elevation.sin().max(0.0), Self::above_layer());
+        let sunward = sun.colour * air * (SUNLIT * showing);
         let skyward = ambient * SKYLIT;
         Self {
             altitude: ALTITUDE,
@@ -251,12 +314,11 @@ mod tests {
         };
         // Straight up, the layer is exactly its own altitude away.
         assert!((reach(1.0) - clouds.altitude).abs() < 1.0, "{}", reach(1.0));
-        // Along the horizon it is `sqrt(2Rh)` — 160 km, which in metres is what a real cloud deck's
-        // horizon is.
+        // Along the horizon it is `sqrt(2Rh)` — 80 km, which is what a real deck's horizon is.
         let horizon = (2.0 * clouds.world_radius * clouds.altitude).sqrt();
         assert!((reach(0.0) - horizon).abs() / horizon < 1e-3);
         assert!(
-            (horizon / UNITS_PER_METRE / 1000.0 - 160.0).abs() < 2.0,
+            (horizon / UNITS_PER_METRE / 1000.0 - 80.0).abs() < 2.0,
             "{} km",
             horizon / UNITS_PER_METRE / 1000.0
         );

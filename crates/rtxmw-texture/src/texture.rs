@@ -138,6 +138,51 @@ impl Texture {
         self.levels[0].height
     }
 
+    /// The same texture with a full mip chain built under it, for one that shipped without.
+    ///
+    /// **Uncompressed formats only**, which is what the callers that need this have: Morrowind's
+    /// `tx_sky_*` sheets are `Bgra8` with a single level, and a shader minifying one — a cloud layer
+    /// repeats its tile forty times across the last degrees above the horizon — has nothing to fall
+    /// back to and aliases. Block formats already ship their chains, and downsampling one would mean
+    /// decoding and re-encoding it.
+    ///
+    /// A box filter, which is what a mip chain is: each level is the average of four texels of the
+    /// one above, in whatever byte order the format keeps. Returns the texture unchanged where it
+    /// already has a chain or the format is compressed.
+    pub fn with_mips(self) -> Self {
+        let unit = self.format.unit_size() as usize;
+        let compressed = self.format.unit_extent() != 1;
+        if self.levels.len() > 1 || compressed {
+            return self;
+        }
+        let (width, height) = (self.width(), self.height());
+        let wanted = describe_levels(self.format, width, height, mip_count(width, height));
+        let total = wanted.last().map_or(0, |l| (l.offset + l.size) as usize);
+        let mut data = Vec::with_capacity(total);
+        data.extend_from_slice(&self.data[..wanted[0].size as usize]);
+
+        for pair in wanted.windows(2) {
+            let (above, level) = (pair[0], pair[1]);
+            let base = above.offset as usize;
+            for y in 0..level.height {
+                for x in 0..level.width {
+                    // The four texels above this one, clamped where a level is one texel wide.
+                    let sx = (2 * x).min(above.width - 1);
+                    let sy = (2 * y).min(above.height - 1);
+                    let ox = (sx + 1).min(above.width - 1);
+                    let oy = (sy + 1).min(above.height - 1);
+                    let at = |px: u32, py: u32| base + ((py * above.width + px) as usize) * unit;
+                    let corners = [at(sx, sy), at(ox, sy), at(sx, oy), at(ox, oy)];
+                    for byte in 0..unit {
+                        let sum: u32 = corners.iter().map(|&c| data[c + byte] as u32).sum();
+                        data.push(((sum + 2) / 4) as u8);
+                    }
+                }
+            }
+        }
+        Self::new(self.format, data, wanted).expect("a box-filtered chain matches its own table")
+    }
+
     /// Every mip level, largest first.
     pub fn levels(&self) -> &[MipLevel] {
         &self.levels
@@ -190,6 +235,11 @@ impl Texture {
     }
 }
 
+/// How many levels a full chain from `width` x `height` has, down to a single texel.
+pub(crate) fn mip_count(width: u32, height: u32) -> u32 {
+    32 - width.max(height).max(1).leading_zeros()
+}
+
 /// The chain of `count` levels starting at `width` x `height`.
 ///
 /// Each level halves, floored at one texel, which is the convention every mipped format uses.
@@ -237,6 +287,32 @@ mod tests {
 
         // Uncompressed is one unit per texel.
         assert_eq!(TextureFormat::Bgra8.level_size(5, 5), 100);
+    }
+
+    #[test]
+    fn a_sheet_with_no_chain_gets_a_box_filtered_one() {
+        // **Four texels averaging to one**, checked on a pattern whose answer is arithmetic: a 2x2
+        // of 0, 100, 200 and 255 in every channel comes to 139 — `(555 + 2) / 4`.
+        let pixels: Vec<u8> = [0u8, 100, 200, 255]
+            .iter()
+            .flat_map(|&v| [v, v, v, v])
+            .collect();
+        let flat = Texture::from_pixels(TextureFormat::Rgba8, 2, 2, pixels);
+        assert_eq!(flat.levels().len(), 1, "the fixture starts with no chain");
+
+        let mipped = flat.with_mips();
+        assert_eq!(mipped.levels().len(), 2, "2x2 has one level under it");
+        let one = mipped.levels()[1];
+        assert_eq!((one.width, one.height), (1, 1));
+        assert_eq!(&mipped.level_data(1)[..4], &[139, 139, 139, 139]);
+        // The top level is untouched, which is the half a caller can least afford to lose.
+        assert_eq!(&mipped.level_data(0)[..4], &[0, 0, 0, 0]);
+
+        // **A chain that already exists is left alone**, and so is a block format, which would have
+        // to be decoded and re-encoded to filter.
+        assert_eq!(mipped.clone().with_mips().levels().len(), 2);
+        let block = Texture::from_pixels(TextureFormat::Bc1, 4, 4, vec![0; 8]);
+        assert_eq!(block.with_mips().levels().len(), 1);
     }
 
     #[test]

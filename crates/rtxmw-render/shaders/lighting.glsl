@@ -9,6 +9,10 @@
 vec3 sun_through_water(vec3 position, float footprint);
 vec3 daylight_reaching(vec3 position);
 
+// Defined below, beside the layer it reads: every light above the clouds is shadowed by them, and
+// `disc_light` is the first thing in the file that needs to say so.
+float cloud_shadow(vec3 position, vec3 towards);
+
 // How many shadow rays the sun gets at the primary hit.
 //
 // More than a lamp's, because its penumbra is the one every outdoor surface is judged by: a disc
@@ -116,6 +120,7 @@ vec3 disc_light(Surface surface, vec3 direction, vec3 colour, float cos_radius, 
         }
     }
     return colour * facing * (visible / float(taken))
+         * cloud_shadow(surface.position, -direction)
          * sun_through_water(surface.position, surface.footprint);
 }
 
@@ -399,6 +404,72 @@ vec3 moon_disc(vec3 direction, Moon moon, float footprint) {
     return moon.colour * (shade * face);
 }
 
+// Where a ray from `from` heading `direction` crosses the cloud layer, in tiles of the sheet.
+//
+// **Where the ray meets a shell over a curved world**, which is the whole of why a sky has depth.
+// With the eye on a world of radius `R` and the layer `h` above it, the shell is centred `R` below
+// and the positive root of the quadratic is the distance to it: `h` looking straight up, and
+// `sqrt(2Rh)` — a hundred and sixty kilometres — along the horizon. A shell centred on the *eye*
+// instead is the same distance in every direction, which piles the whole sheet into a ring in the
+// last few degrees.
+//
+// **Solved as `c / (b + sqrt(b*b + c))` rather than `-b + sqrt(b*b + c)`**, which is the same root
+// without the cancellation. `b` is the world's radius times the ray's climb — 4.5e8 in game units —
+// so `b*b` is 2e17 and subtracting `b` from its own square root throws away every digit that
+// mattered: straight up it came out 17 units from an answer that is exactly the altitude. The
+// conjugate form adds two positive numbers instead and is exact there.
+//
+// **Anchored to the world rather than to the viewer**, which it was not: the sheet was addressed by
+// the ray's direction alone, so the whole deck travelled with the camera and no shadow it cast could
+// have lined up with it.
+vec2 cloud_uv(vec3 from, vec3 direction, out float reach) {
+    float b = frame.cloud_world_radius * direction.z;
+    float c = frame.cloud_altitude * (2.0 * frame.cloud_world_radius + frame.cloud_altitude);
+    reach = c / (b + sqrt(b * b + c));
+    // **Minus the drift, not plus.** A feature sits at a fixed coordinate in the sheet, so its
+    // world position is `(uv - drift) * tile` — adding the drift walks the whole layer *against* the
+    // bearing `Clouds::BEARING` says the wind blows on.
+    return (from.xy + direction.xy * reach) / frame.cloud_tile - frame.cloud_drift;
+}
+
+// How much of a light above the layer reaches `position`, which is the layer's shadow on the world.
+//
+// **The same sheet the sky is drawn from, addressed at the same scale**, so a shadow lies under the
+// cloud that casts it. Sampled a few levels down rather than at the finest: a shadow is a soft thing
+// and every shading point pays for this. That only became true once `SkyTextures` built the sheet a
+// mip chain — it ships with one level, so this and the layer's own lod were both clamping to zero
+// and the coarse sampling here was a comment describing nothing.
+//
+// **Beer-Lambert, not a crossfade.** Light through a medium falls off as `exp(-density)`, which is
+// what `fog.glsl` and `water.glsl` already use and what this should always have been. Mixing toward
+// a floor by coverage is a blend between two pictures, and it *saturates*: deepening that mix by
+// four — to make a cirrus sky cast anything at all — pinned 48.5% of the clear sheet at its darkest
+// value, so half the ground sat at one flat shade and the only thing that varied was the gaps
+// between clouds. What read on screen was bright patches rather than shadows, and an eye tracking
+// those gaps sees them travel opposite to the clouds that make them. The exponential never flattens:
+// a thick cloud is strictly darker than a thin one all the way up, so the pattern on the ground is
+// the pattern in the sky. Same mean darkening as the mix at four, 0.47 of the sun against 0.48, with
+// none of it saturated.
+//
+// `OPACITY` is the one number in the layer chosen rather than derived. Clear weather's sheet is
+// cirrus, whose alpha averages a quarter and which in life casts almost nothing; the exterior fog is
+// still a placeholder thick enough to wash out most of what it does cast. A shadow that cannot be
+// seen is not worth tracing. The weather system should retire it — `tx_sky_cloudy`'s alpha averages
+// 0.74 against clear's 0.25, and the per-weather fog depths replace the placeholder.
+float cloud_shadow(vec3 position, vec3 towards) {
+    if (frame.cloud_cover <= 0.0 || frame.cloud_sheet == 0u || towards.z <= 0.0) {
+        return 1.0;
+    }
+    const float OPACITY = 4.0;
+    const float SHADOW_LOD = 3.0;
+    float reach;
+    float alpha = textureLod(textures[frame.cloud_sheet],
+                             cloud_uv(position, towards, reach), SHADOW_LOD).a;
+    return exp(-alpha * frame.cloud_cover * OPACITY);
+}
+
+
+
 // What the cloud layer puts in front of the sky along `direction`, and how much of it it hides.
 //
 // **A vanilla asset lit rather than shown.** `tx_sky_*.dds` is a painted photograph of a sky with
@@ -415,22 +486,8 @@ vec3 cloud_layer(vec3 direction, float footprint, out float hiding) {
         return vec3(0.0);
     }
 
-    // **Where the ray meets a shell over a curved world**, which is the whole of why a sky has
-    // depth. With the eye on a world of radius `R` and the layer `h` above it, the shell is centred
-    // `R` below and the positive root of the quadratic is the distance to it: `h` looking straight
-    // up, and `sqrt(2Rh)` — a hundred and sixty kilometres — along the horizon. A shell centred on
-    // the *eye* instead is the same distance in every direction, which piles the whole sheet into a
-    // ring in the last few degrees.
-    //
-    // **Solved as `c / (b + sqrt(b*b + c))` rather than `-b + sqrt(b*b + c)`**, which is the same
-    // root without the cancellation. `b` is the world's radius times the ray's climb — 4.5e8 in
-    // game units — so `b*b` is 2e17 and subtracting `b` from its own square root throws away every
-    // digit that mattered: straight up it came out 17 units from an answer that is exactly the
-    // altitude. The conjugate form adds two positive numbers instead and is exact there.
-    float b = frame.cloud_world_radius * direction.z;
-    float c = frame.cloud_altitude * (2.0 * frame.cloud_world_radius + frame.cloud_altitude);
-    float reach = c / (b + sqrt(b * b + c));
-    vec2 where = direction.xy * (reach / frame.cloud_tile) + frame.cloud_drift;
+    float reach;
+    vec2 where = cloud_uv(frame.camera_position, direction, reach);
 
     // **The level the ray can actually resolve**, the same argument `cone_lod` makes for a surface:
     // the cone is `footprint` wide per unit travelled and it has travelled `reach`, so it covers

@@ -3232,9 +3232,9 @@ light reaching it has crossed thirty atmospheres, not because anyone painted it 
 **A shell over a curved world, not a dome round the eye.** `sky_clouds_01.nif` is a cap of radius
 1000 rising 100 to 307 — flat enough that its own artist was drawing this picture — but a mesh
 centred on the viewer meets every ray at one distance, so the last few degrees above the horizon
-smear the whole sheet into radial streaks. Two kilometres up over the Earth's own radius gives a ray
-`h` overhead and `sqrt(2Rh)` — **160 km** — along the horizon, which is what a sky's depth is made
-of. One tile spans eight kilometres, which puts a cloud a kilometre or two across.
+smear the whole sheet into radial streaks. Five hundred metres up over the Earth's own radius gives
+a ray `h` overhead and `sqrt(2Rh)` — **80 km** — along the horizon, which is what a sky's depth is
+made of. One tile spans two kilometres, which puts a cloud feature at about 200 metres.
 
 **And that geometry is a precision trap.** The obvious root of the ray-shell quadratic is `-b +
 sqrt(b*b + c)`, where `b` is the world's radius times the ray's climb: 4.5e8 in game units, so `b*b`
@@ -3273,3 +3273,101 @@ What is not built yet is the weather system this is one sheet of: the ten `[Weat
 sky, fog, ambient and sun colours at four times of day, `Land Fog Depth`, `Clouds Maximum Percent`,
 and the `Transition Delta` that blends between them. Clear weather's sheet and its `Cloud Speed` of
 1.25 are borrowed ahead of the rest.
+
+### 8.57 The clouds get their own horizon, and cast a shadow on the world
+
+**A cloud is still in sunlight after the ground has lost it, and that is the whole of a sunset.**
+The layer was being handed `Sky`'s own sun — already faded out over the disc's half-degree at the
+*ground's* horizon — so it lost the sun at the same instant the ground did and changed colour in a
+single step at six o'clock. Measured: 70% of the clouds' colour in 1.2 game minutes, against 1.5 to
+3.4% either side of it.
+
+Three things were wrong and each is worth its own line. The layer's **horizon is lower**: a deck at
+height `h` over a world of radius R keeps the sun until it is `sqrt(2h/R)` under the ground's
+horizon — 0.72 degrees at five hundred metres, three and a half minutes of game time — and the layer
+reaches its own horizon 80 km away whose clouds keep it that much longer again, so the deck goes out
+over roughly twice the dip. It crosses **less air**: five hundred metres up is above a twentieth of
+the atmosphere's mass and sees the sun 0.72 degrees higher, so at the moment of sunset its beam has
+crossed twenty-seven air masses against the ground's thirty-eight — which is why a sunset cloud is
+gold rather than black, lit by light the ground has already lost. And the fade is keyed to **how far
+the sun is under**, not to the sine of where it is.
+
+**That last one is a symptom of something deeper and it is still there.** Morrowind's sun path
+scales its height by `sqrt(1 - orbit^2)`, whose derivative at the horizon is infinite: the sun drops
+from 0.57 degrees to nothing in the last eighteen seconds of the day. Anything keyed to elevation
+steps there however smooth its own curve — the air mass runs 30.5 to 38.0 across those eighteen
+seconds, and the sky's own brightness inherits it too. The three fixes above took the clouds from
+about 25% of their daylit level per 2.4 seconds of watching down to **12.3%**, and what remains is
+that singularity. Removing it means changing the sun's elevation profile, which moves every image
+this project has made — 4 degrees at the default hour for `cos(orbit * pi/2)`, 12 for a true great
+circle — so it is recorded here rather than taken.
+
+**And the layer casts.** The same sheet the sky is drawn from, sampled along the ray to each light
+above it, at a coarse mip because a shadow is a soft thing and every shading point pays for it. A
+deck lets a quarter through — the same fifth-to-a-quarter that `SKYLIT` is the other side of — so a
+cloud shadow is not black, which would read as an eclipse. Fault injection confirms the path:
+forcing it to full shadow moves 40.8% of the frame's pixels by more than 16 of 255.
+
+**And the shadows were invisible until the layer shrank, which is a scale argument rather than a
+lighting one.** A cloud's shadow is the size of the cloud. At eight-kilometre tiles a feature was
+780 metres across against a visible landscape of about three hundred, so the whole view sat under
+one cloud and dimmed as a body — the sky changed and the ground did not dapple. Shrinking the tile
+alone would have shrunk the clouds in the sky too, so the base came down with it: the angle a cloud
+subtends is `feature / altitude`, and holding that fixed keeps the sky while the shadow halves. Two
+kilometres of tile at five hundred metres of base is the pair that gives both — at two kilometres of
+base the same tile turned the sky into a mackerel plaid. Toggling the shadow on and off moves the
+frame by max 49 of 255 where the first scale managed 12.
+
+**Three things were hiding them, and only one was a bug.** The scale was, and is fixed above. The
+other two are not. Clear weather's sheet is **cirrus** — its alpha averages a quarter, and cirrus in
+life casts almost nothing, so drawing exactly what the sheet says is faithful and invisible:
+toggling the shadow moved 2.0% of a frame's pixels by more than 16 of 255. And the exterior **fog is
+still a placeholder**, `OUTDOOR_FOG_DENSITY` at 0.30 by eye until the weather system reads `Land Fog
+Depth`, thick enough to wash out most of what does get cast — the same toggle with `--fog 0` moves
+6.9%.
+
+So the shadow is deepened past what the sheet asks for, by four, which takes an average cirrus sky
+from a fifth of the sun blocked to three quarters and the toggle to 6.1% of pixels at max 83. It is
+the one number in the layer chosen rather than derived, and it is written down as such: a shadow
+that cannot be seen is not worth tracing. The weather system should retire it — `tx_sky_cloudy`'s
+alpha averages 0.74 against clear's 0.25, and the per-weather fog depths replace the placeholder
+that is washing it out.
+
+It also forced the layer to be **anchored to the world** rather than to the viewer. The sheet had
+been addressed by the ray's direction alone, so the whole deck travelled with the camera — invisible
+on its own at 140,000 units up, and fatal the moment a shadow had to lie under the cloud casting it.
+
+### 8.58 The sun's elevation was a circle where it should have been a cosine
+
+§8.57 recorded a singularity and declined to take it: Morrowind's sun scaled its height by `sqrt(1 -
+orbit^2)`, whose derivative at the horizon is infinite, so the sun dropped from 0.57 degrees to
+nothing in the last eighteen seconds of the day and everything keyed to its elevation stepped there.
+**Measured on the ground at Seyda Neen: the light fell from 1.33 to 0.46 between 17:58 and 18:00**,
+a 19.9% step of the daylit level in one 2.4 seconds of watching.
+
+**The circle was this project's own, not Bethesda's**, which is what made it takeable. The game's
+third component is a constant −100 — its sun swings east to west without ever descending — and the
+`sqrt(1 - orbit^2)` scaling was added here to give the day the ends it is named for. `cos(orbit *
+pi/2)` gives those same ends: one at noon, nought at both horizons. It is smooth there, and it is
+more physical besides — a real sun's elevation against an hour angle linear in time is a cosine, and
+feeding a linear quantity to a function that expects one already cosine-shaped is precisely what put
+the vertical tangent at the horizon.
+
+The step is **19.9% down to 7.2%**. What remains is a kink rather than a cliff: the day now reaches
+the horizon at 22 degrees per unit of orbit while the night leaves it at `NIGHT_DESCENT`'s 70, so
+the rate trebles at the crossing. Matching them means reshaping the night's descent, and 70 degrees
+at midnight is what §8.47 bought to stop the twilight glow burning all night — at 22 the glow would
+be 2.8% of its horizon value at midnight rather than 0.012%. That trade is not obviously worth
+taking and is not taken here.
+
+**Two things had to be re-fitted, and both were doing their job.** `SKY_STRENGTH` exists to pin the
+default hour at a luminance of 0.518 so that every image made against it stays comparable; the sun
+is lower at nine in the morning now — 18.3 degrees against 22.1 — so it went 1.5786 to 1.7000 and
+the pin holds. `DAY_LUMINANCE`, the noon figure the exposure curve is fitted between, follows it
+from 0.702 to 0.755.
+
+And one test changed rather than one behaviour: the zenith is no longer blue at 17:30, because at 2
+degrees of elevation `warmth` is near one and the dome's warm tint reaches the top. That is a real
+weakness in spreading warmth by `sunward` alone — the zenith looks through one air mass and should
+stay blue at any hour — but the new curve exposed it rather than caused it, and it is recorded here
+rather than papered over.

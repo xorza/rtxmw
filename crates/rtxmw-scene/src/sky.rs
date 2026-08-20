@@ -20,14 +20,15 @@ const ZENITH_DEPTH: Vec3 = Vec3::new(0.0464, 0.1080, 0.2648);
 /// The sky's radiance against what the arithmetic below produces.
 ///
 /// Pure scale, set so the **default hour** comes out exactly where the model before it did — a
-/// luminance of 0.518 — which keeps every image made against that one comparable. It is not the
+/// luminance of 0.518, which it is re-fitted to whenever anything upstream moves the sun; §8.58's
+/// change to the elevation curve is the second time — which keeps every image made against that one comparable. It is not the
 /// fixed overcast blue that preceded all of this: that was 0.414, and the first version of the sky
 /// matched it at *noon* while landing a quarter above it at half past nine. A test pins the hour
 /// rather than the claim now.
 ///
 /// `ZENITH_DEPTH` is the only constant in this file that came from anywhere but an eye; this, the
 /// greying, the twilight width and the night floor are all tuned, and say so.
-const SKY_STRENGTH: f32 = 1.5786;
+const SKY_STRENGTH: f32 = 1.7000;
 
 /// What the sky radiates once the sun is properly down.
 ///
@@ -139,7 +140,7 @@ pub struct Sky {
 /// Measured from `Sky::at` rather than derived — the dome's average has no closed form and asking
 /// for it here would need a `Sky` that is still being built. A test holds it to the real thing, which
 /// is what stops `SKY_STRENGTH` moving and this quietly fitting the wrong range.
-const DAY_LUMINANCE: f32 = 0.702;
+const DAY_LUMINANCE: f32 = 0.755;
 
 /// How many stops darker than noon the darkest night is allowed to render.
 ///
@@ -224,7 +225,10 @@ impl Sky {
         // **After the dome's average, because the layer is lit by it.** The clouds are not part of
         // the average in turn: they sit under the sky rather than being it, and a dome that counted
         // them would light the ground by its own clouds.
-        sky.clouds = Clouds::at(time, sky.sun, sky.ambient);
+        // **The beam before any air at all**, because the layer crosses different air from the
+        // ground: less of it, and at a different angle. `Clouds` applies its own extinction and its
+        // own horizon fade — see the notes there.
+        sky.clouds = Clouds::at(time, bare, sky.ambient);
         sky.exposure_bias = sky.bias_from_dome();
         sky
     }
@@ -329,7 +333,19 @@ impl Sky {
     /// flat-earth `1/sin`, which is off by 10% at ten degrees and diverges at the horizon where all
     /// of this matters most — theirs stays finite, reaching 38 atmospheres at zero.
     pub(crate) fn transmittance(climb: f32) -> Vec3 {
-        (-ZENITH_DEPTH * Self::air_mass(climb)).exp()
+        Self::transmittance_above(climb, 1.0)
+    }
+
+    /// The same, for a beam arriving somewhere with `above` of the atmosphere's mass still in front
+    /// of it — one at the ground, and less for anything standing above part of the air.
+    ///
+    /// **What makes a sunset cloud gold rather than black.** The deck at two kilometres is above a
+    /// fifth of the atmosphere and its own horizon is lower than the ground's, so the beam reaching
+    /// it at the moment of sunset has crossed seventeen air masses where one reaching the ground has
+    /// crossed thirty-eight. Handing the clouds the ground's figure is what left them extinguished
+    /// at the hour they should be at their brightest.
+    pub(crate) fn transmittance_above(climb: f32, above: f32) -> Vec3 {
+        (-ZENITH_DEPTH * above * Self::air_mass(climb)).exp()
     }
 
     /// How many atmospheres a beam crosses to something `climb` above the horizon.

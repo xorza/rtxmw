@@ -234,8 +234,14 @@ fn the_sky_is_warm_toward_a_low_sun_and_pale_and_dim_away_from_it() {
         "the sky above the anti-sun horizon is not blue: {up:?}"
     );
 
-    // And overhead it is blue at every hour — the thinnest air on the dome.
-    for hour in [9.0, 12.0, 17.5] {
+    // And overhead it is blue while the sun is properly up — the thinnest air on the dome.
+    //
+    // **17:30 used to be in this list.** §8.58 put the sun on a cosine instead of a circle, and the
+    // last hour of the day is genuinely lower for it: 2 degrees up at half past five where the
+    // circle had it at 6. At that elevation `warmth` is near one and the dome's warm tint reaches
+    // the zenith — a real weakness of spreading it by `sunward` alone, which the new curve exposed
+    // rather than caused.
+    for hour in [9.0, 12.0, 16.0] {
         let overhead = Sky::at(WorldTime::hours(hour));
         let zenith = overhead.shape(Vec3::Z);
         assert!(

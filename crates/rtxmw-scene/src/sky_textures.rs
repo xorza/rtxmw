@@ -46,7 +46,11 @@ impl SkyTextures {
                 .ok()
                 .and_then(|bytes| Texture::decode(&bytes).ok())
         };
-        let clouds = read(r"textures\tx_sky_clear.dds");
+        // **Mipped here, because the file is not.** The sheets ship one level apiece, and the
+        // layer repeats its tile some forty times across the last degrees above the horizon — a
+        // minifying lookup with nothing to fall back to. The moons' portraits ship their own chains
+        // and are magnified rather than minified, so they are left as they are.
+        let clouds = read(r"textures\tx_sky_clear.dds").map(Texture::with_mips);
         Ok(Some(Self {
             masser: read(r"textures\tx_masser_full.dds"),
             secunda: read(r"textures\tx_secunda_full.dds"),

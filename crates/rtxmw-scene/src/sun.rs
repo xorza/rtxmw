@@ -1,5 +1,7 @@
 //! The sun: the only thing lighting an exterior.
 
+use std::f32::consts::FRAC_PI_2;
+
 use glam::Vec3;
 
 /// A directional light with a disc, far enough away that its rays are parallel.
@@ -71,8 +73,17 @@ impl Sun {
     /// **The vertical is not, and it is a deliberate departure.** The game's third component is the
     /// constant −100, so its sun swings east to west without ever descending: at sunrise it stands
     /// fourteen degrees up and it has stood there since the world began. Morrowind has no sunrise.
-    /// Scaling that component by `sqrt(1 - orbit²)` keeps its noon exactly — 100 of 125, the same
-    /// 53 degrees — and lets the ends of the day reach the horizon they are named for.
+    /// Scaling that component keeps its noon exactly — 100 of 125, the same 53 degrees — and lets the
+    /// ends of the day reach the horizon they are named for.
+    ///
+    /// **By a cosine, and it was `sqrt(1 - orbit²)` first.** Both satisfy those two, and only one is
+    /// smooth at the ends: a circle's edge is vertical there, so the sun fell from 0.57 degrees to
+    /// nothing in the last eighteen seconds of the day and *everything* keyed to its elevation
+    /// stepped with it — the air mass runs 30.5 to 38.0 across those seconds, and the ground's
+    /// lighting dropped by 65% in two minutes of game time. A cosine of an angle that is itself
+    /// linear in time has a finite slope at the horizon, which is also what a real sun's elevation
+    /// does. The circle was the mistake of feeding a quantity linear in time to a function expecting
+    /// one that was already a cosine.
     ///
     /// **And past the ends it keeps going, which it has to.** Clamping there leaves the sun parked
     /// *on* the horizon all night with nothing but an invented fade to say the difference, which is
@@ -93,9 +104,15 @@ impl Sun {
     /// Full strength, before any air. What a beam has left by the time it arrives depends on how
     /// much atmosphere it crossed, which is [`crate::Sky`]'s to say.
     pub fn at(orbit: f32) -> Self {
-        let square = 1.0 - orbit * orbit;
-        let direction = if square >= 0.0 {
-            Vec3::new(-SWING * orbit, NORTHING, -CLIMB * square.sqrt())
+        let direction = if orbit.abs() <= 1.0 {
+            // Clamped at nought because `cos` of a quarter turn is not exactly zero in `f32` — it
+            // is −4.4e-8, which would tip the setting sun a hair *above* the horizon and send its
+            // light upward. `sqrt(1 - 1)` was exact and needed no such guard.
+            Vec3::new(
+                -SWING * orbit,
+                NORTHING,
+                -CLIMB * (orbit * FRAC_PI_2).cos().max(0.0),
+            )
         } else {
             // **How far through the night, nought at sunset and one at sunrise.** The orbit runs off
             // the end of the day at both ends *and wraps at midnight* — it reaches −2 at one minute
