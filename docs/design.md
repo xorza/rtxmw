@@ -3683,3 +3683,16 @@ That change moved the tests' own window with it: at 1,400 the advection saturate
 seconds, so the wind is measured over one second and the churn — eleven to nineteen units a second
 against a gale's fourteen hundred — over ten. Two claims about the same field on two timescales,
 because the two things move three orders apart.
+
+**And the layer was in the water as well as over it.** §8.39 measured the fog's height from the
+water rather than from the origin, because fog gathers over water and drains off high ground. What
+that leaves below the surface is `max(z - water, 0)` clamped to zero — the layer's *full* thickness,
+everywhere, all the way down. So every submerged ray carried a second medium laid over the one
+`water.glsl` already attenuates and colours, and a camera under the surface saw the fog's grey on
+top of the water's own. Removing it moves a wholly submerged frame by **36 of 255**; from the ship's
+deck it is a quarter of the pixels and a mean of 0.15, because a ray across a shallow bay is only
+briefly under it, and under a blizzard it is nothing at all — at sixteen times clear's density the
+ray is opaque before it reaches the water.
+
+The guard is `water_level - z > 0`, which is the idiom `primary_visibility.comp` already uses and
+which needs no flag: a dry cell carries negative infinity for its level, so it can never fire.

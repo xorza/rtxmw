@@ -221,6 +221,17 @@ float fog_fbm(vec3 position) {
 // ground, so the surface a cell records is the level it should pool at — and above the layer there
 // is none of it, which is what standing on a hill is supposed to look like.
 float fog_density_at(vec3 position) {
+    // **Air only, and under a bay there is none.** The layer pools *at* the water rather than in
+    // it: `above` clamps at the surface, so every point below one was coming out at the layer's
+    // full thickness — a whole second medium laid over the water's own, which `water.glsl` already
+    // attenuates and colours. Looking down into Seyda Neen's bay that put the fog's grey between
+    // the eye and the seabed twice over.
+    //
+    // `water_level - z` is never positive for a dry cell, which is what the negative infinity in
+    // the frame constants is for — so this costs a dry interior nothing and needs no flag.
+    if (frame.water_level - position.z > 0.0) {
+        return 0.0;
+    }
     float above = max(position.z - fog_base(), 0.0);
     // **How deep the layer stands**, which the host settles out of the weather's own fog depth and
     // its wind together — see `Sky::fog_lift`. This is what makes the fog agree with §8.61's veil

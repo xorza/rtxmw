@@ -81,8 +81,14 @@ fn wall(distance: f32, lights: &[Light], diffuse: Vec3) -> StaticScene {
     scene
 }
 
-/// The middle of the frame, tracing `scene` with `fog` of the cell's own applied.
-fn centre(scene: &StaticScene, fog: f32) -> Vec3 {
+/// A frame of `scene` in `cell`, from the origin looking down `+X` at whatever the fixture put
+/// there.
+///
+/// **`dials` is the only thing the tests here disagree about** — the fog strength, a sky, a clock —
+/// so it is a closure rather than four more parameters, and everything either side of it is the
+/// same setup three tests were each carrying their own copy of. No bounce and no filter in any of
+/// them: what is measured is the fog, and both would stir it into the rest.
+fn traced(cell: CellId, scene: &StaticScene, dials: impl FnOnce(&mut SceneRenderer)) -> Vec<u8> {
     let gpu = TestGpu::shared();
     let mut renderer = SceneRenderer::new(
         gpu.device(),
@@ -94,10 +100,9 @@ fn centre(scene: &StaticScene, fog: f32) -> Vec3 {
         },
     )
     .expect("renderer should build");
-    // No bounce and no filter: what is measured is the fog, and both would stir it into the rest.
     renderer.set_bounce_samples(0);
     renderer.set_denoise_passes(0);
-    renderer.set_fog(fog);
+    dials(&mut renderer);
 
     let mut uploader = gpu.uploader();
     renderer
@@ -105,7 +110,7 @@ fn centre(scene: &StaticScene, fog: f32) -> Vec3 {
             gpu.device(),
             &mut uploader,
             gpu.physical().limits(),
-            CellId::Interior("fixture".to_owned()),
+            cell,
             scene,
             &[],
         )
@@ -127,6 +132,14 @@ fn centre(scene: &StaticScene, fog: f32) -> Vec3 {
     .expect("readback should succeed");
     drop(uploader);
     gpu.assert_no_validation_errors();
+    pixels
+}
+
+/// The middle of the frame, tracing `scene` with `fog` of the cell's own applied.
+fn centre(scene: &StaticScene, fog: f32) -> Vec3 {
+    let pixels = traced(CellId::Interior("fixture".to_owned()), scene, |renderer| {
+        renderer.set_fog(fog)
+    });
 
     // A patch rather than a texel, since the march's start is jittered per pixel.
     let mut total = Vec3::ZERO;
@@ -376,54 +389,17 @@ fn outdoors(distance: f32) -> StaticScene {
     scene
 }
 
-/// The frame `sky` gives at `seconds` on the world's clock, looking down `+X` at a distant wall.
+/// The frame `sky` gives at `seconds` on the world's clock, over a cell with weather in it.
 fn drifting(sky: rtxmw_scene::Sky, seconds: f32) -> Vec<u8> {
-    let gpu = TestGpu::shared();
-    let mut renderer = SceneRenderer::new(
-        gpu.device(),
-        gpu.physical(),
-        gpu.memory(),
-        vk::Extent2D {
-            width: WIDTH,
-            height: HEIGHT,
+    traced(
+        CellId::Exterior { x: 0, y: 0 },
+        &outdoors(12_000.0),
+        |renderer| {
+            renderer.set_fog(1.0);
+            renderer.set_sky(sky);
+            renderer.set_time(seconds);
         },
     )
-    .expect("renderer should build");
-    renderer.set_bounce_samples(0);
-    renderer.set_denoise_passes(0);
-    renderer.set_fog(1.0);
-    renderer.set_sky(sky);
-    renderer.set_time(seconds);
-
-    let mut uploader = gpu.uploader();
-    renderer
-        .load_scene(
-            gpu.device(),
-            &mut uploader,
-            gpu.physical().limits(),
-            CellId::Exterior { x: 0, y: 0 },
-            &outdoors(12_000.0),
-            &[],
-        )
-        .expect("scene should load");
-
-    let eye = Vec3::ZERO;
-    let view = glam::camera::rh::view::look_to_mat4(eye, Vec3::X, Vec3::Z);
-    let projection =
-        glam::camera::rh::proj::vulkan::perspective_infinite_reverse(75f32.to_radians(), 1.0, 0.05);
-    let constants = renderer.frame_constants(view, projection, eye);
-    renderer
-        .render_once(&mut uploader, &constants)
-        .expect("trace should run");
-    let pixels = readback::image_to_rgba8(
-        &mut uploader,
-        renderer.target(),
-        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-    )
-    .expect("readback should succeed");
-    drop(uploader);
-    gpu.assert_no_validation_errors();
-    pixels
 }
 
 /// Mean absolute difference between two frames, per channel, in 0..255.
@@ -574,4 +550,42 @@ fn the_wind_stirs_the_banks_flat_without_touching_how_deep_they_are() {
         );
         last = stirred;
     }
+}
+
+#[test]
+fn there_is_no_fog_under_the_water() {
+    // **The layer pools at the surface, and `above` clamps there.** So every point below the water
+    // used to come out at the layer's full thickness rather than at none of it — a second medium
+    // laid over the one `water.glsl` already attenuates and colours, which looking down into a bay
+    // put the fog's grey between the eye and the seabed twice over.
+    //
+    // Asserted as "the fog dial changes nothing", which is the only statement that holds however
+    // the water itself is drawn: whatever is down there, it is not the fog's doing.
+    let submerged = |fog: f32| {
+        let mut scene = wall(4_000.0, &[], Vec3::splat(0.6));
+        // Well over the camera at the origin, so the whole view is under it.
+        scene.water_level = Some(20_000.0);
+        traced(CellId::Interior("under".to_owned()), &scene, |renderer| {
+            renderer.set_fog(fog)
+        })
+    };
+    let moved = apart(&submerged(0.0), &submerged(1.0));
+    assert_eq!(
+        moved, 0.0,
+        "the fog reached under the water and moved the picture by {moved}"
+    );
+
+    // **And the same fixture with the water taken away is fogged**, which is what says the test
+    // above is the water doing it rather than the fog being off for some other reason. A dry cell
+    // carries negative infinity for its level, so the guard cannot fire.
+    let dry = |fog: f32| {
+        let scene = wall(4_000.0, &[], Vec3::splat(0.6));
+        assert!(scene.water_level.is_none());
+        centre(&scene, fog)
+    };
+    let parched = (dry(1.0) - dry(0.0)).abs().max_element();
+    assert!(
+        parched > 0.01,
+        "without water the same cell should still fog, and it moved by {parched}"
+    );
 }
