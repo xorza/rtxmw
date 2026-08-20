@@ -21,9 +21,7 @@
     "args": [
       "run",
       "-p",
-      "rtxmw",
-      "--",
-      "-2,-9"
+      "rtxmw"
     ],
     "env": {
       "RUST_BACKTRACE": "1"
