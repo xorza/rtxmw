@@ -587,6 +587,14 @@ the renderer proves efficient enough the internal resolution moves up to 2560×1
 cost. Morrowind's shape helps — ~1.1 GB of data, 256² textures, low-poly meshes — so BLAS memory and build
 time are a non-issue in 16 GB. The pressure is **TLAS instance count** and **alpha-tested foliage**.
 
+**Features first, and the bar is not chased until they are done.** Measured against this at 3840×2160 the
+frame costs 44 ms, roughly two and a half times the budget, and that is knowingly where it stays for now.
+Optimising a renderer that is still growing light paths means tuning work that the next feature invalidates,
+and the techniques that close a gap this size — opacity micromaps for the foliage above, SER, cluster
+acceleration structures — are structural rather than incremental, so they are cheaper to fit once against a
+finished set of passes than repeatedly against a moving one. The number is recorded so it cannot be
+forgotten, not so it can be worked on.
+
 ### 5.4 Smaller decisions — settled by default
 
 - **Light units.** Physical units throughout, 69.99125109 units per metre. `LIGH` radius maps to inverse
@@ -2685,7 +2693,8 @@ a couple of units of that puts nothing in the transparency layer while the water
 **And the fixture had to come down to the water.** A ring is eleven centimetres across and the cone fade averages it away exactly as it
 does the swell; a camera four hundred units up at sixty-four pixels square read that correctly as no ripples at all.
 
-**Not done:** wet surfaces. Rain darkens and glosses whatever the sky can see, and that is what actually sells rain on stone and timber
+**The other half** — rain darkening and glossing whatever the sky can see, which is what sells a shower on stone and timber rather
+than on water — is §8.70.
 
 ### 8.66 The exposure was answering for the rain
 
