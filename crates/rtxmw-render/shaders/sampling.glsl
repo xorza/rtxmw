@@ -10,6 +10,12 @@
 // camera, filtered, went from bit-identical to 0.7% RMSE apart. The stream constants keep one
 // estimator's samples from repeating another's, and `sample_stream` keeps this frame's from
 // repeating the last.
+//
+// **Four thousand and ninety-six apart, and two of these once were not.** `STREAM_FLASH` and
+// `STREAM_FILM` were both written as 24576, so the point drawn along a lightning channel and the
+// direction drawn for a wet surface's reflection came back *identical* on every pixel of every
+// frame — two estimators that must be independent, sharing one sequence. Nothing about that is
+// visible as noise; it is visible as the two agreeing, which is much harder to notice.
 
 // The hash stream a pixel draws from this frame.
 //
@@ -43,7 +49,8 @@ const uint STREAM_FOG = 12288u;
 const uint STREAM_WATER_REFRACT = 8193u;
 const uint STREAM_MASSER = 16384u;
 const uint STREAM_SECUNDA = 20480u;
-const uint STREAM_FILM = 24576u;
+const uint STREAM_FLASH = 24576u;
+const uint STREAM_FILM = 28672u;
 
 // A cheap, stable hash of four integers, for decorrelating one pixel's samples from its
 // neighbours'.

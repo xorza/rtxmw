@@ -9,6 +9,11 @@
 vec3 sun_through_water(vec3 position, float footprint);
 vec3 daylight_reaching(vec3 position);
 
+// Defined by `lightning.glsl`, which needs `Surface` and `occluded` and so comes after this file.
+// A flash is seen in the sky it happens in and it lights what it can reach, and those are the two.
+vec3 flash_sky(vec3 direction);
+vec3 flash_light(Surface surface, uvec2 pixel, uint samples);
+
 // Defined by `wetness.glsl`, which comes after this file for the same reason.
 //
 // **`shade` is the only place a bounce learns what it landed on**, so it is the only place the rain
@@ -178,6 +183,11 @@ vec3 direct_light(Surface surface, uvec2 pixel, uint salt, uint samples) {
     total += disc_light(surface, frame.secunda.direction, frame.secunda.light,
                         frame.secunda.cos_radius, leaving(surface, -frame.secunda.direction), pixel,
                         salt + STREAM_SECUNDA, samples, MOON_SAMPLES);
+    // **The brightest thing in this world, when there is one.** A discharge is a light like any
+    // other and it belongs here with the rest of them rather than folded into an ambient: what makes
+    // a flash dramatic is that it comes from *somewhere*, so a wall takes it on one face and throws
+    // a shadow off the other.
+    total += flash_light(surface, pixel, samples);
     uvec2 near = lights_reaching(surface.position);
     for (uint k = near.x; k < near.y; ++k) {
         uint i = light_grid_indices[k];

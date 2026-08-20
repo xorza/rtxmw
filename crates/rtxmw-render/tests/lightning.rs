@@ -157,3 +157,58 @@ fn a_channel_is_drawn_where_the_discharge_has_one_and_nowhere_else() {
         "clear weather should draw no channel, not {clear}"
     );
 }
+
+/// How much of the channel's glow survives at `near` from a radius of `radius`, out of
+/// `bolt_falloff` in `lightning.glsl`.
+///
+/// Repeated here because a shader function is not visible from Rust, and the property below is the
+/// one thing standing between this feature and an artefact that came back twice.
+fn bolt_falloff(near: f32, radius: f32) -> f32 {
+    let x = (near * near) / (radius * radius);
+    let window = (1.0 - x).max(0.0);
+    window * window / (1.0 + GLARE * x)
+}
+
+/// How steeply the glare falls away from the channel, out of `BOLT_GLARE`.
+const GLARE: f32 = 25.0;
+
+/// How far past its radius `BOLT_BOUND` lets the bounding test reach.
+///
+/// **Checked where it is written rather than where it is used.** The bound must sit at or past the
+/// radius the profile has already fallen to nothing at, or the cut lands where there is still
+/// something to cut — which is the whole of the artefact below. It is a constant, so the check is a
+/// constant too, and the compiler is the right thing to make it.
+const BOUND: f32 = 1.25;
+const _: () = assert!(BOUND >= 1.0, "the bound may not reach inside the glow");
+
+#[test]
+fn the_glow_reaches_zero_before_the_bound_cuts_it() {
+    // **The artefact this exists to make impossible.** `bolt_along` skips the march for rays far
+    // from the channel, and a skip is sound only where what is skipped is *nothing*. The profile was
+    // `1 / (1 + x^2)` — the right shape, and one that never reaches zero — so the bound was always
+    // discarding something, and the capsule it describes stood in the sky as a hard-edged pill
+    // around the bolt. Pushing the bound out only made the discarded value smaller, and every time
+    // the flash grew brighter the step came back: a fixed cut through a curve that never lands is a
+    // step whose visibility is a matter of exposure, not of distance.
+    //
+    // Two facts make it impossible rather than merely faint, and both are pinned here.
+
+    // One: the glow is exactly nothing at its own radius and beyond it.
+    let radius = 40.0;
+    assert_eq!(bolt_falloff(radius, radius), 0.0);
+    assert_eq!(bolt_falloff(radius * 2.0, radius), 0.0);
+    assert!(
+        bolt_falloff(0.0, radius) > 0.99,
+        "and all of it at the centre"
+    );
+
+    // Two: it arrives there flat. A profile that hit zero with slope still on it would leave a
+    // crease rather than an edge — visible for the same reason and harder to see coming.
+    let edge = bolt_falloff(radius * 0.99, radius);
+    assert!(
+        edge < 1e-3,
+        "the glow should flatten into the sky, not run into it — {edge}"
+    );
+
+    // The bound sits at or past that radius — see `BOUND`, which the compiler checks.
+}

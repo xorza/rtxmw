@@ -22,14 +22,6 @@ use crate::wave_spectrum::{GpuWave, SeaState, WAVE_COUNT};
 /// over at ten metres a second against a fall of forty-one, which is the lean a storm has.
 const PRECIP_SLANT: f32 = 1400.0;
 
-/// What a flash at full brightness adds to the ambient, against the dome's own.
-///
-/// A channel is the brightest thing in this world by orders of magnitude, and what reaches a
-/// landscape a few hundred metres off is still comparable to daylight — which is why a photograph
-/// taken by one is exposed like a photograph taken by the sun. Tuned against an overcast storm sky,
-/// where the flash has to beat a dome that is already pale.
-const FLASH_AMBIENT: f32 = 6.0;
-
 /// Everything lighting a cell, which arrives together and goes stale together.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Lighting {
@@ -391,12 +383,16 @@ impl FrameConstants {
             light_grid_scale: lighting.light_grid.scale,
             light_grid_origin: lighting.light_grid.origin.to_array(),
             light_grid_dimensions: lighting.light_grid.dimensions,
-            // **The flash is in the ambient rather than beside it**, because everything an ambient
-            // reaches — the rain in the air, the film on the ground, the fog, the indirect bounce —
-            // is something a flash lights, and folding it in here means not one of them needs to
-            // know lightning exists. What is passed separately below is for the sky and the channel,
-            // which are the flash being *seen* rather than the flash lighting something.
-            ambient: (lighting.ambient + flash.radiance * FLASH_AMBIENT).to_array(),
+            // **The dome's own average and nothing else, which took three tries to leave alone.** A
+            // flash was folded in here at first, on the reasoning that everything an ambient reaches
+            // is something a flash lights. It is — but an ambient is what arrives from *everywhere*,
+            // and a discharge is a place: written this way it lit every face of everything equally
+            // and cast nothing, and worse, it reached the several things that read this term as "the
+            // sky's colour" rather than as a light. `absorbed_by_water` scatters it through the whole
+            // bay, so a storm at sunrise came out red overhead and blue-white underfoot. The flash is
+            // a light now — `flash_light` for surfaces, `flash_sky` for the dome, `flash_fog` for the
+            // air — and each of them knows what it is doing with it.
+            ambient: lighting.ambient.to_array(),
             cone_spread,
             sun_direction: sun.direction.to_array(),
             sun_cos_radius: sun.angular_radius.cos(),

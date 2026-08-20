@@ -44,6 +44,27 @@ float fog_base() {
 // How far a ray that hits nothing carries fog. Beyond this the sky is the sky.
 const float FOG_REACH = 30000.0;
 
+// Defined by `lightning.glsl`, which needs what this file defines and so comes after it.
+//
+// **A flash lights the air it happens in, and that is most of what a storm looks like.** A discharge
+// half a kilometre off throws its light through every metre of haze between, and the haze scatters
+// it back — which is why a distant strike is a wall of glowing weather rather than a line with a
+// dark sky around it. Without this the fog was the one thing in the frame a flash could not reach.
+vec3 flash_reaching(vec3 position);
+
+// How much of a flash the air scatters back, against what it delivers to a surface.
+//
+// **The same light, and nowhere near the same number.** `fog_light` adds this at every step of a
+// march that runs thirty thousand units, so what a surface takes once the air takes twenty-four
+// times over a path long enough to matter — and a flash arrives there at a hundred times a lamp's
+// colour, which is what the isotropic term beside it was written for. Handed the surface figure
+// whole, a night storm came out as a white sheet with a ship silhouetted on it.
+//
+// Low, then, and it is still the brightest thing the fog ever sees: a distant strike reads as a wall
+// of lit weather, which is most of what a storm looks like from inside one.
+const float FLASH_IN_AIR = 0.03;
+
+
 // How large one cell of the coarsest drift noise is.
 //
 // **Sized to what the march can resolve where it is looked at.** The steps bunch near the camera —
@@ -374,7 +395,7 @@ vec3 fog_light(vec3 position, vec3 sun) {
             lamps += light.colour * attenuation(reach, light.radius);
         }
     }
-    return frame.fog + sun + INV_FOUR_PI * lamps;
+    return frame.fog + sun + INV_FOUR_PI * (lamps + flash_reaching(position) * FLASH_IN_AIR);
 }
 
 // `colour` and `lighting` as they reach the eye through `distance` units of fog.
