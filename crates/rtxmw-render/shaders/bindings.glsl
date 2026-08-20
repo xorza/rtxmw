@@ -161,6 +161,11 @@ struct Moon {
     // Luminance of the portrait's own mean texel, which is what the portrait is divided by so its
     // mottling multiplies `colour` as a ratio rather than replacing it with a level.
     float face_mean;
+    // The axis the moon turns about, which its face is held upright against rather than against the
+    // horizon — a locked moon's orientation follows its orbit, so the face turns as it crosses.
+    vec3 pole;
+    // How far the shading leans on Lommel-Seeliger rather than Lambert. See `Moon::lunar_lambert`.
+    float lunar_lambert;
 };
 
 layout(set = 0, binding = 14, scalar) readonly buffer Frame {

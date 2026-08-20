@@ -3007,14 +3007,24 @@ half; the moons are the half that changes what a night *is*, because a moon is a
 not.
 
 **Everything about them is read out of the game, and nothing about them is a schedule.**
-`Morrowind.ini`'s `[Moons]` gives `Masser Size=94` and `Secunda Size=40`, and
-`meshes/sky_night_01.nif` puts the star dome's vertices at exactly 2000 from the origin — which is
-the distance those sizes are sizes *at*, and the only way either becomes an angle. `atan(94/2000)`
-is a disc **5.38 degrees across**, ten times the real moon and exactly the sky Morrowind is
-remembered for; Secunda's is 2.29. The faces are `tx_masser_full.dds` and `tx_secunda_full.dds`,
-whose mean opaque texel decoded to linear is (0.0332, 0.0099, 0.0123) and (0.0440, 0.0373, 0.0295) —
-one red, one grey, and the red one two and a half times the darker, which is kept rather than
-normalised away.
+`Morrowind.ini`'s `[Moons]` gives `Masser Size=94` and `Secunda Size=40`, and each moon's own sky
+mesh says how far away that radius sits: `meshes/sky_moon_large.nif` hangs its dome 606.84 from the
+origin and `sky_moon_small.nif` its own 503.58. So `atan(94/606.84)` is a disc **17.6 degrees
+across** — thirty-five times the real moon, and the sky Morrowind is actually remembered for —
+against Secunda's 9.08.
+
+**This shipped at a third of that and was wrong**, which is worth keeping because of how the mistake
+was made: `sky_night_01.nif` puts the *star dome* at 2000, that looked like the one radius the sky
+is drawn on, and both `Size`s were read against it. Two things say otherwise and both were there to
+be checked. Secunda's mesh is authored at radius **39.0625** and its `Size` is **40** — the ini
+number *is* the mesh's own radius, not a size on a shared dome. And the ratio falls out right: sizes
+of 94 and 40 are 2.35 apart, the angles at their own distances are **1.94**, and the two portraits
+are authored 512 pixels against 256. A ratio that matches the art is worth more than a radius that
+matched a different mesh.
+
+The faces are `tx_masser_full.dds` and `tx_secunda_full.dds`, whose mean opaque texel decoded to
+linear is (0.0332, 0.0099, 0.0123) and (0.0440, 0.0373, 0.0295) — one red, one grey, and the red one
+two and a half times the darker, which is kept rather than normalised away.
 
 **The phase is geometry.** The game ships eight painted phases per moon and switches between them;
 this draws the `full` face only and carves the terminator by reconstructing the sphere's own normal
@@ -3039,15 +3049,19 @@ Masser crawling at eighteen degrees and Secunda at three. Swinging the pole arou
 instead keeps both moons as high as the sun gets and moves where they rise, which is the visible
 thing two moons want; taking the two in opposite directions is what makes their arcs cross.
 
-**Lommel-Seeliger for the disc, and Allen's measured law for the light.** A Lambertian sphere is
-brightest in the middle and falls to its limb, so a full moon would read as a shaded ball; the real
-one reads as a flat disc, because a rough dusty surface scatters back the way the light came. `mu0 /
-(mu0 + mu)` is that, in one divide, and at opposition the two cosines are equal everywhere so the
-disc comes out uniform. The *total* light is a different question and gets a different answer:
-Lommel-Seeliger integrated says a half moon is 0.38 of a full one and the geometric lit fraction
-says 0.5, where photometry says **0.09**. Allen's fit — `dm = 0.026|a| + 4e-9 a^4` — gives that, and
-its quartic term is the opposition surge which is why the nights either side of full are so much
-darker than full itself.
+**McEwen's lunar-Lambert for the disc, and Allen's measured law for the light.** A Lambertian sphere
+is brightest in the middle and falls to its limb, so a full moon would read as a shaded ball; the
+real one reads as a flat disc, because a rough dusty surface scatters back the way the light came.
+Lommel-Seeliger's `mu0 / (mu0 + mu)` is that, in one divide — but on its own it puts the sunward
+limb at exactly **twice** the disc's middle at every phase but full, because its emission cosine
+goes to zero at the limb while the incidence cosine does not. Blending toward a Lambertian term,
+whose cosine *does* vanish there, is the standard correction and the one planetary photometry uses:
+`1 - 0.019a + 0.000242a² - 1.46e-6 a³`, one at opposition and a half by a half moon. It leaves a
+full moon flat and keeps the 1.25x the limb really has. The *total* light is a different question
+and gets a different answer: Lommel-Seeliger integrated says a half moon is 0.38 of a full one and
+the geometric lit fraction says 0.5, where photometry says **0.09**. Allen's fit — `dm = 0.026|a| +
+4e-9 a^4` — gives that, and its quartic term is the opposition surge which is why the nights either
+side of full are so much darker than full itself.
 
 | | radiance of the lit face | irradiance delivered |
 |---|---|---|
@@ -3067,7 +3081,7 @@ rather than a second number to keep in step.
 exterior, best of four: a night trace of **5.88 ms** became 10.47 at sixteen shadow rays a moon and
 **9.12 at eight**, which is what shipped — so moonlight is 3.24 ms where the sun's own sixteen rays
 are 2.1. Eight is enough where sixteen is not for the sun because the questions are different sizes
-— Masser subtends ten times the sun's angle, so its penumbra is spread over ten times the distance
+— Masser subtends thirty-five times the sun's angle, so its penumbra is spread that much wider
 and eight steps across a metre are smoother than sixteen across a hand's width — and because the
 light is a fraction of the sun's, so what noise survives is a fraction of a fraction. A one-frame
 render with the upscaler off shows no banding. Day frames are unchanged at 7.97 ms: the moons are
@@ -3080,6 +3094,13 @@ labelled "1920x1080" was a 720p number. `FrameTimings` now prints what it traced
 displayed to, so a duration copied out of it carries its own units and there is nothing left to
 assume.
 
+**And a moon is a rock, which took a second pass to remember.** The disc was *added* to the sky the
+ray already had, which is right for the dome's own glow — that is air in front of the moon and it
+really does sit on top — and wrong for the stars, which are behind it. The constellations showed
+through Masser's face. `moon_covers` is the cone test on its own, and where it holds the star field
+is skipped; the same flag suppresses the sun's disc, so an eclipse now works, and with Masser at
+eighteen degrees against the sun's half a degree it is total when it happens.
+
 **And they are drawn but not gathered**, like the stars and for a sharper version of the same
 reason. Masser's disc is a thousand times the sun's solid angle, so a bounce ray finds one about
 once in a thousand at three hundred times the night sky's floor — a firefly every few hundred
@@ -3090,6 +3111,28 @@ The clock had to learn the date for any of this: `WorldTime` counts hours since 
 rather than hours since midnight, because a phase advances between one midnight and the next and a
 clock that forgets which day it is cannot say which phase. `--time 25` is therefore one in the
 morning of the second day, which is how a still reaches a moon phase other than the first's.
+
+**The bright outline round every moon was none of that.** It survived lunar-Lambert, it survived
+turning the upscaler off, and the shading law measured smooth — 1.25x from middle to limb, no spike.
+Rendering with the portrait disabled found it: the disc came out perfectly uniform. **The vanilla
+portraits are not premultiplied.** Past the edge of the painted disc the file's colour climbs back —
+for Secunda to 0.39 of its mean, where the disc just inside has fallen to 0.14 — and the alpha that
+exists to mask it was being sampled and thrown away. Two pixels at luma 149 against 78 inside.
+Multiplying by alpha removes it and hands over the silhouette's antialiasing for nothing: the cut at
+`across` is a hard yes or no, while the painted alpha ramps over a couple of texels.
+
+**The face does not rotate with the phase, and the game agrees.** The eight painted phases are one
+face under eight terminators: their maria correlate at 0.29 to 0.77 as painted against −0.14 to
++0.30 mirrored, so the markings sit in the same places in every one. That is also what a tidally
+locked moon does — it keeps one face toward us while the terminator sweeps across it — so carving
+the terminator from the sun over a face that stays put is right twice over.
+
+**What was missing is the other rotation.** A locked moon keeps its face toward *us* and its
+orientation toward its *orbit*, so as it crosses the sky the face turns against the horizon — **106
+degrees across one of Masser's transits**, measured. The face's up was being built from the world's,
+which pins it to the horizon all night; that is what a billboard does, and it is what vanilla does.
+It now stands upright against the moon's own orbital pole, which is a `vec3` on `Moon` and two lines
+in the shader.
 
 **What this unblocks and has not spent.** `NIGHT_SKY`'s note has said since §8.49 that nothing
 scaling the whole scene can separate a dark sky from a legible ground, and that the fix is a light
@@ -3142,3 +3185,32 @@ loading already runs on the streamer's thread and never blocks a frame. Not wort
 worth recording where the time in that 173 ms actually goes, because it is not asset decoding: under
 40 ms of the 1436 ms initial window fill is reading or decoding anything. The rest is ESM record
 walking, `Mesh::from_nif` and terrain building, which is where a profile should start.
+
+
+### 8.55 The sun jumped forty degrees at midnight, and nothing had noticed
+
+`Sun::at` takes an `orbit` that runs 1 at sunrise to −1 at sunset and off both ends into the night —
+and **wraps**: it reaches −2 a minute before midnight and +2 a minute after. Past the horizon the
+old night branch built its heading from `-400 * orbit` the way the daylit half does, so at the wrap
+the heading flipped from west of north to east of it. Measured at **40 degrees in 1.2 game
+minutes.**
+
+**It had been there since the night branch was written and nothing had ever read it.** The sun is
+seventy degrees under at midnight, its colour is zero, and the sky's twilight term is into the
+rounding — so every consumer of the sun's *direction* at that hour was multiplying it by nothing.
+The first thing that wasn't was a moon's terminator, which is carved from where the sun actually is:
+the crescent snapped across the disc at 00:00 and the bug surfaced three sections after the code
+that caused it.
+
+The night now runs on one continuous parameter — nought at sunset, one at sunrise — rather than on a
+quantity that wraps in the middle of it. The descent is untouched, reproducing `|orbit| - 1`
+exactly, and the bearing sweeps from where the sun set through **due north at midnight** to where it
+rises, which is where a body going round once a day is. Sunset and sunrise sit symmetrically either
+side of north, so half the sweep lands exactly there and both ends meet the daylit formula to the
+bit — the day did not move. A test walks the whole night at a tenth of a game minute and asks for no
+step larger than a twentieth of a degree.
+
+**Worth keeping as a shape of bug rather than a bug.** A quantity that is continuous where it is
+read and discontinuous where it is not stays correct until something starts reading it there. The
+three constants the two branches share are named now, because the property the test asserts — that
+the night's ends meet the day's exactly — is only true while both read the same numbers.

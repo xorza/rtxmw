@@ -90,7 +90,7 @@ impl Default for Lighting {
 
 /// One moon as the shader reads it — see `struct Moon` in `bindings.glsl`.
 ///
-/// Twelve floats packed tightly, which under `scalar` layout is exactly what the shader expects.
+/// Sixteen floats packed tightly, which under `scalar` layout is exactly what the shader expects.
 /// `face` is a slot in the bindless array or **zero for none**, which is the array's own fallback
 /// and so the one index that can never name a real portrait.
 #[repr(C)]
@@ -102,6 +102,8 @@ struct GpuMoon {
     face: u32,
     light: [f32; 3],
     face_mean: f32,
+    pole: [f32; 3],
+    lunar_lambert: f32,
 }
 
 impl GpuMoon {
@@ -114,6 +116,8 @@ impl GpuMoon {
             face,
             light: moon.light.to_array(),
             face_mean: moon.face_mean,
+            pole: moon.pole.to_array(),
+            lunar_lambert: moon.lunar_lambert,
         }
     }
 }
@@ -711,12 +715,12 @@ mod tests {
         assert_eq!(offset_of!(FrameConstants, sky_floor), 356);
         assert_eq!(offset_of!(FrameConstants, sky_stars), 368);
         assert_eq!(offset_of!(FrameConstants, fog_uniform), 372);
-        // Two moons of twelve tightly packed floats apiece.
+        // Two moons of sixteen tightly packed floats apiece.
         assert_eq!(offset_of!(FrameConstants, masser), 376);
-        assert_eq!(offset_of!(FrameConstants, secunda), 424);
+        assert_eq!(offset_of!(FrameConstants, secunda), 440);
         // The wave table follows, twenty tightly packed bytes apiece.
-        assert_eq!(offset_of!(FrameConstants, waves), 472);
-        assert_eq!(size_of::<FrameConstants>(), 472 + 20 * WAVE_COUNT);
+        assert_eq!(offset_of!(FrameConstants, waves), 504);
+        assert_eq!(size_of::<FrameConstants>(), 504 + 20 * WAVE_COUNT);
     }
 
     #[test]

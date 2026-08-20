@@ -10,13 +10,6 @@ use crate::srgb::LUMA;
 use crate::sun::Sun;
 use crate::world_time::WorldTime;
 
-/// The radius of Morrowind's sky, in the game's own units.
-///
-/// Read off `meshes/sky_night_01.nif`, whose star dome's vertices sit exactly 2000 from the origin.
-/// It is the distance every `[Moons]` size in `Morrowind.ini` is a size *at*, which is the only way
-/// those numbers become an angle.
-const SKY_RADIUS: f32 = 2000.0;
-
 /// How many phases the game draws, which is how many its daily increment counts in.
 ///
 /// Eight, and they are shipped as eight textures apiece: `tx_masser_new` through `tx_masser_one_wan`
@@ -56,8 +49,23 @@ const FULL_IRRADIANCE: f32 = 0.5;
 /// number rather than a body, and one name for the two would have been a false pair.
 #[derive(Debug, Clone, Copy)]
 struct Almanac {
-    /// The moon's radius on the sky of [`SKY_RADIUS`], out of `Morrowind.ini`'s `[Moons]`.
+    /// The moon's radius in the game's own units, out of `Morrowind.ini`'s `[Moons]` `Size`.
     size: f32,
+    /// How far away its own sky mesh was authored, which is what turns that radius into an angle.
+    ///
+    /// **The two moons do not hang at the same distance, and that is the whole of why this is a
+    /// field.** `meshes/sky_moon_large.nif` puts its dome 606.84 from the origin and
+    /// `sky_moon_small.nif` puts its own 503.58, so the same `Size` at each subtends a different
+    /// angle and the ratio of the two moons is *not* the ratio of their sizes.
+    ///
+    /// **Read off the meshes because the ini alone cannot say it, and confirmed by them too.**
+    /// Secunda's mesh is authored at radius 39.0625 and its `Size` is 40 — the ini number *is* the
+    /// mesh's own radius, not a size on some shared dome. Sizing both against the 2000-unit star
+    /// dome of `sky_night_01.nif` instead was the first reading here and it was wrong by 3.3x: it
+    /// made Masser 5.4 degrees across where the art asks for 17.6, and put the two moons in a ratio
+    /// of 2.35 where this puts them at 1.94 — which is the ratio their textures are authored at,
+    /// 512 pixels against 256.
+    distance: f32,
     /// How far the orbit's pole is swung around the zenith from due north, in radians.
     ///
     /// **`Axis Offset`, read as a bearing rather than a tilt, and the signs are mine.** The ini
@@ -93,6 +101,22 @@ struct Almanac {
 }
 
 impl Almanac {
+    /// The axis the moon turns about, as a unit vector.
+    ///
+    /// **Not a number of its own.** Morrowind's noon sun stands 53.13 degrees up, so the pole it is
+    /// turning about stands at the complement of that, 36.87 — and both fall straight out of the
+    /// game's `(0, 75, -100)`, which is a 3-4-5 triangle. Reading it off [`Sun::at`] rather than
+    /// writing it down keeps a moon on the same sky as the sun if that constant ever moves. Then
+    /// swung around the zenith by this moon's own bearing, which is what separates the two arcs.
+    fn pole(&self) -> Vec3 {
+        // The sun at its highest. Light travels *from* it, so this points down and north, and the
+        // pole is that turned a quarter circle up — which for a unit vector is a swap and a sign.
+        let noon = Sun::at(0.0).direction;
+        let north = Vec3::new(0.0, -noon.z, noon.y);
+        let (sin, cos) = self.pole_bearing.sin_cos();
+        Vec3::new(north.y * sin, north.y * cos, north.z)
+    }
+
     /// The colour a fully lit face radiates, before any level is put on it.
     ///
     /// **Both moons over one divisor, rather than each normalised to itself**, which is a decision
@@ -109,6 +133,7 @@ impl Almanac {
 /// The larger moon, red and mottled, the one Morrowind's sky is remembered for.
 const MASSER: Almanac = Almanac {
     size: 94.0,
+    distance: 606.838_13,
     pole_bearing: 35.0 * (std::f32::consts::PI / 180.0),
     daily_increment: 1.0,
     epoch: 0.55,
@@ -118,6 +143,7 @@ const MASSER: Almanac = Almanac {
 /// The smaller one, pale and grey, on an arc that crosses Masser's.
 const SECUNDA: Almanac = Almanac {
     size: 40.0,
+    distance: 503.575_68,
     pole_bearing: -50.0 * (std::f32::consts::PI / 180.0),
     daily_increment: 1.2,
     epoch: 0.30,
@@ -182,6 +208,32 @@ pub struct Moon {
     /// and the unlit part of the same disc radiates nothing. Zero once the moon has set, which is
     /// how a moon that is not up says so without a flag.
     pub colour: Vec3,
+    /// The axis the moon turns about, which is what its face is held upright against.
+    ///
+    /// **A tidally locked moon keeps its face toward us and its *orientation* toward its orbit**, so
+    /// as it crosses the sky the face turns against the horizon — 106 degrees across one of Masser's
+    /// transits, which on a disc eighteen degrees wide with maria on it is not subtle. Building the
+    /// face's up from the world's instead leaves it pinned to the horizon all night, which is what
+    /// vanilla does with a billboard and what this did until the swing was measured.
+    ///
+    /// The phase is a separate question and needs no rotation at all: the terminator sweeps across a
+    /// face that stays put, which is both what a locked moon does and what Bethesda painted — the
+    /// eight phase textures are one face under eight terminators, and their maria correlate at 0.29
+    /// to 0.77 as painted against −0.14 to +0.30 mirrored.
+    pub pole: Vec3,
+    /// How far the disc's shading leans on Lommel-Seeliger rather than on Lambert, from 0 to 1.
+    ///
+    /// **What stops the limb being a bright outline.** Lommel-Seeliger alone puts the sunward limb
+    /// at exactly twice the disc's middle at every phase but full, because its emission cosine goes
+    /// to zero there while the incidence cosine does not — and `sqrt(1 - across)` collapses over the
+    /// outermost fraction of a pixel, so it draws as a hard rim rather than a gradient.
+    ///
+    /// McEwen's lunar-Lambert law is the standard answer and the one planetary photometry uses:
+    /// blend toward a Lambertian term, whose own cosine *does* vanish at the limb, by a weight that
+    /// falls with phase — `1 - 0.019a + 0.000242a² - 1.46e-6 a³`, `a` in degrees. At opposition it
+    /// is one and the two agree; by a half moon it is a half. A full moon comes out flat, which is
+    /// what a full moon looks like, and a gibbous one keeps the brighter limb it really has.
+    pub lunar_lambert: f32,
     /// Luminance of the portrait's own mean texel, which the shader divides the portrait by.
     ///
     /// **So the mottling is a level and not a level plus a brightness.** The faces were drawn to be
@@ -207,6 +259,8 @@ impl Moon {
         direction: Vec3::NEG_Z,
         angular_radius: 0.0,
         colour: Vec3::ZERO,
+        pole: Vec3::Z,
+        lunar_lambert: 1.0,
         face_mean: 1.0,
         light: Vec3::ZERO,
     };
@@ -232,22 +286,35 @@ impl Moon {
     /// `sun_direction` is a parameter rather than a field because that is what the shader has: one
     /// sun direction in the frame constants, shared by the sky, the shadows and both moons. Carrying
     /// a second copy on each moon would be a second thing to keep in step for no gain.
-    pub fn radiance(&self, direction: Vec3, sun_direction: Vec3) -> Vec3 {
+    ///
+    /// `footprint` is how wide the ray is where it lands, in radians — the cone a pixel subtends.
+    /// **The limb genuinely depends on it**, which is why it is not a detail the caller can skip: a
+    /// sphere's emission cosine falls to zero over the outermost fraction of its disc, faster than
+    /// any pixel can resolve, and point-sampling something finer than the ray is aliasing whatever
+    /// else is true about it. Worth 24 of 255 on the limb pixels and nothing elsewhere — invisible
+    /// in a still, and the size of thing that crawls under a temporal filter.
+    pub fn radiance(&self, direction: Vec3, sun_direction: Vec3, footprint: f32) -> Vec3 {
         let along = direction.dot(-self.direction);
         if along <= self.angular_radius.cos() || self.colour == Vec3::ZERO {
             return Vec3::ZERO;
         }
-        let offset = (direction + self.direction * along) / self.angular_radius.sin();
+        let sine = self.angular_radius.sin();
+        let offset = (direction + self.direction * along) / sine;
         let across = offset.length_squared();
         if across >= 1.0 {
             return Vec3::ZERO;
         }
-        // The sphere's own normal, then Lommel-Seeliger's `mu0 / (mu0 + mu)` — doubled, because at
-        // opposition the operator is a half and a full moon has to come out the colour it was given.
-        let emission = (1.0 - across).sqrt();
+        // How much of the disc's width one ray covers, which is the finest the curvature can be
+        // resolved at — see the note on `footprint` above.
+        let pixel = (footprint / sine.max(1e-6)).clamp(0.0, 1.0);
+        // The sphere's own normal, then McEwen's lunar-Lambert: Lommel-Seeliger's
+        // `mu0 / (mu0 + mu)` — doubled, because at opposition it is a half and a full moon has to
+        // come out the colour it was given — blended toward plain Lambert by `lunar_lambert`.
+        let emission = (1.0 - across).max(pixel).sqrt();
         let normal = offset + self.direction * emission;
         let incidence = normal.dot(-sun_direction).max(0.0);
-        self.colour * (2.0 * incidence / (incidence + emission).max(1e-4))
+        let lommel = 2.0 * self.lunar_lambert / (incidence + emission).max(1e-4);
+        self.colour * (incidence * (lommel + 1.0 - self.lunar_lambert))
     }
 
     /// Where `moon` stands at `time`, and what it is worth there.
@@ -260,9 +327,9 @@ impl Moon {
         // The sine of the moon's elevation, which is what both the air it is seen through and the
         // fade across the horizon are functions of.
         let climb = position.z;
-        // Set over its own diameter, the same as the sun does — a disc five degrees across takes
-        // that long to go.
-        let radius = (moon.size / SKY_RADIUS).atan();
+        // Set over its own diameter, the same as the sun does — a disc eighteen degrees across takes
+        // well over an hour to go.
+        let radius = (moon.size / moon.distance).atan();
         let showing = Sky::showing(climb, radius);
         // The same air the sun is reddened by, and for the same reason — a moon on the horizon is
         // seen through thirty-eight atmospheres and comes up orange.
@@ -274,16 +341,20 @@ impl Moon {
         let opposition = -sun.direction.dot(-position);
 
         // **How much sky the moon covers, against Masser's**, which is what turns a radiance into
-        // the light a surface receives. Secunda is less than half Masser's width and so a fifth of
-        // its area; scaling by it is what makes the big moon the one a night is lit by, and it is
-        // derived from the two sizes rather than a second pair of numbers to keep in step.
-        let coverage = (moon.size / MASSER.size).powi(2);
+        // the light a surface receives. Secunda is a little over half Masser's width and so a
+        // quarter of its area; scaling by it is what makes the big moon the one a night is lit by.
+        //
+        // From the angles rather than the sizes, which is not the same thing now that the two hang
+        // at different distances — 94 against 40 is a ratio of 2.35 and the angles are 1.94.
+        let coverage = (radius / (MASSER.size / MASSER.distance).atan()).powi(2);
         let delivered = FULL_IRRADIANCE * coverage * showing * Self::phase_law(opposition);
 
         Self {
             direction: -position,
             angular_radius: radius,
             colour: moon.tint() * (FULL_RADIANCE * showing) * air,
+            pole: moon.pole(),
+            lunar_lambert: Self::lunar_lambert(opposition),
             face_mean: moon.face.dot(LUMA),
             light: moon.tint() * delivered * air,
         }
@@ -292,23 +363,12 @@ impl Moon {
     /// Which way the moon lies from the world's centre, as a unit vector.
     ///
     /// **A great circle about a pole**, which is what every body in a sky travels on and what the
-    /// sun's own arc is a near miss of. The pole's elevation is not a number of its own: Morrowind's
-    /// noon sun stands 53.13 degrees up, so the pole it is turning about stands at the complement of
-    /// that, 36.87 — and both fall straight out of the game's `(0, 75, -100)`, which is a 3-4-5
-    /// triangle. Reading it off `Sun::at` rather than writing it down is what keeps a moon on the
-    /// same sky as the sun if that constant ever moves.
+    /// sun's own arc is a near miss of — see [`Almanac::pole`].
     fn position(moon: Almanac, time: WorldTime, phase: f32) -> Vec3 {
-        // The sun at its highest, which is the one direction that fixes the whole frame. Light
-        // travels *from* it, so this points down and north — and the pole is that turned a quarter
-        // circle up, which for a unit vector is a swap and a sign.
-        let noon = Sun::at(0.0).direction;
-        let north = Vec3::new(0.0, -noon.z, noon.y);
-        // Swung around the zenith by the moon's own bearing, which is what separates the two arcs.
-        let (sin, cos) = moon.pole_bearing.sin_cos();
-        let pole = Vec3::new(north.y * sin, north.y * cos, north.z);
-
+        let pole = moon.pole();
         // The arc itself: due east on the horizon at hour angle zero, culminating a quarter turn
         // later. Both are perpendicular to the pole by construction, so the two span its equator.
+        let (sin, cos) = moon.pole_bearing.sin_cos();
         let rise = Vec3::new(cos, -sin, 0.0);
         let culmination = rise.cross(pole);
 
@@ -318,6 +378,19 @@ impl Moon {
         // a fraction of a day each day is the whole of a moon's motion against the sun.
         let angle = std::f32::consts::TAU * (time.turns_since_sunrise() - phase);
         rise * angle.cos() + culmination * angle.sin()
+    }
+
+    /// McEwen's blend between Lommel-Seeliger and Lambert at phase angle `opposition`.
+    ///
+    /// One at opposition, where the two laws agree and the disc is flat; falling to a half by a
+    /// half moon and to nothing beyond about a hundred and twenty degrees, which is where the cubic
+    /// runs out and the clamp takes over. `opposition` is the cosine of the angle, as everywhere
+    /// else here.
+    fn lunar_lambert(opposition: f32) -> f32 {
+        let degrees = opposition.clamp(-1.0, 1.0).acos().to_degrees();
+        (1.0 - 0.019 * degrees + 0.000_242 * degrees * degrees
+            - 1.46e-6 * degrees * degrees * degrees)
+            .clamp(0.0, 1.0)
     }
 
     /// How much light a moon at phase angle `opposition` sends, against a full one.
@@ -360,27 +433,41 @@ mod tests {
     }
 
     #[test]
-    fn the_discs_are_the_size_the_ini_gives_at_the_radius_the_sky_mesh_has() {
-        // `Masser Size=94` on a sky of 2000: `atan(94/2000)` is 2.691 degrees of radius, so the
-        // disc is 5.38 across — ten times the real moon, which is what Morrowind's sky looks like.
+    fn the_discs_are_the_size_the_ini_gives_at_the_distance_its_own_mesh_hangs_at() {
+        // `Masser Size=94` at the 606.84 its own `sky_moon_large.nif` is authored at: 8.805 degrees
+        // of radius, so the disc is **17.6 across** — thirty-five times the real moon, which is the
+        // sky Morrowind is remembered for.
         let [masser, secunda] = moons(23.0);
         assert!(
-            (masser.angular_radius.to_degrees() - 2.6909).abs() < 1e-3,
+            (masser.angular_radius.to_degrees() - 8.8052).abs() < 1e-3,
             "{}",
             masser.angular_radius.to_degrees()
         );
-        // And `Secunda Size=40`: 1.1458 degrees, so the ratio of the two is the ratio of the sizes.
+        // And `Secunda Size=40` at its own 503.58: 4.5416 degrees, so 9.08 across.
         assert!(
-            (secunda.angular_radius.to_degrees() - 1.1458).abs() < 1e-3,
+            (secunda.angular_radius.to_degrees() - 4.5416).abs() < 1e-3,
             "{}",
             secunda.angular_radius.to_degrees()
         );
-        let ratio = masser.angular_radius.tan() / secunda.angular_radius.tan();
-        assert!((ratio - 94.0 / 40.0).abs() < 1e-4, "{ratio}");
+
+        // **The ratio is not the ratio of the sizes**, which is the whole reason each moon carries
+        // its own distance: 94 against 40 is 2.35, and the angles come out at 1.94 — which is the
+        // ratio their textures are authored at, 512 pixels against 256.
+        let ratio = masser.angular_radius / secunda.angular_radius;
+        assert!((ratio - 1.939).abs() < 0.01, "{ratio}");
+        assert!(
+            (ratio - MASSER.size / SECUNDA.size).abs() > 0.3,
+            "the two distances have stopped mattering"
+        );
+
+        // Secunda's `Size` is its own mesh's authored radius rather than a number about anything
+        // else, and that is the evidence the distances are read right. `sky_moon_small.nif` is
+        // authored at 39.0625.
+        assert!((SECUNDA.size - 39.0625).abs() < 1.0);
 
         // Both are far larger than the sun's half-degree disc, which is the whole reason a moon here
         // is a thing with a face rather than a bright dot.
-        assert!(secunda.angular_radius > 4.0 * Sun::REAL_ANGULAR_RADIUS);
+        assert!(secunda.angular_radius > 15.0 * Sun::REAL_ANGULAR_RADIUS);
     }
 
     /// Every quarter hour of forty days, which is long enough for both cycles to close.
@@ -497,7 +584,7 @@ mod tests {
         assert!(set > 8, "only {set} of 48 readings had a moon down");
 
         // **And it goes out over its own width rather than at a line**, which is what stops a moon
-        // blinking off against a sea horizon. Masser's disc is 5.4 degrees across, so there is a
+        // blinking off against a sea horizon. Masser's disc is 17.6 degrees across, so there is a
         // band that wide where it is neither fully up nor fully gone.
         let partly = (0..2000)
             .map(|i| {

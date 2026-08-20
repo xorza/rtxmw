@@ -16,9 +16,21 @@ mod common;
 const WIDTH: u32 = 160;
 const HEIGHT: u32 = 160;
 
+/// How wide one pixel's ray is, in radians, for the narrow view the moons are checked in.
+///
+/// The same figure `FrameConstants::cone_spread_from` gives the renderer, written here because a
+/// moon's limb depends on it: the shader averages the sphere's curvature over the ray rather than
+/// point-sampling it, so a comparison against `Moon::radiance` has to hand over the same width.
+fn narrow_footprint() -> f32 {
+    2.0 * (NARROW.to_radians() * 0.5).tan() / HEIGHT as f32
+}
+
 /// The view the dome is checked across, and the one a moon is.
+///
+/// Masser is 17.6 degrees across, so the narrow view has to be wider than that with room to spare —
+/// it was 10 while the moons were thought to be a third of their size, which no longer fits one.
 const WIDE: f32 = 75.0;
-const NARROW: f32 = 10.0;
+const NARROW: f32 = 30.0;
 
 /// A cell with nothing in it, so every ray escapes and every pixel is sky.
 ///
@@ -242,9 +254,13 @@ fn both_moons_are_the_discs_the_scene_crate_puts_in_the_sky() {
     // **Stars off**, as the dome's own cross-check has them: a star landing on a moon's disc is
     // sixty times the sky's floor added to a pixel this is trying to attribute to the moon, and it
     // is drawn from a hash `Moon::radiance` knows nothing about.
+    // **A quarter past five on the third morning**, which is not arbitrary: it is an hour where
+    // *both* moons stand well clear of the horizon at close to half phase. A moon up at midnight is
+    // near full by construction — it is opposite the sun, which is what puts it there — so midnight
+    // is exactly the hour at which a terminator is hardest to see.
     let sky = Sky {
         stars: 0.0,
-        ..Sky::at(WorldTime::hours(23.0))
+        ..Sky::at(WorldTime::hours(53.25))
     };
     for (name, moon) in [("masser", sky.masser), ("secunda", sky.secunda)] {
         // Straight at it, so the disc is near the middle of the frame where a pixel's direction is
@@ -252,8 +268,15 @@ fn both_moons_are_the_discs_the_scene_crate_puts_in_the_sky() {
         let forward = -moon.direction;
         let (pixels, directions) = looking(sky, forward, NARROW);
 
+        // Which way the sun lies *across the disc*, so the two halves either side of the terminator
+        // can be compared. The component of the direction to the sun perpendicular to the moon.
+        let to_sun = -sky.sun.direction;
+        let across = (to_sun - moon.direction * to_sun.dot(moon.direction)).normalize();
+
+        let footprint = narrow_footprint();
         let (mut worst, mut worst_at) = (0.0f32, Vec3::ZERO);
-        let (mut covered, mut lit, mut dark) = (0, 0, 0);
+        let mut covered = 0;
+        let (mut sunward, mut away) = ((0.0f32, 0), (0.0f32, 0));
         for (index, direction) in directions.iter().enumerate() {
             // Inside the disc is the cone test and nothing else, which is what says how *wide* the
             // moon is — the lit fraction says nothing about that, and a new moon has none of it.
@@ -261,14 +284,27 @@ fn both_moons_are_the_discs_the_scene_crate_puts_in_the_sky() {
                 continue;
             }
             covered += 1;
-            let disc = moon.radiance(*direction, sky.sun.direction);
-            match disc.max_element() > 0.5 * moon.colour.max_element() {
-                true => lit += 1,
-                false => dark += 1,
-            }
+            let disc = moon.radiance(*direction, sky.sun.direction, footprint);
+            // Which side of the moon's middle this pixel fell, measured toward the sun.
+            let offset = *direction + moon.direction * direction.dot(-moon.direction);
+            match offset.dot(across) > 0.0 {
+                true => (sunward.0 += disc.max_element(), sunward.1 += 1),
+                false => (away.0 += disc.max_element(), away.1 += 1),
+            };
             // Drawn *on top of* the sky rather than instead of it: a moon is behind the air, and
             // the airglow in front of it adds. So the pixel is both, which is what the shader sums.
-            let wanted = sky.shape(*direction) + Sky::NIGHT_FLOOR + disc;
+            //
+            // **Both moons, not just the one under examination.** At this hour they stand five
+            // degrees apart, so a view wide enough to hold one holds the other — and counting only
+            // one made the second read as a two-tenths disagreement over the whole of its disc.
+            let wanted = sky.shape(*direction)
+                + Sky::NIGHT_FLOOR
+                + sky
+                    .masser
+                    .radiance(*direction, sky.sun.direction, footprint)
+                + sky
+                    .secunda
+                    .radiance(*direction, sky.sun.direction, footprint);
             if wanted.max_element() > 0.97 {
                 continue;
             }
@@ -288,12 +324,17 @@ fn both_moons_are_the_discs_the_scene_crate_puts_in_the_sky() {
             (ratio - 1.0).abs() < 0.05,
             "{name} covered {covered} pixels where the ini's size wants {expected:.0}"
         );
-        // And a terminator runs across it, or the comparison above would pass just as well against
-        // a flat disc of one colour. A twelfth, because at this hour of the first day Secunda is all
-        // but full and the shadowed part of it is a sliver down one limb.
+        // **And the terminator faces the sun**, which the comparison above cannot say: it would pass
+        // just as well against a flat disc, or against one shaded the wrong way round. Asserted as
+        // the two halves either side of the moon's middle rather than by counting dark pixels —
+        // which is what this did until lunar-Lambert correctly flattened a nearly-full moon and left
+        // too few of them to count.
+        let mean = |half: (f32, u32)| half.0 / half.1.max(1) as f32;
         assert!(
-            lit > covered / 12 && dark > covered / 12,
-            "{name} has no terminator: {lit} lit, {dark} dark of {covered}"
+            mean(sunward) > 2.0 * mean(away),
+            "{name} is not brighter toward the sun: {} against {}",
+            mean(sunward),
+            mean(away)
         );
         // A little over one part in 255, which is what an 8-bit target can carry.
         assert!(
@@ -303,8 +344,11 @@ fn both_moons_are_the_discs_the_scene_crate_puts_in_the_sky() {
     }
 
     // And the bigger moon covers the more sky, which is the one thing a per-pixel comparison of two
-    // agreeing implementations cannot tell you — they would agree about a moon of any size.
-    assert!(sky.masser.angular_radius > 2.0 * sky.secunda.angular_radius);
+    // agreeing implementations cannot tell you — they would agree about a moon of any size. Not
+    // twice over, though it looks as if it should be: the sizes are 94 and 40 but the two hang at
+    // different distances, so the angles are 1.94 apart rather than 2.35.
+    let ratio = sky.masser.angular_radius / sky.secunda.angular_radius;
+    assert!((ratio - 1.939).abs() < 0.01, "{ratio}");
 }
 
 #[test]
