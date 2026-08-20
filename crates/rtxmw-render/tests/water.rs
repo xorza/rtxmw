@@ -135,28 +135,33 @@ fn centre_radiance(scene: &StaticScene, eye: Vec3, forward: Vec3) -> Vec3 {
     ) / 255.0
 }
 
+/// The traced radiance of a finished frame, as RGBA8.
+fn target_pixels(uploader: &mut rtxmw_gpu::Uploader, renderer: &SceneRenderer) -> Vec<u8> {
+    readback::image_to_rgba8(
+        uploader,
+        renderer.target(),
+        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+    )
+    .expect("readback should succeed")
+}
+
 /// Traces `scene` from `eye` toward `forward` with the clock at `time`, and returns the frame.
 fn frame_at(scene: &StaticScene, eye: Vec3, forward: Vec3, time: f32) -> Vec<u8> {
-    rendered(scene, eye, forward, time, |uploader, renderer| {
-        readback::image_to_rgba8(
-            uploader,
-            renderer.target(),
-            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-        )
-        .expect("readback should succeed")
-    })
+    rendered(scene, eye, forward, time, |_| {}, target_pixels)
 }
 
 /// Renders one frame of `scene` and hands the finished renderer to `read`.
 ///
 /// Which image a test wants back is the only thing that varies — the trace's own radiance for the
 /// numbers most of these assert, the material target for the guides — so the setup lives here once
-/// rather than beside each.
+/// rather than beside each. `dials` is for the one test that needs weather over the water; the rest
+/// pass nothing.
 fn rendered<T>(
     scene: &StaticScene,
     eye: Vec3,
     forward: Vec3,
     time: f32,
+    dials: impl FnOnce(&mut SceneRenderer),
     read: impl FnOnce(&mut rtxmw_gpu::Uploader, &SceneRenderer) -> T,
 ) -> T {
     let gpu = TestGpu::shared();
@@ -176,6 +181,7 @@ fn rendered<T>(
     // wrong one.
     renderer.set_denoise_passes(0);
     renderer.set_time(time);
+    dials(&mut renderer);
 
     let mut uploader = gpu.uploader();
     renderer
@@ -220,17 +226,26 @@ fn rendered<T>(
 /// DLSS Ray Reconstruction's packed mode looks for it. A test reading both from one image would
 /// keep passing if they were written to the wrong one.
 fn guides_at(scene: &StaticScene, eye: Vec3, forward: Vec3) -> glam::Vec4 {
+    rendered(
+        scene,
+        eye,
+        forward,
+        0.0,
+        |_| {},
+        |uploader, renderer| {
+            let albedo = centre_texel(uploader, renderer.material());
+            let roughness = centre_texel(uploader, renderer.normal_roughness()).w;
+            albedo.truncate().extend(roughness)
+        },
+    )
+}
+
+/// The four channels `image` holds at the middle pixel.
+fn centre_texel(uploader: &mut rtxmw_gpu::Uploader, image: &rtxmw_gpu::Image) -> glam::Vec4 {
     let middle = ((HEIGHT / 2) * WIDTH + WIDTH / 2) as usize * 4;
-    let read = |image: &rtxmw_gpu::Image, uploader: &mut rtxmw_gpu::Uploader| {
-        let channels = readback::image_to_f32(uploader, image, vk::ImageLayout::GENERAL)
-            .expect("readback should succeed");
-        glam::Vec4::from_slice(&channels[middle..middle + 4])
-    };
-    rendered(scene, eye, forward, 0.0, |uploader, renderer| {
-        let albedo = read(renderer.material(), uploader);
-        let roughness = read(renderer.normal_roughness(), uploader).w;
-        albedo.truncate().extend(roughness)
-    })
+    let channels = readback::image_to_f32(uploader, image, vk::ImageLayout::GENERAL)
+        .expect("readback should succeed");
+    glam::Vec4::from_slice(&channels[middle..middle + 4])
 }
 
 #[test]
@@ -640,5 +655,148 @@ fn the_sky_dims_with_depth_as_the_sun_does() {
         (measured - expected).abs() < 0.12,
         "the deeper floor should keep about {expected} of the shallow one's skylight, \
          got {measured} ({deep} against {shallow})"
+    );
+}
+
+/// One frame of the pool under `precipitation` at `time`, from an eye `height` above the water,
+/// read however the caller needs it.
+///
+/// **Sixty units is close to the surface, because a ring is eleven centimetres across.** A cone
+/// wider than that averages its crest and trough away exactly as it does for the swell — which is
+/// correct, and which a camera four hundred units up at sixty-four pixels square reads as the
+/// ripples not being there at all. That far view is its own case below, and reads the roughness
+/// rather than the picture.
+fn over_the_pool<T>(
+    height: f32,
+    precipitation: rtxmw_scene::Precipitation,
+    time: f32,
+    read: impl FnOnce(&mut rtxmw_gpu::Uploader, &SceneRenderer) -> T,
+) -> T {
+    let scene = pool(2_000.0);
+    rendered(
+        &scene,
+        Vec3::new(0.0, 0.0, height),
+        Vec3::new(1.0, 0.0, -0.9).normalize(),
+        time,
+        |renderer| {
+            renderer.set_sky(rtxmw_scene::Sky {
+                precipitation,
+                ..rtxmw_scene::Sky::at(rtxmw_scene::WorldTime::hours(12.0))
+            });
+        },
+        read,
+    )
+}
+
+/// The traced picture of that frame.
+fn surface_from(height: f32, precipitation: rtxmw_scene::Precipitation, time: f32) -> Vec<u8> {
+    over_the_pool(height, precipitation, time, target_pixels)
+}
+
+/// Rain as `[Weather Rain]` describes it, but falling through a volume too small to draw.
+///
+/// **Which is what isolates the ripples.** A drop is drawn only within the weather's own diameter of
+/// the eye, and a couple of units of that is nothing at all — so nothing reaches the transparency
+/// layer, while the water still knows it is raining. Without that the comparison is hopeless: a
+/// snowy frame differs from a dry one on the flakes in the air alone, and no amount of looking at
+/// the surface separates the two.
+///
+/// Nor does reading the guides get round it, which was the other thing tried. Water writes
+/// `-direction` into the normal target rather than its own normal, deliberately — see
+/// `water_is_the_only_thing_that_reflects_and_it_says_so_in_the_guide` — so no ring reaches those
+/// three channels. The *fourth* is a different quantity and does carry them, which is what the far
+/// view at the end of the test reads; it is the ripples as roughness rather than as shape, and only
+/// once they are too small to draw.
+fn raining(snow: bool) -> rtxmw_scene::Precipitation {
+    rtxmw_scene::Precipitation {
+        count: 450.0,
+        diameter: 2.0,
+        height: 500.0,
+        fall: 4025.0,
+        snow,
+    }
+}
+
+#[test]
+fn rain_rings_the_water_and_snow_lands_on_it_without_a_sound() {
+    let pixels = (WIDTH * HEIGHT) as usize;
+    // Which pixels two frames of the same water disagree about, by more than the tonemap's own
+    // rounding.
+    let apart = |was: &[u8], now: &[u8]| -> Vec<bool> {
+        was.chunks_exact(4)
+            .zip(now.chunks_exact(4))
+            .map(|(was, now)| (0..3).any(|c| was[c].abs_diff(now[c]) > 2))
+            .collect()
+    };
+    let count = |mask: &[bool]| mask.iter().filter(|shown| **shown).count();
+
+    // **Snow is the reference, and this is what earns it that.** It puts the same nothing in the
+    // air — the diameter above is too small for a flake to be drawn at all — and it does not ring,
+    // so a snowy frame and a dry one are the same frame down to the byte. Both halves of the
+    // fixture's claim, and neither of them true by construction.
+    let dry = surface_from(60.0, rtxmw_scene::Precipitation::NONE, 1.0);
+    let snowed = surface_from(60.0, raining(true), 1.0);
+    assert_eq!(
+        count(&apart(&dry, &snowed)),
+        0,
+        "snow should land on water without a sound, and nothing should be drawn falling"
+    );
+
+    // **A fair share of the surface at any moment**, which is what rings living half a second on a
+    // lattice this fine come to — every cell has an impact, and what varies is whether one is
+    // passing under this pixel now.
+    let ringing = apart(&snowed, &surface_from(60.0, raining(false), 1.0));
+    let rings = count(&ringing);
+    assert!(
+        rings > pixels / 20,
+        "rain should ring the water, and it moved {rings} of {pixels}"
+    );
+
+    // And the rings spread rather than standing still. **Measured against snow at each instant
+    // rather than against rain a moment earlier**, which would be no test at all: the swell moves
+    // too — `waves_break_up_the_surface_and_travel_with_the_clock` asserts exactly that — so two
+    // rainy frames differ whether or not a single ring went anywhere. Differencing each against its
+    // own snow cancels the swell and leaves the rings.
+    //
+    // **A twentieth of a second, which is short on purpose.** The cancellation is not perfect: a
+    // ring's effect on a pixel rides on the slope it is added to, so a swell that moved changes
+    // which pixels show a ring even where none of them travelled. That leak grows with the gap, and
+    // it is what a third of a second was measuring. Over a twentieth the swell barely moves while
+    // the ring front covers a fifth of its own wavelength — pinning the field to one instant and
+    // leaving everything else alone drops this from 455 pixels to 97.
+    let later = apart(
+        &surface_from(60.0, raining(true), 1.05),
+        &surface_from(60.0, raining(false), 1.05),
+    );
+    let moved = ringing
+        .iter()
+        .zip(&later)
+        .filter(|(was, now)| was != now)
+        .count();
+    // More pixels change than were ringing to begin with, which is the whole pattern being
+    // somewhere else rather than the same one nudged.
+    assert!(
+        moved > rings,
+        "the rings should spread, not sit — {moved} pixels changed against {rings} ringing"
+    );
+
+    // **And far enough out to draw none of them, rain still dulls the water.** What a cone cannot
+    // resolve is not gone, it is rough — `water_normal`'s own argument for the swell — or the far
+    // half of a rainy bay is a mirror. From four hundred units up not one ring survives the fade,
+    // so the roughness guide is the whole of what is left of them.
+    //
+    // Read from the guide rather than from the picture, because the picture cannot show it here: a
+    // wider reflection cone over the smooth sky this fixture has returns the same radiance, and the
+    // frames come back identical to the byte. What the lobe does is spread a *reflection*, and this
+    // pool has nothing in its sky to spread.
+    let roughness = |precipitation| {
+        over_the_pool(400.0, precipitation, 1.0, |uploader, renderer| {
+            centre_texel(uploader, renderer.normal_roughness()).w
+        })
+    };
+    let (still, rough) = (roughness(raining(true)), roughness(raining(false)));
+    assert!(
+        rough > still * 1.5,
+        "rain should roughen water too distant to ring — {rough} against {still}"
     );
 }

@@ -80,19 +80,120 @@ vec2 drifted(vec2 p, float time) {
                                  cos(along) - 0.6 * sin(across));
 }
 
+// How much of a wave that long a cone this wide can still tell apart, from none of it to all.
+//
+// A wave narrower than the pixel looking at it is averaged away rather than drawn: a ray cone a
+// wavelength wide covers a crest and a trough whose slopes cancel, and picking one of them instead
+// is what makes distant water a field of crawling white sparks. A property of the cone rather than
+// of what raised the wave, so the swell and the rain's rings fade by the same rule.
+float resolved(float wavelength, float footprint) {
+    return 1.0 - smoothstep(0.25 * wavelength, 0.75 * wavelength, footprint);
+}
+
 WaveSample sample_wave(int index, vec2 p, float time, float footprint) {
     Wave component = frame.waves[index];
     float wavelength = TAU / component.wavenumber;
     WaveSample wave;
     wave.amplitude = component.amplitude;
     wave.direction = component.direction;
-    // A wave narrower than the pixel looking at it is averaged away rather than drawn: a ray cone a
-    // wavelength wide covers a crest and a trough whose slopes cancel, and picking one of them
-    // instead is what makes distant water a field of crawling white sparks.
-    wave.detail = 1.0 - smoothstep(0.25 * wavelength, 0.75 * wavelength, footprint);
+    wave.detail = resolved(wavelength, footprint);
     wave.wavenumber = component.wavenumber;
     wave.phase = wave.wavenumber * dot(wave.direction, p) - component.speed * time;
     return wave;
+}
+
+// How far apart the raindrops that leave a ring on the water land, in world units.
+//
+// **Not how many fall, which is thousands to the square metre a second.** A real rain deposits far
+// more drops than a surface could show as separate rings — what an eye picks out is a few tens at a
+// time, each living about half a second. Twenty units is twenty-nine centimetres, which puts a dozen
+// impacts on a square metre and a handful of them ringing at any moment.
+const float RIPPLE_CELL = 20.0;
+
+// How long one ring lasts before it has spread into nothing, in seconds.
+const float RIPPLE_LIFE = 0.6;
+
+// How fast a ring spreads, in world units a second.
+//
+// Capillary-gravity waves on water cannot travel slower than 0.23 m/s, which is where the surface
+// tension and the gravity branches of the dispersion relation meet, and a splash ring runs out at
+// twice that: thirty-five units is half a metre a second, so a ring reaches about thirty centimetres
+// before `RIPPLE_LIFE` is up.
+const float RIPPLE_SPEED = 35.0;
+
+// The wavelength of the ring itself, in world units — about eleven centimetres, which is the scale
+// capillary ripples actually take.
+const float RIPPLE_LENGTH = 8.0;
+
+// How steep a fresh ring is, as slope at its crest.
+//
+// Per ring, and rings overlap — nine cells are summed — so what it comes to as a *field* is the
+// number to compare against the sea: the variance below works out to an rms slope of 0.20 against
+// the spectrum's summed 0.58. About a third of the swell's, which is enough to break a reflection
+// where it lands and gone again within `RIPPLE_LIFE`.
+const float RIPPLE_STEEPNESS = 0.30;
+
+// What the rain does to the water it lands on, as a slope added to the wave field's.
+//
+// **Rings from a lattice of impacts, the same trick the drops themselves use.** Each cell of the
+// water plane holds one impact at a hashed place, repeating on its own phase, and what it leaves is
+// a ring expanding at `RIPPLE_SPEED` and dying at `RIPPLE_LIFE`. The slope points away from the
+// impact, because that is what a ring is.
+//
+// **Rain only, which the file says rather than this.** `[Weather]` carries `Rain Ripples=1` and
+// `Snow Ripples=0`: a flake lands on water without a splash, and Bethesda wrote both halves down.
+//
+// `unresolved` comes back as the mean square slope the cone averaged away, on the same terms the
+// spectrum reports its own — see `water_normal`. Rings are eleven centimetres across and stop being
+// resolvable within a hundred metres of the eye, and rain on water at that range is a *duller*
+// sheet rather than a smooth one, so throwing their slope away instead of roughening with it is
+// what would put a mirror on the far half of a bay in a downpour.
+vec2 ripple_slope(vec2 p, float time, float footprint, out float unresolved) {
+    unresolved = 0.0;
+    if (frame.precip_spacing <= 0.0 || frame.precip_snow > 0.0) {
+        return vec2(0.0);
+    }
+    float detail = resolved(RIPPLE_LENGTH, footprint);
+    float lost = 1.0 - detail * detail;
+
+    vec2 slope = vec2(0.0);
+    float wavenumber = TAU / RIPPLE_LENGTH;
+    vec2 base = floor(p / RIPPLE_CELL);
+    // The eight neighbours as well as the cell itself: a ring outlives its own cell, so an impact
+    // next door is still ringing over this one.
+    for (int y = -1; y <= 1; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+            vec2 cell = base + vec2(x, y);
+            uint noise = hash(uvec4(uvec2(ivec2(cell) + 4096), 0u, 0u));
+            vec2 jitter = vec2(float(noise & 0xFFFu), float((noise >> 12) & 0xFFFu)) / 4095.0;
+            float offset = float(noise >> 24) / 255.0;
+            vec2 fell = (cell + jitter) * RIPPLE_CELL;
+            // Where this impact is in its own life, which each cell keeps its own phase of so the
+            // whole surface does not ring at once.
+            float age = fract(time / RIPPLE_LIFE + offset) * RIPPLE_LIFE;
+
+            vec2 away = p - fell;
+            float distance = length(away);
+            float front = RIPPLE_SPEED * age;
+            // Behind the front there is nothing yet, and the ring fades as it spreads — its energy
+            // over a circumference that grows, and its own life running out.
+            if (distance > front || front <= 0.0) {
+                continue;
+            }
+            float faded = (1.0 - age / RIPPLE_LIFE) * front / max(distance, front * 0.15);
+            float steepness = RIPPLE_STEEPNESS * min(faded, 1.0);
+            // Whatever share of this ring the cone could not resolve, kept as variance rather than
+            // dropped — a sinusoid of steepness `s` has mean square slope `s^2 / 2`, which is the
+            // argument `water_normal` makes for the swell and holds here unchanged.
+            unresolved += lost * 0.5 * steepness * steepness;
+            if (detail <= 0.0) {
+                continue;
+            }
+            slope += away / max(distance, 1e-4)
+                   * (detail * steepness * cos(wavenumber * (distance - front)));
+        }
+    }
+    return slope;
 }
 
 // The surface normal at a point, from the gradient of the wave height field.
@@ -121,5 +222,11 @@ vec3 water_normal(vec2 p, float time, float footprint, out float unresolved) {
         }
         slope += wave.direction * (wave.detail * steepness * cos(wave.phase));
     }
+    // What the rain adds on top, which is not part of the spectrum and must not be: the caustics
+    // differentiate the swell and a ring is far too small to carry one. Its roughness joins the
+    // spectrum's, though, because a cone that cannot resolve a ring lost real slope either way.
+    float rain;
+    slope += ripple_slope(p, time, footprint, rain);
+    unresolved += rain;
     return normalize(vec3(-slope, 1.0));
 }

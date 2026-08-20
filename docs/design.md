@@ -3795,3 +3795,82 @@ What it comes to is streaks that stay streaks, the same rain from every angle, a
 tell from a shower. The same frame that came out of DLSS as a grey wash
 now shows every drop, and the two paths — upscaled and not — draw the same rain without either
 drawing it twice.
+
+### 8.65 Rain that lands
+
+The drops fell through a world that stayed bone dry. The first half of fixing that is the water: a
+raindrop breaks the surface and leaves a ring, and `water_normal` already sums slopes from the wave
+spectrum, so a ring is one more slope term rather than a new system.
+
+**Which weather rings is the file's own claim, not a choice here.** The general `[Weather]` section
+carries `Rain Ripples=1` beside `Snow Ripples=0` — a raindrop breaks the surface and a flake settles
+onto it, and Bethesda wrote both halves down. The shader returns before it reads anything when the
+weather is snow.
+
+**A lattice of impacts, the same trick the drops themselves use.** Each cell of the water plane holds
+one impact at a hashed place on its own phase, and what it leaves is a ring expanding at half a metre
+a second — a little above the minimum phase speed of capillary-gravity waves — and dying within
+`RIPPLE_LIFE`. The nine neighbouring cells are read as well as the one underfoot, because a ring
+outlives its own cell. **Not part of the spectrum, and it must not be**: the caustics stage
+differentiates the swell a second time, and a ring eleven centimetres across carries none.
+
+**How many rings is not how many drops.** A real rain deposits thousands of drops a second on a
+square metre and a surface cannot show them as separate rings; what an eye picks out is a few tens at
+a time. The cell is twenty units, which puts a dozen impacts on a square metre with a handful ringing
+at any moment, and measured against the same frame with the term switched off they move **a quarter
+of the open water**.
+
+**And what the cone cannot resolve comes back as roughness**, which is the invariant `water_normal`
+already states for the swell and which the rings broke on their first draft. A ring is eleven
+centimetres across, so the same fade that averages a distant crest against its trough zeroes the
+rings entirely within about ninety metres at 1080p — and rain on water at *that* range is a duller
+sheet rather than a smoother one. So `ripple_slope` reports the mean square slope it lost on the same
+terms the spectrum does, `(1 - detail²) · s²/2` per ring, and the roughness guide four hundred units
+up goes from **0.031 to 0.407**: from near-mirror to matte, which is what a bay in a downpour is.
+
+**And no rain under the water**, which is the other thing the lattice knows nothing about. A drop
+that reached the surface stopped being a drop, so a submerged eye had a downpour hanging in the bay
+beside it, lit by a sun the water had already taken most of. Two clips: nothing at all when the eye
+is under, and a downward ray cut where it crosses the level. An opaque hit already ends the march —
+what the second one covers is a ray that finds nothing and would otherwise carry the rain straight
+down through open water. `water_level` is negative infinity in a dry cell, so the crossing comes out
+at infinity and an interior pays nothing, the same sentinel `fog_density_at` leans on.
+
+**Testing it took several goes, and the failures are the interesting part.** Comparing a rainy frame
+against a dry one measures the *drops in the air*, not the rings — a snowy frame differs from a dry
+one on the flakes alone, and 137 pixels of a 4,096-pixel fixture said so. Reading the normal target
+instead looks like the clean isolation and is not: water writes `-direction` there rather than its
+own normal, deliberately, so a ring never reaches it — §8.20's reason, still holding.
+
+What works is a weather whose drop *volume* is too small to draw. A drop is drawn only within the
+weather's own `Diameter` of the eye, so a couple of units of that puts nothing in the transparency
+layer while the water still knows it is raining — and then rain against **snow** differs by the rings
+and nothing else. With the term stubbed out the test reports zero, which is what says it bites.
+
+**And the fixture had to come down to the water.** A ring is eleven centimetres across and the cone
+fade averages it away exactly as it does the swell; a camera four hundred units up at sixty-four
+pixels square read that correctly as no ripples at all. That same far view is now its own case, for
+the roughness — read from the *guide* rather than from the picture, because a wider reflection cone
+over a smooth sky returns the same radiance and the two frames come back identical to the byte.
+
+**Two assertions written first could not fail, and both were found by injecting the fault rather than
+by rereading them.** One compared the reference frame against itself. The other asked whether the
+rings had spread by differencing two rainy frames a third of a second apart — but the *swell* moves
+over a third of a second, which `waves_break_up_the_surface_and_travel_with_the_clock` asserts
+outright, so the swell alone passed it. Differencing each frame against its own snow cancels the
+swell and leaves the rings; and the gap came down to a twentieth of a second, because the
+cancellation is not perfect — a ring's effect on a pixel rides on the slope it is added to, so a
+swell that moved changes which pixels show a ring even where none of them travelled. Over a twentieth
+the swell barely moves while the ring front covers a fifth of its own wavelength: pinning the field
+to a single instant and changing nothing else drops the measurement from 455 pixels to 97, against
+276 that were ringing at all.
+
+The underwater clip needed the same care for the opposite reason. A water level is *not* free of the
+rest of the picture — the backdrop wall runs on below it, a wall the sun reaches through water is
+darker, and the auto-exposure then follows that across every pixel of the frame. Counting any
+difference saturated at the whole frame. What survives is a pixel the rain made *brighter* by more
+than a couple of levels, which against a wall of 0.05 albedo is a streak and nothing else; and the
+darker wall biases that against the test, since a streak stands out further on it.
+
+**Not done:** wet surfaces. Rain darkens and glosses whatever the sky can see, and that is what
+actually sells rain on stone and timber rather than on water.

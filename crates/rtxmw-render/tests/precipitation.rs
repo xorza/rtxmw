@@ -56,8 +56,13 @@ fn backdrop() -> StaticScene {
     scene
 }
 
-/// A frame under `weather`'s own sky at `seconds` on the world's clock.
+/// A frame of the plain backdrop under `weather`'s own sky at `seconds` on the world's clock.
 fn falling(precipitation: Precipitation, seconds: f32) -> Vec<u8> {
+    falling_in(&backdrop(), precipitation, seconds)
+}
+
+/// The same, over a scene of the caller's — which is how the water gets into one.
+fn falling_in(scene: &StaticScene, precipitation: Precipitation, seconds: f32) -> Vec<u8> {
     let gpu = TestGpu::shared();
     let mut renderer = SceneRenderer::new(
         gpu.device(),
@@ -86,7 +91,7 @@ fn falling(precipitation: Precipitation, seconds: f32) -> Vec<u8> {
             &mut uploader,
             gpu.physical().limits(),
             CellId::Exterior { x: 0, y: 0 },
-            &backdrop(),
+            scene,
             &[],
         )
         .expect("scene should load");
@@ -194,5 +199,55 @@ fn snow_falls_slower_and_wider_than_rain() {
     assert!(
         snow_carried < rain_carried,
         "snow should drift where rain falls — {snow_carried} against {rain_carried}"
+    );
+}
+
+#[test]
+fn nothing_falls_under_the_water_and_a_surface_below_the_eye_cuts_it_off() {
+    // **Every ray submerged**, with the surface far overhead. A drop that reached the water stopped
+    // being a drop, and the lattice knows nothing about that on its own — so this hung a downpour in
+    // the bay beside the eye, lit by a sun the water had already taken most of.
+    let mut under = backdrop();
+    under.water_level = Some(20_000.0);
+    let poured = moved(
+        &falling_in(&under, Precipitation::NONE, 0.0),
+        &falling_in(&under, rain(), 0.0),
+    );
+    assert_eq!(
+        poured, 0,
+        "rain reached under the water, on {poured} pixels"
+    );
+
+    // **And a surface below the eye cuts the downward rays at it**, which is the half a hit does not
+    // already cover: a ray that finds nothing within the weather's reach would otherwise carry the
+    // rain straight down through open water. Fifty units under the eye, so the steeper of those rays
+    // cross before the hundred it takes for a streak to be worth drawing at all.
+    let mut bay = backdrop();
+    bay.water_level = Some(-50.0);
+
+    // **Each against its own dry frame, and counting streaks rather than differences.** A water
+    // level is not free of the rest of the picture — the backdrop runs on below it, and a wall the
+    // sun has to reach through water is darker, which the exposure then follows across every pixel
+    // of the frame. So does the rain itself, by a level or two. What survives both is a pixel the
+    // rain made *brighter* by more than that, which against a wall of 0.05 albedo is a streak and
+    // nothing else. The darker wall biases this the wrong way for the test, since a streak stands
+    // out further against it.
+    let lower = |dry: &[u8], wet: &[u8]| {
+        let half = (HEIGHT / 2 * WIDTH) as usize * 4;
+        dry[half..]
+            .chunks_exact(4)
+            .zip(wet[half..].chunks_exact(4))
+            .filter(|(was, now)| (0..3).any(|c| now[c].saturating_sub(was[c]) > 8))
+            .count()
+    };
+    let over_water = lower(
+        &falling_in(&bay, Precipitation::NONE, 0.0),
+        &falling_in(&bay, rain(), 0.0),
+    );
+    let over_land = lower(&falling(Precipitation::NONE, 0.0), &falling(rain(), 0.0));
+    assert!(
+        over_water < over_land * 3 / 4,
+        "open water should take the rain out of the rays that reach it — {over_water} against \
+         {over_land}"
     );
 }

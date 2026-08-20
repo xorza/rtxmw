@@ -174,9 +174,28 @@ vec4 precipitation_along(vec3 origin, vec3 direction, float span) {
     if (frame.precip_spacing <= 0.0) {
         return vec4(0.0, 0.0, 0.0, 1.0);
     }
-    // Only as far as the weather says its own volume reaches, and never past what the ray hit
-    // first. Beyond that a drop is finer than a pixel and what stands in for it is the fog.
+    // **Air only, and under a bay there is none**, which is the same thing `fog_density_at` says
+    // about the fog and for a stronger reason: a drop that reached the water stopped being a drop.
+    // Nothing in this lattice knows that, so a submerged eye had a downpour hanging in the bay with
+    // it, lit by a sun the water had already taken most of.
+    //
+    // `water_level - z` is never positive for a dry cell — that is what the negative infinity in
+    // the frame constants is for — so this is the same guard every other reader of the level
+    // writes, and the crossing below comes out at infinity rather than biting.
+    if (frame.water_level - origin.z > 0.0) {
+        return vec4(0.0, 0.0, 0.0, 1.0);
+    }
+    // How much air stands under the eye, which is what a downward ray spends before it reaches the
+    // surface.
+    float head = origin.z - frame.water_level;
+    // Only as far as the weather says its own volume reaches, never past what the ray hit first,
+    // and never past the surface a downward ray crosses — an opaque hit already ends the march, but
+    // a ray that finds nothing would otherwise carry the rain down through open water. Beyond all
+    // three a drop is finer than a pixel and what stands in for it is the fog.
     float reach = min(span, frame.precip_reach);
+    if (direction.z < 0.0) {
+        reach = min(reach, head / -direction.z);
+    }
     vec3 fall = normalize(frame.precip_fall);
     vec3 across, along;
     precip_basis(fall, across, along);
