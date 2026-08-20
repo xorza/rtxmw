@@ -2686,4 +2686,133 @@ a couple of units of that puts nothing in the transparency layer while the water
 does the swell; a camera four hundred units up at sixty-four pixels square read that correctly as no ripples at all.
 
 **Not done:** wet surfaces. Rain darkens and glosses whatever the sky can see, and that is what actually sells rain on stone and timber
-rather than on water.
+
+### 8.66 The exposure was answering for the rain
+
+Every assertion in `tests/precipitation.rs` passed on the auto-exposure. Metering follows the frame's overall brightness, so
+putting rain in the air drops every pixel three levels and snow drops them twenty: a difference count came back saturated at
+16,384 of 16,384 while 572 pixels actually had a drop on them. One threshold cleared its bar by seven pixels of rounding; "snow
+drifts where rain falls" compared 16,329 against 16,377 and **reverses** on the honest measure.
+
+`lit_by` is the fix, and one constant suffices because the bias has a sign: precipitation only adds light, so the exposure it
+provokes can only subtract it. Four levels is above a twenty-level shift in the wrong direction and far below a streak.
+
+Fixing the measurement is not enough to fix the snow test. Snow lights ten times as many pixels as rain, so it turns more of
+them over while moving a tenth as far — the comparable quantity is turnover as a *fraction* of coverage. Read that way, over a
+hundredth of a second rain scores 1.99 of its own coverage (a complete turnover) against snow's 0.74.
+
+**And no rain under the water.** Two clips: nothing when the eye is submerged, and a downward ray cut where it crosses the
+level. An opaque hit already ends the march; the second covers a ray that finds nothing and would carry rain down through open
+water.
+
+### 8.67 A streak is the weather's own speed
+
+`PRECIP_TERMINAL` was a speed — 630 units a second — so every weather's smear was rain's. A flake at 345 units a second came out
+smeared over the same fifteen centimetres: a needle ten times longer than it was drawn wide.
+
+It is a ratio now, `630 / 4025`, and rain is bit-identical. Snow drops to 2.1 units, set by the floor rather than by its 0.90
+physical smear: never shorter than twice the drawn radius, because below that a shape is not short but pointed the wrong way.
+
+Coverage is untouched by construction — `column = streak / PRECIP_DUTY`, so the share of a column a streak fills is constant
+whatever its length. Shortening the smear stacks more of them in the same air rather than thinning the shower.
+
+Shape is what tells the two apart: lit pixels with a lit neighbour below against one to the right give rain 6.16 and snow **1.42
+→ 1.06**. Bounded on the excess over round, because snow covers a third of the frame and fusing adds neighbours in both
+directions equally, pulling any ratio toward one whatever the flakes are shaped like.
+
+### 8.68 The clamp that made a storm and a shower the same picture
+
+Rain and thunderstorm rendered **byte-identical**. `alpha` came out at 1.8 and 4.6, both clamped to 1, so `Max Raindrops`,
+`RAINFALL` and `COUNT_CURVE` decided nothing for the two weathers they were written for.
+
+The cause: the drawn radius was a fraction of the sampling cell, so in `steps · pi r^2 / cell^2` the two cancelled and `alpha`
+had nowhere to go. Same error as the ray-derived lattice behind §8.64's horizon band — how wide a drop is drawn cannot depend on
+how finely the ray is sampled. With the radius in world units, `walked` cancels and the cell solves in closed form:
+
+    cell = spacing * cbrt(PRECIP_OPACITY * r^2 * duty / (PRECIP_SPREAD * PRECIP_RADIUS^2))
+
+The cell tracks each weather's drop spacing and the drawn radius to the two-thirds power, which holds a flake drawn three times
+a drop's width to the same opacity instead of a ninth. Every weather lands at `PRECIP_OPACITY` and the clamp cannot bind. Per
+weather is not per pixel, so the band stays fixed.
+
+Two things rendering it made obvious and reasoning did not:
+
+- **`RAINFALL` at 5,000 is a wall of static.** It is 2,900, and derived: rain's cylinder holds 450 drops in 412 cubic metres —
+  1.09 per cubic metre, not the 0.6 the doc claimed, which predates the `height = high - low` fix — against Marshall and
+  Palmer's `N0 / Λ` of 3,165. The 2,750 tuned against screenshots first landed within five percent of it, which is why the
+  derivation replaced the tuning.
+- **`COUNT_CURVE` was a workaround for the clamp**, added because 650-against-450 looked invisible. That was the clamp, not the
+  ratio. Deleted, with `LIGHTEST`.
+
+**The cross-section was wrong twice.** The target was `4 * PRECIP_RADIUS^2`, called a cross-section beside itself; a sphere
+presents `pi r^2`, and `PRECIP_RADIUS` was a large drop's radius applied to every drop. For `N(D) = N0 exp(-ΛD)` the mean square
+diameter is `2 / Λ^2`, so the mean cross-section is `π / (2Λ^2)` and the equivalent radius is
+
+    r = 1 / (Λ sqrt 2)
+
+0.280 mm at moderate rain — a fifth of the 1.5 mm that stood there, a twenty-ninth of the area.
+
+Run that out and moderate rain blocks two parts in a thousand of a three-metre ray. Real rain is nearly transparent; streaks
+show because a drop is a lens far brighter than what is behind it. This renderer cannot draw that — sub-pixel specks at fifty
+times the background alias into static and Ray Reconstruction eats them (§8.64) — so the signal is spread: more coverage, dimmer
+streaks, `coverage * radiance` held. `PRECIP_SPREAD` is that factor, and the only number here physics does not give. Its check:
+`PRECIP_SPREAD * PRECIP_LIT` is a lens gain near fifty, the order Garg and Nayar and Wang both put a drop's at.
+
+### 8.69 The rain fell upward
+
+`precip_fall.z` is negative and the shader sampled at `position + drift`, which solves for the drop at *minus* the drift. The
+whole field climbed.
+
+Rain hid it: a streak seven pixels tall and one wide, slid along its own axis, lies on top of itself. Only a round flake has
+anywhere to go. The correlation must fit inside one lattice column — every cell is jittered on its own hash, so a drift of one
+column maps each cell onto a *different* neighbour and the profile past that is flat at chance. A fiftieth of a second measured
+a peak six percent above chance, meaning nothing; a two-hundredth gives **952 pixels one row down against 517 one row up**, and
+the old sign inverts it.
+
+### 8.70 What the rain leaves behind
+
+A wet surface is a substrate under a film: darker because the film keeps handing light back for another pass, glossed because
+the film has a top.
+
+**The darkening is a closed form.** Light leaving the substrate meets the film's top from inside, and everything past the
+critical angle — 48.6 degrees, most of the hemisphere by solid angle — is turned round for the stone to absorb again. Egan and
+Hilgeman's fit gives 0.475 at water's index, and the whole path is a geometric series in `albedo * F`. That is Lekner and Dorf,
+and the series is why it cannot be a multiplier: a bright substrate gets more back each pass, so **a dark floor loses
+proportionally more than a bright one**. A flat 0.6 makes the test report 0.5998 against 0.5998 where the closed form separates
+them.
+
+**Only where the rain reaches**, one ray back along `precip_fall` — the wind's slant is already in that vector, so a dry patch
+sits offset from the eave that casts it. A single direction drew the boundary as the building's own silhouette, polygon by
+polygon; rain gusts and splashes, so it samples a ten-degree spread.
+
+**Slope runs opposite to the rate.** The square root of the cosine was wrong: a surface saturates once covered, but what it
+*holds* is deposition against runoff, and a tilted face sheds what a level one keeps. Squared.
+
+Four looks were rejected, each a different fault:
+
+- **Plastic** — the reflection was added on top of the full diffuse response, and Schlick runs to one at grazing. It has to take
+  from the diffuse what it returns.
+- **One giant puddle** — widening `cone_spread` by the lobe picks a coarser mip and leaves the ray a perfect mirror, so
+  roughness blurred textures and never geometry. Roughness must move the ray: GGX puts the lobe near `alpha = roughness^2` and a
+  reflection turns by twice its normal, drawn per frame for Ray Reconstruction to accumulate.
+- **Washed out** — there was no BRDF at all, nothing to say the facets facing the eye at a glancing angle are shadowed by those
+  in front. At roughness 0.55 that gave **0.45** at grazing where the answer is **0.107**. The reflection is a cone sample of
+  the environment, which is what the split-sum approximation is for; Lazarov's fit agrees with Schlick to a thousandth head-on,
+  and the whole difference is the shadowing.
+- **White spots** — Lagarde: a *thin* film reflects the disturbed normal of what is under it, a thick one a flat normal. With no
+  normal map the film disturbed an interpolated vertex normal across a flat plank — the puddle case everywhere. The rain is the
+  disturbance; `waves.glsl`'s lattice rings a wet deck because it is the same rain. But a ring only shows if the reflection is
+  sharp enough to bend, and a thirty-degree cone average is uniform enough that tilting the normal changes nothing. **Standing
+  water is smooth and soaked-in water is not**: roughness runs `FILM_ROUGHNESS` → `FILM_PUDDLE` with how much stands, so rings
+  bend what a pool reflects while the damp ground stays matte. `FILM_HELD` is Lagarde's porosity with no map to read it from.
+
+**The film reaches every hit.** `shade` is the only place a bounce learns what it landed on; left out, ground under shallow
+water was drawn dry against a wet bank and the two met at the waterline. 0.9 ms.
+
+**Still owed:** returning one for drowned ground put the bed darker than the shore beside it in weather with no rain, which
+§8.20's no-seam rule caught at 0.205 against 0.269. The film fades to nothing over `SHORE_FADE` instead — hiding the step rather
+than being right about it.
+
+**One measurement worth keeping:** tracing the reflection cost 16.7 ms against 7.9 and was nearly abandoned, but the cost was
+entirely *shading* the hit — a shadow ray per light — not the trace. Flat-lighting it, which a lobe this wide deserves, brought
+it back to 7.9 with no visible difference.
