@@ -301,6 +301,11 @@ impl Renderer {
         self.scene.set_time(seconds);
     }
 
+    /// Brings the storm's next flash forward to now, for the key that asks for one.
+    pub(crate) fn strike(&mut self, eye: Vec3, facing: Vec3) {
+        self.scene.strike(eye, facing);
+    }
+
     /// Moves the sky every resident exterior stands under.
     pub(crate) fn set_sky(&mut self, sky: Sky) {
         self.scene.set_sky(sky);

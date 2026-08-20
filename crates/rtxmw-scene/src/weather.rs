@@ -3,6 +3,7 @@
 use glam::Vec3;
 use rtxmw_esm::{Cell, CellId, RegionRecord};
 
+use crate::lightning::Lightning;
 use crate::precipitation::Precipitation;
 
 use crate::game_data::GameData;
@@ -256,6 +257,8 @@ pub struct Weather {
     /// What falls out of the sky, and how much of it. [`Precipitation::NONE`] for the six that
     /// carry none.
     pub precipitation: Precipitation,
+    /// How often it throws a bolt, which only `[Weather Thunderstorm]` says anything about.
+    pub lightning: Lightning,
     /// How thick the air is by day and by night, out of `Land Fog Day/Night Depth`.
     pub fog_day_depth: f32,
     pub fog_night_depth: f32,
@@ -379,6 +382,7 @@ impl Weather {
         Self {
             name: name.to_owned(),
             precipitation: Precipitation::read(ini, &section, &cloud_texture),
+            lightning: Lightning::read(ini, &section),
             sky: Schedule::read(ini, &section, "Sky", CLEAR_SKY),
             fog: Schedule::read(ini, &section, "Fog", CLEAR_FOG),
             ambient: Schedule::read(ini, &section, "Ambient", CLEAR_AMBIENT),

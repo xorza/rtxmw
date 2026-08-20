@@ -3,6 +3,7 @@
 use glam::{Vec2, Vec3};
 
 use crate::clouds::{BEARING, CloudSheet, Clouds, SKYLIT};
+use crate::lightning::Lightning;
 use crate::moon::Moon;
 use crate::precipitation::Precipitation;
 use crate::srgb::LUMA;
@@ -291,6 +292,11 @@ pub struct Sky {
     pub scale: f32,
     /// How much of the star field is out, from none to all of it — [`WorldTime::starlight`].
     pub stars: f32,
+    /// How often this weather throws a bolt, and how fast one fades.
+    ///
+    /// **The schedule rather than the flash**, because a flash is a function of the frame's clock
+    /// and where the eye is standing, and this crate knows neither — see [`Lightning::flash`].
+    pub lightning: Lightning,
     /// The weather's own medium, over everything the sky has in it. [`Veil::NONE`] under clear.
     ///
     /// Solved from the ini's `Sky * Color` against its `Fog * Color`, so what it draws is the
@@ -455,6 +461,7 @@ impl Sky {
             fog_lift: thicker * (1.0 + weather.wind * WIND_LIFT),
             wind: Vec2::from_angle(BEARING) * weather.wind,
             precipitation: weather.precipitation,
+            lightning: weather.lightning,
             exposure_bias: 1.0,
         };
         // **The open dome first**, which is what lights the cloud tops: a deck is lit from above by

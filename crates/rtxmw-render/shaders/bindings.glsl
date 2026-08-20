@@ -277,5 +277,13 @@ layout(set = 0, binding = 14, scalar) readonly buffer Frame {
     uint cloud_sheet;
     // The sinusoids the sea is summed from, built on the host from an empirical spectrum rather
     // than a series chosen by eye — see `wave_spectrum.rs`.
+    // The flash, if one is burning: what it puts into the sky, which of the three shapes it took —
+    // 0 sheet, 1 in-cloud, 2 to ground — where the channel stands and where it ends. A zero radiance
+    // is no flash, which is every frame of every weather but one.
+    vec3 flash_radiance;
+    float flash_kind;
+    uint flash_seed;
+    vec3 flash_source;
+    vec3 flash_ground;
     Wave waves[WAVE_COUNT];
 } frame;

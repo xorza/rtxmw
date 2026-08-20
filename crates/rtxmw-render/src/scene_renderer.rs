@@ -152,6 +152,9 @@ pub struct SceneRenderer {
     bounce_samples: u32,
     denoise_passes: u32,
     time: f32,
+    /// How far the lightning clock is nudged from the frame's, so a key can bring a flash forward
+    /// without anything having to remember that it was pressed — see [`Self::strike`].
+    lightning_offset: f32,
     /// Where the camera stood when [`Self::frame_constants`] was last asked, or `None` before the
     /// first frame. What this frame's motion vectors are measured against.
     previous_view: Option<Viewpoint>,
@@ -227,6 +230,7 @@ impl SceneRenderer {
             bounce_samples: DEFAULT_BOUNCE_SAMPLES,
             denoise_passes: DEFAULT_PASSES,
             time: 0.0,
+            lightning_offset: 0.0,
             previous_view: None,
             jitter: false,
             delight: DEFAULT_DELIGHT,
@@ -367,6 +371,24 @@ impl SceneRenderer {
     /// surface at time zero is one definite shape rather than whenever the frame happened to run.
     pub fn set_time(&mut self, seconds: f32) {
         self.time = seconds;
+    }
+
+    /// Brings the next flash forward to now.
+    ///
+    /// **By moving the clock rather than by setting a flag**, which is what keeps the whole thing a
+    /// function of time: `Lightning::flash` reads a schedule and nothing anywhere remembers that a
+    /// key was pressed, so a screenshot taken a frame later draws exactly what the window did. The
+    /// offset nudges the lightning clock onto a flash boundary and stays there, so the storm carries
+    /// on from the moment it was asked for rather than snapping back.
+    ///
+    /// Brings forward a flash that can be *seen* from `eye` looking `facing` — see
+    /// [`rtxmw_scene::Lightning::staged`], which is why this needs a camera at all.
+    ///
+    /// Does nothing under a weather with no lightning, which is nine of the ten.
+    pub fn strike(&mut self, eye: Vec3, facing: Vec3) {
+        let now = self.time + self.lightning_offset;
+        let altitude = self.sky.clouds.altitude;
+        self.lightning_offset += self.sky.lightning.staged(now, eye, altitude, facing);
     }
 
     pub fn set_bounce_samples(&mut self, samples: u32) {
@@ -667,6 +689,7 @@ impl SceneRenderer {
             // resolution it is being traced at.
             FrameConstants::cone_spread_from(projection, self.target.extent().height),
             self.time,
+            self.time + self.lightning_offset,
         )
     }
 

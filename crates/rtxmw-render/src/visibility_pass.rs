@@ -4,7 +4,7 @@ use ash::vk;
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec2, Vec3};
 use rtxmw_gpu::{Binding, Buffer, BufferMemory, ComputePipeline, Device, Image, Memory};
-use rtxmw_scene::{Clouds, Moon, Precipitation, Sun, Veil};
+use rtxmw_scene::{Clouds, Discharge, Lightning, Moon, Precipitation, Sun, Veil};
 
 use crate::acceleration_structure::AccelerationStructure;
 use crate::gbuffer::GBuffer;
@@ -22,6 +22,14 @@ use crate::wave_spectrum::{GpuWave, SeaState, WAVE_COUNT};
 /// over at ten metres a second against a fall of forty-one, which is the lean a storm has.
 const PRECIP_SLANT: f32 = 1400.0;
 
+/// What a flash at full brightness adds to the ambient, against the dome's own.
+///
+/// A channel is the brightest thing in this world by orders of magnitude, and what reaches a
+/// landscape a few hundred metres off is still comparable to daylight — which is why a photograph
+/// taken by one is exposed like a photograph taken by the sun. Tuned against an overcast storm sky,
+/// where the flash has to beat a dome that is already pale.
+const FLASH_AMBIENT: f32 = 6.0;
+
 /// Everything lighting a cell, which arrives together and goes stale together.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Lighting {
@@ -31,6 +39,8 @@ pub(crate) struct Lighting {
     pub(crate) light_grid: LightGridExtent,
     /// The sun, for a cell with a sky.
     pub(crate) sun: Option<Sun>,
+    /// How often this cell's weather throws a bolt — see [`rtxmw_scene::Lightning`].
+    pub(crate) lightning: Lightning,
     /// Where the water surface sits, for shading what is under it. Absent for a dry cell.
     pub(crate) water_level: Option<f32>,
     /// The colour the cell's fog scatters, and how thickly it sits.
@@ -88,6 +98,7 @@ impl Default for Lighting {
     fn default() -> Self {
         Self {
             ambient: Vec3::ZERO,
+            lightning: Lightning::NONE,
             light_grid: LightGridExtent::default(),
             sun: None,
             water_level: None,
@@ -312,6 +323,17 @@ pub struct FrameConstants {
     /// Static for the life of a sea state, and carried here rather than in a buffer of its own
     /// because it is six hundred bytes beside a block that is already uploaded every frame, and a
     /// second binding would cost more to explain than the copy costs to make.
+    /// The flash, if one is burning: what it puts into the sky, which of the three shapes it took,
+    /// where the channel stands and where it ends. Zero radiance is no flash, which is every frame
+    /// of every weather but one.
+    ///
+    /// The seed is what the channel's crookedness is drawn from: the shader has nothing else to hash,
+    /// and seeded from a constant every flash came out the same bolt.
+    flash_radiance: [f32; 3],
+    flash_kind: f32,
+    flash_seed: u32,
+    flash_source: [f32; 3],
+    flash_ground: [f32; 3],
     waves: [GpuWave; WAVE_COUNT],
 }
 
@@ -344,7 +366,14 @@ impl FrameConstants {
         sampling: Sampling,
         cone_spread: f32,
         time: f32,
+        storm: f32,
     ) -> Self {
+        // **The one place that knows both the clock and where the eye is standing**, which is what a
+        // flash needs: `rtxmw_scene` settles the schedule out of the ini and this settles which
+        // moment of it the frame has landed in.
+        let flash = lighting
+            .lightning
+            .flash(storm, now.position, lighting.clouds.altitude);
         // No sun is a black one: every term it feeds is a multiplication, so the shader needs no
         // flag to branch on and an interior costs nothing for having no sky.
         let sun = lighting.sun.unwrap_or(Sun {
@@ -362,7 +391,12 @@ impl FrameConstants {
             light_grid_scale: lighting.light_grid.scale,
             light_grid_origin: lighting.light_grid.origin.to_array(),
             light_grid_dimensions: lighting.light_grid.dimensions,
-            ambient: lighting.ambient.to_array(),
+            // **The flash is in the ambient rather than beside it**, because everything an ambient
+            // reaches — the rain in the air, the film on the ground, the fog, the indirect bounce —
+            // is something a flash lights, and folding it in here means not one of them needs to
+            // know lightning exists. What is passed separately below is for the sky and the channel,
+            // which are the flash being *seen* rather than the flash lighting something.
+            ambient: (lighting.ambient + flash.radiance * FLASH_AMBIENT).to_array(),
             cone_spread,
             sun_direction: sun.direction.to_array(),
             sun_cos_radius: sun.angular_radius.cos(),
@@ -420,6 +454,15 @@ impl FrameConstants {
             // Rebuilt each frame rather than cached: it is a few hundred floats of arithmetic once
             // per frame against a million rays that read it, and a cache would need invalidating
             // the moment the sea state becomes something a cell can set.
+            flash_radiance: flash.radiance.to_array(),
+            flash_kind: match flash.kind {
+                Discharge::Sheet => 0.0,
+                Discharge::InCloud => 1.0,
+                Discharge::ToGround => 2.0,
+            },
+            flash_seed: flash.seed,
+            flash_source: flash.source.to_array(),
+            flash_ground: flash.ground.to_array(),
             waves: SeaState::default().waves(),
         }
     }
@@ -829,8 +872,14 @@ mod tests {
         assert_eq!(offset_of!(FrameConstants, cloud_altitude), 556);
         assert_eq!(offset_of!(FrameConstants, cloud_sheet), 608);
         // The wave table follows, twenty tightly packed bytes apiece.
-        assert_eq!(offset_of!(FrameConstants, waves), 612);
-        assert_eq!(size_of::<FrameConstants>(), 612 + 20 * WAVE_COUNT);
+        // The flash sits between the sheet and the waves — see `FrameConstants`.
+        assert_eq!(offset_of!(FrameConstants, flash_radiance), 612);
+        assert_eq!(offset_of!(FrameConstants, flash_kind), 624);
+        assert_eq!(offset_of!(FrameConstants, flash_seed), 628);
+        assert_eq!(offset_of!(FrameConstants, flash_source), 632);
+        assert_eq!(offset_of!(FrameConstants, flash_ground), 644);
+        assert_eq!(offset_of!(FrameConstants, waves), 656);
+        assert_eq!(size_of::<FrameConstants>(), 656 + 20 * WAVE_COUNT);
     }
 
     #[test]
@@ -884,6 +933,7 @@ mod tests {
             before.viewpoint(projection),
             Lighting::default(),
             Sampling::default(),
+            0.0,
             0.0,
             0.0,
         )

@@ -27,7 +27,7 @@ use crate::world_clock::WorldClock;
 const KEYS: &str = concat!(
     "keys: WASD, space and ctrl to fly \u{b7} shift to hurry \u{b7} ",
     "[ ] time speed \u{b7} \\ pause time \u{b7} , . step the hour by half \u{b7} ",
-    "; ' cycle the weather this region has \u{b7} esc to release the mouse",
+    "; ' cycle the weather this region has \u{b7} l for a bolt \u{b7} esc to release the mouse",
 );
 
 /// Starting resolution — the internal render target from the design's performance budget.
@@ -588,6 +588,14 @@ impl ApplicationHandler for App {
                     // nobody saw.
                     KeyCode::Quote if pressed && !event.repeat => self.cycle_weather(1),
                     KeyCode::Semicolon if pressed && !event.repeat => self.cycle_weather(-1),
+                    // Nothing to hold: the strike moves the storm's own clock onto a flash, so the
+                    // weather carries on from there rather than the key having to be remembered.
+                    KeyCode::KeyL if pressed && !event.repeat => {
+                        let (eye, facing) = (self.camera.position(), self.camera.forward());
+                        if let Some(renderer) = self.renderer.as_mut() {
+                            renderer.strike(eye, facing);
+                        }
+                    }
                     KeyCode::Escape if pressed => {
                         if self.mouse_captured {
                             self.set_capture(false);

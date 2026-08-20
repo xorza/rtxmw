@@ -634,7 +634,10 @@ vec3 sky_seen_through(vec3 direction, float lobe, bool looking) {
         float level = dot(colour, LUMA) / max(dot(frame.sky_veil, LUMA), 1e-4);
         colour = mix(colour, frame.sky_veil * level, frame.sky_veiled);
     }
-    return colour;
+    // **After the veil, because a flash is not seen through the weather, it is inside it.** The veil
+    // is what the air between here and the dome does to what the dome sends; a discharge happens in
+    // that air rather than behind it, so nothing stands between it and the eye to take its colour.
+    return colour + flash_sky(direction);
 }
 
 // What a ray that hits nothing sees, from a surface sharp enough not to smear it.

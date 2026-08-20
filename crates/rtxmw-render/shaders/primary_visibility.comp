@@ -15,6 +15,7 @@
 
 #include "bindings.glsl"
 #include "sampling.glsl"
+#include "lightning.glsl"
 #include "surface.glsl"
 #include "lighting.glsl"
 #include "waves.glsl"
@@ -168,6 +169,12 @@ void main() {
     // within the weather's own `Diameter` of the eye — nine metres for rain — where even a
     // thunderstorm's air has taken a sixth of a stop out of the frame, so leaving it out of the
     // march costs nothing an eye could find.
+    // **The channel, before the fog is applied and after everything else.** It is a thing in the
+    // world at a distance rather than an overlay, so it is occluded by what stands in front of it
+    // and dimmed by the air between — see `bolt_along`.
+    emitted += bolt_along(frame.camera_position, direction,
+                          surface.hit ? surface.t : RAY_MAX) * fog.w;
+
     vec4 falling = precipitation_along(frame.camera_position, direction,
                                        surface.hit ? surface.t : FOG_REACH);
     imageStore(transparency_target, ivec2(pixel), vec4(falling.xyz, 1.0 - falling.w));
