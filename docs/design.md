@@ -2825,3 +2825,100 @@ than being right about it.
 **One measurement worth keeping:** tracing the reflection cost 16.7 ms against 7.9 and was nearly abandoned, but the cost was
 entirely *shading* the hit — a shadow ray per light — not the trace. Flat-lighting it, which a lobe this wide deserves, brought
 it back to 7.9 with no visible difference.
+
+### 8.71 A flash is a place, not an ambient
+
+Lightning was folded into `frame.ambient` — light from everywhere at once, so it lit every face equally, cast nothing, and put a
+white bay beside a dark shore, water returning a lit dome one for one. Split in two: `FLASH_LIT` is what a discharge throws on a
+surface at `FLASH_REFERENCE`, `FLASH_SEEN` how far the dome brightens toward it. The bay is the constraint on the second.
+
+The schedule is the ini's — `Thunder Frequency`, `Threshold` and `Sound Decrement` are already a Poisson process with a fixed
+decay. One roll picks four kinds: 22% to ground, 11% crawler, 12% in-cloud, the rest sheet, against 20–25% observed
+cloud-to-ground. `STROKES` restrikes `RESTRIKE` apart are the flicker; `CHANNEL` is 30,000 K.
+
+Two bugs the structure hid:
+
+- **`hash(0) == 0`** — splitmix64's finalizer fixes zero, so every storm's first flash drew the same shape. Golden-ratio
+  increment. The tell was that it was always *that* flash.
+- **The speed key reached the weather.** It multiplies the clock by up to 256, so a quarter-second flash lasted one frame at
+  16×. `weather_seconds()` is a second clock it never touches.
+
+### 8.72 Four times, saturation was mistaken for a shape
+
+A channel is 2.4 px across and its glow runs to a quarter of the frame. No one falloff spans that, so there are three tiers —
+`BOLT_CORE`, `BOLT_HALO`, `BOLT_CORONA` — the core deliberately blown out. Each failure was read as a bounding-volume artefact
+first:
+
+- **A Lorentzian never reaches zero**, so any cut leaves a step. Compact support is what makes the bound sound: `BOLT_REACH` is
+  the widest tier and the profile is exactly zero at its radius, so cut and profile are one number and cannot disagree.
+- **A hard tube**, from the halo saturating while `(1-x)^2` is flat at the centre. Glare's shape times the window, not plus.
+- **A white capsule.** The amplitude was written as a ratio to `BOLT_ARC`, a number in the tens of thousands, so whether it came
+  out above white was invisible where it was written: it peaked at **58 times white** and stayed saturated to seven tenths of
+  its radius. Peaks are now in display terms, bounded at compile time.
+- **A ring at 45 px, in fog only.** The corona's weather term was read off the depth of whichever *narrow* tier won the pixel,
+  which is absent past the halo's reach — a **5.3-fold drop in the width of a pixel**, invisible in still air because there the
+  term is nought either side.
+
+The last was found by measuring a screenshot rather than the code: `107, 106, 107, 111, 119, 123` across the edge, 16 levels in
+three pixels. The rule it left: nothing whose support is narrower than the corona may scale the corona, asserted `HALO < CORONA`.
+
+### 8.73 A discharge is a line, and the point at its middle drew a bulb
+
+`flash_reaching` modelled the arc as a point at its midpoint floored at `FLASH_NEAREST`, which is a ball that wide. A crawler
+runs 74,000 to 140,000 units, so the fog painted a glowing sphere at its halfway mark with no bolt inside it — while
+`flash_light` already sampled along the channel, so the two halves of one discharge had disagreed from the start.
+
+The inverse square along a segment is closed form:
+
+    integral ds / (r^2 + s^2) = atan(s / r) / r
+
+divided by the run, so the arc carries one discharge however long it is. Far off the arctangents collapse to `1 / d^2`, which
+keeps the calibration and lets a sheet — source and ground one point — take the same expression with no branch.
+
+It fixes shape rather than brightness: **7.604 at a crawler's middle against 7.522 a quarter of the way down**, where a point at
+its centre gave 100 and 0.99. `FLASH_NEAREST` came down 5,000 → 2,500 with it; 71 m is wider than the piece of deck being looked
+at, 36 m is a channel's luminous envelope.
+
+### 8.74 The halo is the air, so it follows how much air there is
+
+Attenuating the corona by haze charges the air for hiding what it makes — the narrow tiers are an object seen through weather,
+the wash is that weather scattering the channel's light back. Drawn that way it was deleted exactly when it should have been
+strongest, cut to a fifteenth in the only weather that has lightning.
+
+The amplitude follows the same argument:
+
+    peak = BOLT_CORONA_PEAK + BOLT_CORONA_AIR * (1 - haze)
+
+A fixed figure cannot serve both ends: what reads against a night sky vanishes inside a storm, and what reads inside a storm
+flattens a clear night into a pale wash. `fog_strength` was also missing from the flash's haze, so a scene asked for no fog
+still charged the cell's density — collapsing the two conditions this exists to tell apart into one.
+
+### 8.75 The deck lit from inside, and the fog that had been deleting it
+
+Over half of all lightning never leaves the cloud; what shows is a region of weather going bright. `flash_on_deck` asks the line
+source where each ray crosses the shell, so the glow sits over the part of the deck the channel is in and follows a crawler
+along its length.
+
+It could not be seen. A storm stands at **7.5 nepers** to the shell — `fog_density` 2.31 over `FOG_HEIGHT` lifted five times,
+half covered — so the deck arrives multiplied by 5e-4. Raising the term fourteenfold moved the frame by four hundredths of a
+level, which is what identified the cause: a constant that does nothing is not one that is too small. So it takes `FLASH_HAZE`'s
+treatment, composited *in front of* the fog under a capped haze. The deck's own colour stays behind it — you cannot see the
+cloud — and only what the lightning lit survives.
+
+Read two mip levels coarser, which is what multiple scattering means (Dobashi and Nishita): at its own level the glow inherited
+the painting's hard alpha edge, which is a cloud's silhouette and not a glow's. Both reflections carry it along with the
+channel.
+
+### 8.76 Measuring against exposure measures exposure
+
+`ADAPTATION` is 0.75, so a sixfold flash survives as `6^0.25` — 1.6. Three measurements here were built wrong first:
+
+- Differencing a lit frame against a dark one measures the exposure shift. `moved()` passed every precipitation assertion on
+  that alone.
+- Two shots compare two tone curves: the side that gained most measured least, and the far side came back *negative*. Both
+  halves in one wide shot gives 70.3 against -12.9, where a flat wash — the failure being guarded — gives 0.88 of the near side
+  against -0.18.
+- On water the absolute lift *falls* when the reflection gains the lit deck, 29 against 37. The ratio survives the curve:
+  **0.419 with it against 0.183 without**.
+
+A statistic that mixes the effect with the frame's mean brightness is measuring the tonemapper.
