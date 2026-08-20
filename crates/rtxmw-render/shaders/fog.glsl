@@ -54,11 +54,19 @@ vec3 flash_reaching(vec3 position);
 
 // How much of a flash the air scatters back, against what it delivers to a surface.
 //
-// **The same light, and nowhere near the same number.** `fog_light` adds this at every step of a
-// march that runs thirty thousand units, so what a surface takes once the air takes twenty-four
-// times over a path long enough to matter — and a flash arrives there at a hundred times a lamp's
-// colour, which is what the isotropic term beside it was written for. Handed the surface figure
+// **The same light, and nowhere near the same number.** A flash arrives at a hundred times a lamp's
+// colour, which is what the isotropic term beside it was written for; handed the surface figure
 // whole, a night storm came out as a white sheet with a ship silhouetted on it.
+//
+// **It does not accumulate over the march, which this said it did.** `fog_along` weights each step
+// by `transmittance * absorbed`, and those weights sum to `1 - T` over the whole path — at most one,
+// never the twenty-four steps taken. What the air returns is a weighted average of `fog_light`, not
+// a total of it, so the figure here is read once whatever the step count is.
+//
+// What it *is* is a near-uniform lift, and that is not a fault in it: the march can only see the
+// first thousand units or so of a storm's air, and that air sits the same distance from a channel
+// whichever way the eye turns. It is why anything with shape in it — the corona, the deck — has to
+// clear this rather than sit under it.
 //
 // Low, then, and it is still the brightest thing the fog ever sees: a distant strike reads as a wall
 // of lit weather, which is most of what a storm looks like from inside one.

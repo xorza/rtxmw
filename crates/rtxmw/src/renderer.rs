@@ -306,6 +306,16 @@ impl Renderer {
         self.scene.strike(eye, facing);
     }
 
+    /// Sends the last one again, down the same channel.
+    pub(crate) fn restrike(&mut self) {
+        self.scene.restrike();
+    }
+
+    /// Sets the clock the weather's own events run on — see [`SceneRenderer::set_storm`].
+    pub(crate) fn set_storm(&mut self, seconds: f32) {
+        self.scene.set_storm(seconds);
+    }
+
     /// Moves the sky every resident exterior stands under.
     pub(crate) fn set_sky(&mut self, sky: Sky) {
         self.scene.set_sky(sky);

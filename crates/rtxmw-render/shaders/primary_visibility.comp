@@ -176,6 +176,13 @@ void main() {
     emitted += bolt_along(frame.camera_position, direction,
                           surface.hit ? surface.t : RAY_MAX);
 
+    // **And the deck the discharge is inside, in front of the fog for the same reason** — see
+    // `flash_on_deck`. Only where the ray reaches the sky at all: a headland in front of the cloud
+    // hides the cloud, and this is added past the point where anything else would have said so.
+    if (!surface.hit) {
+        emitted += flash_on_deck(direction, frame.cone_spread);
+    }
+
     vec4 falling = precipitation_along(frame.camera_position, direction,
                                        surface.hit ? surface.t : FOG_REACH);
     imageStore(transparency_target, ivec2(pixel), vec4(falling.xyz, 1.0 - falling.w));

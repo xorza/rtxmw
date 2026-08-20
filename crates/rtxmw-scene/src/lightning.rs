@@ -31,6 +31,15 @@ const RESTRIKE: Range<f32> = 0.04..0.08;
 /// How many strokes a flash carries, from one to this.
 const STROKES: u32 = 4;
 
+/// How far a crawler runs sideways, as a multiple of the deck's own height.
+///
+/// **The anvil crawler, and it is the longest thing lightning does.** A discharge inside a cloud has
+/// no ground pulling it down and nothing to stop it spreading, so it travels along the underside of
+/// the deck instead — tens of kilometres of it, branching as it goes, crossing more sky than any
+/// strike ever reaches. Four to ten times the deck's height puts one across a good part of the view
+/// without leaving it.
+const CRAWL: Range<f32> = 4.0..10.0;
+
 /// How far a channel buried in the deck runs, as a fraction of the cloud's own height.
 ///
 /// **An in-cloud discharge has somewhere to go.** It is the same event as a sheet flash and differs
@@ -79,6 +88,8 @@ pub enum Discharge {
     Sheet,
     /// Inside the cloud with the channel showing through it.
     InCloud,
+    /// Along the underside of the deck rather than down out of it, for kilometres.
+    Crawler,
     /// Down to the ground, which is the one that lights a landscape.
     ToGround,
 }
@@ -199,17 +210,33 @@ impl Lightning {
         }
         let interval = 1.0 / self.frequency;
         let ahead = facing.truncate().normalize_or_zero();
-        for step in 0..(60.0 * self.frequency) as u32 {
+        // **From the interval after this one, so a new flash is new.** Starting where the clock
+        // already stands looks harmless and is not: a restrike parks it at the beginning of a
+        // qualifying flash, so the very next request for a fresh bolt found that one still sitting
+        // there and staged it again. Whatever moment this is asked from, the answer is one the eye
+        // has not just been shown.
+        //
+        // **And the best of what it finds rather than the first thing that passes.** This returned
+        // the next flash of *any* shape when a minute of them were all facing the wrong way, which
+        // meant asking for a bolt sometimes handed back a sheet flash — a discharge that draws no
+        // channel at all, and so a key that did nothing. A channel behind you is worth more than no
+        // channel in front of you, so it is kept and only used if nothing better turns up.
+        let mut anywhere = None;
+        for step in 1..=(60.0 * self.frequency) as u32 {
             let at = (now / interval).floor() * interval + step as f32 * interval;
             let flash = self.flash(at, eye, altitude);
+            if flash.kind == Discharge::Sheet {
+                continue;
+            }
+            // Within a wide half of the compass, which is a good deal more forgiving than the frame
+            // is and still never behind.
             let toward = (flash.source - eye).truncate().normalize_or_zero();
-            // A channel to see, and somewhere the eye can see it: within a wide half of the compass,
-            // which is a good deal more forgiving than the frame is and still never behind.
-            if flash.kind != Discharge::Sheet && ahead.dot(toward) > 0.5 {
+            if ahead.dot(toward) > 0.5 {
                 return at - now;
             }
+            anywhere.get_or_insert(at - now);
         }
-        self.brought_forward(now)
+        anywhere.unwrap_or_else(|| self.brought_forward(now))
     }
 
     /// The flash at `seconds`, seen from `eye`, with the cloud deck at `altitude`.
@@ -252,6 +279,7 @@ impl Lightning {
         let roll = unit(hash(seed ^ 0x9E37_79B9));
         let kind = match roll {
             _ if roll < 0.22 => Discharge::ToGround,
+            _ if roll < 0.33 => Discharge::Crawler,
             _ if roll < 0.45 => Discharge::InCloud,
             _ => Discharge::Sheet,
         };
@@ -277,6 +305,22 @@ impl Lightning {
                     let drop = (source.z - anchor.z) * IN_CLOUD;
                     let lean = unit(hash(seed ^ 0x27D4_EB2F)) * std::f32::consts::TAU;
                     source + Vec3::new(lean.cos() * drop * 0.4, lean.sin() * drop * 0.4, -drop)
+                }
+                // **Sideways, and a long way.** Nothing under a crawler is pulling it down, so it
+                // spreads along the deck it is in rather than out of it — the drop over its whole
+                // length is a fraction of what it covers horizontally.
+                Discharge::Crawler => {
+                    let deck = source.z - anchor.z;
+                    let run = deck
+                        * (CRAWL.start
+                            + unit(hash(seed ^ 0x1B87_3593)) * (CRAWL.end - CRAWL.start));
+                    let heading = unit(hash(seed ^ 0x27D4_EB2F)) * std::f32::consts::TAU;
+                    source
+                        + Vec3::new(
+                            heading.cos() * run,
+                            heading.sin() * run,
+                            -deck * IN_CLOUD * 0.5,
+                        )
                 }
                 Discharge::Sheet => source,
             },
@@ -321,15 +365,16 @@ mod tests {
     }
 
     /// How many of `count` flashes fall to each shape, walked one interval at a time.
-    fn shapes(count: u32) -> [u32; 3] {
+    fn shapes(count: u32) -> [u32; 4] {
         let storm = storm();
-        let mut seen = [0; 3];
+        let mut seen = [0; 4];
         for index in 0..count {
             let flash = storm.flash(index as f32 / storm.frequency, Vec3::ZERO, 5_000.0);
             seen[match flash.kind {
                 Discharge::ToGround => 0,
-                Discharge::InCloud => 1,
-                Discharge::Sheet => 2,
+                Discharge::Crawler => 1,
+                Discharge::InCloud => 2,
+                Discharge::Sheet => 3,
             }] += 1;
         }
         seen
@@ -395,29 +440,44 @@ mod tests {
     }
 
     #[test]
-    fn the_three_shapes_come_in_the_proportions_nature_gives_them() {
+    fn the_four_shapes_come_in_the_proportions_nature_gives_them() {
         // Cloud-to-ground is a fifth to a quarter of all discharges and well over half never leave
         // the cloud at all. Over a thousand flashes the draw has to land there.
-        let [ground, in_cloud, sheet] = shapes(1_000);
+        let [ground, crawler, in_cloud, sheet] = shapes(1_000);
         assert!(
             (180..=260).contains(&ground),
             "about a fifth should reach the ground, not {ground} of a thousand"
         );
         assert!(
-            sheet > ground + in_cloud,
-            "most should never leave the cloud — {sheet} against {ground} and {in_cloud}"
+            sheet > ground + crawler + in_cloud,
+            "most should never leave the cloud — {sheet} against {ground}, {crawler}, {in_cloud}"
+        );
+        // **And a crawler is the rarest thing worth drawing**, which is why one is an event: it is a
+        // tenth of the flashes, against a sheet that is half of them and shows nothing at all.
+        assert!(
+            (70..=150).contains(&crawler),
+            "about a tenth should crawl the deck, not {crawler}"
         );
     }
 
     #[test]
     fn a_strike_never_lands_near_the_eye() {
-        // **The one thing a storm may not do to a camera it cannot hurt.** Every flash of a thousand
+        // **The one thing a storm may not do to a camera it cannot hurt.** Every strike of a thousand
         // has to stand at least `REACH.start` off, whatever the hash drew.
+        //
+        // **Strikes, and only strikes.** A crawler runs kilometres along the underside of the deck on
+        // whatever heading it drew, so one aimed back this way passes overhead — which is what an
+        // anvil crawler does and the best thing in the sky when it happens. It never lands, so it
+        // has nothing to do with the rule this is about; scoping to `ToGround` is what the rule
+        // always meant, and the crawler is what made it say so.
         let storm = storm();
         let eye = Vec3::new(1_234.0, -5_678.0, 90.0);
         let mut nearest = f32::INFINITY;
         for index in 0..1_000 {
             let flash = storm.flash(index as f32 / storm.frequency, eye, 5_000.0);
+            if flash.kind != Discharge::ToGround {
+                continue;
+            }
             let away = (flash.ground - eye).truncate().length();
             nearest = nearest.min(away);
         }
@@ -427,6 +487,10 @@ mod tests {
         assert!(
             nearest > closest,
             "the nearest strike should clear {closest}, not {nearest}"
+        );
+        assert!(
+            nearest.is_finite(),
+            "a thousand flashes should include a strike"
         );
     }
 
@@ -516,6 +580,30 @@ mod tests {
             200,
             "two hundred flashes want two hundred shapes"
         );
+    }
+
+    #[test]
+    fn asking_for_a_bolt_never_hands_back_one_with_no_channel() {
+        // **A sheet flash draws nothing at all**, which is more than half of them and exactly what a
+        // key that asks for a bolt must never return. This used to take the next flash of any shape
+        // when a minute of them all faced the wrong way, so now and then pressing it did nothing —
+        // and looked like the key being broken rather than the storm being obeyed.
+        let storm = storm();
+        let eye = Vec3::new(-400.0, 700.0, 40.0);
+        for step in 0..400 {
+            // Every heading, and moments between flashes as well as inside them.
+            let turn = step as f32 * 0.31;
+            let facing = Vec3::new(turn.cos(), turn.sin(), -0.2);
+            let now = step as f32 * 0.7;
+            let staged = now + storm.staged(now, eye, 35_000.0, facing);
+            let flash = storm.flash(staged, eye, 35_000.0);
+            assert!(flash.burning(), "the staged moment should burn, at {now}");
+            assert_ne!(
+                flash.kind,
+                Discharge::Sheet,
+                "a bolt was asked for and a sheet flash came back, at {now}"
+            );
+        }
     }
 
     #[test]

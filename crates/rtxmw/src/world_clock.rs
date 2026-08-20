@@ -56,6 +56,8 @@ const NUDGE: f32 = 0.5;
 pub(crate) struct WorldClock {
     /// Seconds the world has run, which is what the fog and the water drift against.
     elapsed: f32,
+    /// The same, with the speed key left out — see [`Self::weather_seconds`].
+    weather: f32,
     /// What the world's clock reads, which counts the days as well as the hour — the moons' phase
     /// is the thing that needs the second half.
     time: WorldTime,
@@ -68,6 +70,7 @@ impl WorldClock {
     pub(crate) fn starting_at(time: WorldTime) -> Self {
         Self {
             elapsed: 0.0,
+            weather: 0.0,
             time,
             speed: SPEED_MIN,
             paused: false,
@@ -79,8 +82,10 @@ impl WorldClock {
         if self.paused {
             return;
         }
-        let seconds = dt.min(LONGEST_STEP) * self.speed;
+        let step = dt.min(LONGEST_STEP);
+        let seconds = step * self.speed;
         self.elapsed += seconds;
+        self.weather += step;
         self.time = self.time.advanced(seconds * TIMESCALE / 3600.0);
     }
 
@@ -108,6 +113,23 @@ impl WorldClock {
     /// Seconds since the world started, at its own rate rather than the wall's.
     pub(crate) fn seconds(&self) -> f32 {
         self.elapsed
+    }
+
+    /// The same clock with the speed key taken out of it, for what happens on its own schedule.
+    ///
+    /// **A quarter of a second is a quarter of a second.** [`Self::seconds`] is what the speed key
+    /// multiplies, which is right for everything it was built for — a fog bank crossing its own
+    /// width, a swell, a day — because those are all *rates* worth watching faster. A lightning
+    /// flash is not a rate: it is an event lasting the two hundred milliseconds it lasts, and run
+    /// through a clock at sixteen it is over inside one frame and at 256 inside a millisecond. Asking
+    /// for a bolt did nothing at all at any speed but the slowest, which is not a tuning problem but
+    /// a category one — the speed key answers "how fast does the world turn", and a flash does not
+    /// turn.
+    ///
+    /// Still stops when the clock is paused, because a paused world holding a bolt at full brightness
+    /// is exactly what pausing is for.
+    pub(crate) fn weather_seconds(&self) -> f32 {
+        self.weather
     }
 
     pub(crate) fn time(&self) -> WorldTime {
@@ -140,6 +162,35 @@ mod tests {
         for _ in 0..(60.0 / LONGEST_STEP) as u32 {
             clock.advance(LONGEST_STEP);
         }
+    }
+
+    #[test]
+    fn the_speed_key_hurries_the_world_and_leaves_the_weather_alone() {
+        // **The two clocks part company here or nowhere.** A flash lasts a fixed quarter of a second,
+        // so run off `seconds` it lasted that divided by the speed — one frame at sixteen, a
+        // millisecond at 256 — and asking for a bolt did nothing at any setting but the slowest. The
+        // fix is a clock the speed key cannot reach, and this is the only place that can say so.
+        let mut clock = WorldClock::starting_at(WorldTime::hours(9.5));
+        clock.step_speed(2.0);
+        a_minute(&mut clock);
+        assert!(
+            (clock.weather_seconds() - 60.0).abs() < 1e-2,
+            "a minute of wall time is a minute of weather, not {}",
+            clock.weather_seconds()
+        );
+        assert!(
+            clock.seconds() > clock.weather_seconds() * 4.0,
+            "and the world should have run well past it — {} against {}",
+            clock.seconds(),
+            clock.weather_seconds()
+        );
+
+        // Both stop together, because a paused world holding a bolt at full brightness is what
+        // pausing is for.
+        let (held, weather) = (clock.seconds(), clock.weather_seconds());
+        clock.toggle_pause();
+        a_minute(&mut clock);
+        assert_eq!((clock.seconds(), clock.weather_seconds()), (held, weather));
     }
 
     #[test]

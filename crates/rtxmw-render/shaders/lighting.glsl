@@ -14,6 +14,11 @@ vec3 daylight_reaching(vec3 position);
 vec3 flash_sky(vec3 direction);
 vec3 flash_light(Surface surface, uvec2 pixel, uint samples);
 
+// And what it delivers to a place, with nothing in the way — `flash_on_deck` lights the deck with
+// it, and asks `flash_through_air` for the capped share of the weather it is seen behind.
+vec3 flash_irradiance(vec3 position, out float away);
+float flash_through_air(float span);
+
 // Defined by `wetness.glsl`, which comes after this file for the same reason.
 //
 // **`shade` is the only place a bounce learns what it landed on**, so it is the only place the rain
@@ -494,6 +499,26 @@ float cloud_shadow(vec3 position, vec3 towards) {
 
 
 
+// How much of a flash the deck scatters back, against what it delivers to a surface facing it.
+//
+// **A display figure like `FLASH_SEEN`, not a radiometric one**, because `FLASH_LIT` is not one
+// either — it is a channel's output blunted by ten orders of magnitude so a tone curve can hold it,
+// and no albedo divided into it comes back out meaning anything. What it is set against is what the
+// deck should read as: a cloud lit from within is the brightest thing in a night storm, and this
+// puts a strike's own patch of it several times over the dome around it while a crawler's runs
+// dimmer and much further.
+//
+// **The bay mirrors it one for one**, which is the standing constraint on every number in this
+// neighbourhood — see `FLASH_SEEN`. That is why the localised term is the one that got the budget
+// and the whole-sky term gave some up to pay for it.
+const float CLOUD_FLASH = 6.0e-3;
+
+// How many mip levels coarser than the layer the glow is read at — see `flash_on_deck`.
+//
+// Two is four times the footprint, which is a few hundred metres of cloud at the deck's range: the
+// order light actually diffuses through a cloud before it comes back out.
+const float CLOUD_FLASH_SPREAD = 2.0;
+
 // What the cloud layer puts in front of the sky along `direction`, and how much of it it hides.
 //
 // **A vanilla asset lit rather than shown.** `tx_sky_*.dds` is a painted photograph of a sky with
@@ -537,7 +562,50 @@ vec3 cloud_layer(vec3 direction, float footprint, out float hiding) {
     // dense parts of the sheet keep the sun and the wisps are lit through; that is the difference
     // between the two colours the host handed over, and the sheet's structure is what picks between
     // them.
-    return mix(frame.cloud_shadowed, frame.cloud_lit, clamp(thickness, 0.0, 1.0));
+    vec3 lit = mix(frame.cloud_shadowed, frame.cloud_lit, clamp(thickness, 0.0, 1.0));
+
+    return lit;
+}
+
+// What a flash puts on the cloud deck, for the caller to add *in front of* the fog.
+//
+// **Kept out of `cloud_layer` because the fog deletes what goes through it.** A thunderstorm's air
+// stands at seven or eight nepers to the shell — `fog_density` 2.31 over a layer `FOG_HEIGHT` deep
+// and lifted five times, half covered — so the deck reaches the eye multiplied by about 5e-4 and the
+// sky in the one weather that has lightning is entirely fog. Drawn behind that, a cloud lit from
+// inside by a return stroke came out as nothing at all: raising this term fourteen fold moved the
+// frame by four hundredths of a level.
+//
+// So it takes the same treatment `FLASH_HAZE` already gives the channel and the light it throws: a
+// discharge is ten orders of magnitude above the haze in front of it, and the air may take a stop or
+// two off it but not delete it. The deck's *own* colour stays behind the fog, where it belongs —
+// you cannot see the cloud. What survives is only the part of it the lightning lit.
+//
+// **Sampled coarser than the layer itself, which is what multiple scattering means.** Dobashi and
+// Nishita's account is that the light bounces many times inside the cloud before it leaves, so the
+// glow is broader and softer than the outline of the cloud making it. Reading the sheet at its own
+// level instead handed the glow the painting's hard alpha edge, which is a cloud's silhouette and
+// not a glow's.
+vec3 flash_on_deck(vec3 direction, float footprint) {
+    if (frame.cloud_cover <= 0.0 || frame.cloud_sheet == 0u || direction.z <= 0.0
+        || frame.flash_radiance == vec3(0.0)) {
+        return vec3(0.0);
+    }
+    float reach;
+    vec2 where = cloud_uv(frame.camera_position, direction, reach);
+    float texels = float(textureSize(textures[frame.cloud_sheet], 0).x) / frame.cloud_tile;
+    float lod = max(0.0, log2(max(footprint * reach * texels, 1e-6))) + CLOUD_FLASH_SPREAD;
+    vec4 sheet = textureLod(textures[frame.cloud_sheet], where, lod);
+
+    // How much water there is here to light, and how much of the sky it stands in front of — the
+    // same two the layer itself is built from, read off the blurred sample so the glow carries the
+    // cloud's shape without carrying its edge.
+    float thickness = clamp(dot(sheet.rgb, LUMA) / max(frame.cloud_mean, 1e-6), 0.0, 2.0);
+    float covering = sheet.a * frame.cloud_cover * smoothstep(0.0, 0.12, direction.z);
+
+    float away;
+    vec3 arriving = flash_irradiance(frame.camera_position + direction * reach, away);
+    return arriving * (CLOUD_FLASH * thickness * covering * flash_through_air(reach));
 }
 
 // How many atmospheres a beam crosses to something `climb` above the horizon — Kasten and Young.

@@ -152,9 +152,20 @@ pub struct SceneRenderer {
     bounce_samples: u32,
     denoise_passes: u32,
     time: f32,
+    /// The clock the weather's own events run on, which is the frame's with the speed key left out.
+    ///
+    /// **A flash is an event, not a rate** — see `WorldClock::weather_seconds`. Driven by [`Self::time`]
+    /// like everything else, a quarter-second flash lasted a quarter second divided by whatever the
+    /// world's speed was set to, so asking for a bolt did nothing at any setting but the slowest.
+    storm: f32,
     /// How far the lightning clock is nudged from the frame's, so a key can bring a flash forward
     /// without anything having to remember that it was pressed — see [`Self::strike`].
     lightning_offset: f32,
+    /// When the last flash a key asked for began, on the storm's own clock.
+    ///
+    /// The one thing here that *is* remembered, and only so [`Self::restrike`] can go back to it.
+    /// Everything the flash is made of is still drawn from that moment rather than stored.
+    last_strike: Option<f32>,
     /// Where the camera stood when [`Self::frame_constants`] was last asked, or `None` before the
     /// first frame. What this frame's motion vectors are measured against.
     previous_view: Option<Viewpoint>,
@@ -230,7 +241,9 @@ impl SceneRenderer {
             bounce_samples: DEFAULT_BOUNCE_SAMPLES,
             denoise_passes: DEFAULT_PASSES,
             time: 0.0,
+            storm: 0.0,
             lightning_offset: 0.0,
+            last_strike: None,
             previous_view: None,
             jitter: false,
             delight: DEFAULT_DELIGHT,
@@ -373,6 +386,15 @@ impl SceneRenderer {
         self.time = seconds;
     }
 
+    /// Sets the clock the weather's own events run on, in seconds the speed key has not touched.
+    ///
+    /// Separate from [`Self::set_time`] because the two answer different questions: that one is how
+    /// fast the world turns, which a swell and a fog bank and a day all ride on, and this is how long
+    /// a thing that happens takes. A flash is two hundred milliseconds however fast the day is going.
+    pub fn set_storm(&mut self, seconds: f32) {
+        self.storm = seconds;
+    }
+
     /// Brings the next flash forward to now.
     ///
     /// **By moving the clock rather than by setting a flag**, which is what keeps the whole thing a
@@ -386,9 +408,25 @@ impl SceneRenderer {
     ///
     /// Does nothing under a weather with no lightning, which is nine of the ten.
     pub fn strike(&mut self, eye: Vec3, facing: Vec3) {
-        let now = self.time + self.lightning_offset;
+        let now = self.storm + self.lightning_offset;
         let altitude = self.sky.clouds.altitude;
         self.lightning_offset += self.sky.lightning.staged(now, eye, altitude, facing);
+        self.last_strike = Some(self.storm + self.lightning_offset);
+    }
+
+    /// Sends the last flash again, down the same channel.
+    ///
+    /// **Which is what a restrike is**, and why it costs nothing to offer: a real flash is a train of
+    /// return strokes re-lighting one path, and this is that a moment later. The clock goes back to
+    /// where the last one began, so the shape, the shore it stands on and the number of times it
+    /// stutters are all drawn again from the same second — see [`rtxmw_scene::Lightning::flash`],
+    /// which reads them rather than storing them.
+    ///
+    /// Does nothing before [`Self::strike`] has been asked for one.
+    pub fn restrike(&mut self) {
+        if let Some(at) = self.last_strike {
+            self.lightning_offset = at - self.storm;
+        }
     }
 
     pub fn set_bounce_samples(&mut self, samples: u32) {
@@ -689,7 +727,7 @@ impl SceneRenderer {
             // resolution it is being traced at.
             FrameConstants::cone_spread_from(projection, self.target.extent().height),
             self.time,
-            self.time + self.lightning_offset,
+            self.storm + self.lightning_offset,
         )
     }
 

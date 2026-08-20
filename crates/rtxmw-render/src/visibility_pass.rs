@@ -451,10 +451,14 @@ impl FrameConstants {
             // per frame against a million rays that read it, and a cache would need invalidating
             // the moment the sea state becomes something a cell can set.
             flash_radiance: flash.radiance.to_array(),
+            // **Ordered so the shader can ask one question of it.** Everything below the ground
+            // strike is a discharge still inside the deck, and what the deck does to a channel is
+            // the same whichever of the three it is — see `BOLT_VEILED`.
             flash_kind: match flash.kind {
                 Discharge::Sheet => 0.0,
                 Discharge::InCloud => 1.0,
-                Discharge::ToGround => 2.0,
+                Discharge::Crawler => 2.0,
+                Discharge::ToGround => 3.0,
             },
             flash_seed: flash.seed,
             flash_source: flash.source.to_array(),

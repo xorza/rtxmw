@@ -27,7 +27,8 @@ use crate::world_clock::WorldClock;
 const KEYS: &str = concat!(
     "keys: WASD, space and ctrl to fly \u{b7} shift to hurry \u{b7} ",
     "[ ] time speed \u{b7} \\ pause time \u{b7} , . step the hour by half \u{b7} ",
-    "; ' cycle the weather this region has \u{b7} l for a bolt \u{b7} esc to release the mouse",
+    "; ' cycle the weather this region has \u{b7} k a new bolt \u{b7} l the same one again \u{b7} ",
+    "esc to release the mouse",
 );
 
 /// Starting resolution — the internal render target from the design's performance budget.
@@ -590,10 +591,18 @@ impl ApplicationHandler for App {
                     KeyCode::Semicolon if pressed && !event.repeat => self.cycle_weather(-1),
                     // Nothing to hold: the strike moves the storm's own clock onto a flash, so the
                     // weather carries on from there rather than the key having to be remembered.
-                    KeyCode::KeyL if pressed && !event.repeat => {
+                    // **A new discharge, and the same one again.** Both move the storm's own clock
+                    // rather than remembering a flash, so what comes back is drawn from the second it
+                    // happened in — which is why the second key can exist at all.
+                    KeyCode::KeyK if pressed && !event.repeat => {
                         let (eye, facing) = (self.camera.position(), self.camera.forward());
                         if let Some(renderer) = self.renderer.as_mut() {
                             renderer.strike(eye, facing);
+                        }
+                    }
+                    KeyCode::KeyL if pressed && !event.repeat => {
+                        if let Some(renderer) = self.renderer.as_mut() {
+                            renderer.restrike();
                         }
                     }
                     KeyCode::Escape if pressed => {
@@ -619,6 +628,7 @@ impl ApplicationHandler for App {
                 if let (Some(renderer), Some(window)) = (&mut self.renderer, &self.window) {
                     let size = window.inner_size();
                     renderer.set_time(self.clock.seconds());
+                    renderer.set_storm(self.clock.weather_seconds());
                     renderer.set_sky(Sky::under(self.clock.time(), &self.weather, self.sheet));
                     let constants = renderer.frame_constants(
                         self.camera.view(),

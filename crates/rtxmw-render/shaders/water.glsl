@@ -5,6 +5,9 @@
 // it landed. All of it analytic, because the surface is a closed-form height field: no photons, no
 // buffer, no splatting.
 
+// Defined by `lightning.glsl`, which needs `Surface` and so comes after this file.
+vec3 bolt_along(vec3 origin, vec3 direction, float span);
+
 // Water's index of refraction, and the reflectance it gives at normal incidence: `((1.33 - 1) /
 // (1.33 + 1))^2`, which is why water is a window head-on and a mirror at a glancing angle.
 const float WATER_IOR = 1.333;
@@ -207,13 +210,33 @@ vec3 water_ray(vec3 origin, vec3 direction, float footprint, float lobe, uvec2 p
     // with it rather than staying mirror-sharp against a matt sea.
     Surface hit = trace(origin, direction, footprint, frame.cone_spread + lobe, MASK_SOLID);
     travelled = hit.hit ? hit.t : WATER_MAX_PATH;
+
+    // **The channel is in the reflection too.** The sky's flash already came back through
+    // `sky_seen_through`, so a strike lit the sea — off a sea with nothing on it that could have
+    // thrown the light. A bolt over a bay is as much a line on the water as it is in the air, and it
+    // is the half anyone looks at.
+    //
+    // **The pixel's own cone and not this ray's widened one**, which is the difference between a
+    // reflected channel and a white sheet over half a bay. `lobe` is an angle; `cone_spread` is an
+    // angle *per pixel*, and `BOLT_CORE` and `BOLT_HALO` are counts of pixels — so adding the two
+    // put the drawn radius at a couple of times the distance to the channel instead of a couple of
+    // pixels across it. That is a blob large enough to defeat the bounding test as well as to fill
+    // the frame, which is why it also landed nowhere near the bolt.
+    //
+    // Nothing is lost by leaving the lobe out: what breaks a reflection up on water is the wave
+    // normal each pixel reflects about, and that is already in `direction`. A rough sea gives back a
+    // shivering broken line, which is what one does.
+    //
+    // Its own span, too — `travelled` is clamped to `WATER_MAX_PATH` for the absorption that reads
+    // it, four thousand units, and a strike stands at fifteen to thirty-five thousand.
+    vec3 arc = bolt_along(origin, direction, hit.hit ? hit.t : RAY_MAX);
     if (!hit.hit) {
         // Stars kept: a reflection is something looked *at*, so the sea shows them the way it
         // shows the sun. It is the lighting path that leaves them out.
-        return sky_seen_through(direction, lobe, true);
+        return arc + sky_seen_through(direction, lobe, true);
     }
-    return shade(hit, frame.ambient * daylight_reaching(hit.position), pixel, salt,
-                 BOUNCE_SHADOW_SAMPLES);
+    return arc + shade(hit, frame.ambient * daylight_reaching(hit.position), pixel, salt,
+                       BOUNCE_SHADOW_SAMPLES);
 }
 
 // What is left of `radiance` after `path` units of water, plus what the water glows back.
