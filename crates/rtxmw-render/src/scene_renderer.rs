@@ -260,6 +260,10 @@ impl SceneRenderer {
             timestamps: Timestamps::new(device, physical, FrameTimings::STAGES as u32 + 1)?,
         };
         renderer.bind_targets();
+        // Every pipeline this run needs now exists, so what the driver compiled can go back to disk
+        // for the next one — see `Device::store_pipeline_cache`. Three seconds a process, and the
+        // test suite starts fourteen of them.
+        device.store_pipeline_cache();
         Ok(renderer)
     }
 

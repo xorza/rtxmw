@@ -179,7 +179,7 @@ impl ComputePipeline {
             .layout(pipeline_layout);
         // SAFETY: every referenced object is alive.
         let pipeline = unsafe {
-            raw.create_compute_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
+            raw.create_compute_pipelines(device.pipeline_cache(), &[pipeline_info], None)
         };
         // The module is baked into the pipeline, so it can go regardless of the outcome.
         // SAFETY: pipeline creation has returned, and nothing else references the module.
