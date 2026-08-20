@@ -21,7 +21,8 @@
 // temporal filter removes.
 const uint FOG_STEPS = 24u;
 
-// Height above the fog's base at which its density falls to `1/e`, in Morrowind units.
+// Height above the fog's base at which its density falls to `1/e`, in Morrowind units, for clear
+// weather in dead still air. Every weather scales it by `frame.fog_lift`.
 //
 // Seventy units to the metre, so about thirty-seven of them: a layer deep enough to fill a valley
 // and still thin out over the hill beside it. It began at four metres, which swallowed a doorstep
@@ -50,7 +51,8 @@ const float FOG_REACH = 30000.0;
 // size, which is what puts shape into fog at eye level rather than only from a ridge.
 const float FOG_GRAIN = 900.0;
 
-// Octaves of noise, and the heading and speed each one drifts on.
+// Octaves of noise, and the heading and speed each one churns on — the air's own turbulence, which
+// is there in a dead calm. What a *wind* adds on top is `FOG_GALE`, below.
 //
 // **The differing speeds are what stops it reading as a texture.** One field scrolling rigidly past
 // is a pattern in motion; three shearing against each other at their own rates make the shapes
@@ -58,11 +60,31 @@ const float FOG_GRAIN = 900.0;
 // reason, and the third has a little vertical drift so banks rise and settle rather than only
 // sliding.
 const int FOG_OCTAVES = 3;
-const vec3 FOG_WIND[FOG_OCTAVES] = vec3[FOG_OCTAVES](
+const vec3 FOG_CHURN[FOG_OCTAVES] = vec3[FOG_OCTAVES](
     vec3(11.0, 7.0, 0.0),
     vec3(-6.0, 14.0, 2.5),
     vec3(19.0, -4.0, -1.5)
 );
+
+// What a `Wind Speed` of one comes to in world units a second.
+//
+// **Advection, which is not what `FOG_CHURN` is.** Those three drag the octaves past each other on
+// headings that disagree, which is what makes the shapes form and pull apart — air doing that in a
+// dead calm is the whole reason a still fog is not a frozen texture. This is the separate thing a
+// wind adds: the entire field carried downwind together, on the heading the cloud layer drifts
+// along, because there is one wind over a landscape.
+//
+// **Read as a wind rather than picked, which is what it took to make an ash storm look like one.**
+// The first figure here was 120, chosen against `FOG_GRAIN` so that the strongest weather crossed
+// one cell of the coarsest noise in about nine seconds — and nine seconds to cross thirteen metres
+// is 1.4 metres a second, which is a still afternoon rather than a storm. Twenty metres a second is
+// a Beaufort 8 gale, and seventy units to the metre makes that 1,400. The ten then land where their
+// names say: clear's 0.1 is a two-metre breeze, rain's 0.3 is six, thunderstorm's 0.5 is ten,
+// ashstorm's 0.8 is sixteen, and blight and blizzard blow eighteen.
+//
+// `frame.time` runs at the clock's own rate rather than the game's thirty-times one, so this is a
+// wind rather than the time-lapse §8.56 caught the cloud layer in.
+const float FOG_GALE = 1400.0;
 
 // Frequency step between octaves. Not two, so the lattices never line up and repeat.
 const float FOG_LACUNARITY = 2.27;
@@ -176,8 +198,15 @@ float fog_fbm(vec3 position) {
     float weight = 0.0;
     float amplitude = 1.0;
     float frequency = 1.0;
+    // The whole field carried downwind, before the octaves are dragged past each other — one
+    // displacement rather than three, because a wind moves the air it is in rather than shearing it.
+    //
+    // **Minus, for the reason `cloud_uv` subtracts its own drift.** A bank sits at a fixed
+    // coordinate in the noise, so sampling from further upwind as the clock runs is what carries it
+    // past; adding would walk the whole field into the wind.
+    position.xy -= frame.fog_wind * (frame.time * FOG_GALE);
     for (int octave = 0; octave < FOG_OCTAVES; ++octave) {
-        vec3 at = position * frequency + FOG_WIND[octave] * frame.time;
+        vec3 at = position * frequency + FOG_CHURN[octave] * frame.time;
         total += amplitude * fog_noise(at / FOG_GRAIN);
         weight += amplitude;
         amplitude *= 0.5;
@@ -193,10 +222,20 @@ float fog_fbm(vec3 position) {
 // is none of it, which is what standing on a hill is supposed to look like.
 float fog_density_at(vec3 position) {
     float above = max(position.z - fog_base(), 0.0);
-    float height = exp(-above / FOG_HEIGHT);
-    // **Even, indoors.** Banks are a thing weather does to a landscape; a room is smaller than one
-    // bank and its air is still, so what belongs there is a faint uniform haze. `FOG_EVEN` is the
-    // band's own mean, so switching between them changes the character and not the amount.
+    // **How deep the layer stands**, which the host settles out of the weather's own fog depth and
+    // its wind together — see `Sky::fog_lift`. This is what makes the fog agree with §8.61's veil
+    // rather than contradict it: the veil says eight of the ten fill the sky, and a medium that
+    // filled the sky while pooling in a 37-metre bank was two answers to one question.
+    float height = exp(-above / (FOG_HEIGHT * frame.fog_lift));
+    // **Even, indoors — and evener the harder it blows.** Banks are a thing weather does to a
+    // landscape; a room is smaller than one bank and its air is still, so what belongs there is a
+    // faint uniform haze. Out of doors the same turbulence that lifts the layer mixes it, so a
+    // blight storm is nine tenths of the way to a flat wall of dust while a fog bank keeps every
+    // gap it has. `FOG_EVEN` is the band's own mean, so moving between them changes the character
+    // and not the amount.
+    //
+    // The host settles which of the two this is, because it is one number for the whole frame and
+    // this runs twenty-four times a ray.
     //
     // `patch` is what `coverage` wants to be called, and GLSL reserves that for tessellation.
     float banks = smoothstep(FOG_CLEARING, FOG_SOLID, fog_fbm(position));

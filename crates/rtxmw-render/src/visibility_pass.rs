@@ -48,6 +48,10 @@ pub(crate) struct Lighting {
     pub(crate) sky_veil: Veil,
     /// Whether the fog forms banks. Weather does that to a landscape; a room's air is still.
     pub(crate) fog_banked: bool,
+    /// Which way the air moves and how hard, out of the weather's `Wind Speed`. Zero indoors.
+    pub(crate) fog_wind: Vec2,
+    /// How deep the fog layer stands, against clear weather's in still air. One indoors.
+    pub(crate) fog_lift: f32,
     /// The larger moon. [`Moon::NONE`] for a cell with no sky, which draws and lights nothing
     /// without a branch anywhere to say so.
     pub(crate) masser: Moon,
@@ -81,6 +85,8 @@ impl Default for Lighting {
             fog_density: 0.0,
             // Unobservable at zero density, and this is what a cell gets until one records its own.
             fog_banked: true,
+            fog_wind: Vec2::ZERO,
+            fog_lift: 1.0,
             // Unobservable at zero scale, the same as `fog_banked` is at zero density: with no
             // dome to shape there is nothing for a tint to tint.
             sky_warm: Vec3::ONE / 3.0,
@@ -259,8 +265,13 @@ pub struct FrameConstants {
     /// The weather's medium and how much of the sky it has: [`rtxmw_scene::Veil`], flattened.
     sky_veil: [f32; 3],
     sky_veiled: f32,
-    /// One where the fog is an even haze rather than banks, which is what a room wants.
+    /// How far the fog is an even haze rather than banks: one in a room, and the weather's own
+    /// wind out of doors.
     fog_uniform: f32,
+    /// The weather's wind: a unit bearing times `Wind Speed`, out of [`Lighting::fog_wind`].
+    fog_wind: [f32; 2],
+    /// How deep the layer stands — see [`rtxmw_scene::Sky::fog_lift`].
+    fog_lift: f32,
     /// The two moons — see [`GpuMoon`].
     masser: GpuMoon,
     secunda: GpuMoon,
@@ -355,7 +366,18 @@ impl FrameConstants {
             sky_stars: lighting.sky_stars,
             sky_veil: lighting.sky_veil.hue.to_array(),
             sky_veiled: lighting.sky_veil.amount,
-            fog_uniform: if lighting.fog_banked { 0.0 } else { 1.0 },
+            // **Indoors is even whatever the weather, and out of doors the wind says how far.**
+            // The two are different arguments for the same number: a room is smaller than one bank
+            // would be, so its air has no shape to take, while a landscape's banks are stirred out
+            // by exactly the turbulence that lifts the layer. Settled here rather than in the
+            // shader because it is one number for the whole frame and the march would recompute it
+            // at every one of twenty-four steps a ray.
+            fog_uniform: match lighting.fog_banked {
+                true => lighting.fog_wind.length().min(1.0),
+                false => 1.0,
+            },
+            fog_wind: lighting.fog_wind.to_array(),
+            fog_lift: lighting.fog_lift,
             masser: GpuMoon::new(lighting.masser, lighting.masser_face),
             secunda: GpuMoon::new(lighting.secunda, lighting.secunda_face),
             cloud_altitude: lighting.clouds.altitude,
@@ -758,15 +780,17 @@ mod tests {
         assert_eq!(offset_of!(FrameConstants, sky_veil), 372);
         assert_eq!(offset_of!(FrameConstants, sky_veiled), 384);
         assert_eq!(offset_of!(FrameConstants, fog_uniform), 388);
+        assert_eq!(offset_of!(FrameConstants, fog_wind), 392);
+        assert_eq!(offset_of!(FrameConstants, fog_lift), 400);
         // Two moons of sixteen tightly packed floats apiece.
-        assert_eq!(offset_of!(FrameConstants, masser), 392);
-        assert_eq!(offset_of!(FrameConstants, secunda), 456);
+        assert_eq!(offset_of!(FrameConstants, masser), 404);
+        assert_eq!(offset_of!(FrameConstants, secunda), 468);
         // Then the cloud layer, fourteen floats of it.
-        assert_eq!(offset_of!(FrameConstants, cloud_altitude), 520);
-        assert_eq!(offset_of!(FrameConstants, cloud_sheet), 572);
+        assert_eq!(offset_of!(FrameConstants, cloud_altitude), 532);
+        assert_eq!(offset_of!(FrameConstants, cloud_sheet), 584);
         // The wave table follows, twenty tightly packed bytes apiece.
-        assert_eq!(offset_of!(FrameConstants, waves), 576);
-        assert_eq!(size_of::<FrameConstants>(), 576 + 20 * WAVE_COUNT);
+        assert_eq!(offset_of!(FrameConstants, waves), 588);
+        assert_eq!(size_of::<FrameConstants>(), 588 + 20 * WAVE_COUNT);
     }
 
     #[test]

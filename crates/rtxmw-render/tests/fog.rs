@@ -365,3 +365,213 @@ fn a_lamp_in_the_fog_lights_it() {
          {without:?}"
     );
 }
+
+/// An exterior with a wall far enough away for the march to have something to integrate over.
+///
+/// **No recorded ambient**, which is what says "outdoors": a cell with one keeps its own flat
+/// colour and its own still air, and the weather's wind never reaches it.
+fn outdoors(distance: f32) -> StaticScene {
+    let mut scene = wall(distance, &[], Vec3::splat(0.6));
+    scene.ambient = None;
+    scene
+}
+
+/// The frame `sky` gives at `seconds` on the world's clock, looking down `+X` at a distant wall.
+fn drifting(sky: rtxmw_scene::Sky, seconds: f32) -> Vec<u8> {
+    let gpu = TestGpu::shared();
+    let mut renderer = SceneRenderer::new(
+        gpu.device(),
+        gpu.physical(),
+        gpu.memory(),
+        vk::Extent2D {
+            width: WIDTH,
+            height: HEIGHT,
+        },
+    )
+    .expect("renderer should build");
+    renderer.set_bounce_samples(0);
+    renderer.set_denoise_passes(0);
+    renderer.set_fog(1.0);
+    renderer.set_sky(sky);
+    renderer.set_time(seconds);
+
+    let mut uploader = gpu.uploader();
+    renderer
+        .load_scene(
+            gpu.device(),
+            &mut uploader,
+            gpu.physical().limits(),
+            CellId::Exterior { x: 0, y: 0 },
+            &outdoors(12_000.0),
+            &[],
+        )
+        .expect("scene should load");
+
+    let eye = Vec3::ZERO;
+    let view = glam::camera::rh::view::look_to_mat4(eye, Vec3::X, Vec3::Z);
+    let projection =
+        glam::camera::rh::proj::vulkan::perspective_infinite_reverse(75f32.to_radians(), 1.0, 0.05);
+    let constants = renderer.frame_constants(view, projection, eye);
+    renderer
+        .render_once(&mut uploader, &constants)
+        .expect("trace should run");
+    let pixels = readback::image_to_rgba8(
+        &mut uploader,
+        renderer.target(),
+        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+    )
+    .expect("readback should succeed");
+    drop(uploader);
+    gpu.assert_no_validation_errors();
+    pixels
+}
+
+/// Mean absolute difference between two frames, per channel, in 0..255.
+fn apart(before: &[u8], after: &[u8]) -> f32 {
+    let total: u32 = before
+        .chunks_exact(4)
+        .zip(after.chunks_exact(4))
+        .map(|(was, now)| {
+            (0..3)
+                .map(|c| u32::from(was[c].abs_diff(now[c])))
+                .sum::<u32>()
+        })
+        .sum();
+    total as f32 / (before.len() / 4 * 3) as f32
+}
+
+/// Rows `y0..y1` of a frame, for asking about the high air or the ground separately.
+fn band(pixels: &[u8], y0: u32, y1: u32) -> &[u8] {
+    &pixels[(y0 * WIDTH * 4) as usize..(y1 * WIDTH * 4) as usize]
+}
+
+/// How far a frame varies across itself, which is what banks are and a flat wall of dust is not.
+fn spread(pixels: &[u8]) -> f32 {
+    let values: Vec<f32> = pixels
+        .chunks_exact(4)
+        .map(|p| 0.2126 * f32::from(p[0]) + 0.7152 * f32::from(p[1]) + 0.0722 * f32::from(p[2]))
+        .collect();
+    let mean = values.iter().sum::<f32>() / values.len() as f32;
+    (values.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / values.len() as f32).sqrt()
+}
+
+/// A clear noon with the wind replaced, which is what carries the fog and stirs its banks.
+fn blowing(wind: Vec2) -> rtxmw_scene::Sky {
+    rtxmw_scene::Sky {
+        wind,
+        ..rtxmw_scene::Sky::at(rtxmw_scene::WorldTime::hours(12.0))
+    }
+}
+
+/// A clear noon with the layer standing `lift` times as deep as clear weather's does in still air.
+///
+/// **Separate from [`blowing`] because the two stopped being one input.** How deep the layer stands
+/// is the weather's own fog depth *and* its wind, settled on the host — so a test that moved the
+/// wind and watched the height would now be watching a number nothing had changed.
+fn standing(lift: f32) -> rtxmw_scene::Sky {
+    rtxmw_scene::Sky {
+        fog_lift: lift,
+        ..rtxmw_scene::Sky::at(rtxmw_scene::WorldTime::hours(12.0))
+    }
+}
+
+#[test]
+fn the_wind_carries_the_fog_and_a_dead_calm_leaves_it_where_it_is() {
+    // **Two winds of the same strength blowing opposite ways.** Everything else the wind decides —
+    // how high the layer stands and how far the banks have been stirred out — reads its *length*,
+    // so these two agree on both and differ only in which way the air is going. That is what makes
+    // this advection alone rather than advection and two other things at once.
+    let (east, west) = (Vec2::new(0.35, 0.0), Vec2::new(-0.35, 0.0));
+
+    // Before the clock has run, nothing has been carried anywhere and the two draw the same fog —
+    // which is also what says the difference below is the carrying rather than the wind itself.
+    let at_rest = apart(&drifting(blowing(east), 0.0), &drifting(blowing(west), 0.0));
+    assert!(
+        at_rest < 0.5,
+        "before any time has passed the two winds should draw one fog, not differ by {at_rest}"
+    );
+
+    // **One second, because ten saturates.** Each has carried the field 0.35 * 1400 = 490 units its
+    // own way, 980 apart, which is one 900-unit cell of the coarsest noise. Much past that the two
+    // are simply uncorrelated and every measure of them levels off at the same number, so a longer
+    // run would compare two saturated things and prove nothing.
+    let seconds = 1.0;
+    let carried = apart(
+        &drifting(blowing(east), seconds),
+        &drifting(blowing(west), seconds),
+    );
+
+    // **Over that same second a dead calm has barely moved**, which is the comparison: the wind
+    // carries the fog and the churn turns it over slowly underneath.
+    let calm = |at: f32| drifting(blowing(Vec2::ZERO), at);
+    let churned = apart(&calm(0.0), &calm(seconds));
+    assert!(
+        carried > churned * 5.0,
+        "the wind should carry the fog well past what a calm turns over — {carried} against \
+         {churned}"
+    );
+
+    // **But it is not a frozen picture either**, and that takes its own window to show: the octaves
+    // drag past each other at eleven to nineteen units a second where a gale carries at fourteen
+    // hundred, so one second is nothing to them and ten is not. A fog in still air forms and
+    // dissolves without going anywhere, which is what a fog does.
+    let turned_over = apart(&calm(0.0), &calm(10.0));
+    assert!(
+        turned_over > 0.5,
+        "still air should still form and dissolve, not sit at {turned_over}"
+    );
+}
+
+#[test]
+fn a_deeper_layer_fills_the_air_the_shallow_one_leaves_clear() {
+    // Depth shows where a bank cannot reach: the top of the frame is the wall at altitude, and the
+    // bottom is the ground under the camera, where the height falloff is one however deep the layer
+    // has been made. So a layer standing higher moves the one and barely touches the other.
+    let bank = drifting(standing(1.0), 0.0);
+    let (top, ground) = ((0, HEIGHT / 4), (HEIGHT * 3 / 4, HEIGHT));
+
+    let mut last = 0.0;
+    for lift in [1.5, 3.0, 6.0, 12.0] {
+        let deep = drifting(standing(lift), 0.0);
+        let (aloft, underfoot) = (
+            apart(band(&bank, top.0, top.1), band(&deep, top.0, top.1)),
+            apart(
+                band(&bank, ground.0, ground.1),
+                band(&deep, ground.0, ground.1),
+            ),
+        );
+        assert!(
+            aloft > underfoot * 3.0,
+            "a layer {lift} times as deep should fill the high air and leave the ground alone — \
+             {aloft} against {underfoot}"
+        );
+        assert!(
+            aloft > last,
+            "{lift} should reach further than the depth below it"
+        );
+        last = aloft;
+    }
+}
+
+#[test]
+fn the_wind_stirs_the_banks_flat_without_touching_how_deep_they_are() {
+    // **At a fixed depth**, so what is left is the mixing alone — and read at the ground, where the
+    // height falloff is one and a layer's depth cannot reach in to confuse it. Banks are what makes
+    // a still fog vary across a frame; a stirred one is a wall.
+    let ground = (HEIGHT * 3 / 4, HEIGHT);
+    let mut last = spread(band(
+        &drifting(blowing(Vec2::ZERO), 0.0),
+        ground.0,
+        ground.1,
+    ));
+    for wind in [0.1, 0.3, 0.5, 0.9] {
+        let gale = drifting(blowing(Vec2::new(wind, 0.0)), 0.0);
+        let stirred = spread(band(&gale, ground.0, ground.1));
+        assert!(
+            stirred < last,
+            "wind {wind} should leave the ground flatter than the calmer air below it — {stirred} \
+             against {last}"
+        );
+        last = stirred;
+    }
+}

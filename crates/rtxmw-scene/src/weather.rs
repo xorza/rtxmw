@@ -239,6 +239,18 @@ pub struct Weather {
     pub cloud_cover: f32,
     /// How fast the wind carries it, out of `Cloud Speed`.
     pub cloud_speed: f32,
+    /// How hard the wind blows, out of `Wind Speed`, from nothing to nine tenths.
+    ///
+    /// **One number and it decides three things about the fog**, because all three are the same
+    /// physics: wind carries the air past, wind lifts what is in it off the ground, and wind mixes
+    /// it until the banks are gone. The ten span the range the way an eye would guess — foggy and
+    /// snow at **0**, clear at .1, rain at .3, thunderstorm at .5, and ashstorm, blight and
+    /// blizzard at .8 and .9. A radiation fog forms in still air and sits in it; a blight storm
+    /// streams past.
+    ///
+    /// Distinct from `Cloud Speed`, which the game keeps separate and which scrolls the painted
+    /// sheet rather than describing the air.
+    pub wind: f32,
     /// How thick the air is by day and by night, out of `Land Fog Day/Night Depth`.
     pub fog_day_depth: f32,
     pub fog_night_depth: f32,
@@ -367,6 +379,7 @@ impl Weather {
                 .replace(".tga", ".dds"),
             cloud_cover: number("Clouds Maximum Percent", 1.0),
             cloud_speed: number("Cloud Speed", 1.25),
+            wind: number("Wind Speed", 0.1),
             fog_day_depth: number("Land Fog Day Depth", 0.69),
             fog_night_depth: number("Land Fog Night Depth", 0.69),
         }

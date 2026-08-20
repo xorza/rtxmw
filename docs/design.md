@@ -3576,3 +3576,110 @@ that matters is invisible from the host: a slot whose memory changed but whose d
 would keep drawing the first sheet while every number the host derives came from the second.
 `tests/sky_textures.rs` renders clear, then overcast, then clear again, and asserts the middle frame
 moved and the last one came back.
+
+### 8.63 One wind, and it decides three things about the fog
+
+The fog already knew what weather it was in: `Fog * Color` gives it a hue and `Land Fog Day/Night
+Depth` a density, both per weather and both crossing on the fog family's own schedule, so foggy's
+air nearly doubles overnight. What it did not know was that weather *moves*. The layer drifted on
+three fixed headings at three fixed rates whether it was a dead calm or a blight storm, sat in a
+37-metre bank at sea level in both, and was banked and patchy in both.
+
+**The measurement that set the direction.** Across the ten, far-field contrast said clear (depth
+0.69) and foggy (1.0) were **indistinguishable** — 42.0 against 43.3, and the difference has the
+wrong sign because the veil moves it more than the density does. Blizzard's 2.8 did read. Thinning
+clear's own fog raises contrast steadily, 42.0 to 50.4 as the depth goes 0.69 to 0.17, so the curve
+responds fine; the ini's ratios are simply undramatic in the middle. Bethesda's fog depth was a
+view-distance dial rather than a density, and 1.45× is not what "foggy" means to an eye.
+
+So the density ratios stay exactly the game's, and the character comes from the one number nothing
+was reading: **`Wind Speed`**, which runs 0 for foggy and snow, .1 clear, .2 cloudy and overcast, .3
+rain, .5 thunderstorm, .8 ashstorm, and .9 for blight and blizzard. That ordering is what an eye
+would guess, and Bethesda putting a fog bank at dead still is right — a radiation fog forms in still
+air and sits in it.
+
+**One number, three effects, because all three are the same physics.** Turbulent mixing driven by
+wind shear is what carries air past, what lifts what is in it off the ground, and what stirs it
+until the banks are gone. So the wind is not three dials:
+
+- **Advection**, which is not what the existing drift was. The three `FOG_CHURN` headings disagree
+  with each other, and that shearing is what makes shapes form and pull apart — air doing that in a
+  dead calm is the whole reason a still fog is not a frozen texture. The wind adds the separate
+  thing: the entire field carried downwind together, on the heading the cloud layer already drifts
+  along, because there is one wind over a landscape.
+- **Lift.** `FOG_HEIGHT` is now clear weather's figure in still air, and the layer stands deeper by
+  the weather's own `Land Fog Depth` — the field is *named* depth — times what its wind adds. This
+  is also what makes the fog agree with §8.61 rather than contradict it: the veil says eight of the
+  ten fill the sky, and a medium that filled the sky while pooling in a 37-metre bank was two
+  answers to one question.
+- **Mixing.** `fog_uniform` was one bit for indoors; out of doors it is now the wind. A blight storm
+  is nine tenths of the way to a flat wall of dust and a fog bank keeps every gap it has.
+
+**Each of the three is separately measurable, which took two wrong assertions to find.** The first
+pair of tests asserted that a gale moves the fog further than a calm, and that a stirred fog varies
+less across the frame. Both failed, and both were wrong rather than unlucky:
+
+- Over a minute, advection and churn have *both* saturated — the field is simply uncorrelated with
+  where it was, and every measure of it levels off at the same number. At ten seconds advection
+  reads 3.29 against churn's 1.09; at sixty it reads 4.19 against 4.68 and the comparison is
+  meaningless. **A difference metric between two noise fields has a ceiling, and a test that runs
+  past it compares two ceilings.**
+- A gale's frame varies *more*, not less, because lift dominates: standing the layer up puts fog
+  where there was none. The stirring is real but it only shows where lift cannot act — at the base
+  of the layer, where the height falloff is one whatever it has been scaled to. Measured in the
+  bottom quarter of the frame, spread falls monotonically: 4.50 still, then 4.02, 3.26, 2.76, 2.38.
+
+The tests now isolate each. Advection is two winds of *equal strength blowing opposite ways*, which
+agree on lift and on mixing by construction and differ only in which way the air is going — and
+which draw the same frame before the clock has run at all, so the difference is the carrying rather
+than the wind. Lift is the top of the frame against the bottom, three to seven times as much. Mixing
+is the ground band alone.
+
+**The wind alone could not set the height, and the picture found it before the arithmetic did.**
+The first version drove the layer's depth from the wind and nothing else, at ten to one for a full
+gale. That gave the weather *named* foggy the shallowest layer of the ten, because Bethesda puts its
+wind at nought — so a foggy day across Seyda Neen's bay let you see **further** than a clear one,
+which is as backwards as it sounds. Reported by eye, and confirmed at 43.3 against 39.4.
+
+The fix is that depth is what the ini's `Land Fog Depth` is called, and it belongs in the height as
+much as in the density: a weather with more fog has fog that reaches higher. The wind multiplies
+that rather than replacing it. And once the two multiply, they have to be ordered against each
+other — foggy is 1.45 times clear's depth and blows at nought against clear's 0.1, so the wind's
+coefficient has to leave `1 + 0.1 x` under 1.45, and **anything over 4.5 inverts them**. Ten did.
+Four is what is there, and it is a bound rather than a taste.
+
+**And the ratios had to give, which is the one place in the weather system the game's own numbers
+are not obeyed.** With all three axes in, foggy was still only about a sixth more fog across the
+frame than clear, because the only thing separating them in density is the authored 1.45× — and
+1.45 times a clear day is a change nobody can see. It is not that the ratio was applied wrongly: in
+the original engine the number set where fog reached full against a fixed far plane, so a small
+change moved a hard cutoff that was doing most of the work, and here it is a density integrated
+along a ray, which has no cutoff to move. **No rescaling that keeps a clear day clear can pull 1.45
+apart** — halving the absolute and quartering it left foggy the same sixth clearer, measured before
+this was reached for.
+
+So the order stays the game's and the spacing does not. A fourth power leaves clear exactly where it
+was by construction — its render is pixel-identical — moves cloudy and overcast by a tenth, doubles
+rain, and puts foggy at four and a half times a clear day, which is the difference between seeing
+the far shore of the bay and not. Far-field contrast goes clear 40.3, rain 34.1, foggy 24.1, blight
+8.1.
+
+**The top needed a cap, and the number that says so is 0.03.** Blizzard's `Land Fog Depth` is 2.8
+against clear's 0.69, and a fourth power of four-times is **271** — which rendered at 0.03 of a
+clear day's contrast, meaning not one thing in the frame was visible, the deck underfoot included.
+Sixteen leaves it a whiteout you can still see the boat from and binds nothing else: ashstorm and
+blight, the next thickest, sit at six and a half.
+
+**The wind was picked and should have been read.** `FOG_GALE` began at 120, chosen against
+`FOG_GRAIN` so the strongest weather crossed one cell of the coarsest noise in about nine seconds —
+and nine seconds to cross thirteen metres is 1.4 metres a second, which is a still afternoon rather
+than an ash storm. Twenty metres a second is a Beaufort 8 gale and there are seventy units to the
+metre, so the figure is 1,400 and every weather's `Wind Speed` becomes a real one: clear's 0.1 is a
+two-metre breeze, rain's 0.3 is six, thunderstorm's 0.5 is ten, ashstorm's 0.8 is sixteen, blight
+and blizzard blow eighteen. **A constant chosen to make a noise field look busy was hiding the fact
+that the units were already there to derive it.**
+
+That change moved the tests' own window with it: at 1,400 the advection saturates within a couple of
+seconds, so the wind is measured over one second and the churn — eleven to nineteen units a second
+against a gale's fourteen hundred — over ten. Two claims about the same field on two timescales,
+because the two things move three orders apart.

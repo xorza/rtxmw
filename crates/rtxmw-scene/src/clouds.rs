@@ -69,7 +69,11 @@ const DRIFT: f32 = 1.8;
 /// **Nothing in the game says.** `Wind Speed` is a scalar and the direction is never given, so this
 /// is chosen — and chosen off-axis so the drift is not along a texture axis, which would make the
 /// repeat obvious.
-const BEARING: f32 = 0.6;
+///
+/// **The fog takes the same one**, out of [`crate::Sky::wind`]: there is one wind over a landscape,
+/// and cloud shadows crossing the ground one way while the air moves another would read as two
+/// weathers at once.
+pub(crate) const BEARING: f32 = 0.6;
 
 /// What a cloud's lit face radiates against the sun that lights it.
 ///

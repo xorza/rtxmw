@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 
+use glam::Vec2;
 use rtxmw_gpu::{Buffer, Device, RayTracingLimits, Uploader};
 use rtxmw_scene::{
     Ambient, CellId, Clouds, Instance, Light, MaterialKind, MaterialTable, Mesh, MeshId, Moon, Sky,
@@ -253,6 +254,8 @@ impl SceneResidency {
                 self.lighting.fog = record.fog;
                 self.lighting.fog_density = record.fog_density * INDOOR_FOG_SCALE;
                 self.lighting.fog_banked = false;
+                self.lighting.fog_wind = Vec2::ZERO;
+                self.lighting.fog_lift = 1.0;
             }
             _ => {
                 // **The weather's, out of the ini**, rather than the dome standing in for it: the
@@ -261,6 +264,8 @@ impl SceneResidency {
                 self.lighting.fog = self.sky.fog;
                 self.lighting.fog_density = self.sky.fog_density;
                 self.lighting.fog_banked = true;
+                self.lighting.fog_wind = self.sky.wind;
+                self.lighting.fog_lift = self.sky.fog_lift;
             }
         }
     }

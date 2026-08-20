@@ -234,8 +234,15 @@ layout(set = 0, binding = 14, scalar) readonly buffer Frame {
     vec3 sky_veil;
     float sky_veiled;
     // One where the fog should be an even haze rather than banks — indoors, where the air is still
-    // and a room is smaller than a single bank would be.
+    // and a room is smaller than a single bank would be, and out of doors however far the weather's
+    // own wind has stirred them out.
     float fog_uniform;
+    // Which way the air moves and how hard, out of the weather's `Wind Speed`. Zero is dead still,
+    // which foggy and snow are; nine tenths is a blight storm. See `Sky::wind` in `rtxmw-scene`.
+    vec2 fog_wind;
+    // How deep the layer stands, against clear weather's in still air: the weather's own
+    // `Land Fog Depth` and its wind together — see `Sky::fog_lift` in `rtxmw-scene`.
+    float fog_lift;
     // Masser and Secunda, which the sky draws as spheres and the surfaces are lit by — see `Moon`
     // above and `moon_disc` in `lighting.glsl`. Black and zero-width for a cell with no sky.
     Moon masser;

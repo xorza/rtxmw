@@ -1,8 +1,8 @@
 //! What lights an exterior, at an hour.
 
-use glam::Vec3;
+use glam::{Vec2, Vec3};
 
-use crate::clouds::{CloudSheet, Clouds, SKYLIT};
+use crate::clouds::{BEARING, CloudSheet, Clouds, SKYLIT};
 use crate::moon::Moon;
 use crate::srgb::LUMA;
 use crate::sun::Sun;
@@ -31,14 +31,60 @@ const ZENITH_DEPTH: Vec3 = Vec3::new(0.0464, 0.1080, 0.2648);
 /// greying, the twilight width and the night floor are all tuned, and say so.
 const SKY_STRENGTH: f32 = 1.7000;
 
-/// What one unit of the ini's `Land Fog Depth` is worth in this renderer's own fog.
+/// What clear weather's air comes to, which every other weather hangs off.
 ///
-/// Clear weather's 0.69 comes to 0.30, which is the density that was settled by eye before there was
-/// a weather system — half the light from a surface surviving a hundred and thirty metres, where the
-/// 0.75 before it lost the far shore of Seyda Neen's bay at fifty-three. So the absolute is still
-/// this renderer's and the *ratios* between the ten weathers, and between a weather's day and its
-/// night, are the game's.
-const FOG_SCALE: f32 = 0.30 / 0.69;
+/// Settled by eye before there was a weather system — half the light from a surface surviving a
+/// hundred and thirty metres, where the 0.75 before it lost the far shore of Seyda Neen's bay at
+/// fifty-three. The absolute is this renderer's, the *order* of the ten is the game's, and the
+/// spacing between them is [`DEPTH_CURVE`]'s, which says why it is not the game's too.
+const CLEAR_DENSITY: f32 = 0.30;
+
+/// `[Weather Clear]`'s own `Land Fog Depth`, which every other weather is a ratio to.
+const CLEAR_DEPTH: f32 = 0.69;
+
+/// How much steeper the ten are in this renderer than `Land Fog Depth` writes them.
+///
+/// **The one place the game's own ratio is not obeyed, and it is obeyed nowhere else because it
+/// cannot be.** `Land Fog Depth` sets foggy at 1.0 against clear's 0.69 — a ratio of 1.45 — and
+/// 1.45 times the density of a clear day is a change nobody can see. Measured across Seyda Neen's
+/// bay it moved the picture by about a sixth, and by eye it moved it not at all.
+///
+/// It is not that this renderer applies the ratio wrongly. In the original engine the number set
+/// where fog reached full against a fixed far plane, so a small change in it moved a hard cutoff
+/// that was doing most of the work; here it is a density integrated along a ray, and a ray does
+/// not care about a cutoff. **No rescaling that keeps a clear day clear can pull 1.45 apart** —
+/// halving the absolute and quartering it leaves foggy the same sixth clearer, which was measured
+/// before this was reached for.
+///
+/// So the *order* stays the game's and the *spacing* does not. A fourth power leaves clear where it
+/// was by construction, moves cloudy and overcast by a tenth, doubles rain, and puts foggy at four
+/// and a half times a clear day — which is the difference between seeing the far shore of the bay
+/// and not.
+const DEPTH_CURVE: f32 = 4.0;
+
+/// The thickest any weather's air gets, as a multiple of a clear day's.
+///
+/// **Because a power of a ratio runs away and blizzard is an outlier.** `Land Fog Depth` puts it at
+/// 2.8 against clear's 0.69, four times over, and a fourth power of that is **271** — which
+/// measured at 0.03 of a clear day's contrast, meaning not one thing in the frame was visible,
+/// including the deck underfoot. Sixteen leaves a blizzard a whiteout you can still see the boat
+/// from, at about forty metres, and binds nothing else: ashstorm and blight, the next thickest, sit
+/// at six and a half.
+const DEEPEST: f32 = 16.0;
+
+/// How much deeper a full gale stands the fog layer than dead still air does.
+///
+/// **Mechanical turbulence is what lifts an aerosol off the ground**, so the depth of the layer
+/// holding it goes with the wind stirring it: a radiation fog lies in the bottom of a valley and a
+/// dust storm fills everything up to the cloud deck.
+///
+/// **Four rather than the ten this was, and the bound is not taste.** The lift multiplies the
+/// weather's own fog depth, so the two have to be ordered against each other: foggy is 1.45 times
+/// clear's depth and blows at nought, clear blows at 0.1, and for the weather *named* foggy not to
+/// stand shallower than a clear day this has to leave `1 + 0.1 x` under 1.45 — anything over 4.5
+/// inverts them. Ten did, and the picture said so before the arithmetic did. Four puts a blight
+/// storm's e-folding height at two hundred and seventy metres against a fog bank's fifty.
+const WIND_LIFT: f32 = 4.0;
 
 /// What the sky radiates once the sun is properly down.
 ///
@@ -261,6 +307,34 @@ pub struct Sky {
     /// eye and every other weather follows the ini's ratio to it.
     pub fog: Vec3,
     pub fog_density: f32,
+    /// How deep the layer stands, against the bank clear weather makes in still air.
+    ///
+    /// **Two things raise it and the game names both.** `Land Fog Depth` is called depth for a
+    /// reason — a weather with more fog has fog that reaches higher, so foggy's air fills the bay
+    /// where clear's lies in the hollows — and `WIND_LIFT` is the turbulence that stands a storm
+    /// up out of a bank on top of that.
+    ///
+    /// **Wind alone was not enough and the picture said so.** Driving the height from the wind by
+    /// itself gave the weather *named* foggy the shallowest layer of the ten, because Bethesda puts
+    /// its wind at nought — so a foggy day let you see further across Seyda Neen's bay than a clear
+    /// one did. A still fog is deep and a still clear day is not, and only the depth tells them
+    /// apart.
+    ///
+    /// A ratio, so the shader's `FOG_HEIGHT` stays the figure settled by eye and every weather
+    /// hangs off it — the same shape `CLEAR_DENSITY` gives the density.
+    pub fog_lift: f32,
+    /// Which way the air is moving and how fast, out of the weather's `Wind Speed`.
+    ///
+    /// **One number doing three jobs**, because all three are turbulent mixing: it carries the fog
+    /// downwind, it lifts the layer off the ground, and it stirs the banks out of it. Zero is dead
+    /// still — foggy and snow, where the air forms and dissolves in place without going anywhere,
+    /// which is what a radiation fog does. A weather always names one, so this is never zero unless
+    /// the weather says so; an interior has no wind at all and the renderer sets that where it sets
+    /// the rest of what a room does not have.
+    ///
+    /// On the cloud layer's own `BEARING`, the heading its sheet drifts along, because there is
+    /// one wind over a landscape.
+    pub wind: Vec2,
     /// What the hour multiplies the metered exposure by — a bias on it, never the exposure itself.
     ///
     /// **Keyed to the sky rather than to the frame.** Metering says how bright the picture is; this
@@ -321,6 +395,16 @@ impl Sky {
     /// runs in until something chooses otherwise.
     pub fn under(time: WorldTime, weather: &Weather, sheet: CloudSheet) -> Self {
         let bare = Sun::at(time.orbit());
+        // Read once for the two that come out of it: how thick the air is where it sits, and how
+        // far up it reaches. They are the same `Land Fog Depth` and asking twice would let them
+        // drift to different hours.
+        let depth = weather.fog_depth(time);
+        // Against clear weather's, which is what both of the two below are a multiple of — how
+        // thick the air is where it sits, and how far up it reaches.
+        let thicker = depth / CLEAR_DEPTH;
+        // **The cap is on the multiple, not on the density**, which the precedence says and an eye
+        // reading it in one line might not.
+        let thickness = thicker.powf(DEPTH_CURVE).min(DEEPEST);
         // The sun's direction travels downward, so its climb above the horizon is the negation —
         // and it is signed, because after sunset there is a good deal of sky left to light and how
         // far under the sun has gone is the only thing that says how much.
@@ -363,7 +447,9 @@ impl Sky {
             scale: SKY_STRENGTH * lit,
             stars: time.starlight(),
             fog: Vec3::ZERO,
-            fog_density: weather.fog_depth(time) * FOG_SCALE,
+            fog_density: CLEAR_DENSITY * thickness,
+            fog_lift: thicker * (1.0 + weather.wind * WIND_LIFT),
+            wind: Vec2::from_angle(BEARING) * weather.wind,
             exposure_bias: 1.0,
         };
         // **The open dome first**, which is what lights the cloud tops: a deck is lit from above by
