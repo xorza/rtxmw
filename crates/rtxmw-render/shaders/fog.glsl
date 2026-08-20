@@ -377,60 +377,54 @@ float fog_beam_depth(float extinction, vec3 towards) {
     return extinction * FOG_HEIGHT * frame.fog_lift / climb;
 }
 
-// How much of the *skirt* around a moon the air hands back, and over how much of the moon's own
-// radius past the limb it gives way to that.
+// How much of the skirt around a moon the air hands back, against what single scattering gives.
 //
-// **The only two figures in `fog_moon_share` that are a look rather than a derivation, and they
-// reach only half of it.** Taken whole, single scattering draws a forward lobe around a moon at
-// nearly half the moon's own brightness — which is what a bright source in water haze really does,
-// and on a night sky it read as a lamp behind frosted glass rather than as a moon.
+// **The only figure in `fog_moon_source` that is a look rather than a derivation, and it reaches
+// only the skirt.** Taken whole, single scattering draws a forward lobe around a moon at nearly half
+// the moon's own brightness — which is what a bright source in water haze really does, and on a
+// night sky it read as a lamp behind frosted glass rather than as a moon.
 //
-// **It cannot simply be scaled down**, because the same term is the whole of why a red moon stays
-// red in rain: dimming it everywhere took the hue to 0.98, against 0.91 with no moonlight in the air
-// at all and 1.33 as it stands. So the face and the skirt are separated, and the separation is the
-// more correct of the two rather than a compromise — **light scattered by less than the source's own
-// angular width still arrives from the moon's direction.** It never leaves the disc, so it is part
-// of the image and keeps its full weight. What is drawn down is only what scatters far enough to
-// land outside the face, which single scattering overstates anyway: that light is itself attenuated
-// and spread again, and this model follows it no further.
+// It reaches nothing on the face, which is why it can be this small: what comes through the disc is
+// the disc's own image and needs no help. Off it, single scattering overstates the skirt anyway —
+// that light is itself attenuated and spread again, and this model follows it no further.
 //
-// The second figure is what makes that a face-and-skirt split rather than a slow fade: at a seventh
-// of the radius the whole of the drop happens just outside the limb, so the disc is untouched and
-// what surrounded it is not. Measured on the radial profile out from Masser's centre in twenty-pixel
-// rings, against a sky of 39: whole, the glow runs 51 at eighty pixels and 43 at a hundred and does
-// not rejoin the sky until a hundred and twenty. Here it is 46 and 39 — gone by a hundred, with the
-// face itself unchanged at 131, which dimming everywhere would have taken to 124.
+// Measured on the radial profile out from Masser's centre in twenty-pixel rings, against a sky of
+// 39: whole, the glow runs 51 at eighty pixels and 43 at a hundred and does not rejoin the sky until
+// a hundred and ten. Here it is 42 at eighty and gone by a hundred, which is a moon with a rim of
+// weather round it rather than a lamp behind glass.
+//
+// **It no longer trades against the red moon**, which is the whole point of the split above:
+// `the_fog_scatters_the_moons_own_colour_and_not_the_domes` reads exactly the same at this and at
+// 0.15, because what it measures is the face and the face is not this number's to touch.
 const float FOG_MOONLIGHT = 0.15;
-const float FOG_MOON_LIMB = 0.15;
 
-// The share of a moon's own radiance the air returns toward `direction`, before the fog in the way.
+// What the air has to scatter toward `direction` from a moon, before the fog in the way.
 //
-// **Built from the disc as it is drawn, not from `light`.** `Moon::FULL_RADIANCE` is set by where
-// the tone curve stops keeping colour — a moon any brighter comes out white whatever tint it was
-// given — while `light` is what a surface should receive, and at Masser the second is thirty-two
-// times the first. Lighting the haze from `light` while drawing the disc from `colour` put a halo
-// several times brighter than the moon inside it and turned the whole night sky pink.
+// **On the face, what the face itself shows there.** Small-angle scattering does not average a
+// source, it carries its image: light turned by less than the moon's own angular width still arrives
+// from the moon's direction, and from the *part* of it that emitted it. Returning the disc's average
+// instead pasted a flat circle of `moon.colour` over the portrait and the limb shading — which,
+// added to a disc the weather had already dimmed, is the washed-out coin a rainy moon had become.
 //
-// **Capped at one, because scattering cannot send more toward the eye than the source is bright.**
-// A disc of radiance `L` subtending `solid` delivers `L * solid` head-on, so the returned radiance
-// is at most `L` — and the moon's own `colour` is that `L`, which is what makes the halo and the
-// face agree by construction.
+// Doing it this way also settles the arithmetic: the air gives back `moon_disc * (1 - T)` and the
+// disc itself arrives as `moon_disc * T`, so a moon behind rain comes through at its own radiance
+// with its own structure. Which is what a moon behind rain looks like.
 //
-// **Measured to the moon's edge rather than its centre.** Draine's forward peak is a fraction of a
-// degree across and Masser is eighteen, so convolving the two flattens everything inside the face
-// and moves the falloff out by the disc's radius — which is what subtracting the radius from the
-// angle does. Read as a point, the peak spent itself on the texel at the exact centre and drew a
-// red spark inside a grey moon; clamped to the edge's own angle instead of shifted by it, the peak
-// was thrown away and the moon went grey again.
-float fog_moon_share(Moon moon, vec3 direction) {
-    float solid = TAU * (1.0 - moon.cos_radius);
+// **Off the face, the whole disc contributes at once** and there is nothing left but its average,
+// spread by the phase. A disc of radiance `L` subtending `solid` delivers `L * solid` head-on, so
+// the returned radiance is capped at `L` — and `moon.colour` is that `L`, which is what makes the
+// skirt and the face agree by construction. Measured to the limb rather than the centre, because
+// Draine's forward peak is a fraction of a degree and Masser is eighteen: read as a point, the peak
+// spent itself on the texel at the exact centre.
+vec3 fog_moon_source(Moon moon, vec3 direction) {
+    float along = dot(direction, -moon.direction);
+    if (along > moon.cos_radius) {
+        return moon_disc(direction, moon, frame.cone_spread);
+    }
     float radius = acos(clamp(moon.cos_radius, -1.0, 1.0));
-    float away = max(acos(clamp(dot(direction, -moon.direction), -1.0, 1.0)) - radius, 0.0);
-    // Whole across the face, where `away` is nought and the scattered light never left the disc,
-    // falling to `FOG_MOONLIGHT`'s share within a fraction of a radius outside it — see the pair for
-    // why the two halves differ.
-    float skirt = mix(1.0, FOG_MOONLIGHT, smoothstep(0.0, radius * FOG_MOON_LIMB, away));
-    return skirt * min(solid * fog_phase(cos(away)), 1.0);
+    float away = acos(clamp(along, -1.0, 1.0)) - radius;
+    float solid = TAU * (1.0 - moon.cos_radius);
+    return moon.colour * (FOG_MOONLIGHT * min(solid * fog_phase(cos(away)), 1.0));
 }
 
 // The radiance scattering toward the eye from a point in the fog.
@@ -493,8 +487,8 @@ vec4 fog_along(vec3 origin, vec3 direction, float distance, uvec2 pixel) {
     // Hoisted out of the march because only the air in the way varies along it: the share is an
     // angle between two fixed directions, and it costs an `acos` that would otherwise be paid
     // twenty-four times a ray.
-    vec3 masser = frame.masser.colour * fog_moon_share(frame.masser, direction);
-    vec3 secunda = frame.secunda.colour * fog_moon_share(frame.secunda, direction);
+    vec3 masser = fog_moon_source(frame.masser, direction);
+    vec3 secunda = fog_moon_source(frame.secunda, direction);
 
     float transmittance = 1.0;
     vec3 scattered = vec3(0.0);
