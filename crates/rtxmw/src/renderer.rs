@@ -9,7 +9,7 @@ use rtxmw_gpu::{
     Validation, image_blit,
 };
 use rtxmw_render::{FrameConstants, OUTPUT_FORMAT, SceneRenderer, TARGET_FORMAT};
-use rtxmw_scene::{CellId, Sky, SkyTextures, StaticScene, Weather};
+use rtxmw_scene::{CellId, CloudSheet, Sky, SkyTextures, StaticScene, Weather};
 use rtxmw_texture::Texture;
 
 use crate::cli::Upscaling;
@@ -46,6 +46,11 @@ fn internal_extent(window: vk::Extent2D) -> vk::Extent2D {
 /// so everything holding one — the uploader included — must precede `device`.
 #[derive(Debug)]
 pub(crate) struct Renderer {
+    /// What the weather's cloud sheet came to, for the caller to build its next sky with.
+    ///
+    /// It only becomes known once the archives have been read, which is after the caller built the
+    /// sky it handed over — so the first frame's sky has no layer in it and every one after does.
+    sheet: CloudSheet,
     /// Everything that does not care about a window: the pass, the target, the loaded cell.
     scene: SceneRenderer,
     /// What DLSS was asked to run at, so a resize can build the next one.
@@ -109,6 +114,9 @@ impl Renderer {
             sky,
             weather,
         } = conditions;
+        // What the weather's sheet comes to, once it has been read. The caller built its `sky`
+        // before there was one, so it hands this back for the next one it builds.
+        let mut sheet = CloudSheet::NONE;
         let extensions = Surface::required_extensions(window)?;
         let instance = Instance::new(c"rtxmw", extensions, Validation::for_build())?;
         let physical = PhysicalDevice::select(&instance, Presentation::Required)?;
@@ -161,12 +169,14 @@ impl Renderer {
         match SkyTextures::load(weather) {
             Ok(Some(textures)) => {
                 scene.set_sky_textures(&device, &mut uploader, physical.limits(), &textures)?;
+                sheet = textures.sheet();
             }
             Ok(None) => {}
             Err(failed) => eprintln!("the sky keeps its own colours: {failed}"),
         }
 
         Ok(Self {
+            sheet,
             scene,
             dlss,
             display,
@@ -179,6 +189,11 @@ impl Renderer {
             instance,
             needs_recreate: false,
         })
+    }
+
+    /// What the weather's cloud sheet came to — see [`Self::sheet`].
+    pub(crate) fn cloud_sheet(&self) -> CloudSheet {
+        self.sheet
     }
 
     /// Uploads `scene` and makes it the only resident cell.

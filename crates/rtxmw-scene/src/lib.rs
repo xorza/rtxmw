@@ -29,7 +29,7 @@ mod world_time;
 pub use rtxmw_esm::CellId;
 
 pub use crate::cell_streamer::{CellStreamer, StreamedCell};
-pub use crate::clouds::Clouds;
+pub use crate::clouds::{CloudSheet, Clouds};
 pub use crate::door::Door;
 pub use crate::error::{Result, SceneError};
 pub use crate::light::{Ambient, Light};

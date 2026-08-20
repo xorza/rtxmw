@@ -100,9 +100,6 @@ pub(crate) struct SceneResidency {
     recorded_sun: Option<Sun>,
     /// What lights an exterior right now.
     sky: Sky,
-    /// The mean luminance of the uploaded cloud sheet, which only the upload knows — see
-    /// [`Clouds::sheet_mean`]. One until one arrives, which is when a layer starts being drawn.
-    sheet_mean: f32,
 }
 
 // The GPU-side members hold `ash` function tables, which implement no `Debug`.
@@ -154,7 +151,6 @@ impl SceneResidency {
             record: None,
             recorded_sun: None,
             sky: Sky::default(),
-            sheet_mean: 1.0,
         })
     }
 
@@ -244,10 +240,7 @@ impl SceneResidency {
         self.lighting.sky_stars = stars;
         self.lighting.masser = masser;
         self.lighting.secunda = secunda;
-        self.lighting.clouds = Clouds {
-            sheet_mean: self.sheet_mean,
-            ..clouds
-        };
+        self.lighting.clouds = clouds;
 
         // **Only interiors carry fog in the record**, so a recorded density is what identifies one
         // and settles all three of these together. An exterior's belongs to the weather, and now
@@ -392,7 +385,6 @@ impl SceneResidency {
         if let Some(texture) = textures.clouds.as_ref() {
             self.textures.fill(uploader, CLOUD_SHEET, texture)?;
             self.lighting.cloud_sheet = CLOUD_SHEET + 1;
-            self.sheet_mean = textures.cloud_mean;
         }
         self.relight();
         Ok(())

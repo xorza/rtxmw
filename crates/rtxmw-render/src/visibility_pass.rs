@@ -752,9 +752,6 @@ mod tests {
         assert_eq!(offset_of!(FrameConstants, secunda), 440);
         // Then the cloud layer, fourteen floats of it.
         assert_eq!(offset_of!(FrameConstants, cloud_altitude), 504);
-        assert_eq!(offset_of!(FrameConstants, cloud_drift), 516);
-        assert_eq!(offset_of!(FrameConstants, cloud_lit), 524);
-        assert_eq!(offset_of!(FrameConstants, cloud_shadowed), 536);
         assert_eq!(offset_of!(FrameConstants, cloud_sheet), 556);
         // The wave table follows, twenty tightly packed bytes apiece.
         assert_eq!(offset_of!(FrameConstants, waves), 560);

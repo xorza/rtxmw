@@ -3413,3 +3413,50 @@ the archives rather than assuming the shape, which is how that was found.
 still the physical model's, and putting the game's four-colour interpolation over it is the next
 slice's argument to have. It shows most under blight, where the fog is red and the sky above it is
 not.
+
+### 8.60 A deck is a lid, and the ini agrees
+
+The ten weathers' colours came with a surprise: **sky and ambient move in opposite directions.**
+Overcast's `Sky Day Color` is 1.19 times clear's in luminance while its `Ambient Day Color` is 0.44;
+foggy's are 2.59 and 0.55. A cloud deck is a bright sheet that leaves the ground dim, and Bethesda
+wrote both halves down.
+
+This renderer had only the first. `dome_average` excluded the clouds deliberately — a dome that
+counted their own light would light the ground by its own clouds — but leaving out their *blocking*
+with it made an overcast noon as bright underfoot as a clear one. The fix is one line and no
+authored figure: the covered fraction of the dome is worth `SKYLIT` of the open one, which is the
+same 0.3 a cloud sends down of the sky that lit it. What a weather hides is its sheet's own mean
+alpha times its `Clouds Maximum Percent`.
+
+**The ini is then the check rather than the source**, and it is a good one:
+
+| | derived | the ini | | | derived | the ini |
+|---|---|---|---|---|---|---|
+| clear | 1.00 | 1.00 | | rain | 0.65 | 0.58 |
+| foggy | **0.55** | **0.55** | | cloudy | 0.59 | 1.06 |
+| overcast | 0.36 | 0.44 | | thunderstorm | 0.65 | 0.38 |
+| snow | 0.36 | 0.44 | | ashstorm | 0.36 | 0.14 |
+| blizzard | 0.36 | 0.44 | | blight | 0.36 | 0.17 |
+
+Foggy lands on the authored figure exactly; overcast, snow, blizzard and rain land within 0.1 of it.
+Where the two part is informative rather than random. A **dust storm** is dark because the air is
+full of ash, not because a deck is over it — the ini simply asserts 0.14 and this renderer has no
+airborne dust to derive it from, only their fog at 1.1 against clear's 0.69, which darkens the
+picture without darkening the light. **Thunderstorm** is the same shape: 0.38 authored against the
+0.66 cloud cover it declares. And **cloudy** is the one weather whose authored answer this does not
+believe — its ambient is clear's to within 6% despite three-quarters cloud cover, which reads as a
+copy.
+
+**The other half did not land, and both attempts are worth keeping.** The plan was to let each
+weather's `Sky * Color` move the dome as a departure from clear's, so that blight's air is red. As a
+tint on the *dome* it double-counts: foggy's sky is 2.59 times clear's **because** of its deck, so
+dimming by that deck as well made overcast brighter than clear. Moved to the *deck* instead — where
+every strongly-coloured weather's sheet is opaque, so the deck is what is seen — it turns overcast
+**orange**: the departure is (2.31, 1.13, 0.46), because dividing a grey by clear's blue is a warm
+ratio however it is normalised.
+
+The mistake behind both is treating one number as two things. The ini's sky colour is *the whole
+sky's average* — the blue air under clear, the deck under overcast — and nothing in the file splits
+those apart. A renderer that derives the air and draws the deck separately needs them split. The
+schedules stay parsed and tested against the file; what to do with them is still open, and blight
+remains red fog under a pale sky until it is settled.

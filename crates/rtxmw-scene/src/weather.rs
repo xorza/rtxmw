@@ -174,6 +174,15 @@ pub struct Weather {
     /// over the other is a real argument about which wins where, not a wiring job, and it is
     /// `docs/design.md` §8.59's "what is not done".
     ///
+    /// **One attempt at using them is already recorded rather than repeated.** The plan was to let
+    /// each weather's sky move the dome as a *departure* from clear's. On the dome that
+    /// double-counts — foggy's sky is 2.59 times clear's in the ini **because** of its deck, so
+    /// dimming by that deck as well made overcast brighter than clear. On the deck instead it turns
+    /// overcast orange, since the departure is (2.31, 1.13, 0.46) and dividing a grey by clear's
+    /// blue is a warm ratio however it is normalised. One number is being asked to be two things:
+    /// the ini's sky colour is the whole sky's average, the blue air under clear and the deck under
+    /// overcast, and nothing in the file splits them. `docs/design.md` §8.60 has it in full.
+    ///
     /// They are parsed now because the parse is the part that can be *tested* against the file:
     /// `every_weather_the_game_ships_is_read_with_its_own_numbers` asserts a clear day sky is blue
     /// and an overcast one grey without either being written down here. Leaving them out would mean

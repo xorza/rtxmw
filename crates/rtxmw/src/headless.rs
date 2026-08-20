@@ -12,7 +12,7 @@ use rtxmw_gpu::{
     readback,
 };
 use rtxmw_render::SceneRenderer;
-use rtxmw_scene::{CellId, CellStreamer, LoadedCell, Sky, SkyTextures, Weather};
+use rtxmw_scene::{CellId, CellStreamer, CloudSheet, LoadedCell, Sky, SkyTextures, Weather};
 
 use crate::cli::ScreenshotOptions;
 use crate::scene_loader;
@@ -68,11 +68,15 @@ pub(crate) fn screenshot(options: &ScreenshotOptions) -> Result<f32, Box<dyn std
     }
     renderer.set_delight(*delight);
     renderer.set_fog(*fog);
+    // **The textures before the sky**, which needs their statistics: how much of the dome the
+    // weather's sheet hides is what the ground under it is dimmed by.
     let weather = &Weather::named(weather)?;
-    renderer.set_sky(Sky::under(*time, weather));
+    let mut sheet = CloudSheet::NONE;
     if let Some(textures) = SkyTextures::load(weather)? {
+        sheet = textures.sheet();
         renderer.set_sky_textures(&device, &mut uploader, physical.limits(), &textures)?;
     }
+    renderer.set_sky(Sky::under(*time, weather, sheet));
 
     let cell = LoadedCell::load_at(cell.clone())?
         .ok_or("no game data configured — set MORROWIND_DATA_DIR, or put it in .env")?;

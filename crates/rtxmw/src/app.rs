@@ -11,7 +11,7 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowId};
 
 use rtxmw_scene::{
-    CellDetail, CellId, CellStreamer, LoadedCell, SceneError, Sky, Weather, WorldTime,
+    CellDetail, CellId, CellStreamer, CloudSheet, LoadedCell, SceneError, Sky, Weather, WorldTime,
 };
 
 use crate::camera::{Camera, Movement};
@@ -93,6 +93,12 @@ pub(crate) struct App {
     clock: WorldClock,
     /// Which of the game's ten weathers the world is under, out of `--weather`.
     weather: Weather,
+    /// What that weather's cloud sheet comes to on average, once the renderer has read it.
+    ///
+    /// Every sky is built with it — how much of the dome the deck hides is what the ground under it
+    /// is dimmed by — so it is held here rather than fetched, and it is `NONE` until the textures
+    /// have loaded, which is a sky with no layer in it.
+    sheet: CloudSheet,
     /// Which cell to open in, from the command line.
     cell: CellId,
     /// **Before `window`, and that is load-bearing.** Fields drop in declaration order, and the
@@ -287,6 +293,7 @@ impl Default for App {
             fog: 1.0,
             clock: WorldClock::starting_at(WorldTime::default()),
             weather: Weather::clear(),
+            sheet: CloudSheet::NONE,
             renderer: None,
             window: None,
             centre: None,
@@ -384,11 +391,14 @@ impl ApplicationHandler for App {
             Conditions {
                 delight: self.delight,
                 fog: self.fog,
-                sky: Sky::under(self.clock.time(), &self.weather),
+                sky: Sky::under(self.clock.time(), &self.weather, self.sheet),
                 weather: &self.weather,
             },
         ) {
             Ok(renderer) => {
+                // The sheet is only known once the archives have been read, which is inside the
+                // renderer — so the first sky was built without a layer and every later one has one.
+                self.sheet = renderer.cloud_sheet();
                 println!("{}", renderer.capability_report());
                 println!("{KEYS}");
                 self.renderer = Some(renderer);
@@ -512,7 +522,7 @@ impl ApplicationHandler for App {
                 if let (Some(renderer), Some(window)) = (&mut self.renderer, &self.window) {
                     let size = window.inner_size();
                     renderer.set_time(self.clock.seconds());
-                    renderer.set_sky(Sky::under(self.clock.time(), &self.weather));
+                    renderer.set_sky(Sky::under(self.clock.time(), &self.weather, self.sheet));
                     let constants = renderer.frame_constants(
                         self.camera.view(),
                         self.camera.projection(renderer.aspect_ratio()),

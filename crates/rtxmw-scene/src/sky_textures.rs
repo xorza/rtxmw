@@ -2,6 +2,7 @@
 
 use rtxmw_texture::Texture;
 
+use crate::clouds::CloudSheet;
 use crate::error::Result;
 use crate::game_data::GameData;
 use crate::srgb::{LUMA, channel_to_linear};
@@ -29,14 +30,28 @@ pub struct SkyTextures {
     /// `Weather::cloud_texture` names it, which for eight of the ten is `tx_sky_*` and for
     /// Bloodmoon's snow and blizzard is `tx_bm_sky_*`.
     pub clouds: Option<Texture>,
+    /// Mean alpha of the cloud sheet — how much of the sky the layer hides, on average.
+    ///
+    /// A quarter for clear weather's cirrus and all of it for every overcast one, which is the
+    /// difference between a sky the ground is lit by and a lid over it. Nought where there is no
+    /// sheet, which draws no layer anyway.
+    cloud_cover_mean: f32,
     /// Mean luminance of the cloud sheet, weighted by its own alpha and decoded to linear.
     ///
     /// What its texels are read as a ratio to, so the painting supplies structure and not a level —
     /// see [`crate::Clouds`]. One where there is no sheet, which draws no layer anyway.
-    pub cloud_mean: f32,
+    cloud_mean: f32,
 }
 
 impl SkyTextures {
+    /// What the cloud sheet comes to on average, which is what building a sky needs of it.
+    pub fn sheet(&self) -> CloudSheet {
+        CloudSheet {
+            covering: self.cloud_cover_mean,
+            mean: self.cloud_mean,
+        }
+    }
+
     /// Reads all of them from the installed game, with `weather`'s cloud sheet.
     ///
     /// `None` where no game data is configured. A sheet that will not read leaves the layer undrawn
@@ -60,6 +75,7 @@ impl SkyTextures {
             masser: read(r"textures\tx_masser_full.dds"),
             secunda: read(r"textures\tx_secunda_full.dds"),
             cloud_mean: clouds.as_ref().map_or(1.0, Self::mean_of),
+            cloud_cover_mean: clouds.as_ref().map_or(0.0, Self::cover_of),
             clouds,
         }))
     }
@@ -69,6 +85,13 @@ impl SkyTextures {
     /// Weighted by that alpha rather than cut at a threshold: a cloud's edge is half a cloud, and
     /// the clear sheet is wisps whose alpha is nowhere near either end. Decoded before the mean
     /// rather than after, which is the same mistake as sampling an albedo through a UNORM view.
+    /// The mean of the sheet's alpha, which is the fraction of sky it hides.
+    fn cover_of(texture: &Texture) -> f32 {
+        let rgba = texture.to_rgba8();
+        let total: f32 = rgba.chunks_exact(4).map(|t| t[3] as f32 / 255.0).sum();
+        total / (rgba.len() / 4).max(1) as f32
+    }
+
     fn mean_of(texture: &Texture) -> f32 {
         let rgba = texture.to_rgba8();
         let (mut total, mut weight) = (0.0f32, 0.0f32);

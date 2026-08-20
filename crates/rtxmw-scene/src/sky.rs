@@ -2,7 +2,7 @@
 
 use glam::Vec3;
 
-use crate::clouds::Clouds;
+use crate::clouds::{CloudSheet, Clouds, SKYLIT};
 use crate::moon::Moon;
 use crate::srgb::LUMA;
 use crate::sun::Sun;
@@ -198,14 +198,14 @@ impl Sky {
 
     /// The light above an exterior at `time`.
     pub fn at(time: WorldTime) -> Self {
-        Self::under(time, &Weather::clear())
+        Self::under(time, &Weather::clear(), CloudSheet::NONE)
     }
 
     /// The light above an exterior at `time`, under `weather`.
     ///
     /// [`Self::at`] is this under clear weather, which is what every test wants and what the engine
     /// runs in until something chooses otherwise.
-    pub fn under(time: WorldTime, weather: &Weather) -> Self {
+    pub fn under(time: WorldTime, weather: &Weather, sheet: CloudSheet) -> Self {
         let bare = Sun::at(time.orbit());
         // The sun's direction travels downward, so its climb above the horizon is the negation —
         // and it is signed, because after sunset there is a good deal of sky left to light and how
@@ -251,6 +251,8 @@ impl Sky {
             fog_density: weather.fog_depth(time) * FOG_SCALE,
             exposure_bias: 1.0,
         };
+        // **The open dome first**, which is what lights the cloud tops: a deck is lit from above by
+        // the sky it is under, not by itself.
         sky.ambient = sky.dome_average();
         // **The weather's hue on the dome's own light.** Fog is lit by the sky, so its level belongs
         // to the dome — which is what made the sky an honest stand-in for it — and its colour
@@ -271,7 +273,16 @@ impl Sky {
         // **The beam before any air at all**, because the layer crosses different air from the
         // ground: less of it, and at a different angle. `Clouds` applies its own extinction and its
         // own horizon fade — see the notes there.
-        sky.clouds = Clouds::at(time, bare, sky.ambient, weather);
+        sky.clouds = Clouds::at(time, bare, sky.ambient, weather, sheet);
+        // **Then the ground's, which is the dome as seen from *under* the layer.** The clouds were
+        // left out of the average deliberately — a dome that counted their own light would light the
+        // ground by its own clouds — but leaving out their *blocking* with it made an overcast noon
+        // as bright underfoot as a clear one. A deck is a lid: what is under it is what got past.
+        //
+        // `SKYLIT` is what a cloud sends down of the sky that lit it, so the covered fraction of the
+        // dome is worth that much of the open one. The ini agrees, and is the check rather than the
+        // source — see `weather_dims_the_ground_the_way_the_game_says_it_does`.
+        sky.ambient *= 1.0 - (1.0 - SKYLIT) * sky.clouds.hidden_mean;
         sky.exposure_bias = sky.bias_from_dome();
         sky
     }

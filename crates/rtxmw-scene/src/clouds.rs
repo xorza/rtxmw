@@ -97,7 +97,29 @@ const SUNLIT: f32 = 0.55;
 ///
 /// Thin cloud is not made dark by this: how much of the sky a wisp replaces at all is its own alpha,
 /// so a deck at 0.2 coverage comes out at 96% of the sky and a solid one at 30%.
-const SKYLIT: f32 = 0.3;
+pub(crate) const SKYLIT: f32 = 0.3;
+
+/// What a weather's painted sheet comes to on average, which is all the sky needs of it.
+///
+/// **Two numbers out of a 512-square picture**, so that building a sky needs the statistics of the
+/// sheet without needing the sheet: how much of the dome it hides, and how bright its cloud is. They
+/// were patched into the layer by the renderer after the fact until the ambient needed them at
+/// construction — the ground under a deck is dimmed by exactly the first of them.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CloudSheet {
+    /// The mean of its alpha: a quarter for clear weather's cirrus, all of it for every overcast.
+    pub covering: f32,
+    /// The mean luminance of what its alpha calls cloud, which its texels are read as a ratio to.
+    pub mean: f32,
+}
+
+impl CloudSheet {
+    /// No sheet at all, which draws no layer and dims nothing.
+    pub const NONE: Self = Self {
+        covering: 0.0,
+        mean: 1.0,
+    };
+}
 
 /// The cloud layer over an exterior at an hour.
 ///
@@ -120,16 +142,22 @@ pub struct Clouds {
     pub lit: Vec3,
     /// What a cloud in its own shadow radiates — the sky's light alone.
     pub shadowed: Vec3,
+    /// What fraction of the sky the layer hides, averaged over the whole dome.
+    ///
+    /// **The sheet's own mean alpha times [`Self::cover`]**, and what the ground's ambient is dimmed
+    /// by: a deck is a lid, and the light under one is the light that got past it. Distinct from
+    /// `cover`, which is only the weather's declared ceiling — an overcast sheet reaches it
+    /// everywhere and clear weather's cirrus reaches a quarter of it.
+    pub hidden_mean: f32,
     /// The sheet's mean opaque luminance, which its texels are read as a ratio to.
     ///
-    /// **Filled in by whoever uploaded the sheet**, since that is the only thing that has read it.
-    /// One until then, which draws a layer scaled wrongly rather than not at all — and nothing draws
-    /// a layer before a sheet exists, so the placeholder is never seen.
+    /// Out of [`CloudSheet::mean`], which is the sheet's own statistics rather than the sheet.
     pub sheet_mean: f32,
-    /// How much of the sky the layer covers at all, from none to all of it.
+    /// The ceiling on how much sky the layer may cover, from none to all of it.
     ///
-    /// The weather's own `Clouds Maximum Percent`, which is 1 for most of the ten and 0.66 for rain.
-    /// Zero is a cell with no sky, which draws no layer without a branch to say so.
+    /// The weather's own `Clouds Maximum Percent`, which is 1 for most of the ten and 0.66 for rain
+    /// — a ceiling the sheet's own alpha then scales, which is what [`Self::hidden_mean`] is the
+    /// average of. Zero is a cell with no sky, which draws no layer without a branch to say so.
     pub cover: f32,
 }
 
@@ -143,6 +171,7 @@ impl Clouds {
         lit: Vec3::ZERO,
         shadowed: Vec3::ZERO,
         sheet_mean: 1.0,
+        hidden_mean: 0.0,
         cover: 0.0,
     };
 
@@ -177,7 +206,13 @@ impl Clouds {
     ///
     /// The drift is taken off the *date* rather than the hour, because it has to accumulate: the
     /// hour wraps at midnight and a layer carried by it would snap back with it.
-    pub fn at(time: WorldTime, sun: Sun, ambient: Vec3, weather: &Weather) -> Self {
+    pub fn at(
+        time: WorldTime,
+        sun: Sun,
+        ambient: Vec3,
+        weather: &Weather,
+        sheet: CloudSheet,
+    ) -> Self {
         // Carried on a steady bearing, in tiles, from the hour the world has run.
         let (sin, cos) = BEARING.sin_cos();
         let travelled = time.day() * DRIFT * weather.cloud_speed;
@@ -217,8 +252,8 @@ impl Clouds {
             drift: Vec2::new(cos, sin) * travelled,
             lit: sunward + skyward,
             shadowed: skyward,
-            // Stood in for until a sheet is uploaded, which is the only thing that knows it.
-            sheet_mean: 1.0,
+            sheet_mean: sheet.mean,
+            hidden_mean: sheet.covering * weather.cloud_cover,
             cover: weather.cloud_cover,
         }
     }
@@ -233,7 +268,13 @@ mod tests {
     fn at(hour: f32) -> Clouds {
         let time = WorldTime::hours(hour);
         let sky = crate::Sky::at(time);
-        Clouds::at(time, sky.sun, sky.ambient, &Weather::clear())
+        Clouds::at(
+            time,
+            sky.sun,
+            sky.ambient,
+            &Weather::clear(),
+            CloudSheet::NONE,
+        )
     }
 
     #[test]
