@@ -607,7 +607,7 @@ impl StaticScene {
                     // the flame belongs to the model, and a hundred candles in a hall are a hundred
                     // placements of the one emitter.
                     let first = seen.emitters.len() as u32;
-                    ParticleEmitter::collect(&nif, &mut self.materials, &mut seen.emitters);
+                    ParticleEmitter::collect(&nif, &mut seen.emitters);
                     if seen.emitters.len() as u32 != first {
                         seen.emitter_spans
                             .insert(id, first..seen.emitters.len() as u32);

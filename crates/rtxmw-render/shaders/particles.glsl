@@ -1,101 +1,197 @@
-// Flames, steam and smoke, drawn out of their emitters rather than out of geometry.
+// Flames, steam and smoke, as volumes the ray walks rather than as the sprites the game drew.
 //
-// **A particle system carries no triangles at all.** The sprites are the whole of the drawing, so
-// there is nothing to put in the acceleration structure even if it were worth putting there — a
-// candle's twenty-two flames are twenty-two sub-pixel quads that would have to be rebuilt every
-// frame, in a structure whose build is per *cell*. They go into the transparency layer instead,
-// beside the rain, and for the same three reasons: an upscaler composites that layer rather than
-// denoising it, coverage comes out as a fraction so a sprite finer than a pixel dims it rather than
-// flickering in and out of it, and the whole thing costs no state.
+// **The numbers are Morrowind's and the drawing is not.** An emitter's file says where it is, which
+// way it points, how fast it lets go, how long a parcel lives, how wide it opens and how much of it
+// there is — and every one of those describes a *plume* as well as it describes a spray of quads.
+// What it also carries is a photograph: `tx_firealpha10` is a pinkish tan puff shot at some
+// unrecorded exposure, and multiplying a flame by it is how fire came out pink. So the parameters
+// are kept and the pictures are dropped. `docs/design.md` §8.103.
 //
-// **Nothing is simulated and nothing is stored.** Slot `i` of an emitter is a closed form in its
-// own hash and the clock: where it was born, which way it left, how fast, how long it lives, and a
-// constant acceleration on top. That is exact rather than approximate — a stepped simulation of a
-// constant acceleration is the same parabola with rounding error — and it means a frame allocates
-// nothing, keeps nothing between frames, and gives the same picture from any starting time.
+// **What replaces them.** A density field shaped by those parameters, roiled by noise advected
+// along the emitter's own axis at the emitter's own speed, marched front to back:
+//
+//   - **Fire emits and does not absorb.** Its colour is the one thing about a flame that is not a
+//     matter of taste — a blackbody at the temperature of the gas — and it cools as it rises, so
+//     the hue reddens and the brightness falls as the fourth power without anything being told to
+//     fade. `blackbody::colour` and `ParticleEmitter::burn` do that on the host.
+//   - **Smoke scatters and absorbs.** Beer-Lambert along the ray, Henyey-Greenstein about the sun,
+//     a short march toward it for self-shadowing, and the powder term a backlit puff needs. That is
+//     the standard cloud recipe, and it is what stops smoke being a flat disc that punches a hole
+//     in whatever is behind it.
+//
+// Nothing is simulated and nothing is stored: the field is a closed form in position and the clock,
+// so a frame allocates nothing and any starting time gives the same picture.
 
 // Most emitters a ray walks, whatever the host uploaded.
-//
-// A guard on the buffer rather than a budget: the fullest interior measured is Seyda Neen's census
-// office at fifty-five, and a cell would have to be twenty times that to bind.
 const uint EMITTER_LIMIT = 1024u;
 
-// Distinct hash streams, so a slot's direction and its birth point are not the same number twice.
-const uint PARTICLE_STREAM_DIRECTION = 0u;
-const uint PARTICLE_STREAM_BIRTH = 1u;
-const uint PARTICLE_STREAM_LIFE = 2u;
+// Steps taken through one emitter's bounding sphere, and toward the sun from each of them.
+//
+// **The sphere is what makes this affordable.** A candle's plume is five units across and the test
+// against it throws the emitter away for almost every pixel of the frame, so the march is paid for
+// only where there is something to march through. The light steps are for smoke alone — a flame
+// emits and casts no shadow of its own.
+const uint PLUME_STEPS = 32u;
+const uint PLUME_LIGHT_STEPS = 4u;
 
-// What a slot's hash gives, unpacked.
-struct Spawn {
-    // Where it started, in world units from the emitter's origin.
-    vec3 offset;
-    // Which way it left, and how fast.
-    vec3 direction;
-    float speed;
-    // How far through its life it is, and how long that life is.
-    float age;
-    float life;
+// How many eddies span the plume's own height.
+//
+// **Tied to the plume rather than to the world**, so a candle's flame and a lava vent's are equally
+// broken up rather than the small one being a smooth blob and the large one static.
+const float PLUME_EDDIES = 6.0;
+
+// Where the noise's own range is taken from, before it is stretched to `0..1`.
+//
+// Averaging octaves of anything piles the result up around the middle — three of them land almost
+// entirely between a third and two thirds — so the ends have to be brought in before the erosion
+// below has anything to work with.
+const float PLUME_FLOOR = 0.35;
+const float PLUME_CEILING = 0.72;
+
+// How deeply the noise eats into the plume's shape.
+//
+// At zero the outline is the shape's own — a cone, which reads as a triangle. At one the noise can
+// remove the plume entirely wherever it is thin, which leaves gaps in the middle of a flame. Six
+// tenths breaks the edge into tongues and leaves the core alone.
+const float PLUME_EROSION = 0.6;
+
+// Octaves of noise, and what each is worth against the one before it.
+const uint PLUME_OCTAVES = 3u;
+const float PLUME_LACUNARITY = 2.3;
+const float PLUME_GAIN = 0.55;
+
+// Where the plume starts and stops, as fractions of the height a parcel reaches.
+//
+// **Neither end is a hard edge.** The bottom is where the fuel is and the gas has had no room to
+// spread; the top is where it has cooled past glowing and thinned into the air. Cutting either
+// square is the fault the sprites had, one scale up.
+const float PLUME_FOOT = 0.10;
+const float PLUME_HEAD = 0.55;
+// A flame is already tapered to a point by its radius, so it keeps more of its own height than a
+// plume of smoke does before the axial fade takes what is left.
+const float PLUME_HEAD_FLAME = 0.8;
+
+// Where the radial falloff begins, as a fraction of the plume's radius at that height.
+const float PLUME_CORE = 0.45;
+
+// How far the plume leans off its own axis, as a fraction of its radius, and over how many bends.
+//
+// **A flame licks; it does not stand.** The axis of a real plume wanders — buoyancy is unstable, so
+// the column snakes and the tongue at the top is somewhere else from one moment to the next. Two
+// noise channels read along the axis give that for nothing, and reading them at a position that
+// *rises* with the gas is what sends each bend travelling upward instead of the whole column
+// waving like a flag nailed at the bottom.
+const float PLUME_WANDER = 0.55;
+const float PLUME_BENDS = 2.5;
+
+// The shape of a flame, as a fraction of its widest: at the fuel, where its belly sits, at the tip.
+//
+// **Fire tapers where smoke spreads, and that is not a stylistic choice.** The luminous zone is
+// where there is still fuel burning; above it the gas has been consumed and what is left rises and
+// cools out of sight. So the *shape* of a flame is a taper even though the gas cone it sits in is
+// opening the whole way — which is why the first attempt, built on the cone alone, came out as an
+// upside-down flame filling a fireplace.
+//
+// **And it necks at the bottom, which the second attempt did not.** A flame is thinnest where it
+// meets the fuel: the gas has not had room to expand and the reaction is still starting. Widest at
+// the foot instead, the plume presents a flat disc to anything looking up at it and a flat base to
+// anything looking level — which is a pyramid, and was reported as one. A quarter of the way up is
+// where the belly sits.
+const float FLAME_NECK = 0.42;
+const float FLAME_BELLY = 0.25;
+const float FLAME_TIP = 0.12;
+
+// How bright fire is where it is thick enough to hide itself.
+//
+// **A flame is a grey body, and that is what makes one number enough.** It emits *and* absorbs, so
+// what leaves a deep flame is not the sum of everything inside it — it is what the outermost layer
+// radiates, because the layers behind that one are hidden by it. Radiance saturates at the
+// blackbody value however deep the fire is, which is why a bonfire is not a thousand times brighter
+// than a candle: it is the same brightness over more of the screen.
+//
+// Emission alone, with no absorption, is what a sprite-based renderer does by piling additive
+// quads, and it is why the first volumetric attempt filled a fireplace with white — forty units of
+// plume summed forty units' worth. With the absorption in, this is a *level* rather than a gain,
+// and it means one thing: how bright the surface of a flame is. The colour is not here at all — it
+// comes from the temperature, and `blackbody::colour` hands it over at unit luminance so this can
+// say the level on its own.
+const float FLAME_RADIANCE = 0.5;
+
+// Optical depth straight up through a plume, from its foot to where it thins away.
+//
+// **Dimensionless, and against the plume rather than the world**, which is what lets a candle's
+// three units and a lava vent's four hundred both come out looking like what they are. A flame is
+// thick enough to hide its own far side; smoke is a veil that mostly does not.
+const float FLAME_DEPTH = 4.0;
+const float SMOKE_DEPTH = 1.5;
+
+// How strongly smoke throws light forward, for Henyey-Greenstein.
+//
+// **Droplets and grains scatter forward**, which is why a plume lit from behind has a bright rim
+// and one lit from in front is flat. Six tenths is the middle of what the cloud literature uses.
+const float SMOKE_ANISOTROPY = 0.6;
+
+// How dark the outside of a backlit puff goes — the "powder" term.
+//
+// Single scattering alone makes a thin edge *bright*, because there is little between it and the
+// sun; what actually happens is that a thin edge has too little medium to have scattered much
+// toward the eye at all, so it darkens. This is the standard correction for that.
+const float SMOKE_POWDER = 1.6;
+
+// A value in `0..1` at one lattice corner.
+float plume_corner(ivec3 at) {
+    return float(hash(uvec4(uvec3(at + 4096), 0x9E37u)) & 0xFFFFu) / 65535.0;
+}
+
+// Smooth value noise in three dimensions, in `0..1`.
+//
+// Value rather than gradient noise: eight hashes against twelve dot products, and what is wanted
+// here is a lumpy field rather than one with a particular spectrum. Fire hides the difference and
+// smoke is filtered by its own scattering.
+float plume_noise(vec3 p) {
+    ivec3 cell = ivec3(floor(p));
+    vec3 f = fract(p);
+    // The cubic weights, which are what make the lattice invisible.
+    f = f * f * (3.0 - 2.0 * f);
+    float total = 0.0;
+    for (int k = 0; k < 2; ++k) {
+        for (int j = 0; j < 2; ++j) {
+            for (int i = 0; i < 2; ++i) {
+                vec3 weight = mix(1.0 - f, f, vec3(i, j, k));
+                total += plume_corner(cell + ivec3(i, j, k)) * weight.x * weight.y * weight.z;
+            }
+        }
+    }
+    return total;
+}
+
+// Several octaves of it, normalised so the sum still runs `0..1`.
+float plume_fbm(vec3 p) {
+    float total = 0.0;
+    float scale = 1.0;
+    float weight = 1.0;
+    float carried = 0.0;
+    for (uint octave = 0u; octave < PLUME_OCTAVES; ++octave) {
+        total += weight * plume_noise(p * scale);
+        carried += weight;
+        scale *= PLUME_LACUNARITY;
+        weight *= PLUME_GAIN;
+    }
+    return total / carried;
+}
+
+// Where a point sits inside a plume: how far up it is, and how much is there.
+struct Inside {
+    // Fraction of the way from the emitter to where a parcel stops, `0..1`.
+    float risen;
+    // What is there, `0..1`, with the noise already in it.
+    float density;
 };
 
-// Four unit values out of one slot, one generation and one stream.
+// The emitter's colour ramp at `fraction` of the way up the plume.
 //
-// **The generation is in the hash and that is what keeps it from repeating.** A slot cycles: it is
-// born, it lives, it is born again. Hashed on the slot alone every rebirth would leave in exactly
-// the same direction, and twenty-two of them would read as a fountain of identical sparks rather
-// than as a flame.
-vec4 particle_random(uint seed, uint slot, uint generation, uint stream) {
-    uint low = hash(uvec4(seed, slot, generation, stream));
-    uint high = hash(uvec4(low, stream, slot, seed));
-    return vec4(unit_pair(low), unit_pair(high));
-}
-
-// Where slot `slot` of `emitter` is, and how old.
-Spawn particle_spawn(Emitter emitter, uint slot, float time) {
-    Spawn spawn;
-    vec4 chance = particle_random(emitter.seed, slot, 0u, PARTICLE_STREAM_LIFE);
-    spawn.life = max(emitter.lifetime + emitter.lifetime_variation * (2.0 * chance.x - 1.0), 1e-3);
-    // **The phase is the slot's own, so the emitter is full from the first frame.** A rate and a
-    // capacity would have to be integrated from a start time to say which slots exist yet; a
-    // scattered phase gives the same steady state with no start time at all, and a candle that has
-    // been burning since before the cell loaded is what a candle is.
-    float cycles = time / spawn.life + chance.y;
-    uint generation = uint(max(floor(cycles), 0.0));
-    spawn.age = fract(cycles) * spawn.life;
-
-    vec4 aim = particle_random(emitter.seed, slot, generation, PARTICLE_STREAM_DIRECTION);
-    // A polar angle off the emitter's own `+Z` and an azimuth about it — zero declination is
-    // straight up, which is what 113 of the game's emitters are and why they are called flames.
-    float declination = emitter.declination + emitter.declination_variation * (2.0 * aim.x - 1.0);
-    float azimuth = emitter.azimuth + emitter.azimuth_variation * (2.0 * aim.y - 1.0);
-    vec3 local = vec3(sin(declination) * cos(azimuth), sin(declination) * sin(azimuth),
-                      cos(declination));
-    spawn.direction = local.x * emitter.axis_x + local.y * emitter.axis_y
-                    + local.z * emitter.axis_z;
-    spawn.speed = emitter.speed + emitter.speed_variation * (2.0 * aim.z - 1.0);
-
-    vec4 born = particle_random(emitter.seed, slot, generation, PARTICLE_STREAM_BIRTH);
-    spawn.offset = emitter.spread_x * (2.0 * born.x - 1.0) * emitter.axis_x
-                 + emitter.spread_y * (2.0 * born.y - 1.0) * emitter.axis_y
-                 + emitter.spread_z * (2.0 * born.z - 1.0) * emitter.axis_z;
-    return spawn;
-}
-
-// How wide a particle is drawn at `age`, as a fraction of the emitter's own size.
-//
-// `NiParticleGrowFade`, which 245 of the 272 files that emit anything carry: in over `grow`
-// seconds, out over `fade`, and full size in between. The twenty-seven without it are full size for
-// their whole life, which is what a grow and a fade of zero come out as here.
-float particle_ramp(Emitter emitter, float age, float life) {
-    float rising = emitter.grow > 0.0 ? clamp(age / emitter.grow, 0.0, 1.0) : 1.0;
-    float falling = emitter.fade > 0.0 ? clamp((life - age) / emitter.fade, 0.0, 1.0) : 1.0;
-    return rising * falling;
-}
-
-// The emitter's colour ramp at `fraction` of a life, which is where a puff of smoke goes out.
-//
-// Two linear segments, which reproduces the shipped ramps exactly rather than approximating them:
-// every one of the game's 85 is three linear keys, and their middle key sits anywhere from a
-// twentieth of a life to nine tenths of one.
+// Two linear segments. For smoke that is the file's own ramp, which is an albedo; for fire it is
+// the blackbody one the host built out of the gas temperature.
 vec4 particle_tint(Emitter emitter, float fraction) {
     if (fraction < emitter.ramp_mid) {
         return mix(emitter.ramp[0], emitter.ramp[1], fraction / max(emitter.ramp_mid, 1e-4));
@@ -104,106 +200,171 @@ vec4 particle_tint(Emitter emitter, float fraction) {
                (fraction - emitter.ramp_mid) / max(1.0 - emitter.ramp_mid, 1e-4));
 }
 
+// Reads the plume at a world position. `burning` shapes it as a flame rather than as smoke.
+Inside plume_at(Emitter emitter, vec3 world, float time, bool burning) {
+    float height = emitter.height;
+    // **Gravity bends the plume rather than tilting it**, which is what a parabola looks like: a
+    // parcel that has risen twice as far has been falling twice as long, so the sideways carry goes
+    // as the square. Taken out of the position before the plume is read, so everything below is
+    // about a straight column.
+    vec3 offset = world - emitter.origin;
+    float up = dot(offset, emitter.axis);
+    float risen = up / height;
+    if (risen <= 0.0 || risen >= 1.0) {
+        return Inside(0.0, 0.0);
+    }
+    offset -= emitter.drop * (risen * risen);
+
+    // A teardrop for fire and an opening cone for smoke — see `FLAME_NECK` and `Emitter::flare`.
+    float radius = burning
+                 ? emitter.foot * mix(FLAME_NECK, 1.0, smoothstep(0.0, FLAME_BELLY, risen))
+                                * mix(1.0, FLAME_TIP, smoothstep(FLAME_BELLY, 1.0, risen))
+                 : emitter.foot + up * emitter.flare;
+
+    // A stable pair of axes across the plume. Built from the emitter's own rather than passed,
+    // because only the direction it leaves in means anything and the turn about that is arbitrary.
+    vec3 sideways = normalize(cross(emitter.axis,
+                                    abs(emitter.axis.z) < 0.99 ? vec3(0.0, 0.0, 1.0)
+                                                               : vec3(1.0, 0.0, 0.0)));
+    vec3 other = cross(emitter.axis, sideways);
+
+    // Where this height's slice of the plume has wandered to, in that cross-section.
+    float bend = (up - height * time / emitter.lifetime) * (PLUME_BENDS / height);
+    vec2 lean = (vec2(plume_noise(vec3(bend, 11.3, 4.1)), plume_noise(vec3(bend, 27.7, 8.9))) - 0.5)
+              * (PLUME_WANDER * radius * risen);
+
+    vec2 across = vec2(dot(offset, sideways), dot(offset, other)) - lean;
+    float shape = (1.0 - smoothstep(PLUME_CORE, 1.0, length(across) / radius))
+                * smoothstep(0.0, PLUME_FOOT, risen)
+                * (1.0 - smoothstep(burning ? PLUME_HEAD_FLAME : PLUME_HEAD, 1.0, risen));
+    if (shape <= 0.0) {
+        return Inside(risen, 0.0);
+    }
+
+    // **The noise rises with the gas**, which is the whole of the animation: subtracting the drift
+    // from the sampled position leaves a field static in the plume's own frame, so the eddies
+    // travel upward at exactly the speed the file says the parcels do. One subtraction, and nothing
+    // is kept between frames.
+    // **The noise rises with the gas.** Height over lifetime is the speed the file gives it, and
+    // subtracting the distance travelled from the sampled position leaves a field that is static in
+    // the plume's own frame — so every eddy climbs at exactly that speed for one subtraction, and
+    // nothing is kept between frames.
+    vec3 drift = emitter.axis * (height * time / emitter.lifetime);
+    float roil = plume_fbm((world - drift) * (PLUME_EDDIES / height));
+    // **Stretched, because value noise does not use its own range.** Three octaves of it pile up
+    // around the middle and almost never reach either end, so the erosion below would have almost
+    // nothing to bite on. This is what puts the contrast back.
+    roil = clamp((roil - PLUME_FLOOR) / (PLUME_CEILING - PLUME_FLOOR), 0.0, 1.0);
+    // **Eroded rather than dimmed, which is the difference between a flame and a triangle.**
+    // Multiplying the shape by the noise leaves the shape's own outline standing and only varies
+    // what is inside it, so a tapered plume reads as a smooth cone however much detail is painted
+    // within. Subtracting instead makes the noise decide where the plume *ends*: a place the noise
+    // is thin needs the shape to be thick to survive at all, so the edge comes apart into tongues
+    // and the silhouette stops being the shape's.
+    //
+    // Subtracted and not renormalised, which the first attempt did: dividing by the noise again
+    // pushes everything the erosion did not remove to full density, and the flame came back as a
+    // ragged *column* with no grade left inside it.
+    return Inside(risen, max(shape - PLUME_EROSION * (1.0 - roil), 0.0));
+}
+
+// What is left of the sun by the time it reaches `world` through the plume itself.
+float plume_shadow(Emitter emitter, vec3 world, float time, float height) {
+    vec3 toward = -frame.sun_direction;
+    float step = height / float(PLUME_LIGHT_STEPS);
+    float depth = 0.0;
+    for (uint i = 0u; i < PLUME_LIGHT_STEPS; ++i) {
+        depth += plume_at(emitter, world + toward * (step * (float(i) + 0.5)), time, false).density
+               * step;
+    }
+    return exp(-SMOKE_DEPTH * depth / height);
+}
+
+// Henyey-Greenstein, with the `1/4pi` left to the caller's own normalisation.
+float plume_phase(float cosine) {
+    float g = SMOKE_ANISOTROPY;
+    float denominator = 1.0 + g * g - 2.0 * g * cosine;
+    return (1.0 - g * g) / max(denominator * sqrt(denominator), 1e-4);
+}
+
 // Everything one emitter puts along the ray, added into `colour` and taken out of `through`.
-void emitter_along(Emitter emitter, vec3 origin, vec3 direction, float span, vec3 right, vec3 up,
+void emitter_along(Emitter emitter, vec3 origin, vec3 direction, float span, uvec2 pixel,
                    inout vec3 colour, inout float through) {
+    // The segment of the ray inside the emitter's bounding sphere, which is the only part of it
+    // that can hold anything.
     vec3 to = emitter.origin - origin;
-    // The emitter's whole reach against the segment the ray actually covers — which is why this is
-    // clamped rather than taken at the unconstrained nearest approach: an emitter behind the eye,
-    // or behind the surface the ray already hit, is not on the ray at all.
-    float nearest = clamp(dot(to, direction), 0.0, span);
-    if (distance(to, direction * nearest) > emitter.reach) {
+    float along = dot(to, direction);
+    float perpendicular = dot(to, to) - along * along;
+    float radius = emitter.reach * emitter.reach;
+    if (perpendicular > radius) {
+        return;
+    }
+    float half_chord = sqrt(max(radius - perpendicular, 0.0));
+    float enter = max(along - half_chord, 0.0);
+    float leave = min(along + half_chord, span);
+    if (leave <= enter) {
         return;
     }
 
-    uint id = materials[emitter.material].base_colour;
-    if (id == NO_TEXTURE) {
-        return;
-    }
-    uint slot = colour_slot(id);
-    float texels = float(textureSize(textures[nonuniformEXT(slot)], 0).x);
+    float height = emitter.height;
+    float step = (leave - enter) / float(PLUME_STEPS);
+    // **Dithered per pixel and not per frame.** Marching from the same offset in every pixel draws
+    // the bounding sphere's own shells across the plume; offsetting each pixel breaks them up. What
+    // it must not do is *move*: this layer is handed to the upscaler to composite rather than to
+    // denoise, so anything reseeded every frame stays in the picture as crawling static instead of
+    // being averaged away. A hash of the pixel alone is a fixed pattern, which the upscaler's own
+    // sub-pixel jitter then walks across and resolves — the same argument `hash` itself makes.
+    float jitter = unit_pair(hash(uvec4(pixel, emitter.seed, 0x5EEDu))).x;
+    bool burning = emitter.additive > 0.0;
+    float phase = burning ? 0.0 : plume_phase(dot(direction, -frame.sun_direction));
 
-    for (uint index = 0u; index < emitter.count; ++index) {
-        Spawn spawn = particle_spawn(emitter, index, frame.time);
-        float radius = 0.5 * emitter.size * particle_ramp(emitter, spawn.age, spawn.life);
-        if (radius <= 0.0) {
+    for (uint i = 0u; i < PLUME_STEPS; ++i) {
+        if (through < 0.01) {
+            break;
+        }
+        vec3 at = origin + direction * (enter + step * (float(i) + jitter));
+        Inside inside = plume_at(emitter, at, frame.time, burning);
+        if (inside.density <= 0.0) {
             continue;
         }
-        // A parabola, taken whole rather than stepped: constant acceleration has a closed form and
-        // integrating it per frame would only add drift.
-        vec3 centre = emitter.origin + spawn.offset
-                    + spawn.direction * (spawn.speed * spawn.age)
-                    + 0.5 * emitter.gravity * spawn.age * spawn.age;
+        vec4 over = emitter.colour * particle_tint(emitter, inside.risen);
+        // **The same integrator for both, and only the source term differs.** What a step adds is
+        // whatever it holds times the fraction of the ray that step stops, and what it takes away
+        // is the rest — which is the emission-absorption equation written once. Sampling the source
+        // at a point and multiplying by the step length instead is what makes a march brighten as
+        // it gets finer; this is the same answer at any step count.
+        float depth = burning ? FLAME_DEPTH : SMOKE_DEPTH;
+        float extinction = inside.density * over.a * depth / height;
+        float leaving = exp(-extinction * step);
 
-        vec3 relative = centre - origin;
-        float distance_along = dot(relative, direction);
-        if (distance_along <= 0.0 || distance_along >= span) {
-            continue;
-        }
-        vec3 offset = relative - direction * distance_along;
-        // A square rather than a disc: the sprite is a quad and its texture is painted to the
-        // corners, so a circular test would throw away the parts of a flame that are furthest out.
-        float turn = emitter.spin * spawn.age;
-        vec2 local = vec2(dot(offset, right), dot(offset, up));
-        local = vec2(local.x * cos(turn) - local.y * sin(turn),
-                     local.x * sin(turn) + local.y * cos(turn));
-        if (max(abs(local.x), abs(local.y)) >= radius) {
-            continue;
-        }
-
-        // The sprite covers `2 * radius` across at `distance_along`, and a pixel covers
-        // `cone_spread * distance_along` — so the ratio is how many texels fall in a pixel.
-        float footprint = frame.cone_spread * distance_along;
-        float lod = log2(max(footprint / (2.0 * radius) * texels, 1.0));
-        vec2 uv = 0.5 + 0.5 * local / radius;
-        vec4 texel = textureLod(textures[nonuniformEXT(slot)], uv, lod);
-        vec4 over = emitter.colour * particle_tint(emitter, spawn.age / spawn.life);
-        float alpha = clamp(texel.a * over.a * materials[emitter.material].opacity, 0.0, 1.0);
-        if (alpha <= 0.0) {
-            continue;
-        }
-        vec3 tint = texel.rgb * over.rgb;
-
-        // **What adds does not occlude, and that is the whole reason it needs no sorting.** An
-        // additive sprite leaves the frame behind it whole and piles its own light on top, so the
-        // order these arrive in cannot change the sum — which is what makes an unsorted walk of a
-        // flame exact rather than approximate. A puff of smoke is the other case: it covers what is
-        // behind it, so it takes the transmittance down and shows the room's own light back.
-        //
-        // **No gain on either, deliberately.** The blend the file asks for is `SRC_ALPHA, ONE` on
-        // 473 of the game's 678 emitters, which says exactly this much and no more — the texel *is*
-        // the radiance, so a flame comes out sixty times the mean of the room it stands in, because
-        // that is what a flame is, and the exposure downstream decides where it lands. A puff is
-        // the same argument with the ramp's own colour standing in for an albedo, the way §8.87
-        // gives ash a seventh: what a grain sends back is what the room sent it.
-        if (emitter.additive > 0.0) {
-            colour += tint * alpha;
+        vec3 source;
+        if (burning) {
+            // A flame's ramp is a blackbody's: the colour is the temperature of the gas, and the
+            // fall toward the top is the fourth power of it.
+            source = over.rgb * FLAME_RADIANCE;
         } else {
-            colour += tint * frame.ambient * (alpha * through);
-            through *= 1.0 - alpha;
+            // **And smoke is lit rather than glowing.** What it sends to the eye is the sun through
+            // whatever of itself stands in the way, thrown forward by the phase function, plus the
+            // sky from every direction at once.
+            float sunlit = plume_shadow(emitter, at, frame.time, height);
+            float powder = 1.0 - exp(-SMOKE_POWDER * inside.density);
+            source = over.rgb
+                   * (frame.sun_colour * (INV_PI * phase * sunlit * powder) + frame.ambient);
         }
+        colour += source * (through * (1.0 - leaving));
+        through *= leaving;
     }
 }
 
 // Everything every emitter puts along the ray: premultiplied colour, and what is left of the ray.
 //
 // Matches `precipitation_along`, which the caller sums with — see the note there.
-vec4 particles_along(vec3 origin, vec3 direction, float span) {
+vec4 particles_along(vec3 origin, vec3 direction, float span, uvec2 pixel) {
     vec3 colour = vec3(0.0);
     float through = 1.0;
-    if (frame.emitter_count == 0u) {
-        return vec4(colour, through);
-    }
-    // One basis for the whole ray, so a sprite is square to the screen rather than to the world.
-    // Built off the ray instead of the camera because the two differ by less than a pixel of turn
-    // and this needs no matrix.
-    vec3 right = normalize(cross(direction, abs(direction.z) < 0.99 ? vec3(0.0, 0.0, 1.0)
-                                                                   : vec3(1.0, 0.0, 0.0)));
-    vec3 up = cross(right, direction);
-
     uint count = min(frame.emitter_count, EMITTER_LIMIT);
     for (uint index = 0u; index < count; ++index) {
-        emitter_along(emitters[index], origin, direction, span, right, up, colour, through);
+        emitter_along(emitters[index], origin, direction, span, pixel, colour, through);
     }
     return vec4(colour, through);
 }

@@ -3,9 +3,25 @@
 use glam::{Affine3A, Vec3, Vec4};
 use rtxmw_nif::{Block, ColourKey, NifFile, ParticleEffect, ParticleSystem};
 
+use crate::blackbody;
 use crate::material::Properties;
-use crate::material_table::MaterialTable;
 use crate::rig;
+
+/// What a flame is at its hottest and at its coldest, in kelvin.
+///
+/// **A flame's colour is its temperature, and the game has no say in it.** The shipped art paints
+/// fire as a photograph — `tx_firealpha10` is a pinkish tan puff, which is what a camera at some
+/// unrecorded exposure made of it — so there is nothing in the file to be faithful to, and the
+/// thing that *is* true of a flame is how hot it is. A candle's envelope runs about 1800 K where
+/// the fuel burns and falls to around 1100 K by the time the gas has risen and cooled to where it
+/// stops glowing.
+///
+/// **The fade comes out of the same number.** A blackbody radiates as the fourth power of its
+/// temperature, so the tip at 1100 K sends out `(1100/1800)^4` — a seventh — of what the base does,
+/// and a flame goes out at the top without anything being asked to fade it. See
+/// [`blackbody::colour`], which gives the hue at unit brightness so this can supply the level.
+const FLAME_HOT: f32 = 1800.0;
+const FLAME_COOL: f32 = 1100.0;
 
 /// How deep a modifier chain is followed before it is called a cycle.
 ///
@@ -39,7 +55,6 @@ pub struct ParticleEmitter {
     pub declination: f32,
     pub declination_variation: f32,
     pub azimuth: f32,
-    pub azimuth_variation: f32,
     /// What every particle is tinted by, over its texture.
     pub colour: Vec4,
     /// The tint again, keyed over a life: at birth, at [`ramp_mid`], and at death.
@@ -57,22 +72,11 @@ pub struct ParticleEmitter {
     pub ramp_mid: f32,
     /// How wide one is drawn at its fullest, in world units.
     pub size: f32,
-    /// Particles born a second, and how long one lives.
-    pub birth_rate: f32,
+    /// How long a parcel lives, which with the speed is how far the plume reaches.
     pub lifetime: f32,
     pub lifetime_variation: f32,
-    /// How many are alive at once — the budget the file was authored against, which for a candle is
-    /// `birth_rate * lifetime` to within a particle.
-    pub capacity: u32,
     /// Constant acceleration, in world units a second squared.
     pub gravity: Vec3,
-    /// Seconds it takes to reach full size, and seconds it takes to vanish at the end.
-    pub grow: f32,
-    pub fade: f32,
-    /// How fast a sprite turns on the screen, in radians a second.
-    pub spin: f32,
-    /// The material it is drawn with, which is where its texture comes from.
-    pub material: u32,
     /// Whether it *adds* to the frame rather than covering it — see [`rtxmw_nif::AlphaProperty`].
     ///
     /// The whole of the difference between a flame and a puff of smoke, and it decides both how the
@@ -89,7 +93,7 @@ impl ParticleEmitter {
     /// placement and no vertices at all, so the two share no answer that could disagree. What it
     /// does need that a single walk cannot give is the *emitter* node's placement, which is
     /// somewhere else in the graph entirely and may be visited long after the system naming it.
-    pub(crate) fn collect(nif: &NifFile, materials: &mut MaterialTable, out: &mut Vec<Self>) {
+    pub(crate) fn collect(nif: &NifFile, out: &mut Vec<Self>) {
         let mut places = vec![None; nif.blocks().len()];
         let mut found: Vec<(usize, Properties)> = Vec::new();
         for &root in nif.roots() {
@@ -117,7 +121,6 @@ impl ParticleEmitter {
             else {
                 continue;
             };
-            let material = properties.resolve(nif, materials);
             let mut emitter = Self {
                 placement,
                 spread: Vec3::from_array(system.spread),
@@ -126,25 +129,19 @@ impl ParticleEmitter {
                 declination: system.declination,
                 declination_variation: system.declination_variation,
                 azimuth: system.azimuth,
-                azimuth_variation: system.azimuth_variation,
                 colour: Vec4::from_array(system.colour),
                 ramp: [Vec4::ONE; 3],
                 ramp_mid: 0.5,
                 size: system.size,
-                birth_rate: system.birth_rate,
                 lifetime: system.lifetime,
                 lifetime_variation: system.lifetime_variation,
-                capacity: u32::from(system.capacity),
                 gravity: Vec3::ZERO,
-                // No ramp at all is a particle that is full size for its whole life, which is what
-                // the twenty-seven emitters carrying no `NiParticleGrowFade` mean.
-                grow: 0.0,
-                fade: 0.0,
-                spin: 0.0,
-                material: materials.intern(material),
                 additive: properties.adds(nif),
             };
             emitter.absorb_modifiers(nif, system);
+            if emitter.additive {
+                emitter.burn();
+            }
             if emitter.is_drawable() {
                 out.push(emitter);
             }
@@ -169,10 +166,9 @@ impl ParticleEmitter {
                 }
                 // A pull towards a point, which nothing shipped uses.
                 ParticleEffect::Gravity(_) => {}
-                ParticleEffect::GrowFade { grow, fade } => {
-                    self.grow = grow;
-                    self.fade = fade;
-                }
+                // The size ramp and the spin shaped a *sprite*; a plume is shaped by its own
+                // profile and roiled by noise, so neither has anything to say here.
+                ParticleEffect::GrowFade { .. } => {}
                 ParticleEffect::Colour { keys } => {
                     if let Some(Block::Colour(track)) = nif.resolve(keys)
                         && !track.keys.is_empty()
@@ -183,10 +179,29 @@ impl ParticleEmitter {
                         self.ramp = [0.0, self.ramp_mid, 1.0].map(|at| sample(&track.keys, at));
                     }
                 }
-                ParticleEffect::Rotation { speed } => self.spin = speed,
+                ParticleEffect::Rotation { .. } => {}
             }
             link = modifier.next;
         }
+    }
+
+    /// Replaces the ramp with what a cooling flame actually radiates.
+    ///
+    /// **Only for what adds to the frame**, which is the classification that already separates fire
+    /// from smoke: 474 of the game's 678 emitters blend `SRC_ALPHA, ONE`, and a thing that adds its
+    /// own light to a room is a thing that is burning. A puff of smoke keeps the file's own ramp,
+    /// which for it is an albedo rather than an emission — see [`Self::ramp`].
+    fn burn(&mut self) {
+        self.ramp = [0.0, 0.5, 1.0].map(|through| {
+            let kelvin = FLAME_HOT + (FLAME_COOL - FLAME_HOT) * through;
+            // **Stefan-Boltzmann against the base, so the ramp carries the fade as well as the
+            // hue.** `blackbody::colour` comes back at unit luminance, so the base is exactly as
+            // bright as an unramped emitter was and only its colour has changed — what the fourth
+            // power adds is how much less the cooler gas at the top is radiating.
+            let power = (kelvin / FLAME_HOT).powi(4);
+            (blackbody::colour(kelvin) * power).extend(1.0)
+        });
+        self.ramp_mid = 0.5;
     }
 
     /// Whether it would put anything on the screen at all.
@@ -195,7 +210,7 @@ impl ParticleEmitter {
     /// divides by zero downstream — so it is dropped here rather than uploaded and skipped per
     /// pixel by every ray in the frame.
     fn is_drawable(&self) -> bool {
-        self.capacity > 0 && self.lifetime > 0.0 && self.size > 0.0 && self.colour.w > 0.0
+        self.lifetime > 0.0 && self.size > 0.0 && self.colour.w > 0.0
     }
 
     /// The same emitter placed into the world by a cell reference.
@@ -323,33 +338,27 @@ mod tests {
 
     #[test]
     fn a_candle_emits_one_flame_that_goes_straight_up_and_reaches_no_further_than_it_should() {
-        let (Some(vfs), mut materials) =
-            (rtxmw_vfs::morrowind_archives(), MaterialTable::default())
-        else {
+        let Some(vfs) = rtxmw_vfs::morrowind_archives() else {
             eprintln!("skipping: the game is not installed");
             return;
         };
         let bytes = vfs.read(CANDLE).expect("the candle should read");
         let nif = NifFile::parse(&bytes).expect("it should parse");
         let mut found = Vec::new();
-        ParticleEmitter::collect(&nif, &mut materials, &mut found);
+        ParticleEmitter::collect(&nif, &mut found);
 
         assert_eq!(found.len(), 1, "a candle has one flame");
         let flame = found[0];
-        assert_eq!(flame.capacity, 22);
         assert_eq!(flame.size, 2.5);
         assert!(
             flame.additive,
-            "a flame adds to the frame rather than covering it"
+            "a flame adds its own light rather than covering the room"
         );
         assert_eq!(flame.declination, 0.0, "it goes straight up");
 
-        // **How far a particle gets, computed rather than guessed**: no spread to be born across,
-        // 5.2 units a second for 0.67 of one is 3.48, and half of a 2.5-wide sprite is another
-        // 1.25 — so 4.73, and nothing beyond that sphere can be part of this candle.
-        // **How far a particle gets, computed rather than guessed**: nothing to be born across,
-        // 5.25 units a second for two thirds of one is 3.5, and half of a 2.5-wide sprite is
-        // another 1.25 — so 4.75, and nothing outside that sphere can belong to this candle.
+        // **How far a parcel gets, computed rather than guessed**: nothing to be born across, and
+        // 5.25 units a second for two thirds of one is 3.5 — plus half of a 2.5-wide parcel, so
+        // 4.75, and nothing outside that sphere can belong to this candle.
         assert_eq!(flame.speed, 5.25);
         assert_eq!(flame.lifetime, 2.0 / 3.0);
         assert_eq!(flame.spread, Vec3::ZERO);
@@ -360,10 +369,21 @@ mod tests {
             flame.reach()
         );
 
-        // No colour ramp on it — every one of the game's belongs to something alpha-blended — so
-        // the tint is flat and the shape comes from the size ramp alone.
-        assert_eq!(flame.ramp, [Vec4::ONE; 3]);
-        assert_eq!(flame.fade, 2.0);
+        // **And its colour is its temperature.** The file's own ramp is replaced for anything that
+        // burns — see `ParticleEmitter::burn` — so what is here is a blackbody cooling from 1800 K
+        // at the wick to 1100 K where it stops glowing. Every stop is red over green over nothing,
+        // because sRGB has no red deep enough for a flame and clamps the blue away entirely.
+        for stop in flame.ramp {
+            assert!(
+                stop.x > stop.y && stop.z == 0.0,
+                "a flame stop came out {stop}"
+            );
+        }
+        // Stefan-Boltzmann is what fades it: `(1100/1800)^4` is 0.1395, so the tip radiates a
+        // seventh of what the wick does without anything being told to fade.
+        let luminance = |stop: Vec4| stop.truncate().dot(Vec3::new(0.2126, 0.7152, 0.0722));
+        assert!((luminance(flame.ramp[0]) - 1.0).abs() < 0.01);
+        assert!((luminance(flame.ramp[2]) - 0.1395).abs() < 0.01);
 
         // **Placed, it is the same flame somewhere else.** A cell reference is a rotation and a
         // translation, and what has to survive both is that the flame still leaves along the

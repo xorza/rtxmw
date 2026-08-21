@@ -128,46 +128,33 @@ layout(set = 0, binding = 16, scalar) readonly buffer LightGridIndices {
 layout(set = 0, binding = 17, rgba16f) uniform writeonly image2D transparency_target;
 layout(set = 0, binding = 18, r16f) uniform writeonly image2D transparency_opacity_target;
 
-// One emitter, as the host builds it — see `GpuEmitter`. Every particle it draws is a closed form
-// in this and the clock; there is no per-particle state anywhere. See `particles.glsl`.
+// One plume, as the host builds it — see `GpuEmitter`. Every number here comes out of the game's
+// own `NiParticleSystemController`; what it draws with does not. See `particles.glsl`.
 struct Emitter {
     vec3 origin;
-    // How far a particle can get from that origin, which is the sphere a ray rejects it by.
+    // How far anything can get from that origin, which is the sphere a ray rejects it by.
     float reach;
-    // The emitter's own axes in world space, each carrying half the width of the box a particle is
-    // born across along it.
-    vec3 axis_x;
-    float spread_x;
-    vec3 axis_y;
-    float spread_y;
-    vec3 axis_z;
-    float spread_z;
-    vec3 gravity;
-    float speed;
-    float speed_variation;
-    // A polar angle off `axis_z` and an azimuth about it, each with the half-width it varies by.
-    float declination;
-    float declination_variation;
-    float azimuth;
-    float azimuth_variation;
+    // The direction parcels actually leave in, unit length — the emission cone's axis and not the
+    // node's, since six of the game's vents point straight down.
+    vec3 axis;
+    // How wide the plume is where it leaves, in world units.
+    float foot;
+    // Where gravity has carried a parcel by the end of its life.
+    vec3 drop;
+    // How far a parcel gets before its life runs out, and how long that takes — which together
+    // are the speed the noise is advected upward at.
+    float height;
+    float lifetime;
     vec4 colour;
-    // The tint keyed over a life: at birth, at `ramp_mid`, and at death. Three keys and linear,
-    // which is exactly what every one of the game's colour ramps is.
+    // The tint keyed over the rise: at the foot, at `ramp_mid`, and at the top. An albedo for
+    // smoke; a blackbody's own colours for fire.
     vec4 ramp[3];
     float ramp_mid;
-    float size;
-    float lifetime;
-    float lifetime_variation;
-    // Seconds to reach full size, and seconds to vanish at the end.
-    float grow;
-    float fade;
-    float spin;
-    uint count;
-    uint material;
-    // One where it adds to the frame rather than covering it, which is the whole of the difference
-    // between a flame and a puff of smoke.
+    // How fast a plume of smoke opens with height, as a tangent.
+    float flare;
+    // One where it burns rather than being lit.
     float additive;
-    // What separates one emitter's hash stream from the next, so two candles do not flicker as one.
+    // What separates one emitter's noise from the next.
     uint seed;
 };
 

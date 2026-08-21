@@ -155,14 +155,8 @@ pub(crate) fn cell_named(argument: &str) -> CellId {
 /// was removed, so a small count is expected and a large one means the path fixups have drifted.
 pub(crate) fn describe(cell: &LoadedCell) -> String {
     let missing = cell.missing_textures();
-    let particles: u32 = cell
-        .scene
-        .emitters
-        .iter()
-        .map(|emitter| emitter.capacity)
-        .sum();
     format!(
-        "{}: {} meshes, {} instances ({} animated), {} lights, {} emitters ({particles} particles), \
+        "{}: {} meshes, {} instances ({} animated), {} lights, {} emitters, \
          {} textures ({missing} missing)",
         cell.id,
         cell.scene.meshes.len(),

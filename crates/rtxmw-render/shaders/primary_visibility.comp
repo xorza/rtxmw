@@ -191,7 +191,7 @@ void main() {
     // and their transmittances multiply, which is exact wherever they do not overlap — and they
     // very nearly never do, since what emits is indoors or at a forge and what falls is weather.
     vec4 burning = particles_along(frame.camera_position, direction,
-                                   surface.hit ? surface.t : FOG_REACH);
+                                   surface.hit ? surface.t : FOG_REACH, pixel);
     vec4 layer = vec4(falling.xyz + burning.xyz, falling.w * burning.w);
     imageStore(transparency_target, ivec2(pixel), vec4(layer.xyz, 1.0 - layer.w));
     imageStore(transparency_opacity_target, ivec2(pixel), vec4(1.0 - layer.w));

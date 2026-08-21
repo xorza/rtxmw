@@ -1,116 +1,102 @@
-//! One particle emitter, as the shader reads it.
+//! One plume, as the shader marches it.
 
 use bytemuck::{Pod, Zeroable};
 use glam::Vec3;
 use rtxmw_scene::ParticleEmitter;
 
-/// How many of an emitter's slots a ray actually walks.
+/// How far a plume of smoke opens as it rises, at the least — see `PLUME_FLARE` in the shader.
 ///
-/// **The budget the file was authored against is not always one worth drawing.** Half the shipped
-/// emitters ask for thirty or fewer and nine in ten for two hundred; what is above that is
-/// `ashcloud.nif` at 7,412, which is drawn analytically as weather instead (§8.87), and Akulakhan's
-/// heart. Capping the walk thins those two rather than distorting them: the slots carry independent
-/// phases, so the first two hundred and fifty-six are spread evenly through the emitter's life
-/// exactly as the whole set would be.
-pub(crate) const PARTICLE_LIMIT: u32 = 256;
+/// A vent's declination variation is a tenth of a radian, which over three units of rise is a third
+/// of a unit: narrower than the plume is at its foot. The floor is what gives smoke the shape of a
+/// plume rather than of a column.
+const LEAST_FLARE: f32 = 0.22;
 
-/// One emitter, laid out for `scalar` block layout — see `struct Emitter` in `particles.glsl`.
+/// One emitter reduced to the plume it describes, laid out for `scalar` block layout — see
+/// `struct Emitter` in `bindings.glsl`.
 ///
-/// **Every particle is derived from this and the clock, and nothing else is stored.** There is no
-/// per-particle state anywhere: slot `i` of an emitter is a closed form in its own hash and the
-/// time, so there is nothing to simulate, nothing to step, and nothing to allocate on a frame. That
-/// is the same bargain `precipitation.glsl` makes with its lattice and for the same reason — see
-/// `docs/design.md` §8.99.
+/// **The file's numbers, not the file's drawing.** Everything here comes out of a
+/// `NiParticleSystemController`: where it is, which way it lets go, how fast, how long a parcel
+/// lives, how wide it opens and what colour it is. What it does *not* carry is the sprite the game
+/// drew with, the count of them, the rate they were born at or the texture — a volume needs none of
+/// those, and the texture is a photograph of fire at an unrecorded exposure that had no business
+/// deciding what a flame looks like. `docs/design.md` §8.103.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable)]
 pub(crate) struct GpuEmitter {
-    /// Where particles are born, in world space.
+    /// Where the plume starts, in world space.
     pub(crate) origin: [f32; 3],
-    /// How far one can get from that origin, which is the sphere a ray rejects the emitter by.
+    /// How far anything can get from that origin, which is the sphere a ray rejects it by.
     pub(crate) reach: f32,
-    /// The emitter's own axes in world space: declination is measured off `axis_z`, azimuth about
-    /// it, and the birth box is stated in all three.
-    pub(crate) axis_x: [f32; 3],
-    /// Half the width of the box a particle is born across, along `axis_x`, and so on.
-    pub(crate) spread_x: f32,
-    pub(crate) axis_y: [f32; 3],
-    pub(crate) spread_y: f32,
-    pub(crate) axis_z: [f32; 3],
-    pub(crate) spread_z: f32,
-    /// Constant acceleration, world units a second squared.
-    pub(crate) gravity: [f32; 3],
-    /// How fast one leaves, and the half-width that varies by.
-    pub(crate) speed: f32,
-    pub(crate) speed_variation: f32,
-    pub(crate) declination: f32,
-    pub(crate) declination_variation: f32,
-    pub(crate) azimuth: f32,
-    pub(crate) azimuth_variation: f32,
-    /// The tint over the texture, and how much of it there is.
+    /// The direction parcels actually leave in, unit length.
+    ///
+    /// **The emission cone's own axis and not the node's.** Declination and azimuth turn the
+    /// emitter's `+Z` into where the gas goes, and six of the game's vents point straight down —
+    /// `xact_sotha_steam00` is `pi` off its axis — so a plume built along the node's `+Z` would
+    /// send their steam up through the ceiling.
+    pub(crate) axis: [f32; 3],
+    /// How wide the plume is where it leaves, in world units.
+    pub(crate) foot: f32,
+    /// Where gravity has carried a parcel by the end of its life, in world units.
+    ///
+    /// Folded into a displacement here rather than left as an acceleration, because the shader
+    /// knows how far up the plume it is and not how long that took.
+    pub(crate) drop: [f32; 3],
+    /// How far a parcel gets before its life runs out, in world units.
+    pub(crate) height: f32,
+    /// How long that takes, in seconds — the file's own lifetime.
+    ///
+    /// **The clock the noise is advected on.** Height over lifetime is the speed the gas rises at,
+    /// and reading the field at a position that falls back at exactly that rate is the whole of the
+    /// animation: the eddies climb as fast as the file says the parcels do, and nothing is kept
+    /// between frames.
+    pub(crate) lifetime: f32,
+    /// What every parcel is tinted by, over the ramp below.
     pub(crate) colour: [f32; 4],
-    /// The tint keyed over a life — at birth, at `ramp_mid`, and at death. Three keys because every
-    /// one of the game's is three, and linear because every one of them is linear.
+    /// The tint keyed over the rise — at the foot, at `ramp_mid`, and at the top. For smoke that is
+    /// the file's own ramp, which is an albedo; for fire it is the blackbody one the host built out
+    /// of the temperature of the gas.
     pub(crate) ramp: [[f32; 4]; 3],
     pub(crate) ramp_mid: f32,
-    /// How wide one is drawn at its fullest, in world units.
-    pub(crate) size: f32,
-    /// How long one lives, and the half-width that varies by.
-    pub(crate) lifetime: f32,
-    pub(crate) lifetime_variation: f32,
-    /// Seconds to reach full size, and seconds to vanish, as fractions of a life.
-    pub(crate) grow: f32,
-    pub(crate) fade: f32,
-    /// How fast the sprite turns, in radians a second.
-    pub(crate) spin: f32,
-    /// How many slots to walk — the emitter's own capacity, held under [`PARTICLE_LIMIT`].
-    pub(crate) count: u32,
-    /// Which material it draws with, which is where the shader finds its texture.
-    pub(crate) material: u32,
-    /// One where it adds to the frame rather than covering it. A float rather than a flag because
-    /// every use of it is a blend between the two branches.
+    /// How fast a plume of smoke opens with height, as a tangent.
+    pub(crate) flare: f32,
+    /// One where it burns rather than being lit — which decides both the shape it takes and whether
+    /// it emits or scatters.
     pub(crate) additive: f32,
-    /// Distinguishes one emitter's hash stream from the next, so two candles do not flicker
-    /// together. Its index at upload, which is stable for as long as the cell is resident.
+    /// What separates one emitter's noise from the next, so two candles do not flicker as one.
     pub(crate) seed: u32,
 }
 
 impl GpuEmitter {
-    /// Flattens a placed emitter into the form a ray reads.
+    /// Flattens a placed emitter into the plume a ray marches.
     ///
-    /// **The model's scale rides into the particles rather than beside them.** A half-size brazier
-    /// is a half-size flame moving half as fast over half the distance, and folding that in here
-    /// means the shader never has to know a placement had a scale at all.
+    /// **The model's scale rides into the plume rather than beside it.** A half-size brazier is a
+    /// half-size flame rising half as far, and folding that in here means the shader never has to
+    /// know a placement had a scale at all.
     pub(crate) fn new(emitter: &ParticleEmitter, seed: u32) -> Self {
         let scale = emitter.scale();
-        let axis = |column: Vec3| (column / scale.max(1e-6)).to_array();
-        let basis = emitter.placement.matrix3;
+        let basis = emitter.placement.matrix3 / scale.max(1e-6);
+        // Declination off the emitter's own `+Z`, azimuth about it — the format's own convention.
+        let (declination, azimuth) = (emitter.declination, emitter.azimuth);
+        let local = Vec3::new(
+            declination.sin() * azimuth.cos(),
+            declination.sin() * azimuth.sin(),
+            declination.cos(),
+        );
+        let axis = (basis * local).normalize_or(Vec3::Z);
+        let lifetime = emitter.lifetime.max(1e-3);
         Self {
             origin: emitter.placement.translation.into(),
             reach: emitter.reach(),
-            axis_x: axis(basis.x_axis.into()),
-            spread_x: 0.5 * scale * emitter.spread.x,
-            axis_y: axis(basis.y_axis.into()),
-            spread_y: 0.5 * scale * emitter.spread.y,
-            axis_z: axis(basis.z_axis.into()),
-            spread_z: 0.5 * scale * emitter.spread.z,
-            gravity: emitter.gravity.to_array(),
-            speed: scale * emitter.speed,
-            speed_variation: scale * emitter.speed_variation,
-            declination: emitter.declination,
-            declination_variation: emitter.declination_variation,
-            azimuth: emitter.azimuth,
-            azimuth_variation: emitter.azimuth_variation,
+            axis: axis.to_array(),
+            // As wide as the box parcels are born across, or as one parcel, whichever is more.
+            foot: scale * (0.5 * emitter.spread.length()).max(0.5 * emitter.size),
+            drop: (0.5 * emitter.gravity * lifetime * lifetime).to_array(),
+            height: (scale * emitter.speed * lifetime).max(scale * emitter.size),
+            lifetime,
             colour: emitter.colour.to_array(),
             ramp: emitter.ramp.map(|stop| stop.to_array()),
             ramp_mid: emitter.ramp_mid,
-            size: scale * emitter.size,
-            lifetime: emitter.lifetime,
-            lifetime_variation: emitter.lifetime_variation.min(emitter.lifetime),
-            grow: emitter.grow,
-            fade: emitter.fade,
-            spin: emitter.spin,
-            count: emitter.capacity.min(PARTICLE_LIMIT),
-            material: emitter.material,
+            flare: emitter.declination_variation.tan().max(LEAST_FLARE),
             additive: f32::from(u8::from(emitter.additive)),
             seed,
         }
@@ -121,13 +107,12 @@ impl GpuEmitter {
 mod tests {
     use std::mem::offset_of;
 
-    use glam::{Affine3A, Vec3, Vec4};
+    use glam::{Affine3A, Vec4};
     use rtxmw_scene::ParticleEmitter;
 
     use super::*;
 
-    /// A flame two units wide, born at the origin, leaving straight up at ten units a second for
-    /// one second — so it reaches 10 + 1 = 11 units.
+    /// A flame two units wide leaving straight up at ten units a second for one second.
     fn flame() -> ParticleEmitter {
         ParticleEmitter {
             placement: Affine3A::IDENTITY,
@@ -137,63 +122,66 @@ mod tests {
             declination: 0.0,
             declination_variation: 0.0,
             azimuth: 0.0,
-            azimuth_variation: 0.0,
             colour: Vec4::ONE,
             ramp: [Vec4::ONE; 3],
             ramp_mid: 0.5,
             size: 2.0,
-            birth_rate: 10.0,
             lifetime: 1.0,
             lifetime_variation: 0.0,
-            capacity: 10,
             gravity: Vec3::ZERO,
-            grow: 0.0,
-            fade: 0.0,
-            spin: 0.0,
-            material: 0,
             additive: true,
         }
     }
 
     #[test]
     fn the_emitter_matches_the_layout_the_shader_declares() {
-        // Fifty-two four-byte fields with nothing between them, which is what `scalar` block
-        // layout gives the shader — see `struct Emitter` in `bindings.glsl`. Every offset below is
-        // a place the two could drift apart without either side failing to compile.
-        assert_eq!(size_of::<GpuEmitter>(), 52 * 4);
+        // Thirty-three four-byte fields with nothing between them, which is what `scalar` block
+        // layout gives the shader. Every offset below is a place the two could drift apart without
+        // either side failing to compile.
+        assert_eq!(size_of::<GpuEmitter>(), 33 * 4);
         assert_eq!(offset_of!(GpuEmitter, reach), 12);
-        assert_eq!(offset_of!(GpuEmitter, axis_x), 16);
-        assert_eq!(offset_of!(GpuEmitter, gravity), 64);
-        assert_eq!(offset_of!(GpuEmitter, colour), 100);
-        assert_eq!(offset_of!(GpuEmitter, ramp), 116);
-        assert_eq!(offset_of!(GpuEmitter, ramp_mid), 164);
-        assert_eq!(offset_of!(GpuEmitter, count), 192);
-        assert_eq!(offset_of!(GpuEmitter, seed), 204);
+        assert_eq!(offset_of!(GpuEmitter, axis), 16);
+        assert_eq!(offset_of!(GpuEmitter, foot), 28);
+        assert_eq!(offset_of!(GpuEmitter, drop), 32);
+        assert_eq!(offset_of!(GpuEmitter, height), 44);
+        assert_eq!(offset_of!(GpuEmitter, lifetime), 48);
+        assert_eq!(offset_of!(GpuEmitter, colour), 52);
+        assert_eq!(offset_of!(GpuEmitter, ramp), 68);
+        assert_eq!(offset_of!(GpuEmitter, ramp_mid), 116);
+        assert_eq!(offset_of!(GpuEmitter, seed), 128);
     }
 
     #[test]
-    fn a_scaled_placement_scales_the_flame_and_leaves_its_axes_alone() {
+    fn a_plume_leaves_along_the_cone_the_file_names_and_scales_with_its_model() {
+        // Ten units a second for one second, and a two-unit sprite: forty units of rise with the
+        // plume one unit wide where it leaves.
         let plain = GpuEmitter::new(&flame(), 0);
-        assert_eq!(plain.reach, 11.0);
-        assert_eq!(plain.axis_z, [0.0, 0.0, 1.0]);
+        assert_eq!(plain.height, 10.0);
+        assert_eq!(plain.foot, 1.0);
+        assert_eq!(plain.axis, [0.0, 0.0, 1.0]);
         assert_eq!(plain.additive, 1.0);
 
-        // **A half-size brazier is a half-size flame**, moving half as fast over half the distance
-        // — so every length halves together and the reach with them, while the axes stay unit
-        // vectors because a direction has no size.
+        // **A vent pointing down sends its steam down.** Six of the game's do — declination is `pi`
+        // off the node's own axis — and a plume built along that axis instead would put their steam
+        // through the ceiling.
+        let mut inverted = flame();
+        inverted.declination = std::f32::consts::PI;
+        let down = GpuEmitter::new(&inverted, 0);
+        assert!(
+            (Vec3::from_array(down.axis) - Vec3::NEG_Z).length() < 1.0e-6,
+            "a vent at pi should point down; it points {:?}",
+            down.axis
+        );
+
+        // **A half-size brazier is a half-size flame**, rising half as far from a foot half as
+        // wide — every length halving together, while the axis stays a unit vector because a
+        // direction has no size.
         let mut small = flame();
         small.placement = Affine3A::from_scale(Vec3::splat(0.5));
         let scaled = GpuEmitter::new(&small, 1);
-        assert_eq!(scaled.speed, 5.0);
-        assert_eq!(scaled.size, 1.0);
-        assert_eq!(scaled.reach, 5.5);
-        assert_eq!(scaled.axis_z, [0.0, 0.0, 1.0]);
+        assert_eq!(scaled.height, 5.0);
+        assert_eq!(scaled.foot, 0.5);
+        assert_eq!(scaled.axis, [0.0, 0.0, 1.0]);
         assert_eq!(scaled.seed, 1);
-
-        // A cap rather than a distortion: the slots carry independent phases, so drawing the first
-        // 256 of a larger set thins the emitter evenly instead of truncating its life.
-        let mut crowded = flame();
-        crowded.capacity = 7_412;
-        assert_eq!(GpuEmitter::new(&crowded, 0).count, PARTICLE_LIMIT);
     }
 }

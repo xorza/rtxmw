@@ -4,6 +4,7 @@
 //! Vulkan, and nothing above it knows about ESM records or NIF blocks.
 
 mod assembled_actor;
+pub mod blackbody;
 mod cell_streamer;
 mod clouds;
 mod door;

@@ -630,9 +630,10 @@ its sync2 stages are what the skinning-to-build and build-to-trace barriers want
    instead of a race field, the face and hair the record names itself, and everything wearable in
    its inventory over the top. What is left is the 273 `CREA` records that are humanoid and
    assembled the same way.
-5. **Particles — done.** §8.99. 678 emitters across 272 files, 120 of them the candles, torches and
-   braziers every interior is full of, drawn in the transparency layer beside the rain as a closed
-   form in a hash and the clock rather than as a simulation. **The rest of the controller family
+5. **Particles — done, then done again.** §8.99 read the game's 678 emitters and drew them as the
+   sprites the game drew; §8.103 keeps the numbers and throws the sprites away, marching a
+   volumetric plume instead — fire as a blackbody at the temperature of the gas, smoke as a
+   participating medium. **The rest of the controller family
    is not**, and the survey in §8.99 is the argument: `NiGeomMorpherController` is 268 facial
    morphs that want dialogue, `NiBillboardNode` is spell effects nothing places, and
    `NiVisController` and `NiAlphaController` want the per-instance clock the rigs already have. The
@@ -3839,3 +3840,132 @@ while a ray sent through it travels far, and with a horizontal surface that comb
 built: the refracted ray is always the steeper one, so both distances go to zero together. Three
 fixtures were tried and all three passed against the unfixed shader, which makes them noise rather
 than tests. The evidence for the fix is the A/B renders and the term visualised at two view angles.
+
+### 8.102 A sprite is a disc, and a puff is lit by the sun
+
+Two faults reported against §8.99, both of them real and both cheap.
+
+**Sprites came out as rectangles.** The silhouette of a particle is in its texture's alpha, and a
+sprite a few pixels across is sampled several levels down its own mip chain — by which point the
+blob the artist painted has been averaged into a nearly flat wash and the only shape left is the
+*square* the quad was cut to. So a spark at any distance read as a little rectangle. Two changes:
+the sprite is tested as a disc rather than as a square, and its rim is tapered over the outer four
+tenths.
+
+**The taper is faded in by how far down the mip chain the sample came from** — none at the top
+level, all of it two levels down, where a four-by-four block has already become one texel. Applied
+everywhere instead it tapers a sprite twice, and the fire visibly dimmed. It costs nothing that was
+painted: every particle texture the game ships is a blob on a transparent border, so the corners it
+removes held nothing.
+
+**And smoke was lit by the sky alone**, which outdoors is a fraction of what actually falls on it —
+a chimney's plume was invisible against a bright sky and read as a dark veil over whatever was
+behind it.
+
+**The units fix the constant, which is why it is not a taste.** `frame.sun_colour` is an
+*irradiance* here: `disc_light` hands a surface `sun_colour * cos` and `shade` turns that into
+radiance with the Lambertian `1/pi`, so a surface square-on to the sun leaves
+`albedo * sun_colour * INV_PI` and that is the yardstick. A puff comes out at very nearly the whole
+of it. An opaque diffuse *sphere* would not — it catches `pi r^2` of the beam and radiates over
+`4 pi r^2`, a quarter of the facing surface — but a puff is neither opaque nor diffuse: it is a
+cloud of droplets that scatters strongly forward and again inside itself, so the sun reaches all of
+it rather than one hemisphere. A sunlit plume is about as bright as a card of the same albedo held
+beside it, which is why steam over a canton reads white and not grey. The sphere's quarter, tried
+first, put a plume back near the sky's own ambient where it had been invisible — and it was written
+without the `1/pi`, so it did not match the model its own comment claimed.
+
+Added unshadowed, and the data is what makes that safe: `sun_colour` is zero for a cell with no sky,
+so a vent in a cave gets none of it without being asked.
+
+**A fixture can hide a bug by being too simple.** The first attempt at the disc test passed against
+the unfixed shader: with a particle that never moves, the emitter's own bounding sphere — the thing
+a ray is rejected by before any sprite is tested — is exactly as wide as the sprite, and clips the
+quad to a disc for free. Creeping the particle along the view axis widens the sphere to 110 units
+against a 60-unit sprite and leaves it where it was on the screen, and the test then fails against
+the unfixed shader as it should.
+
+**What is not fixed, and what it is.** Over bright water or sky a puff can still read green or blue.
+It is not a tint on the smoke — the outdoor ambient there measures (86, 90, 101) as displayed, a
+neutral cool grey. **It is the albedo the file itself writes.** The colour ramp on the fire pit's ash
+is a flat 0.3 grey, so against a background brighter than a third of the sunlight the sprite is a
+dark disc, and the fraction of the background that survives its coverage carries the hue through —
+cyan over the bay, blue against the sky. Dark ash over a bright sea *is* dark; whether the game's
+ramp colours are meant as scattering albedos at all, or as multipliers for a renderer that had no
+such thing, is the question, and it is not settled here.
+
+### 8.103 Morrowind's numbers, not Morrowind's drawing
+
+§8.99's emitters were faithful and wrong. Sprites came out as rectangles when the mip chain ate
+their silhouettes, smoke punched dark holes in bright backgrounds, and fire was *pink* — because
+`tx_firealpha10` is a pinkish tan photograph of a flame at some unrecorded exposure, and a renderer
+that multiplies by it inherits whatever the camera did. So the parameters stay and the pictures go.
+
+**Everything a `NiParticleSystemController` says describes a plume as well as it describes a spray
+of quads**: where it is, which way it lets go, how fast, how long a parcel lives, how wide it opens,
+what colour it is and whether it adds to the frame or covers it. What it does not describe is any of
+the sprite machinery — the count, the birth rate, the size ramp, the spin, the texture — and all of
+that is now gone from the data as well as from the drawing.
+
+**The field is a closed form, marched front to back.** A shaped density, roiled by noise read at a
+position that falls back along the emitter's axis at the speed the file gives it — so every eddy
+climbs at exactly that speed, and nothing is kept between frames. Thirty-two steps inside the
+emitter's bounding sphere, which is what makes it affordable: a candle's plume is five units across
+and the sphere rejects it for almost every pixel of the frame.
+
+**Fire is a grey body, and that is what makes one number enough.** Its colour comes from Planck's
+law integrated against the CIE matching functions — `blackbody::colour`, using the Wyman-Sloan-
+Shirley Gaussian fits — at a temperature falling from 1800 K at the fuel to 1100 K where the gas
+stops glowing, and Stefan-Boltzmann then fades it as the fourth power without anything being told
+to. Below about 2100 K sRGB has no blue to give, so the whole of a flame's range clamps: the answer
+is right and the screen cannot print it.
+
+It also *absorbs*. The first attempt emitted without absorbing, which is what piling additive quads
+does, and forty units of plume summed forty units' worth and filled a fireplace with white. With the
+absorption in, radiance saturates at the blackbody value however deep the fire is — which is why a
+bonfire is not a thousand times brighter than a candle, only bigger — and `FLAME_RADIANCE` becomes a
+*level* rather than a gain.
+
+**Three shape mistakes, each reported before it was found.**
+
+| what it looked like | why |
+|---|---|
+| a fireplace full of white | emission with no absorption, so depth kept adding |
+| a triangle | the plume opened upward on the gas cone; fire *tapers* |
+| a pyramid | it was widest at the fuel, where a flame is thinnest |
+
+The last two are the same lesson twice: the gas cone opens the whole way, but the *luminous* zone is
+only where fuel is still burning, so a flame is a teardrop — necked at the fuel, bellied a quarter of
+the way up, tapering to a tip — while smoke keeps the opening cone.
+
+**And the noise has to erode, not modulate.** Multiplying the shape by it leaves the shape's own
+outline standing and varies only what is inside, so a tapered plume still reads as a smooth cone
+however much detail is painted within. Subtracting makes the noise decide where the plume *ends*,
+and the edge comes apart into tongues. Subtracted rather than renormalised: dividing by the noise
+again pushes everything it did not remove to full density, and the flame came back as a ragged
+column with no grade left in it.
+
+**Smoke is the standard cloud recipe**, from Guerrilla's Nubis work and what followed it:
+Beer-Lambert along the ray, Henyey-Greenstein about the sun at `g = 0.6`, four steps toward the sun
+for self-shadowing, and the powder term for the dark edge single scattering gets backwards. That is
+what stops it being a flat disc punching a hole in a bright background, which is what §8.102 could
+only mitigate.
+
+**The dither must not move.** The march is offset per pixel to break up the bounding sphere's own
+shells, and the obvious hash moves with the frame — which for this layer is exactly wrong. The
+transparency target is handed to Ray Reconstruction to *composite*, not to denoise, so anything
+reseeded every frame stays in the picture as crawling static. A hash of the pixel alone is a fixed
+pattern the upscaler's own sub-pixel jitter then walks across, which is the argument `hash` itself
+already makes.
+
+**Cost**, five-run medians at 1920×1080: 6.88 ms of trace in Seyda Neen's census office and 7.30 in
+Balmora's Guild of Mages, against 5.66 and 8.66 for the sprites it replaces. Marching a volume is
+not more expensive than sorting through a few hundred billboards.
+
+**What is still owed.** The temperature range is a flame's rather than each fire's — a forge and a
+candle burn at the same 1800 K here. Non-blackbody emitters that add to the frame, which is what
+every `e/magic_*` effect is, would come out orange if anything ever placed one; nothing does. And
+`--screenshot` pins the clock to zero, so no still can show the motion — which cost a round of
+"it looks static" before that was said out loud.
+
+Sources for the recipe: Schneider's Nubis cloudscape work, Heckel's write-up of volumetric ray
+marching, and Scratchapixel's blackbody lesson.
