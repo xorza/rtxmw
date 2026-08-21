@@ -131,6 +131,25 @@ layout(set = 0, binding = 18, r16f) uniform writeonly image2D transparency_opaci
 // Last, because a variable descriptor count is only allowed on a set's final binding.
 layout(set = 0, binding = 19) uniform sampler2D textures[];
 
+// Where a texture id's colour lands in the array above.
+//
+// Slot zero is the fallback a material with no texture takes, the next three are the sky's own
+// pictures — two moon portraits and the weather's cloud sheet — and every texture after them is
+// followed by the shading map estimated from it. One array rather than two because Vulkan allows a
+// variable descriptor count only on a set's final binding.
+//
+// The sky's are reserved rather than appended because a material's id addresses a *fixed* pair of
+// slots: anything inserted after the first cell had loaded would move every id behind it.
+const uint SKY_SLOTS = 3u;
+
+uint colour_slot(uint id) {
+    return 1u + SKY_SLOTS + 2u * id;
+}
+
+uint shading_slot(uint id) {
+    return 2u + SKY_SLOTS + 2u * id;
+}
+
 // Stands in for a material with no base colour texture. Declared as `NO_TEXTURE` in
 // `material_buffers.rs` too, and pinned there by a test, because a shader cannot see a Rust
 // constant.
@@ -229,6 +248,9 @@ layout(set = 0, binding = 14, scalar) readonly buffer Frame {
     // How much of the lighting painted into a texture to divide back out, from zero for the texture
     // as shipped to one for the whole estimate. See `baked_shading` in `surface.glsl`.
     float delight;
+    // How far the relief painted into a texture tilts the normal it is shaded by, from zero for the
+    // vertex normal alone to one for the whole of it. See `relief.glsl`.
+    float relief;
     // The radiance the cell's fog scatters, how thickly it sits, and how much of the whole effect
     // to apply — see `fog.glsl`.
     vec3 fog;

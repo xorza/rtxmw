@@ -52,6 +52,13 @@ const DEFAULT_BOUNCE_SAMPLES: u32 = 4;
 /// A/B, and §5.1's warning about over-correction is what that switch is for.
 const DEFAULT_DELIGHT: f32 = 1.0;
 
+/// How far a texture's painted relief tilts the normal unless a caller says otherwise.
+///
+/// **All of it.** Vanilla meshes carry no normal map and the format cannot hold one, so without
+/// this every wall in the game is lit as the flat triangle it is — `--relief 0` is the A/B, and
+/// `relief.glsl` is what it switches off.
+const DEFAULT_RELIEF: f32 = 1.0;
+
 /// How long the device spent on each stage of a frame, in milliseconds, and at what size.
 ///
 /// Device time, not wall clock: what the GPU was busy for, which is the number `docs/design.md`
@@ -174,6 +181,8 @@ pub struct SceneRenderer {
     /// How much of the lighting painted into a texture to divide back out. See
     /// [`SceneRenderer::set_delight`].
     delight: f32,
+    /// How far a texture's painted relief tilts the normal. See [`SceneRenderer::set_relief`].
+    relief: f32,
     /// How much of the cell's fog to apply. See [`SceneRenderer::set_fog`].
     fog: f32,
     /// The sky every resident exterior stands under. See [`SceneRenderer::set_sky`].
@@ -247,6 +256,7 @@ impl SceneRenderer {
             previous_view: None,
             jitter: false,
             delight: DEFAULT_DELIGHT,
+            relief: DEFAULT_RELIEF,
             fog: 1.0,
             sky: Sky::default(),
             #[cfg(feature = "dlss")]
@@ -338,6 +348,18 @@ impl SceneRenderer {
             "de-lighting runs from none to the whole estimate, not {strength}"
         );
         self.delight = strength;
+    }
+
+    /// Sets how far a texture's painted relief tilts the normal it is shaded by.
+    ///
+    /// Zero is the vertex normal alone — the surface as the mesh describes it — and one the whole
+    /// of what the texture says about its own shape. See `relief.glsl` for what it reads.
+    pub fn set_relief(&mut self, strength: f32) {
+        assert!(
+            (0.0..=1.0).contains(&strength),
+            "relief runs from none to the whole of it, not {strength}"
+        );
+        self.relief = strength;
     }
 
     /// Moves the sky: the sun in it, and the light it casts on everything out of doors.
@@ -739,6 +761,7 @@ impl SceneRenderer {
                 bounce_samples: self.bounce_samples,
                 sequence: self.frames,
                 delight: self.delight,
+                relief: self.relief,
                 fog: self.fog,
             },
             // From the renderer's own target height, so the mip a surface samples follows the

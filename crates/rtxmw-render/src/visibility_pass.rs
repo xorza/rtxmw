@@ -267,6 +267,13 @@ pub struct FrameConstants {
     /// have shading and ambient occlusion painted into their albedo for a renderer with no lighting
     /// of its own, so tracing over them lights everything twice — `docs/design.md` §5.1.
     delight: f32,
+    /// How far the relief painted into a texture tilts the normal it is shaded by.
+    ///
+    /// **Zero is the mesh's own normal** and one the whole of what the texture says about its
+    /// shape. Vanilla meshes carry no normal map and the NIF format at this version cannot hold
+    /// one, so without this every surface in the world is lit as the flat triangle it is —
+    /// `docs/design.md` §5.1.
+    relief: f32,
     /// The radiance the cell's fog scatters, how thickly it sits, and how much of it to apply.
     ///
     /// Read by the trace rather than by the composite, which is where the lights are — see
@@ -346,6 +353,8 @@ pub(crate) struct Sampling {
     pub(crate) bounce_samples: u32,
     /// How much of the baked lighting to divide out of every texture.
     pub(crate) delight: f32,
+    /// How far a texture's painted relief tilts the normal it is shaded by.
+    pub(crate) relief: f32,
     /// How much of the cell's fog to apply, from none to all of it.
     pub(crate) fog: f32,
     /// Which frame this is, counted from the renderer's first.
@@ -408,6 +417,7 @@ impl FrameConstants {
             time,
             sequence: sampling.sequence,
             delight: sampling.delight,
+            relief: sampling.relief,
             fog: lighting.fog.to_array(),
             fog_density: lighting.fog_density,
             fog_strength: sampling.fog,
@@ -859,37 +869,38 @@ mod tests {
         assert_eq!(offset_of!(FrameConstants, time), 304);
         assert_eq!(offset_of!(FrameConstants, sequence), 308);
         assert_eq!(offset_of!(FrameConstants, delight), 312);
-        assert_eq!(offset_of!(FrameConstants, fog), 316);
-        assert_eq!(offset_of!(FrameConstants, fog_density), 328);
-        assert_eq!(offset_of!(FrameConstants, fog_strength), 332);
-        assert_eq!(offset_of!(FrameConstants, sky_warm), 336);
-        assert_eq!(offset_of!(FrameConstants, sky_warmth), 348);
-        assert_eq!(offset_of!(FrameConstants, sky_scale), 352);
-        assert_eq!(offset_of!(FrameConstants, sky_floor), 356);
-        assert_eq!(offset_of!(FrameConstants, sky_stars), 368);
-        assert_eq!(offset_of!(FrameConstants, sky_veil), 372);
-        assert_eq!(offset_of!(FrameConstants, sky_veiled), 384);
-        assert_eq!(offset_of!(FrameConstants, fog_uniform), 388);
-        assert_eq!(offset_of!(FrameConstants, fog_wind), 392);
-        assert_eq!(offset_of!(FrameConstants, fog_lift), 400);
+        assert_eq!(offset_of!(FrameConstants, relief), 316);
+        assert_eq!(offset_of!(FrameConstants, fog), 320);
+        assert_eq!(offset_of!(FrameConstants, fog_density), 332);
+        assert_eq!(offset_of!(FrameConstants, fog_strength), 336);
+        assert_eq!(offset_of!(FrameConstants, sky_warm), 340);
+        assert_eq!(offset_of!(FrameConstants, sky_warmth), 352);
+        assert_eq!(offset_of!(FrameConstants, sky_scale), 356);
+        assert_eq!(offset_of!(FrameConstants, sky_floor), 360);
+        assert_eq!(offset_of!(FrameConstants, sky_stars), 372);
+        assert_eq!(offset_of!(FrameConstants, sky_veil), 376);
+        assert_eq!(offset_of!(FrameConstants, sky_veiled), 388);
+        assert_eq!(offset_of!(FrameConstants, fog_uniform), 392);
+        assert_eq!(offset_of!(FrameConstants, fog_wind), 396);
+        assert_eq!(offset_of!(FrameConstants, fog_lift), 404);
         // What falls: four scalars and the velocity it falls at.
-        assert_eq!(offset_of!(FrameConstants, precip_spacing), 404);
-        assert_eq!(offset_of!(FrameConstants, precip_fall), 416);
+        assert_eq!(offset_of!(FrameConstants, precip_spacing), 408);
+        assert_eq!(offset_of!(FrameConstants, precip_fall), 420);
         // Two moons of sixteen tightly packed floats apiece.
-        assert_eq!(offset_of!(FrameConstants, masser), 428);
-        assert_eq!(offset_of!(FrameConstants, secunda), 492);
+        assert_eq!(offset_of!(FrameConstants, masser), 432);
+        assert_eq!(offset_of!(FrameConstants, secunda), 496);
         // Then the cloud layer, fourteen floats of it.
-        assert_eq!(offset_of!(FrameConstants, cloud_altitude), 556);
-        assert_eq!(offset_of!(FrameConstants, cloud_sheet), 608);
+        assert_eq!(offset_of!(FrameConstants, cloud_altitude), 560);
+        assert_eq!(offset_of!(FrameConstants, cloud_sheet), 612);
         // The wave table follows, twenty tightly packed bytes apiece.
         // The flash sits between the sheet and the waves — see `FrameConstants`.
-        assert_eq!(offset_of!(FrameConstants, flash_radiance), 612);
-        assert_eq!(offset_of!(FrameConstants, flash_kind), 624);
-        assert_eq!(offset_of!(FrameConstants, flash_seed), 628);
-        assert_eq!(offset_of!(FrameConstants, flash_source), 632);
-        assert_eq!(offset_of!(FrameConstants, flash_ground), 644);
-        assert_eq!(offset_of!(FrameConstants, waves), 656);
-        assert_eq!(size_of::<FrameConstants>(), 656 + 20 * WAVE_COUNT);
+        assert_eq!(offset_of!(FrameConstants, flash_radiance), 616);
+        assert_eq!(offset_of!(FrameConstants, flash_kind), 628);
+        assert_eq!(offset_of!(FrameConstants, flash_seed), 632);
+        assert_eq!(offset_of!(FrameConstants, flash_source), 636);
+        assert_eq!(offset_of!(FrameConstants, flash_ground), 648);
+        assert_eq!(offset_of!(FrameConstants, waves), 660);
+        assert_eq!(size_of::<FrameConstants>(), 660 + 20 * WAVE_COUNT);
     }
 
     #[test]

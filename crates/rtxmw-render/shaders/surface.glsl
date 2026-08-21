@@ -47,25 +47,6 @@ vec3 interpolate_normal(uvec3 verts, vec3 weights) {
          + attributes[verts.z].normal * weights.z;
 }
 
-// Where a texture id's colour lands in the bindless array.
-//
-// Slot zero is the fallback a material with no texture takes, the next three are the sky's own
-// pictures — two moon portraits and the weather's cloud sheet — and every texture after them is
-// followed by the shading map estimated from it. One array rather than two because Vulkan allows a
-// variable descriptor count only on a set's final binding.
-//
-// The sky's are reserved rather than appended because a material's id addresses a *fixed* pair of
-// slots: anything inserted after the first cell had loaded would move every id behind it.
-const uint SKY_SLOTS = 3u;
-
-uint colour_slot(uint id) {
-    return 1u + SKY_SLOTS + 2u * id;
-}
-
-uint shading_slot(uint id) {
-    return 2u + SKY_SLOTS + 2u * id;
-}
-
 // Mip level for a hit, from the width of the ray's cone where it landed.
 //
 // A rasterizer takes this from screen-space derivatives, which a compute shader does not have, so
@@ -151,7 +132,7 @@ uint[4] terrain_layers(Material material) {
                    material.terrain_layers1 >> 16);
 }
 
-// The ground's colour, blended across the four tiles nearest the point.
+// How much of each of the four tiles nearest a point on the ground it draws.
 //
 // **A cell names one texture per 512-unit tile and nothing in between.** Drawn as it is written,
 // each tile meets its neighbours along a straight line, and a coast comes out as a patchwork of
@@ -162,24 +143,30 @@ uint[4] terrain_layers(Material material) {
 // origin never enters it — a cell is a whole number of tiles across, so it falls out of the
 // fractional part and the ground is continuous across a cell boundary for free.
 //
+// **Not a ramp across the whole tile.** Interpolating centre to centre leaves no point on the map
+// drawing a single texture — every one is a mix of four, and a tile reads as a translucent square
+// laid over its neighbours rather than as ground. The original engine blends through a map of two
+// texels per tile, each tile's own pair at full weight, so bilinear filtering confines the
+// transition to the 256 units straddling the tile boundary and leaves the middle half of every tile
+// pure. `components/esmterrain/storage.cpp:497` is where OpenMW says so — "upscale the blendmap 2x
+// with nearest neighbor sampling to look like Vanilla".
+//
+// The ramp is that transition, written directly: flat for the first quarter, across over the middle
+// half, flat again for the last quarter.
+vec4 tile_weights(vec2 world) {
+    vec2 weight = clamp(fract(world / TERRAIN_TILE - 0.5) * 2.0 - 0.5, 0.0, 1.0);
+    return vec4((1.0 - weight.x) * (1.0 - weight.y), weight.x * (1.0 - weight.y),
+                (1.0 - weight.x) * weight.y, weight.x * weight.y);
+}
+
+// The ground's colour, blended across those four.
+//
 // Four samples where an unblended ground took one. They are of the same texture more often than
 // not: most of a cell is interior to a tile whose neighbours match it, and the sampler's cache is
 // what makes that cheap.
 vec3 ground_colour(Material material, vec2 world, vec2 uv, float lod) {
     uint layers[4] = terrain_layers(material);
-    // **Not a ramp across the whole tile.** Interpolating centre to centre leaves no point on the
-    // map drawing a single texture — every one is a mix of four, and a tile reads as a translucent
-    // square laid over its neighbours rather than as ground. The original engine blends through a
-    // map of two texels per tile, each tile's own pair at full weight, so bilinear filtering
-    // confines the transition to the 256 units straddling the tile boundary and leaves the middle
-    // half of every tile pure. `components/esmterrain/storage.cpp:497` is where OpenMW says so —
-    // "upscale the blendmap 2x with nearest neighbor sampling to look like Vanilla".
-    //
-    // The ramp is that transition, written directly: flat for the first quarter, across over the
-    // middle half, flat again for the last quarter.
-    vec2 weight = clamp(fract(world / TERRAIN_TILE - 0.5) * 2.0 - 0.5, 0.0, 1.0);
-    vec4 across = vec4((1.0 - weight.x) * (1.0 - weight.y), weight.x * (1.0 - weight.y),
-                       (1.0 - weight.x) * weight.y, weight.x * weight.y);
+    vec4 across = tile_weights(world);
     vec3 colour = vec3(0.0);
     for (int layer = 0; layer < 4; ++layer) {
         uint id = layers[layer];
@@ -187,6 +174,24 @@ vec3 ground_colour(Material material, vec2 world, vec2 uv, float lod) {
         colour += across[layer] * tile / baked_shading(id, uv);
     }
     return colour;
+}
+
+// The ground's painted relief, blended across the same four tiles the colour is.
+//
+// The gradients are blended rather than the heights: a height is only defined up to the constant
+// each tile was painted around, so a mix of four of them steps wherever the constants differ, and a
+// derivative of that mix is a wall along every tile boundary. A mix of the four derivatives has no
+// such term in it.
+//
+// **Terrain never carries a cutout**, so no alpha gate — the ground is opaque everywhere.
+vec2 ground_relief(Material material, vec2 world, vec2 uv, float lod) {
+    uint layers[4] = terrain_layers(material);
+    vec4 across = tile_weights(world);
+    vec2 gradient = vec2(0.0);
+    for (int layer = 0; layer < 4; ++layer) {
+        gradient += across[layer] * relief_gradient(colour_slot(layers[layer]), uv, lod, 0.0);
+    }
+    return gradient;
 }
 
 // What an upscaler needs about a surface beyond its colour.
@@ -302,6 +307,17 @@ struct Surface {
     bool hit;
     // Water shades through `water_shade` rather than `shade`, and has no albedo of its own.
     bool water;
+    // The vertex normal the mesh interpolated, before any relief a texture painted into it tilted
+    // it — the same vector as `normal` on an untextured surface.
+    //
+    // **What an upscaler is guided by.** A guide normal answers "which surface is this pixel on",
+    // which is what history is reprojected and rejected against, and painted relief is not a
+    // different surface: it is detail inside one, and it is already in the albedo the upscaler has.
+    // Handing it the tilted normal costs Ray Reconstruction most of its temporal accumulation — the
+    // settled error at DLAA goes from 0.0093 to 0.0126 against a converged reference that has the
+    // relief in it, so the frame is measurably *less* like the truth for having described the
+    // surface in more detail. See `docs/design.md` §8.90.
+    vec3 interpolated;
     // The plane the triangle actually lies in, as wound — with no side chosen for it.
     //
     // **Every ray leaving a surface is offset along this and not along `normal`.** A normal comes
@@ -346,6 +362,7 @@ Surface trace(vec3 origin, vec3 direction, float cone_width, float cone_spread, 
     Surface surface;
     surface.position = vec3(0.0);
     surface.normal = vec3(0.0);
+    surface.interpolated = vec3(0.0);
     surface.albedo = vec3(0.0);
     surface.emissive = vec3(0.0);
     surface.footprint = 0.0;
@@ -417,6 +434,7 @@ Surface trace(vec3 origin, vec3 direction, float cone_width, float cone_spread, 
     // The plane cannot disagree with itself that way: either the ray met the front of the triangle
     // or it met the back.
     surface.normal = faceforward(surface.normal, direction, surface.geometric);
+    surface.interpolated = surface.normal;
     surface.position = origin + direction * hit_t;
     surface.footprint = cone_width + hit_t * cone_spread;
     surface.t = hit_t;
@@ -432,17 +450,32 @@ Surface trace(vec3 origin, vec3 direction, float cone_width, float cone_spread, 
 
     surface.emissive = material.emissive;
     surface.albedo = material.diffuse;
+    // The relief the texture has painted into it, applied to the shading normal — see
+    // `relief.glsl`. Nothing to read it from where the material has no texture, and nothing to
+    // apply it to where the triangle's uvs are degenerate.
     if (material.kind == KIND_TERRAIN) {
         // One lod for all four, chosen from the first: they are sampled over the same footprint
         // with the same uv, and every land texture the game ships is 256 square.
         float lod = cone_lod(verts, to_world, direction, surface.footprint,
                              colour_slot(terrain_layers(material)[0]));
-        surface.albedo *= ground_colour(material, surface.position.xy,
-                                        interpolate_uv(verts, weights), lod);
+        vec2 uv = interpolate_uv(verts, weights);
+        surface.albedo *= ground_colour(material, surface.position.xy, uv, lod);
+        if (frame.relief > 0.0) {
+            surface.normal = relief_normal(surface.normal, surface.geometric, direction,
+                                           surface_tangents(verts, to_world),
+                                           ground_relief(material, surface.position.xy, uv, lod));
+        }
     } else if (material.base_colour != NO_TEXTURE) {
         float lod = cone_lod(verts, to_world, direction, surface.footprint,
                              colour_slot(material.base_colour));
-        surface.albedo *= base_colour(material, interpolate_uv(verts, weights), lod).rgb;
+        vec2 uv = interpolate_uv(verts, weights);
+        surface.albedo *= base_colour(material, uv, lod).rgb;
+        if (frame.relief > 0.0) {
+            vec2 gradient = relief_gradient(colour_slot(material.base_colour), uv, lod,
+                                            material.alpha_cutoff);
+            surface.normal = relief_normal(surface.normal, surface.geometric, direction,
+                                           surface_tangents(verts, to_world), gradient);
+        }
     }
     return surface;
 }

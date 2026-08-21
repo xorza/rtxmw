@@ -262,6 +262,15 @@ pub(crate) struct WindowOptions {
         allow_negative_numbers = true,
     )]
     pub(crate) delight: f32,
+    /// How far the relief painted into each texture tilts the normal it is shaded by, from 0 to 1.
+    #[arg(
+        long,
+        value_name = "STRENGTH",
+        default_value_t = 1.0,
+        value_parser = strength,
+        allow_negative_numbers = true,
+    )]
+    pub(crate) relief: f32,
     /// How much of the cell's own fog to apply, from 0 to 1.
     #[arg(
         long,
@@ -342,6 +351,15 @@ pub(crate) struct ScreenshotOptions {
         allow_negative_numbers = true,
     )]
     pub(crate) delight: f32,
+    /// How far the relief painted into each texture tilts the normal it is shaded by, from 0 to 1.
+    #[arg(
+        long,
+        value_name = "STRENGTH",
+        default_value_t = 1.0,
+        value_parser = strength,
+        allow_negative_numbers = true,
+    )]
+    pub(crate) relief: f32,
     /// How much of the cell's own fog to apply, from 0 to 1.
     #[arg(
         long,

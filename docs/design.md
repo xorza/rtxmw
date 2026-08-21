@@ -556,9 +556,9 @@ Collected rather than decided here — each is recorded where the work was done:
 - **M8's post chain.** Bloom, grading, sharpening, exposure adaptation over time, HDR output.
 - **M10's water.** Shoreline foam — the Jacobian's *sign* is computed and thrown away — and underwater
   shafts (§7.8).
-- **§5.1's other half.** De-lighting recovers base colour only. Roughness is dropped and replacer packs
-  refused; a normal map synthesised from the painted relief is what remains, and nothing keyed to cd/m²
-  can be applied until it settles.
+- **§5.1's other half.** Settled — roughness dropped, replacer packs refused, and the normal map
+  synthesised from painted relief built in §8.90. What waits on it is the specular coat §8.89 tried
+  early, and the absolute units §8.51–§8.53 each recorded a debt for.
 - **§5.4's scope boundary.** Bind pose only: no animation, no particles, no creatures or NPCs, which is
   what has kept BLAS refit out of the renderer.
 - **§5.3's budget.** 44 ms at 3840×2160 against 16.6, knowingly, and not to be opened until the feature
@@ -606,22 +606,26 @@ painted 256² texture contains none. What is left is invention, and §8.89 is wh
 a uniform dielectric floor exceeds the diffuse return of anything below about 2.5% albedo, which is most
 of an interior, and arrives as exactly the wash this section exists to avoid.
 
-**Normals: still open, and the one worth doing.** The signal is really there, because the relief in these
-textures is *painted* — an artist drew the highlight and the shadow along a brick's edge, lit from a
-direction consistent across the texture. Retinex (Land and McCann) gives the discriminator the community
-tools lack: painted relief is achromatic and directionally coherent, while a pigment change carries
-chromaticity and aligns with nothing. That also yields a per-texture confidence — how strongly the
-achromatic gradients agree on one light direction — where the best existing effort for this content sets
-one cautious global strength to "improve every texture and ruin none". And the failure mode is mild: a
-normal map redistributes light rather than adding a floor, so getting it partly wrong lights a wall oddly
-instead of washing it out.
+**Normals: taken, and built — §8.90.** The signal is really there, because the relief in these textures
+is *painted*: an artist drew the mortar dark because it is deep and the stone light because it stands
+proud. Read as a height field, the log of luminance is that account and its gradient is the normal, taken
+per hit off the colour texture already resident rather than baked into a second map. The failure mode is
+mild by construction — a normal map redistributes light rather than adding a floor, so getting it partly
+wrong lights a wall oddly instead of washing it out.
+
+**The Retinex discriminator this section planned on does not exist in the content.** The premise was that
+painted relief is achromatic where a pigment change is not; measured across fifty shipped textures, the
+chromaticity step *rises* with the luminance step beside it, 0.0027 to 0.059, so the strongest edges are
+the most chromatic and a gate keyed on colour deletes exactly the shape. §8.90 has the numbers and the two
+causes. Straight log-luminance, with no gate and no per-texture normalisation, is what shipped.
 
 **A coat waits on that map rather than the other way round.** §8.89 tried the specular layer first, over a
 world with a single roughness in it, and a sheen with no variation in it reads as a film over the lens.
+The map is now there for it.
 
-**And it is the blocker for absolute units.** `DAYLIGHT`, `SKY_STRENGTH` and the night floor are numbers
+**And it was the blocker for absolute units.** `DAYLIGHT`, `SKY_STRENGTH` and the night floor are numbers
 tuned to reproduce a screenshot, so nothing keyed to cd/m² — the exposure literature, the moons' real
-irradiance, a Purkinje shift — can be applied as published until this is settled (§8.51, §8.52, §8.53).
+irradiance, a Purkinje shift — can be applied as published until that is redone (§8.51, §8.52, §8.53).
 
 ### 5.2 Licensing — settled: MIT OR Apache-2.0
 
@@ -3201,3 +3205,52 @@ rather than substances.
 
 So the coat waits for the derived map. A uniform 4% sheen over a world with one roughness in it has
 no variation to read as material — it reads as a film over the lens, which is what it looked like.
+
+### 8.90 Relief out of the albedo, read as a gradient and given to no upscaler
+
+§5.1's remaining half, built — and built differently than it was planned, because the discriminator
+it named is not in the content.
+
+**The height is the log of luminance and the answer is its gradient.** Log because a painted shadow
+multiplies the pigment under it, so the ratio carries the shape and a difference of logs is
+invariant to how brightly the texture was painted. A gradient rather than an integrated height,
+because a normal map need not be integrable and solving for one throws the answer away again. Four
+bilinear taps half a texel out on each diagonal, which is a 3×3 Sobel *exactly* — a corner tap
+returns the mean of the four texels around it, and differencing those means gives Sobel's own 1-2-1
+weights with the averaging done by the sampler. A plain central difference is two taps and visibly
+grainier on 256² art. The offsets are a texel of the level being read, held to the levels the
+texture has, so relief coarsens with distance the way a normal map's mip chain would.
+
+**The Retinex gate is refused, by measurement.** §5.1 planned to separate painted relief from
+pigment on the premise that relief is achromatic. Across fifty shipped textures, between neighbours
+both above 5% grey, the mean chromaticity step *rises* monotonically with the luminance step beside
+it — **0.0027** where luminance barely moves, **0.059** across the strongest edges. The strongest
+edges are the most chromatic, so the gate suppresses exactly the mortar lines and carved mouldings
+that carry the shape; rendered, the stonework flattened and noise stood where the relief had been.
+Two causes compound: BC1 quantises a block to a segment between two 5-6-5 endpoints, which cannot
+darken without leaving grey unless that segment happens to lie along it, and the art shadows with a
+cooler pigment rather than with less of the same one.
+
+**No per-texture normalisation either.** Log space already removes exposure, so what is left in the
+spread of gradient magnitudes across textures — p90 from 0.6 on carved wood to 2.1 on cave rock — is
+genuine: the rock really is rougher. Equalising them would have been the one thing worth
+precomputing, and there is nothing to precompute. The slope is one constant, compressed toward its
+bound by `tanh` rather than clamped, because a clamp is flat past its knee and renders a strongly
+painted edge as one facet with a crease down it.
+
+**The upscaler is guided by the untilted normal, and that is worth more than it sounds.** A guide
+normal answers *which surface is this pixel on*, which is what history is reprojected and rejected
+against. Relief is detail inside one surface and it is already in the albedo the upscaler has.
+Handing over the tilted normal costs Ray Reconstruction most of its temporal accumulation: against
+the §8.88 reference, settled DLAA error goes **0.0085 → 0.0126** with the tilted guide and
+**0.0085 → 0.0093** with the mesh's own, for the same picture. Nearly the whole reconstruction cost
+of the feature was a guide describing texture as geometry. The à-trous filter is indifferent —
+0.0300 → 0.0303 — so nothing is smeared by telling it the surface is flat.
+
+**Terrain blends gradients, not heights.** A height is defined only up to the constant each tile was
+painted around, so a mix of four steps wherever those constants differ and its derivative is a wall
+along every tile boundary; a mix of four derivatives has no such term. Sixteen taps on a ground hit,
+which is the cost, and it stays until §5.3 opens.
+
+The measured effect is a 3–6% mean change in radiance on lit surfaces and much more at an edge, off
+a base that was flat everywhere. `--relief 0` is the A/B.

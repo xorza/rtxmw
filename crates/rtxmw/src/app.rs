@@ -88,6 +88,8 @@ pub(crate) struct App {
     dlss: Upscaling,
     /// How much baked lighting to divide out, held for the renderer built when the window appears.
     delight: f32,
+    /// How far painted relief tilts the normal, held for the renderer built when the window appears.
+    relief: f32,
     /// How much of the cell's fog to apply, held for the renderer built when the window appears.
     fog: f32,
     /// How long the world has run and what hour it is there, which the keys below drive.
@@ -452,6 +454,7 @@ impl App {
             cell: options.cell,
             dlss: options.dlss,
             delight: options.delight,
+            relief: options.relief,
             fog: options.fog,
             clock: WorldClock::starting_at(options.time),
             exit_after: options.exit_after,
@@ -467,6 +470,7 @@ impl Default for App {
             cell: scene_loader::cell_named(scene_loader::DEFAULT_CELL),
             dlss: Upscaling(None),
             delight: 1.0,
+            relief: 1.0,
             fog: 1.0,
             clock: WorldClock::starting_at(WorldTime::default()),
             weather: Weather::clear(),
@@ -577,6 +581,7 @@ impl ApplicationHandler for App {
             self.dlss,
             Conditions {
                 delight: self.delight,
+                relief: self.relief,
                 fog: self.fog,
                 sky: Sky::under(self.clock.time(), &self.weather, self.sheet),
                 weather: &self.weather,

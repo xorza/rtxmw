@@ -6,10 +6,11 @@ It is not a port of OpenMW's rasterizer — it is a new renderer against the sam
 tracing is the primary rendering mode, not an effect layered on a rasterizer.
 
 **Status: a renderer, not a game.** The tree reads an unmodified Morrowind install and ray-traces
-it — interiors and streamed exteriors, bindless materials de-lit from the vanilla textures, direct
-and indirect light, water, a day-night cycle with both moons, and the game's own ten weathers —
-through DLSS Ray Reconstruction. Nothing is playable: there is no animation, and no creatures or
-NPCs are placed. `docs/design.md` records the architecture and the decisions behind it.
+it — interiors and streamed exteriors, bindless materials de-lit from the vanilla textures with
+their painted relief read back out as a normal, direct and indirect light, water, a day-night cycle
+with both moons, and the game's own ten weathers — through DLSS Ray Reconstruction. Nothing is
+playable: there is no animation, and no creatures or NPCs are placed. `docs/design.md` records the
+architecture and the decisions behind it.
 
 ## Building
 

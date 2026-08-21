@@ -88,6 +88,8 @@ pub(crate) struct Renderer {
 pub(crate) struct Conditions<'a> {
     /// How much of the lighting painted into a texture to divide back out.
     pub(crate) delight: f32,
+    /// How far the relief painted into a texture tilts the normal it is shaded by.
+    pub(crate) relief: f32,
     /// How much of the cell's own fog to apply.
     pub(crate) fog: f32,
     /// The hour's light, already built under `weather`.
@@ -139,6 +141,7 @@ impl Renderer {
     {
         let Conditions {
             delight,
+            relief,
             fog,
             sky,
             weather,
@@ -188,6 +191,7 @@ impl Renderer {
             upscaler::render_size(upscaler.as_ref(), internal_extent(display)),
         )?;
         scene.set_delight(delight);
+        scene.set_relief(relief);
         scene.set_fog(fog);
         scene.set_sky(sky);
         if let Err(failed) = upscaler::attach(&memory, &mut scene, upscaler) {

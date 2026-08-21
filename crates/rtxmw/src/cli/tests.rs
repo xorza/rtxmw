@@ -159,6 +159,7 @@ fn the_cell_and_the_frame_limit_go_in_either_order() {
             cell: default.clone(),
             exit_after: None,
             delight: 1.0,
+            relief: 1.0,
             fog: 1.0,
             time: WorldTime::default(),
             dlss: Upscaling(None),
@@ -173,6 +174,7 @@ fn the_cell_and_the_frame_limit_go_in_either_order() {
             cell: default,
             exit_after: Some(3),
             delight: 1.0,
+            relief: 1.0,
             fog: 1.0,
             time: WorldTime::default(),
             dlss: Upscaling(None),
@@ -184,6 +186,7 @@ fn the_cell_and_the_frame_limit_go_in_either_order() {
         cell: CellId::Exterior { x: -2, y: -9 },
         exit_after: Some(3),
         delight: 1.0,
+        relief: 1.0,
         fog: 1.0,
         time: WorldTime::default(),
         dlss: Upscaling(None),
@@ -229,6 +232,7 @@ fn a_screenshot_can_be_told_where_to_stand_and_which_way_to_look() {
             samples: None,
             denoise: None,
             delight: 1.0,
+            relief: 1.0,
             fog: 1.0,
             time: WorldTime::default(),
             dlss: Upscaling(None),
@@ -281,6 +285,7 @@ fn a_screenshot_takes_a_path_then_a_size_then_a_cell() {
             samples: None,
             denoise: None,
             delight: 1.0,
+            relief: 1.0,
             fog: 1.0,
             time: WorldTime::default(),
             dlss: Upscaling(None),
@@ -301,6 +306,7 @@ fn a_screenshot_takes_a_path_then_a_size_then_a_cell() {
             samples: None,
             denoise: None,
             delight: 1.0,
+            relief: 1.0,
             fog: 1.0,
             time: WorldTime::default(),
             dlss: Upscaling(None),
@@ -332,6 +338,7 @@ fn a_screenshot_takes_a_path_then_a_size_then_a_cell() {
             samples: Some(1024),
             denoise: Some(0),
             delight: 1.0,
+            relief: 1.0,
             fog: 1.0,
             time: WorldTime::default(),
             dlss: Upscaling(None),
@@ -411,26 +418,37 @@ fn the_upscaler_defaults_to_on_and_can_be_turned_off() {
 }
 
 #[test]
-fn de_lighting_strength_is_a_fraction_or_it_is_refused() {
-    // **On by default**: leaving the painted lighting in is the wrong answer for a renderer that
-    // lights things itself, so the switch exists to turn the correction *off* for an A/B.
-    assert_eq!(screenshot_options(&["out.png"]).unwrap().delight, 1.0);
-    for (given, expected) in [("0", 0.0), ("0.5", 0.5), ("1", 1.0)] {
+fn texture_correction_strengths_are_fractions_or_they_are_refused() {
+    // The two corrections read out of a texture rather than out of the mesh — what lighting was
+    // painted into it, and what shape it says it has.
+    type Strength = fn(&ScreenshotOptions) -> f32;
+    let corrections: [(&str, Strength); 2] =
+        [("--delight", |o| o.delight), ("--relief", |o| o.relief)];
+    for (flag, read) in corrections {
+        // **On by default**: leaving the painted lighting in, or the painted relief out, is the
+        // wrong answer for a renderer that lights things itself, so the switch exists to turn the
+        // correction *off* for an A/B.
         assert_eq!(
-            screenshot_options(&["out.png", "--delight", given])
-                .unwrap()
-                .delight,
-            expected
+            read(&screenshot_options(&["out.png"]).unwrap()),
+            1.0,
+            "{flag} should default to the whole correction"
         );
-    }
-    // **Refused rather than clamped.** Two is not a stronger wish, it is a misreading of what the
-    // number is — dividing by the square of an estimate is not on the scale at all.
-    for wrong in ["2", "-0.5", "lots"] {
-        let failed = screenshot_options(&["out.png", "--delight", wrong])
-            .expect_err("{wrong} is not a strength");
-        assert!(
-            failed.contains("0 to 1"),
-            "{wrong:?} was refused without saying the range: {failed}"
-        );
+        for (given, expected) in [("0", 0.0), ("0.5", 0.5), ("1", 1.0)] {
+            assert_eq!(
+                read(&screenshot_options(&["out.png", flag, given]).unwrap()),
+                expected,
+                "{flag} {given}"
+            );
+        }
+        // **Refused rather than clamped.** Two is not a stronger wish, it is a misreading of what
+        // the number is — dividing by the square of an estimate is not on the scale at all.
+        for wrong in ["2", "-0.5", "lots"] {
+            let failed = screenshot_options(&["out.png", flag, wrong])
+                .expect_err("{wrong} is not a strength");
+            assert!(
+                failed.contains("0 to 1"),
+                "{flag} {wrong:?} was refused without saying the range: {failed}"
+            );
+        }
     }
 }

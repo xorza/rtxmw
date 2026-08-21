@@ -37,6 +37,7 @@ pub(crate) fn screenshot(options: &ScreenshotOptions) -> Result<f32, Box<dyn std
         denoise,
         dlss,
         delight,
+        relief,
         fog,
         time,
         weather,
@@ -67,6 +68,7 @@ pub(crate) fn screenshot(options: &ScreenshotOptions) -> Result<f32, Box<dyn std
         renderer.set_denoise_passes(passes);
     }
     renderer.set_delight(*delight);
+    renderer.set_relief(*relief);
     renderer.set_fog(*fog);
     // **The textures before the sky**, which needs their statistics: how much of the dome the
     // weather's sheet hides is what the ground under it is dimmed by.

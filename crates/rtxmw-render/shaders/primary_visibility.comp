@@ -15,6 +15,7 @@
 
 #include "bindings.glsl"
 #include "sampling.glsl"
+#include "relief.glsl"
 #include "surface.glsl"
 #include "lighting.glsl"
 #include "waves.glsl"
@@ -145,7 +146,7 @@ void main() {
     // **The frame does not change.** The composite adds `albedo * lighting`, and lighting is zero on
     // both of these paths, so what is written here is read by the upscaler and by nothing else.
     vec3 guide_albedo = albedo;
-    vec3 guide_normal = surface.normal;
+    vec3 guide_normal = surface.interpolated;
     if (!surface.hit || surface.water) {
         guide_albedo = vec3(SKY_GUIDE_ALBEDO);
         guide_normal = -direction;
