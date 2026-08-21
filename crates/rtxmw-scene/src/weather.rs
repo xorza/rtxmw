@@ -254,8 +254,8 @@ pub struct Weather {
     /// Distinct from `Cloud Speed`, which the game keeps separate and which scrolls the painted
     /// sheet rather than describing the air.
     pub wind: f32,
-    /// What falls out of the sky, and how much of it. [`Precipitation::NONE`] for the six that
-    /// carry none.
+    /// What is in the air, and how much of it. [`Precipitation::NONE`] for the four that carry
+    /// none.
     pub precipitation: Precipitation,
     /// How often it throws a bolt, which only `[Weather Thunderstorm]` says anything about.
     pub lightning: Lightning,

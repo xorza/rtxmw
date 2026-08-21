@@ -258,7 +258,7 @@ layout(set = 0, binding = 14, scalar) readonly buffer Frame {
     // `Land Fog Depth` and its wind together — see `Sky::fog_lift` in `rtxmw-scene`.
     float fog_lift;
     // What is in the air: how far apart they stand, how far the volume reaches, which of the three
-    // they are, and what the air does with them. Spacing is zero for the five weathers carrying
+    // they are, and what the air does with them. Spacing is zero for the four weathers carrying
     // nothing — see `Precipitation` in `rtxmw-scene`.
     //
     // **The kind is ordered so one comparison answers the commonest question.** Rain is nought and

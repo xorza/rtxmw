@@ -72,8 +72,8 @@ const ASH_SETTLES: f32 = 0.05;
 /// **Derived against the real figure and then knowingly far short of it, which rain is too.** A
 /// severe dust storm runs about ten milligrams of PM10 to the cubic metre; a twenty-micron grain of
 /// ash at 2,500 kg/m^3 masses 1.05e-11 kg, so that is **9.6e5 motes to the cubic metre**. The mesh
-/// puts 172 in seventeen and a half thousand — 0.0098 — so reality is forty-four million times what
-/// the game draws, against rain's two thousand nine hundred.
+/// puts 172 in seventeen and a half thousand — 0.0098 — so reality is ninety-eight million times
+/// what the game draws, against rain's two thousand nine hundred.
 ///
 /// The lattice cannot go there, and it cannot go anywhere near. One mote to a cube of `spacing` at
 /// the real density is a cube 0.71 units on a side, far below the `PRECIP_CELL_MIN` the march can
@@ -130,7 +130,7 @@ pub struct Precipitation {
 }
 
 impl Precipitation {
-    /// A weather with nothing in the air, which is five of the ten.
+    /// A weather with nothing in the air, which is four of the ten.
     ///
     /// The kind is arbitrary and means nothing here — an enum needs a value, and `falls` is what
     /// says whether any of the rest of this is worth reading.
@@ -369,11 +369,14 @@ mod tests {
             "a blizzard is Bloodmoon's and snows"
         );
         assert_eq!(of("rain").kind, Falling::Rain);
-        assert_eq!(
-            of("clear"),
-            Precipitation::NONE,
-            "and five of the ten carry nothing"
-        );
+        // Counted rather than named, because the number moved when ash arrived and the prose that
+        // said it did not: six of the ten carried nothing until the two storms were read.
+        let bare: Vec<&str> = all
+            .iter()
+            .filter(|w| w.precipitation == Precipitation::NONE)
+            .map(|w| w.name.as_str())
+            .collect();
+        assert_eq!(bare, ["clear", "cloudy", "foggy", "overcast"]);
 
         // **What moves ash is the air, not the ground.** A wind blowing east carries it east and it
         // sinks at `ASH_SETTLES` of that; the same wind leans a raindrop over while it falls three
