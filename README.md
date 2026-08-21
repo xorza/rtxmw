@@ -5,9 +5,11 @@ A Morrowind engine in Rust with a hardware-raytraced renderer, built on raw Vulk
 It is not a port of OpenMW's rasterizer — it is a new renderer against the same game data. Ray
 tracing is the primary rendering mode, not an effect layered on a rasterizer.
 
-**Status: early. Nothing is playable.** The current tree brings up a Vulkan device with the ray
-tracing extensions, a window and a camera, and an offscreen golden-image test harness. No game data
-is loaded yet. `docs/design.md` records the architecture and the decisions behind it.
+**Status: a renderer, not a game.** The tree reads an unmodified Morrowind install and ray-traces
+it — interiors and streamed exteriors, bindless materials de-lit from the vanilla textures, direct
+and indirect light, water, a day-night cycle with both moons, and the game's own ten weathers —
+through DLSS Ray Reconstruction. Nothing is playable: there is no animation, and no creatures or
+NPCs are placed. `docs/design.md` records the architecture and the decisions behind it.
 
 ## Building
 
@@ -16,12 +18,15 @@ plus `spirv-val` on `PATH`. Running against game data additionally needs an exis
 install, pointed at by a hand-written `.env` in the repo root:
 
 ```
-MORROWIND_DIR=/path/to/Morrowind
-MORROWIND_DATA_DIR=/path/to/Morrowind/Data Files
+MORROWIND_DIR="/path/to/Morrowind"
+MORROWIND_DATA_DIR="/path/to/Morrowind/Data Files"
 ```
 
+A value containing a space has to be quoted, or the dotenv parser drops the line.
+
 ```sh
-cargo run -p rtxmw
+cargo run                          # a window on the deck of the ship the game starts on
+cargo run -- --screenshot out.png  # one frame, no window, no surface extensions
 ```
 
 No game assets are included or redistributed.

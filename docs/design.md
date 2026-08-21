@@ -531,6 +531,36 @@ frame, not a dropped one.
 Per-cell water plane, RT reflection and refraction, absorption and scattering, analytic caustics. Design
 and findings: §7. **Not done:** foam at the shoreline, sun shafts underwater.
 
+### M11 — Sky, weather and time of day — **done**
+A clock, the sun on Morrowind's own twelve-hour arc, both moons as lit spheres carrying their vanilla
+portraits, the star field, the painted cloud deck, and the ten weathers out of `Morrowind.ini`:
+volumetric fog, rain, snow, blown ash, lightning, and the film rain leaves behind. Design and findings:
+§8.38–§8.87. Almost none of it is invented — the ini holds ten blocks of 49 fields, `Morrowind.esm` a fog
+density for every one of the 1,134 interiors and the region lists, and where the file says nothing the
+game still ships a mesh that does. What this renderer supplies is the levels and the light transport.
+
+**Not done:** weather never changes — `;` cycles the region's list and the choice holds, which is why
+`Thunder Threshold` is parsed and unread; the ambient and `Sun *` schedules stay parsed and unused
+deliberately (§8.60, §8.61); shafts are cast for the sun and one moon only, since shadowing the fog costs
+a ray per light per step (§8.43, §8.80); nothing accumulates — no snow on the ground, no ash on ledges;
+and no Purkinje shift or absolute units, which §5.1 blocks rather than this milestone.
+
+### What is left, across the milestones
+
+Collected rather than decided here — each is recorded where the work was done:
+
+- **M7's bar.** No numeric comparison of 1 spp against a converged reference, and the budget is met only
+  on a settled clock.
+- **M8's post chain.** Bloom, grading, sharpening, exposure adaptation over time, HDR output.
+- **M10's water.** Shoreline foam — the Jacobian's *sign* is computed and thrown away — and underwater
+  shafts (§7.8).
+- **§5.1's other half.** De-lighting recovers base colour only; normal and roughness still want replacer
+  packs or synthesis, and nothing keyed to cd/m² can be applied until it settles.
+- **§5.4's scope boundary.** Bind pose only: no animation, no particles, no creatures or NPCs, which is
+  what has kept BLAS refit out of the renderer.
+- **§5.3's budget.** 44 ms at 3840×2160 against 16.6, knowingly, and not to be opened until the feature
+  set is closed. Opacity micromaps, SER and cluster acceleration structures wait there.
+
 ---
 
 ## 5. Decisions still open
@@ -2922,3 +2952,140 @@ channel.
   **0.419 with it against 0.183 without**.
 
 A statistic that mixes the effect with the frame's mean brightness is measuring the tonemapper.
+
+### 8.77 A beam and the medium it crosses cannot be reading different layers
+
+`fog_density_at` thins the fog over `FOG_HEIGHT * fog_lift`; the sun's slant depth measured across a bare `FOG_HEIGHT`.
+The two disagreed about how deep the air is by whatever the weather's lift was — **eighteenfold in a blizzard**, where
+the layer stands highest. Generalising the term to any direction is what surfaced it: while it was `fog_sun_depth` there
+was nothing to compare it against.
+
+### 8.78 The moons light the air, and the disc is what lights it
+
+At night the only thing lighting the haze was `frame.fog`, the dome's own colour — and since the disc itself is
+extinguished by the weather in front of it, a rainy night drew none of Masser's red: **R/G 0.945 against 2.34 in clear
+air**. Not a washed-out moon, a different colour.
+
+- **From the disc's `colour`, not from `light`.** `FULL_RADIANCE` is set by where the tone curve stops keeping colour;
+  `light` is what a surface should receive, thirty-two times larger at Masser. Mixing them put a halo brighter than the
+  moon inside it and turned the night sky pink.
+- **Capped at the source's radiance**, which the geometry gives free: a disc of radiance `L` over `solid` delivers
+  `L * solid` head-on, and `moon.colour` is that `L`, so skirt and face agree by construction.
+- **Measured to the limb, not the centre.** Draine's peak is a fraction of a degree and Masser is eighteen; read as a
+  point it spent itself on the centre texel and drew a red spark in a grey moon.
+
+### 8.79 A moon's face is an image, not an average
+
+Taken whole, single scattering draws a lobe at nearly half the moon's brightness — right for a bright source in water
+haze, and on a night sky it read as a lamp behind frosted glass. It could not simply be scaled: the same term is why a
+red moon stays red in rain, and dimming everywhere took the hue to 0.98 against 1.33 as it stands.
+
+So face and skirt split. **Small-angle scattering carries a source's image rather than averaging it** — light turned by
+less than the moon's own width still arrives from the part of the moon that emitted it — so the face returns the disc as
+drawn, and `disc * (1 - T) + disc * T` is a moon behind rain at its own radiance with its own structure. The average had
+pasted a flat circle over the portrait, which is the washed-out coin. Off the face, `FOG_MOONLIGHT` takes the skirt down
+to 0.15: radial rings out from Masser against a sky of 39 run 51/43 and rejoin at a hundred and ten, against 42 and gone
+by a hundred.
+
+### 8.80 A headland covers a moon, and two different things say so
+
+The image term exists only where the ray points *at* the moon, so the ray's own hit is the occlusion test, already paid
+for; without it the march painted a whole moon onto a cliff, hard-edged where the disc crossed the skyline. The skirt is
+air lit from a direction the ray is not pointing along and needs a shadow ray — one for the pair, aimed at whichever
+delivers more, spending at night what the day already spends.
+
+**Read as a hue, because a leak is red and the sky is not:** under a lid the dome is 0.0039 red to 0.0045 green, a leak
+0.024 to 0.008. On brightness it hid an order of magnitude under the threshold, the open frame being the disc's blown
+core.
+
+**And the two meet at the limb.** The face darkens to nothing there while a step outside it the whole disc contributes
+at once — left to disagree, a dark ring between a lit face and its own halo. The skirt is the floor on the face, which
+is also the physics: the air over the limb sees all of the moon.
+
+### 8.81 The painted alpha is the silhouette, and everything behind has to agree
+
+`moon_covers` hid the sky geometrically; `moon_disc` draws through the portrait's alpha, which ramps to nothing over the
+outermost texels and is what antialiases the limb. The stars were cut off across the band where the moon had already
+faded — a **dark ring inside every setting moon**. `covering` now comes out of the call that draws the face, so one
+number does both, and the sun's eclipse is partial at the limb rather than binary.
+
+### 8.82 A cloud is a depth, not a coverage
+
+An alpha composites the sky behind it. Run a moon through the same mix and half a cloud leaves half a moon, which is
+still the brightest thing in a night sky — so the deck read as ignoring the moons while swallowing the stars. A cloud is
+a depth of droplets: `exp(-CLOUD_MOON_DEPTH * hidden)`, eight e-foldings at full thickness, while dome and stars keep
+the mix. The layer is therefore read before the moons are drawn and composited after.
+
+### 8.83 Every interior the game ships is fogged, and none of them showed
+
+§8.42 cut `INDOOR_FOG_SCALE` to 0.006, which is not a veil but **nothing**: the median interior came out at a
+sixty-seventh of a clear day's air, and a fixture there rendered byte-identical fog on and off. **1,134 interiors carry
+a density in `Morrowind.esm`, none zero, range 0.25 to 1.5, mean 0.87** — showing none of that discards the record
+rather than reading it. Settled by eye between the Guild of Mages and Abaelun Mine.
+
+The test reads a hall's depth, because across a closet the veil resolves to one 8-bit level, and reads the fog's red
+against grey rather than a brightness. **The fixture's density is half a product and moves with it:** 140 left standing
+when the scale rose made two tests so opaque that forward and back came out identical, a ratio of NaN.
+
+### 8.84 A coverage that was carrying density, and a dead calm that was a photograph
+
+`FOG_EVEN` is the coverage when fog is even rather than banked, and a half is the midpoint of `FOG_CLEARING` and
+`FOG_SOLID` — but those are thresholds on the *noise*, and what the smoothstep between them produces averages **a
+third**. The constant exists so indoors and out differ in character rather than in how much air there is, and at a half
+every step toward evenness was also a step toward more air.
+
+That mattered once `FOG_STIRRED` was added beside it: `Weather` gives foggy and snow a wind of exactly nought, so their
+coverage was the raw threshold — banks with clear gaps, which reads as blotches rather than weather. It lifts the whole
+set a quarter toward even, so a rain at 0.3 comes out near a half and an ashstorm at 0.8 barely moves. Indoors is never
+banked, so a room's coverage simply *is* `FOG_EVEN`, and `INDOOR_FOG_SCALE` rose by the same ratio to 0.045.
+
+### 8.85 A curve that respaces the weathers must not respace the hour
+
+`DEPTH_CURVE` spreads the ten apart with clear fixed. Applied to the *interpolated* depth it amplified the gap between a
+weather's day and night as hard as the gap between weathers: foggy's night is 1.9 times its day in the ini, and a fourth
+power made that four times the air, pinned at `DEEPEST` — a blizzard's whiteout for a fog meant to be a little thicker
+than noon's. So the curve reads the day depth, the figure the ten are ordered by, and the hour rides on top as the ini's
+plain ratio; `stands * hour` is the same product either way and only decides where the power lands.
+
+The exponent came down 4 → 3.5 with it: cloudy and overcast move a fiftieth, rain a fourteenth, foggy, snow and
+thunderstorm a sixth, ashstorm and blight a fifth, and a blizzard not at all — 134 either way, with `DEEPEST` always
+deciding. Foggy goes from four and a half times a clear day to three and two thirds.
+
+### 8.86 Three seconds of every start was one shader
+
+`primary_visibility.comp` is **172,043 words of SPIR-V** and the driver takes three seconds on it; the other five
+modules take one millisecond together. A `VkPipelineCache` on disk takes a fresh process to **72 ms against 3,169**
+and a second renderer in-process to 20 against 3,100 — which the suite paid fourteen times over.
+
+- **Keyed by nothing here, because Vulkan keys it already** — entries are indexed by the whole pipeline, so a changed
+  shader misses and recompiles. Naming the file by a source hash would key it again, coarser, and throw away every other
+  pipeline. A blob from another driver is *safe*: the header carries vendor, device and driver.
+- **Written once the pipelines exist, not at teardown** — the tests share a device out of a `static`, which is never
+  dropped. The once-per-run latch is set on the write, or a call arriving before anything was compiled would burn it.
+- **Through a temporary and a rename**, because a dozen test processes finish into the same half-megabyte file. Last
+  writer wins, with a superset of what it started from.
+
+### 8.87 Ash is carried, not dropped, and the ini says nothing about it
+
+Ashstorm and blight carry colours, a fog depth, a wind speed and a `Storm Threshold` — nothing about what is blowing.
+What the game ships instead is `meshes/ashcloud.nif`: seven `NiParticleSystemController` emitters on the camera, zero
+triangles, 172 vertices, spanning ±1,224 and standing 116 to 1,394. A sprite-era budget in exactly the way `Max
+Raindrops`'s 450 is, so the count, spread and height are read off it. **Told from a blizzard by its sheet** — both carry
+a threshold, only Bloodmoon's is `tx_bm_` — which is §8.59's argument reused.
+
+**It goes where the air goes.** A mote fine enough to stay up has a terminal velocity of centimetres a second against a
+wind of tens of metres, so `Wind Speed` through `GALE` is its speed and gravity gets a twentieth. That is why `velocity`
+belongs to `Precipitation`: it is the one thing the three kinds differ in by more than a constant.
+
+**The density is derived and then knowingly missed by three orders.** Ten milligrams of PM10 to the cubic metre, a
+twenty-micron grain at 2,500 kg/m³ massing 1.05e-11 kg — **9.6e5 motes/m³**. One to a cube of `spacing` at that density
+is 0.71 units on a side, far under what the march resolves, and specks finer than a pixel are what §8.64 and §8.68 are
+about: at 2.5 units it was static across the frame, at 10 scattered specks, at **7** a field of motes with the ship
+legible through it — 982/m³, a thousandth of real. What stands in for the rest is the weather's own fog, thickest of the
+ten after a blizzard. The dust that is not drawn is the dust you are looking through.
+
+**Rock, not crystal.** Snow's albedo is nine tenths, volcanic ash's a seventh — the whole reason a dust storm is a brown
+gloom where a blizzard is a white one, and at a flake's brightness the motes were pale grains against their own storm.
+Drawn 1.6 times a drop's width, between a flake's 3 and a drop's 1, and moving sixteen metres a second across the view,
+so it comes out short and slanted with no case of its own. `precip_snow` became `precip_kind`, **ordered so one
+comparison answers the commonest question**: anything above rain does not wet a surface or ring the water.
