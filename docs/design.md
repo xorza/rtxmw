@@ -404,7 +404,7 @@ perpendicular, deleting the *depth* term changed nothing, so a panel parallel to
 identically surfaced was added. Composing the lighting before filtering — the regression this design
 exists to prevent — spreads the albedo step over fifteen columns.
 
-### M7 — Denoise and upscale — **built, short of its own bar**
+### M7 — Denoise and upscale — **done for accuracy, timing deferred to §5.3**
 DLSS Ray Reconstruction via NGX: denoise, antialias and upscale in one pass, with no separate TAA —
 running TAA over a temporally-accumulated denoiser double-blurs and compounds ghosting. **Done when:**
 a still frame at 1 spp is comparable to a 1024-sample reference by a numeric metric, and the frame holds
@@ -413,11 +413,15 @@ a still frame at 1 spp is comparable to a 1024-sample reference by a numeric met
 `crates/rtxmw/src/upscaler.rs` brings NGX up for both front ends, `--dlss off|performance|balanced|
 quality|dlaa` selects it, and it replaces the à-trous filter rather than sitting beside it.
 
-**Neither half of "done when" is met.** There is no numeric comparison against a converged reference,
-and stability is not accuracy. At the §5.3 target a frame is **15.6 ms at night and 14.1 by day**
-against a 16.7 ms budget — inside it, but only on a settled clock; the same five runs spanned to 37 ms
-and the first of every batch was the slow one. A budget met at the bottom of a two-to-one spread is not
-a budget held.
+**The accuracy half is met** — §8.88, and `tests/reconstruction.rs` is what holds it: against a
+4,096-sample reference, one sample a pixel comes out at 0.1918 relative RMSE as traced, 0.0300 under
+the four à-trous passes Ray Reconstruction replaced, and **0.0085 under Ray Reconstruction itself**.
+
+**The timing half is §5.3's now rather than this milestone's.** It was measured here at 15.6 ms by
+night and 14.1 by day against a 16.7 ms budget — inside it, but only on a settled clock, with the same
+five runs spanning to 37 ms and the first of every batch the slow one. Since then the weather set has
+gone in and the frame is 44 ms at the §5.3 target, which is recorded there along with why it is not
+being worked on yet.
 
 Practical notes: NGX ships real Linux `.so` files and needs specific Vulkan instance and device
 extensions **at creation time**; OTA model updates are broken on Linux, so the baked-in model is what
@@ -549,8 +553,6 @@ and no Purkinje shift or absolute units, which §5.1 blocks rather than this mil
 
 Collected rather than decided here — each is recorded where the work was done:
 
-- **M7's bar.** No numeric comparison of 1 spp against a converged reference, and the budget is met only
-  on a settled clock.
 - **M8's post chain.** Bloom, grading, sharpening, exposure adaptation over time, HDR output.
 - **M10's water.** Shoreline foam — the Jacobian's *sign* is computed and thrown away — and underwater
   shafts (§7.8).
@@ -3092,3 +3094,49 @@ gloom where a blizzard is a white one, and at a flake's brightness the motes wer
 Drawn 1.6 times a drop's width, between a flake's 3 and a drop's 1, and moving sixteen metres a second across the view,
 so it comes out short and slanted with no case of its own. `precip_snow` became `precip_kind`, **ordered so one
 comparison answers the commonest question**: anything above rain does not wet a surface or ring the water.
+
+### 8.88 One sample a pixel, against four thousand
+
+M7's done-when, and the half that had never been measured: stability is not accuracy, and a filter
+returning last frame unchanged would pass every other check here. One reference, four candidates.
+
+| | relative RMSE |
+|---|---|
+| 1 spp as traced | 0.1918 |
+| 4 à-trous passes | 0.0300 |
+| Ray Reconstruction, first frame | 0.0295 |
+| **Ray Reconstruction, settled (DLAA)** | **0.0085** |
+| Ray Reconstruction at Performance | 0.0255 |
+
+**Relative, and in units of the frame's own mean.** The frame is scene-referred and unbounded, so a
+plain RMSE over linear radiance is decided by whichever handful of pixels holds the ceiling lamp.
+Rousselle's ε of 1e-2 taken literally would have been the same mistake wearing the other hat: this
+interior's mean radiance is **0.0168**, so the floor would swamp every denominator in the frame and
+quietly turn a relative error back into an absolute one. Dividing both frames by the reference's mean
+first is what makes the number mean the same thing in a cave and on a beach — §8.76 again.
+
+**The reference is 32 frames of 128 samples, averaged in linear and jittered.** Averaged in linear
+because the tone curve is concave where a firefly lands, so the mean of tone-mapped frames is not the
+tone-mapped mean. Jittered because Ray Reconstruction resolves sub-pixel detail out of the jitter it
+is given, and a reference sampled at pixel centres would charge it for every edge it got *right*.
+**Bought in samples rather than in frames**, because every estimator's stream rotates with the frame
+index — so frames converge all of them and samples only the bounce, but a frame is read back over the
+bus and a sample is not: over 64 frames, 16, 32 and 64 samples give 0.0062, 0.0045 and 0.0034 of
+residual for 0.52, 0.57 and 0.63 seconds. The same four thousand at half the frames costs 0.46.
+
+**Splitting the reference by parity measured a half-pixel shift, not noise.** The two halves exist to
+say what the reference's own residual is; taken as evens against odds it came back at 0.0248, four
+times the truth, because Halton in base 2 is a bit reversal — every odd index lands in the right half
+of the pixel and every even one in the left. Consecutive runs each cover the pixel evenly: 0.0062.
+
+**That residual is then taken back out in quadrature**, since two independent errors add that way and
+these draw from different streams. The evidence it is sound is that the corrected candidate figures
+are *identical* across references of three different lengths — 0.0085 and 0.0256 at 16, 32 and 64
+samples a frame, where the uncorrected readings move. It is guarded rather than trusted: the residual must stay under
+the best candidate's own error, or the correction is what is doing the measuring.
+
+Two things the table says that a single number would not. **Ray Reconstruction's first frame, with no
+history, measures 0.0295 against the à-trous filter's 0.0300** — the two are the same picture, and
+everything Ray Reconstruction gains over the filter it replaced is temporal. And **Performance, at a
+quarter of the traced pixels, lands level with that filter at full resolution**, which is what §5.3 is
+buying with.

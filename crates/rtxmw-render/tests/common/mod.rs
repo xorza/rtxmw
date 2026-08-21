@@ -3,6 +3,11 @@
 //! Loading a real cell lives in `rtxmw_scene::LoadedCell`, because the engine needs it too. What is
 //! left here is describing a scene without a content file, which only a test wants.
 
+/// The bring-up both Ray Reconstruction tests share — see `NgxGpu`, and why they cannot use the
+/// device the rest of the suite runs on.
+#[cfg(feature = "dlss")]
+pub(crate) mod ngx_gpu;
+
 use glam::Vec3;
 use rtxmw_scene::{
     Ambient, Instance, Light, Material, MaterialKind, MaterialTable, Mesh, MeshId, StaticScene,

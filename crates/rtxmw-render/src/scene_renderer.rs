@@ -664,6 +664,20 @@ impl SceneRenderer {
         self.gbuffer.motion()
     }
 
+    /// What Ray Reconstruction reconstructed, at the output size and still linear.
+    ///
+    /// `None` without an upscaler, where [`SceneRenderer::target`] is already the finished frame.
+    /// In `GENERAL` once [`SceneRenderer::record`] has run — the tone curve reads it there, and
+    /// nothing transitions it afterwards.
+    ///
+    /// **Scene-referred, because Ray Reconstruction does not do exposure**, so this and `target`
+    /// are the same quantity at two resolutions and one is directly comparable to the other. That
+    /// comparison is the whole of `tests/reconstruction.rs`.
+    #[cfg(feature = "dlss")]
+    pub fn upscaled(&self) -> Option<&Image> {
+        self.upscaler.as_ref().map(crate::dlss::Upscaler::output)
+    }
+
     /// The exposed, tone-mapped, sRGB-encoded image, ready to blit to a swapchain or write to a
     /// PNG unchanged.
     pub fn output(&self) -> &Image {

@@ -12,22 +12,20 @@
 #![cfg(feature = "dlss")]
 
 use ash::vk;
-use glam::Vec3;
-use rtxmw_gpu::{
-    Device, Instance, Memory, PhysicalDevice, Presentation, Uploader, Validation, readback,
-};
+use rtxmw_gpu::{Uploader, readback};
 use rtxmw_render::SceneRenderer;
-use rtxmw_render::dlss::{Paths, Preset, Requirements, Upscaler};
+use rtxmw_render::dlss::{Paths, Preset, Upscaler};
 use rtxmw_scene::LoadedCell;
+
+mod common;
+
+use common::ngx_gpu::{CELL, NgxGpu, Viewing};
 
 /// Output size, and — at DLAA — the size traced too.
 ///
 /// **DLAA rather than an upscaling preset**, so that what this measures is the temporal resolve
 /// alone. Any mode that upscales would fold reconstruction error into the same number and leave a
 /// failure ambiguous.
-/// The cell this renders, and the one the shake was seen in.
-const CELL: &str = "Seyda Neen, Census and Excise Office";
-
 const SIZE: vk::Extent2D = vk::Extent2D {
     width: 1280,
     height: 720,
@@ -53,28 +51,18 @@ fn rms(a: &[u8], b: &[u8]) -> f32 {
 
 #[test]
 fn a_still_camera_gives_ray_reconstruction_a_still_image() {
-    let required = Requirements::query().expect("the SDK should answer");
-    let instance = Instance::new(c"rtxmw-stability", &[], Validation::Record)
-        .expect("an instance should build");
-    let Ok(physical) = PhysicalDevice::select(&instance, Presentation::NotNeeded) else {
-        eprintln!("skipping: no device this renderer can use");
+    let Some(NgxGpu {
+        instance,
+        physical,
+        device,
+        memory,
+        mut uploader,
+    }) = NgxGpu::new(c"rtxmw-stability")
+    else {
         return;
     };
-    for name in &required.device {
-        assert!(
-            physical.supports(name),
-            "{} does not offer {name:?}, which NGX says it needs",
-            physical.name()
-        );
-    }
-    let device = Device::new(&instance, &physical, &required.device)
-        .expect("a device should build with what NGX asked for");
-    let memory = Memory::new(&instance, &physical, &device).expect("memory should come up");
-    let mut uploader = Uploader::new(&device, &memory, physical.graphics_queue_family())
-        .expect("an uploader should build");
 
-    let data = std::env::temp_dir().join("rtxmw-ngx");
-    std::fs::create_dir_all(&data).expect("a scratch directory should be creatable");
+    let data = NgxGpu::scratch();
     let upscaler = Upscaler::new(
         &instance,
         &physical,
@@ -119,20 +107,10 @@ fn a_still_camera_gives_ray_reconstruction_a_still_image() {
         )
         .expect("scene should load");
 
-    // One camera, never moved, for every frame below — and placed by the scene rather than by hand
-    // so that it faces geometry whichever of the two loaded.
-    let eye = cell
-        .scene
-        .bounds()
-        .map_or(Vec3::ZERO, |bounds| bounds.centre());
-    let view = glam::camera::rh::view::look_to_mat4(eye, Vec3::X, Vec3::Z);
-    let projection = glam::camera::rh::proj::vulkan::perspective_infinite_reverse(
-        75f32.to_radians(),
-        SIZE.width as f32 / SIZE.height as f32,
-        0.05,
-    );
+    // One camera, never moved, for every frame below.
+    let camera = Viewing::of(&cell.scene, SIZE);
     let frame = |renderer: &mut SceneRenderer, uploader: &mut Uploader| -> Vec<u8> {
-        let constants = renderer.frame_constants(view, projection, eye);
+        let constants = renderer.frame_constants(camera.view, camera.projection, camera.eye);
         renderer
             .render_once(uploader, &constants)
             .expect("trace should run");
