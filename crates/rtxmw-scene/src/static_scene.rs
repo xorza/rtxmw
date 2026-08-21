@@ -198,9 +198,11 @@ impl ModelIndex {
         let sex = if npc.female { "f" } else { "m" };
         let prefix = format!("b_n_{}_{sex}_", npc.race);
 
-        // **One piece per slot**, because that is how a body is decided: the skin goes on first and
-        // whatever is worn covers it. Twenty-seven of them, most empty on most people.
-        let mut slots: Vec<Option<&BodyRecord>> = vec![None; PartSlot::COUNT];
+        // **One piece per slot, and the highest bidder takes it.** The skin bids lowest, an
+        // ordinary garment beats it, armour beats clothing, and a robe beats everything — see
+        // [`WornSlot::priority`], whose numbers are the game's own.
+        const SKIN: u8 = 1;
+        let mut slots: Vec<(u8, Option<&BodyRecord>)> = vec![(0, None); PartSlot::COUNT];
         for part in BodyPart::ALL {
             let skin = match part {
                 // The face and the hair are named by the record itself rather than found by race:
@@ -219,35 +221,44 @@ impl ModelIndex {
                         && !id.ends_with(".1st")
                 }),
             };
-            let Some(skin) = skin else { continue };
+            let Some(skin_record) = skin else { continue };
             for slot in part.slots().into_iter().flatten() {
-                slots[slot.0 as usize] = Some(skin);
+                slots[slot.0 as usize] = (SKIN, Some(skin_record));
             }
         }
 
-        // **Everything the record hands them, clothing first and armour over it.** Morrowind
-        // decides what an actor actually wears when it spawns them, out of a ranking this has no
-        // business reimplementing; what it does have is the list, and dressing them in all of it
-        // puts the last shirt on the body rather than none.
-        let mut worn: Vec<&WearableRecord> = npc
-            .inventory
-            .iter()
-            .filter_map(|id| self.wearables.get(id))
-            .collect();
-        worn.sort_by_key(|item| item.kind);
-        for item in worn {
+        // **Everything the record hands them.** Morrowind decides what an actor actually wears when
+        // it spawns them, out of a ranking this has no business reimplementing; what it does have
+        // is the list, and dressing them in all of it puts the best garment on the body rather than
+        // none. A robe covering a shirt is what the priorities are for.
+        let mut reserved = vec![0u8; PartSlot::COUNT];
+        for item in npc.inventory.iter().filter_map(|id| self.wearables.get(id)) {
+            let priority = item.worn.priority(item.kind);
             for reference in &item.parts {
                 let Some(record) = self.body_named(reference.worn_by(npc.female)) else {
                     continue;
                 };
-                slots[reference.slot.0 as usize] = Some(record);
+                let slot = &mut slots[reference.slot.0 as usize];
+                if priority > slot.0 {
+                    *slot = (priority, Some(record));
+                }
+            }
+            // **And what it covers without naming**: a robe hides the arms and legs under it, a
+            // skirt the legs, a helmet the hair.
+            for slot in item.worn.reserves() {
+                reserved[*slot as usize] = reserved[*slot as usize].max(priority);
+            }
+        }
+        for (slot, hidden) in slots.iter_mut().zip(&reserved) {
+            if slot.0 < *hidden {
+                *slot = (0, None);
             }
         }
 
         let parts = slots
             .iter()
             .enumerate()
-            .filter_map(|(slot, record)| ActorPart::of((*record)?, PartSlot(slot as u8)))
+            .filter_map(|(slot, (_, record))| ActorPart::of((*record)?, PartSlot(slot as u8)))
             .collect();
         Some(ActorPlan {
             // **Beast races have a skeleton of their own** and only one of it: there is no female

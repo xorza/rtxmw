@@ -36,7 +36,7 @@ pub use crate::position::Position;
 pub use crate::race_record::RaceRecord;
 pub use crate::record_name::RecordName;
 pub use crate::region_record::RegionRecord;
-pub use crate::wearable_record::{PartReference, WearableKind, WearableRecord};
+pub use crate::wearable_record::{PartReference, WearableKind, WearableRecord, WornSlot};
 
 // The gate must match the module's, or the module is `pub` yet unreachable under cfg(test).
 #[cfg(any(test, feature = "internals"))]

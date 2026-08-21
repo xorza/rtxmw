@@ -3599,3 +3599,36 @@ Balmora guild's mage went from 231 textures to 255.
 **Still not dressed**: the 273 `CREA` records that name a `base_anim` variant. They are humanoid and
 assembled exactly this way, but their parts are found by a naming convention this has not confirmed
 — and guessing at it is how the first-person hands got onto a Breton woman.
+
+### 8.97 A hit reads itself out of a table, and the table was a commit behind
+
+Reported as *the clothes look like mirrors*, and guessed at as an enchantment effect. It was neither.
+
+**A body's mesh, uvs, normals, materials and textures were all correct**, verified one at a time:
+every worn mesh carries full normals and a texturing property, every uv set matches its vertex
+count, every `.bmp` a NIF names resolves to a `.dds` that is present, and no material carries an
+emissive. The assembled mesh's runs each name a distinct texture and start at a plausible uv.
+
+**What separated it was placing the same body twice.** As a static instance it drew as a dark red
+robe; as a deforming one, pale and faceted. Then identity skinning — positions, normals and uvs
+copied through the pass verbatim — still drew pale. So nothing the shader computes was wrong, and
+the fault was in what the *trace* read.
+
+**`MaterialBuffers::upload` ran before the vertex regions existed.** A hit finds its material and its
+vertex offset by indexing `GpuGeometry` at `instanceCustomIndex + geometry_index`, and handing every
+resident placement a region is what appends the mesh ranges and submeshes those entries come from.
+The commit built the table first and reserved the regions second, so every deforming placement
+indexed past the end of it and shaded with whatever material and vertex offset happened to be
+there — geometry right, because the acceleration structure reads the ranges live; everything else
+arbitrary. It is a bug §8.94's ordering did not have and the streaming rework of §8.9x introduced by
+moving reservation from the cell's arrival into the commit.
+
+**And the covered parts.** A garment hides more than it names, and nothing in the record says so —
+it is a fact about how the thing is cut, which the game carries in code. A robe reserves the groin,
+the skirt, both legs, both upper arms, both knees, both forearms and the chest; a skirt reserves the
+groin and both legs; a helmet reserves the hair. The priorities are the game's own —
+`apps/openmw/mwrender/npcanimation.cpp:590` gives a robe a base of 11 and a skirt 3 against nothing
+for everything else, and turns each into `((base + 1) << 1) + is_armour`. So a robe at 24 beats every
+other garment, a skirt at 8 beats an ordinary one, armour at 3 beats clothing at 2, and skin at 1
+loses to all of them. Which item is a robe comes from the first word of `CTDT`, and which is a helmet
+from the first word of `AODT`.

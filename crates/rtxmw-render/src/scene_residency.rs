@@ -363,6 +363,18 @@ impl SceneResidency {
         uploader: &mut Uploader,
         limits: RayTracingLimits,
     ) -> rtxmw_gpu::Result<()> {
+        // **The regions first, because the geometry table is what a hit reads itself out of.**
+        // Handing every resident placement a vertex region appends mesh ranges and submeshes, and a
+        // table uploaded before that has no entry for them — so a hit on one indexes past the end
+        // and shades with whatever material and vertex offset it finds there.
+        let mut instances: Vec<Instance> = self
+            .cells
+            .iter()
+            .flat_map(|cell| cell.instances.iter())
+            .copied()
+            .collect();
+        instances.extend(self.pose_resident(uploader, limits)?);
+
         self.tables =
             MaterialBuffers::upload(uploader, &self.geometry, self.materials.materials())?;
 
@@ -375,14 +387,6 @@ impl SceneResidency {
         self.lights = Buffer::storage_of(uploader, "scene lights", bytemuck::cast_slice(&table))?;
         self.light_grid = LightGrid::build(uploader, &table)?;
         self.lighting.light_grid = self.light_grid.extent();
-
-        let mut instances: Vec<Instance> = self
-            .cells
-            .iter()
-            .flat_map(|cell| cell.instances.iter())
-            .copied()
-            .collect();
-        instances.extend(self.pose_resident(uploader, limits)?);
 
         // **And the deforming structures are built once here, before anything references them.**
         // They are created unbuilt over regions holding whatever the allocator left there, and a
