@@ -133,6 +133,10 @@ fn trace_scene(
     // gradient across a wall these tests need flat, and change what a scene renders as when it is
     // moved away from the origin.
     renderer.set_fog(0.0);
+    // **And unglared**, which is the same argument about the other thing that moves light between
+    // pixels: a point spread carries a green wall's light onto the red one beside it, and a wall
+    // these tests need to be exactly one colour comes back as twenty-five of them.
+    renderer.set_glare(0.0);
 
     // One uploader for the whole trace, held across load and render. It wraps a single queue, so
     // the harness serialises every test through it — which is exactly why the renderer borrows one

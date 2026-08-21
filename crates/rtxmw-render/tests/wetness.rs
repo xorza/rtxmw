@@ -160,6 +160,9 @@ fn middle<T>(
     renderer.set_denoise_passes(0);
     // No fog: what is measured is what the film did, and a march would lay a gradient over it.
     renderer.set_fog(0.0);
+    // And no glare, which is fog's counterpart in the display chain: it moves light between
+    // pixels by construction, and every expectation here is about one pixel at a time.
+    renderer.set_glare(0.0);
     renderer.set_sky(Sky {
         precipitation,
         ..Sky::at(WorldTime::hours(12.0))

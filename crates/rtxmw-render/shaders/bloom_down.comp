@@ -1,0 +1,43 @@
+#version 460
+
+// One step down the bloom pyramid: a 2x2 box average of the level above.
+//
+// **A box, and exactly a box, because the pyramid is what does the widening.** A single wide blur
+// at full resolution would cost hundreds of taps a pixel; six halvings with four taps apiece reach
+// the same distance for a thirtieth of the work, and the tent filter on the way back up
+// (`bloom_up.comp`) is what turns the stack of boxes into something smooth. Each level is exactly
+// half the one above in each axis, so the four texels cover the destination pixel's footprint with
+// no overlap and no gap — which is what makes this step conserve energy exactly rather than
+// approximately.
+//
+// **No firefly clamp, deliberately.** The usual first-level Karis average is there to stop a lone
+// aliased specular sample from pumping the whole glow between frames. What is bright here is not an
+// aliased sample: a candle flame is two pixels at sixty times the mean radiance of the room, it is
+// *supposed* to be, and Ray Reconstruction has already settled it temporally. Weighting by inverse
+// luminance would crush exactly the highlight this exists to spread. If a flicker ever shows up,
+// that is when to reach for one — and it would be a note about that flicker, not about energy.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0, rgba16f) uniform readonly image2D source;
+layout(set = 0, binding = 1, rgba16f) uniform writeonly image2D target;
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(target);
+    if (any(greaterThanEqual(pixel, size))) {
+        return;
+    }
+
+    // An odd source dimension leaves one row or column over; clamping folds it into the last
+    // destination pixel rather than dropping it, which is what keeps the total energy the total.
+    ivec2 limit = imageSize(source) - ivec2(1);
+    ivec2 origin = pixel * 2;
+    vec3 sum = vec3(0.0);
+    for (int y = 0; y < 2; ++y) {
+        for (int x = 0; x < 2; ++x) {
+            sum += imageLoad(source, min(origin + ivec2(x, y), limit)).rgb;
+        }
+    }
+    imageStore(target, pixel, vec4(sum * 0.25, 1.0));
+}

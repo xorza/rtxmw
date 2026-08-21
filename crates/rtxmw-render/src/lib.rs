@@ -4,6 +4,7 @@ pub mod shaders;
 
 mod acceleration_structure;
 mod auto_exposure;
+mod bloom;
 mod composite;
 mod denoiser;
 mod skin_pass;

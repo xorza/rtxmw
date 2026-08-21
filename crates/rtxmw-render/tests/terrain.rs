@@ -105,6 +105,9 @@ fn trace(layers: [u32; 4]) -> Vec<u8> {
     // And no fog: it is atmosphere between the eye and the ground rather than the ground's own
     // colour, and every expectation here is a blend weight worked out by hand.
     renderer.set_fog(0.0);
+    // And no glare, which is fog's counterpart in the display chain: it moves light between
+    // pixels by construction, and every expectation here is about one pixel at a time.
+    renderer.set_glare(0.0);
     renderer.set_denoise_passes(0);
 
     let mut uploader = gpu.uploader();

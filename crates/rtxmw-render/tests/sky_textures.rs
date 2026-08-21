@@ -57,6 +57,9 @@ fn a_second_weather_replaces_the_sheet_the_first_one_left_on_the_device() {
     renderer.set_bounce_samples(0);
     renderer.set_denoise_passes(0);
     renderer.set_fog(0.0);
+    // And no glare, which is fog's counterpart in the display chain: it moves light between
+    // pixels by construction, and every expectation here is about one pixel at a time.
+    renderer.set_glare(0.0);
 
     let mut uploader = gpu.uploader();
     renderer

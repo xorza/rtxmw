@@ -100,6 +100,9 @@ fn present(scene: &StaticScene) -> Vec<u8> {
     // is what fog is for and it is exactly what these tests must not have: an unlit surface with fog
     // on it is a lit one, and half of what is measured here is that the unlit half stays unlit.
     renderer.set_fog(0.0);
+    // And no glare, which is fog's counterpart in the display chain: it moves light between
+    // pixels by construction, and every expectation here is about one pixel at a time.
+    renderer.set_glare(0.0);
 
     let mut uploader = gpu.uploader();
     renderer

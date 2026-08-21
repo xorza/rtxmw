@@ -646,14 +646,16 @@ the cell put it and plays an idle; what this milestone owns is that the world st
 
 Collected rather than decided here — each is recorded where the work was done:
 
-- **M8's post chain.** Bloom, grading, sharpening, exposure adaptation over time, HDR output.
+- **M8's post chain.** Bloom landed in §8.100, opened early by the flames of §8.99. Grading,
+  sharpening, exposure adaptation over time and HDR output are still ahead.
 - **M10's water.** Shoreline foam — the Jacobian's *sign* is computed and thrown away — and underwater
   shafts (§7.8).
 - **§5.1's other half.** Settled — roughness dropped, replacer packs refused, and the normal map
   synthesised from painted relief built in §8.90. What waits on it is the specular coat §8.89 tried
   early, and the absolute units §8.51–§8.53 each recorded a debt for.
-- **§5.4's scope boundary.** Bind pose only: no animation, no particles, no creatures or NPCs. Planned
-  as M12, which is the last feature block before §5.3 opens.
+- **§5.4's scope boundary.** Lifted: animation, particles, creatures and NPCs all landed in M12, which
+  was the last feature block before §5.3 opens. What is left of it is `NiUVController` (§8.99) and the
+  273 humanoid `CREA` records that are assembled like an NPC and still invisible (§8.96).
 - **§5.3's budget.** 44 ms at 3840×2160 against 16.6, knowingly, and not to be opened until the feature
   set is closed. Opacity micromaps, SER and cluster acceleration structures wait there.
 
@@ -3735,3 +3737,57 @@ and `NiAlphaController` (51) are creature and spell effects, and want the per-in
 already have. The one with placed static content behind it is **`NiUVController`** at 50 files: Vivec's
 waterfalls, `in_lava_1024_01`, the glowing fences and the force fields, all of which scroll and none
 of which do here yet.
+
+### 8.100 Glare is the eye's, not the lens's, and it is a blend rather than an addition
+
+M8's post chain, opened by §8.99 rather than by the schedule: putting 678 self-luminous emitters into
+the world at sixty times the mean radiance of the rooms they stand in left every one of them a
+hard-edged sprite that clipped to white and stopped. A flame with no halo does not read as a flame,
+and the same was already true of the sun, of a lightning channel and of every lamp.
+
+**Down and back up rather than one wide blur.** Reaching several hundred pixels directly costs
+hundreds of taps a pixel. Halving to a four-pixel level — eight of them at 1080 lines, nine at 2160 —
+and climbing back with a 1-2-1 tent at every step reaches the same distance for a fraction of the
+work, and the sum over the levels is a *mixture* of widths rather than one: a bright core from the
+fine levels and a long faint skirt from the coarse ones. That mixture is what a real point spread
+function looks like and what no single Gaussian can be.
+
+**A blend, not an addition, and that is what makes the constant mean something.** What an optic does
+to a bright point is move part of its energy elsewhere — the part that scatters is exactly the part
+that no longer arrives where it was aimed. Written as `mix(frame, pyramid, k)` with the pyramid
+brought to unit gain, a flat field blooms to itself and the frame's total is untouched, so `k` is the
+fraction scattered rather than a knob turned until it looked right. It also cannot wash the picture
+out: only a *contrast* has anywhere to spread.
+
+**Eight percent, which is the eye's figure and not a lens's.** Veiling glare in a clean photographic
+lens is a couple of percent by the ISO 9358 index, and if this were standing in for a camera that is
+what would belong. It is standing in for being in the room, where the scatter that matters happens in
+the viewer's own cornea, lens and vitreous — something near a tenth. **A monitor cannot provoke
+that**: a flame arrives at sixty times the room's mean and leaves the tone curve at less than twice
+it, so the luminance that would have made a real eye scatter never reaches the real eye looking at the
+screen. The render has to supply what the display cannot. At four percent the glow was there and did
+nothing; at eight the sparks over a hearth read as embers.
+
+**No firefly clamp.** The usual Karis average on the first downsample exists to stop a lone aliased
+specular sample pumping the whole glow between frames. What is bright here is not an aliased sample —
+a candle flame is two pixels at sixty times the mean, it is *supposed* to be, and Ray Reconstruction
+has already settled it. Weighting by inverse luminance would crush exactly the highlight this exists
+to spread.
+
+**Where it goes in the chain, and one place it must not.** After the upscaler, because what scatters
+sits in front of the *display* and an upscaler handed a hazed frame reconstructs detail out of a haze
+that has none. And after the **meter**, which is the sharper constraint and was found by breaking a
+test: the histogram deliberately leaves surfaces with no light on them out of its average, and a glow
+*is* light — spread first, it puts a faint value on every black pixel in the frame and drags exactly
+the population the exposure was built to ignore back into it. Metering first costs nothing, since the
+blend conserves the total and is linear, so applying it either side of the exposure multiply gives the
+same picture.
+
+**And it needs a switch, for the same reason fog does.** A glow moves light between pixels by
+construction, which is what half the render tests must not have underneath them: rain over open water
+measured *more* changed pixels than rain over land, the halo of the streaks above the waterline
+arriving on a darker frame the exposure had opened up; and a wall that is exactly one material came
+back as twenty-five colours where a green wall's light landed on a red one. `set_glare(0.0)` sits
+beside `set_fog(0.0)` in every test that counts pixels rather than looking at them.
+
+**Cost**, five-run medians: 0.13 ms at 1920×1080 and 0.26 ms at 3840×2160, against §5.3's 16.6.

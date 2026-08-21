@@ -96,6 +96,9 @@ fn trace(scene: &StaticScene, eye: Vec3, forward: Vec3) -> Vec<u8> {
     // And no fog, which scatters light into the shadow and would soften an edge these tests need
     // sharp — the whole measurement here is how wide the sun's own penumbra is.
     renderer.set_fog(0.0);
+    // And no glare, which is fog's counterpart in the display chain: it moves light between
+    // pixels by construction, and every expectation here is about one pixel at a time.
+    renderer.set_glare(0.0);
 
     let mut uploader = gpu.uploader();
     renderer

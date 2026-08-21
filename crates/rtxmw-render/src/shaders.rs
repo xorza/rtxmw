@@ -53,6 +53,21 @@ pub fn skin() -> &'static [u32] {
     include_spirv!("skin.comp")
 }
 
+/// One halving of the bloom pyramid.
+pub fn bloom_down() -> &'static [u32] {
+    include_spirv!("bloom_down.comp")
+}
+
+/// One doubling back up it, spread with a tent and added to the level it lands on.
+pub fn bloom_up() -> &'static [u32] {
+    include_spirv!("bloom_up.comp")
+}
+
+/// Blends the finished pyramid back into the frame.
+pub fn bloom_apply() -> &'static [u32] {
+    include_spirv!("bloom_apply.comp")
+}
+
 /// Exposure, tone curve and sRGB encoding, from linear radiance to display bytes.
 pub fn tonemap() -> &'static [u32] {
     include_spirv!("tonemap.comp")
@@ -73,6 +88,9 @@ mod tests {
             ("exposure", exposure()),
             ("denoise", denoise()),
             ("composite", composite()),
+            ("bloom_down", bloom_down()),
+            ("bloom_up", bloom_up()),
+            ("bloom_apply", bloom_apply()),
             ("tonemap", tonemap()),
         ] {
             assert!(!module.is_empty(), "{name} is empty");

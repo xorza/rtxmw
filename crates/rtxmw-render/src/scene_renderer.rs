@@ -15,6 +15,7 @@ use rtxmw_scene::{CellId, Sky, SkyTextures, StaticScene};
 use rtxmw_texture::Texture;
 
 use crate::auto_exposure::AutoExposure;
+use crate::bloom::Bloom;
 use crate::composite::Composite;
 use crate::denoiser::{DEFAULT_PASSES, Denoiser};
 use crate::gbuffer::GBuffer;
@@ -99,13 +100,15 @@ pub struct FrameTimings {
     pub upscale: f32,
     /// Histogram and the reduction over it.
     pub exposure: f32,
+    /// The pyramid down, back up, and blended into the frame.
+    pub bloom: f32,
     /// Tone curve and sRGB encoding.
     pub tonemap: f32,
 }
 
 impl FrameTimings {
     /// How many stages a frame is measured in, and so how many timestamps it writes.
-    const STAGES: usize = 7;
+    const STAGES: usize = 8;
 
     /// Everything the device spent on the frame.
     pub fn total(&self) -> f32 {
@@ -115,6 +118,7 @@ impl FrameTimings {
             + self.composite
             + self.upscale
             + self.exposure
+            + self.bloom
             + self.tonemap
     }
 
@@ -133,7 +137,8 @@ impl FrameTimings {
             composite: durations[3],
             upscale: durations[4],
             exposure: durations[5],
-            tonemap: durations[6],
+            bloom: durations[6],
+            tonemap: durations[7],
         }
     }
 }
@@ -158,13 +163,14 @@ impl std::fmt::Display for FrameTimings {
         write!(
             f,
             ": animate {:.2}, trace {:.2}, denoise {:.2}, composite {:.2}, upscale {:.2}, \
-             exposure {:.2}, tonemap {:.2}",
+             exposure {:.2}, bloom {:.2}, tonemap {:.2}",
             self.animate,
             self.trace,
             self.denoise,
             self.composite,
             self.upscale,
             self.exposure,
+            self.bloom,
             self.tonemap,
         )
     }
@@ -176,6 +182,7 @@ pub struct SceneRenderer {
     gbuffer: GBuffer,
     denoiser: Denoiser,
     composite: Composite,
+    bloom: Bloom,
     exposure: AutoExposure,
     tonemap: Tonemap,
     target: Image,
@@ -270,6 +277,7 @@ impl SceneRenderer {
             gbuffer: GBuffer::new(memory, extent)?,
             denoiser: Denoiser::new(device)?,
             composite: Composite::new(device)?,
+            bloom: Bloom::new(device, memory, extent)?,
             exposure: AutoExposure::new(device, memory)?,
             tonemap: Tonemap::new(device, memory, extent)?,
             target: target_image(memory, extent)?,
@@ -326,6 +334,9 @@ impl SceneRenderer {
         // mean, so a noisy frame measures darker than it is and the curve opens to compensate —
         // which under an upscaler, where the à-trous passes are off, is a single sample per pixel.
         // See `docs/design.md` §8.28 for what that cost.
+        // The same image as the two below, spread in place between them — see the note in
+        // [`SceneRenderer::record`] for why the glow goes after the meter and not before it.
+        self.bloom.bind(source);
         self.exposure.bind(source);
         self.tonemap.bind(source, self.exposure.buffer());
     }
@@ -359,8 +370,10 @@ impl SceneRenderer {
             crate::denoiser::DEFAULT_PASSES
         };
         self.upscaler = upscaler;
-        // The tone curve now runs at the upscaled size, so its own output follows.
+        // The tone curve now runs at the upscaled size, so its own output follows — and the glow
+        // with it, being a property of the frame that is displayed rather than of the one traced.
         self.tonemap.resize(memory, output)?;
+        self.bloom.resize(memory, output)?;
         self.bind_targets();
         Ok(())
     }
@@ -425,6 +438,15 @@ impl SceneRenderer {
             "fog runs from none to the cell's own, not {strength}"
         );
         self.fog = strength;
+    }
+
+    /// Sets how much of the light the optic scatters across the frame.
+    ///
+    /// Zero is the frame with none of it, which is what a measurement of one localised effect needs
+    /// underneath it — see `Bloom::set_strength`, and `SceneRenderer::set_fog` for the same
+    /// argument about the other thing that moves light everywhere.
+    pub fn set_glare(&mut self, strength: f32) {
+        self.bloom.set_strength(strength);
     }
 
     /// Sets how many à-trous passes smooth the lighting. Zero leaves it as traced.
@@ -674,6 +696,7 @@ impl SceneRenderer {
         self.target = target_image(memory, extent)?;
         self.gbuffer = GBuffer::new(memory, extent)?;
         self.tonemap.resize(memory, extent)?;
+        self.bloom.resize(memory, extent)?;
         self.bind_targets();
         self.bind_scene();
         Ok(())
@@ -869,6 +892,7 @@ impl SceneRenderer {
                 .into_iter()
                 .chain(self.gbuffer.images())
                 .chain([self.tonemap.output()])
+                .chain(self.bloom.levels())
                 .chain(upscaled)
             {
                 image_barrier::transition(
@@ -960,9 +984,27 @@ impl SceneRenderer {
                 .record(device, command_buffer, displayed, bias);
             self.timestamps.write(command_buffer, 6);
 
-            self.tonemap.record(command_buffer, displayed);
+            // **The glow, after the meter has read the frame and before the curve maps it.**
+            //
+            // After the upscaler because what scatters is the optic in front of the *display*, and
+            // an upscaler handed a hazed frame would be reconstructing detail out of a haze that
+            // has none. After the *meter* for a sharper reason: the histogram deliberately leaves
+            // out surfaces with no light on them, and a glow is light — spreading one first puts a
+            // faint value on every black pixel in the frame and drags exactly the population the
+            // exposure was built to ignore back into its average.
+            //
+            // Nothing is lost by metering first. The blend conserves the frame's total, so a meter
+            // that averaged over everything would read the same number either way; and the blend is
+            // linear, so applying it before the exposure multiply or after gives the same picture.
+            // See `docs/design.md` §8.100.
+            memory_barrier::full(device, command_buffer);
+            self.bloom.record(device, command_buffer);
             memory_barrier::full(device, command_buffer);
             self.timestamps.write(command_buffer, 7);
+
+            self.tonemap.record(command_buffer, displayed);
+            memory_barrier::full(device, command_buffer);
+            self.timestamps.write(command_buffer, 8);
 
             for image in [self.target.raw(), self.tonemap.output().raw()] {
                 image_barrier::transition(
@@ -1011,7 +1053,7 @@ mod tests {
         // In the order `record` writes them. The array's width is the type's guarantee that a
         // caller cannot hand over a stage count that disagrees with the pool's.
         let timings = FrameTimings::from_durations(
-            [0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0],
+            [0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0],
             extent(1920, 1080),
             extent(3840, 2160),
         );
@@ -1019,8 +1061,9 @@ mod tests {
         assert_eq!(timings.trace, 1.0);
         assert_eq!(timings.denoise, 2.0);
         assert_eq!(timings.upscale, 8.0);
-        assert_eq!(timings.tonemap, 32.0);
-        assert_eq!(timings.total(), 63.5);
+        assert_eq!(timings.exposure, 16.0);
+        assert_eq!(timings.tonemap, 64.0);
+        assert_eq!(timings.total(), 127.5);
     }
 
     #[test]
@@ -1030,7 +1073,7 @@ mod tests {
         // 1920x1080` names the output and an upscaler on quality traces at 1280x720. Both sizes are
         // in the line, so there is nothing left to assume about which one a number belongs to.
         let upscaled = FrameTimings::from_durations(
-            [0.0, 1.0, 0.0, 0.0, 8.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0, 8.0, 0.0, 0.0, 0.0],
             extent(1280, 720),
             extent(1920, 1080),
         );

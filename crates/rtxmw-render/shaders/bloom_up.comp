@@ -1,0 +1,54 @@
+#version 460
+
+// One step back up the bloom pyramid: the level below, spread with a 3x3 tent, added to this one.
+//
+// **The tent is what makes a stack of box filters look like a lens.** Downsampling alone leaves the
+// pyramid blocky — every level is a grid of hard squares — and simply doubling one back up carries
+// those squares straight into the picture. A 1-2-1 tent in each axis is the smallest kernel that
+// removes them, and applying it at *every* level rather than once at the end is what turns the
+// sequence into a smooth, near-Gaussian falloff several hundred pixels across.
+//
+// **Added rather than blended, and that is what shapes the glow.** Each level contributes its own
+// width to the total, so the sum over the pyramid is a mixture of Gaussians — a sharp core from the
+// fine levels and a long skirt from the coarse ones. That mixture is much closer to what a real
+// lens does than any single Gaussian is: the point spread function of an optical system has a
+// bright centre and a wide, faint halo, and a one-width blur can have one or the other.
+//
+// Normalised by the number of levels each pixel accumulates, which the host passes, so the whole
+// pyramid comes out at unit gain and the strength is decided in one place.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+// The coarser, half-sized level being spread.
+layout(set = 0, binding = 0, rgba16f) uniform readonly image2D coarse;
+// This level, read for what it already holds and written with the sum.
+layout(set = 0, binding = 1, rgba16f) uniform image2D target;
+
+// One tap of the tent, clamped so an edge borrows from itself rather than from nothing.
+vec3 tap(ivec2 at, ivec2 limit) {
+    return imageLoad(coarse, clamp(at, ivec2(0), limit)).rgb;
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(pixel, imageSize(target)))) {
+        return;
+    }
+    ivec2 limit = imageSize(coarse) - ivec2(1);
+
+    // Where this pixel sits in the coarser level: the two are exactly a factor of two apart, so a
+    // destination pixel lands on a quarter-texel offset and the tent's weights fall out of which
+    // side of the source texel it is on. Taken as the nearest source texel plus a signed neighbour,
+    // which is the same 1-2-1 tent written without a division.
+    ivec2 centre = pixel / 2;
+    ivec2 towards = ivec2(pixel & ivec2(1)) * 2 - ivec2(1);
+
+    // 9/16, 3/16 twice and 1/16 — the outer product of 3-1 with itself over four, which is the
+    // 1-2-1 tent evaluated at a quarter-texel offset.
+    vec3 spread = tap(centre, limit) * (9.0 / 16.0)
+                + tap(centre + ivec2(towards.x, 0), limit) * (3.0 / 16.0)
+                + tap(centre + ivec2(0, towards.y), limit) * (3.0 / 16.0)
+                + tap(centre + towards, limit) * (1.0 / 16.0);
+
+    imageStore(target, pixel, vec4(imageLoad(target, pixel).rgb + spread, 1.0));
+}

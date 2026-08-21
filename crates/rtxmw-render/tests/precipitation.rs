@@ -89,6 +89,12 @@ fn falling_in(scene: &StaticScene, precipitation: Precipitation, seconds: f32) -
     renderer.set_denoise_passes(0);
     // No fog: what is measured is what falls, and a march would put a gradient across it.
     renderer.set_fog(0.0);
+    // **And no glare, for the same reason one step further out.** Every assertion below counts the
+    // pixels a streak changed; a point spread carries that streak's light onto its neighbours by
+    // construction, so with one underneath the count stops being a count of streaks. The rain over
+    // open water measured *more* changed pixels than the rain over land with one on — the halo of
+    // the streaks above the waterline, arriving on a darker frame the exposure had opened up.
+    renderer.set_glare(0.0);
     renderer.set_sky(Sky {
         precipitation,
         ..Sky::at(WorldTime::hours(12.0))

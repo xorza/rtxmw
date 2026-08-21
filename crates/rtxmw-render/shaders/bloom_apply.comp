@@ -1,0 +1,55 @@
+#version 460
+
+// Puts the glow back into the frame: the pyramid, brought to unit gain, blended in by the fraction
+// of the light an optic scatters.
+//
+// **A blend rather than an addition, because glare moves light, it does not make it.** What a lens
+// does to a bright point is spread part of its energy over the sensor; the part that scatters is
+// exactly the part that no longer arrives where it was aimed. Written as a mix, a flat field blooms
+// to itself and the frame's total is untouched — which is the property that makes the strength below
+// mean something physical rather than being a knob turned until it looked right.
+//
+// It also means this cannot wash the picture out. A uniform grey stays that grey; only a *contrast*
+// between a bright thing and its surroundings has anywhere to spread.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+// The finest level of the pyramid, at half the frame's width and height, holding the accumulated
+// sum of every level above it.
+layout(set = 0, binding = 0, rgba16f) uniform readonly image2D bloom;
+// The frame, read and written in place.
+layout(set = 0, binding = 1, rgba16f) uniform image2D target;
+
+layout(push_constant) uniform Glare {
+    // The fraction of the light the optic scatters — see `Bloom::SCATTERED`.
+    float strength;
+    // One over the number of levels the pyramid accumulated, which is what brings it to unit gain.
+    float normalise;
+} glare;
+
+vec3 tap(ivec2 at, ivec2 limit) {
+    return imageLoad(bloom, clamp(at, ivec2(0), limit)).rgb;
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(pixel, imageSize(target)))) {
+        return;
+    }
+    ivec2 limit = imageSize(bloom) - ivec2(1);
+
+    // The same quarter-offset tent the pyramid climbs with — see `bloom_up.comp`. Nearest would do
+    // almost as well on something this smooth, but a doubled grid is exactly the artefact the tent
+    // exists to remove and there is no reason to reintroduce it at the last step.
+    ivec2 centre = pixel / 2;
+    ivec2 towards = ivec2(pixel & ivec2(1)) * 2 - ivec2(1);
+    vec3 spread = tap(centre, limit) * (9.0 / 16.0)
+                + tap(centre + ivec2(towards.x, 0), limit) * (3.0 / 16.0)
+                + tap(centre + ivec2(0, towards.y), limit) * (3.0 / 16.0)
+                + tap(centre + towards, limit) * (1.0 / 16.0);
+
+    vec4 frame = imageLoad(target, pixel);
+    // Alpha carries the trace's hit flag rather than a coverage, so it passes through untouched.
+    vec3 mixed = mix(frame.rgb, spread * glare.normalise, glare.strength);
+    imageStore(target, pixel, vec4(mixed, frame.a));
+}
