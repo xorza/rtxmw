@@ -3791,3 +3791,51 @@ back as twenty-five colours where a green wall's light landed on a red one. `set
 beside `set_fog(0.0)` in every test that counts pixels rather than looking at them.
 
 **Cost**, five-run medians: 0.13 ms at 1920×1080 and 0.26 ms at 3840×2160, against §5.3's 16.6.
+
+### 8.101 A shore is as deep as the water over it, not as far as a ray through it goes
+
+The hard line down Seyda Neen's beach, which is the first exterior view the project has — `-2,-9` is
+the deck of the ship the game itself opens on.
+
+**It is the water, and the issue log said otherwise.** The note recorded that a screen-space mask
+found no water pixels in the band the seam crosses, and concluded terrain. Removing the 429 water
+quads removes the seam completely, so that conclusion was wrong; what the mask was measuring is not
+recorded and cannot now be rechecked.
+
+**What it is not**, each ruled out by a render rather than by reading: not fog (it survives
+`--fog 0`), not lighting or shadowing (identical at 9am, 2pm and 7pm), not the upscaler (identical
+with `--dlss off`), not a gap between cells (all 429 quads abut exactly — logged), and not an
+occlusion silhouette (the primary hit distance, banded, runs straight across the seam with no jump).
+
+**What it is.** `SHORE_FADE` exists precisely to stop the plane cutting the terrain along a hard
+line, and it was not engaging: the fade was keyed on how far the *refraction* ray travelled before
+finding anything, and that ray leaves the surface at forty-three degrees off the vertical and lands
+somewhere else entirely — at a shore, somewhere the bed is much further down. Visualised, the term
+came back saturated right up to the seam at a grazing view while fading properly from straight above,
+which is the signature of a criterion that depends on where the viewer stands.
+
+The quantity the fade is about is *how much water is over this pixel*, and that is a question with a
+view-independent answer: one short ray straight down. It costs nothing measurable — 10.15 ms of trace
+against 9.25 after, five-run medians at 1920×1080, the difference being noise and the straightened
+refraction.
+
+**And the bending goes with it**, which is the other half: water that is not there cannot refract, so
+the refracted direction is blended back toward the incident one by the same shore term. Without that,
+the last pixel of water still shows a piece of ground displaced by a fifth of a radian from the dry
+pixel beside it — a hard line however faint the surface over it has been made.
+
+**Improved rather than closed, and the log says so.** The hard step is gone and what is left reads as
+a shoreline, but a faint edge remains. Two things are not accounted for. The seam's *shape* is a
+straight polyline, which is the water plane crossing a triangulated terrain that runs within a few
+units of sea level for hundreds of units here — the heightmap around the camera is quantised to
+multiples of eight and crosses zero around column 50, so the two surfaces are very nearly parallel
+and their intersection inside one 128-unit facet runs a long way. But the refraction path measured
+~100 units at the seam, and a bed that shallow cannot produce that: refraction bends a ray *steeper*,
+so its path is always shorter than the straight one. Something is making that ray shallow — the wave
+normal at grazing incidence is the candidate — and that is where a next look should start.
+
+**No regression test, deliberately.** The failure needs a bed whose depth under the pixel is small
+while a ray sent through it travels far, and with a horizontal surface that combination cannot be
+built: the refracted ray is always the steeper one, so both distances go to zero together. Three
+fixtures were tried and all three passed against the unfixed shader, which makes them noise rather
+than tests. The evidence for the fix is the A/B renders and the term visualised at two view angles.

@@ -88,6 +88,14 @@ const float CAUSTIC_MAX_DEPTH = 140.0;
 // — otherwise the plane cuts the terrain along a hard line, which is the classic tell of a water
 // plane and is on screen in 533 of the game's 1,292 land cells. Half a metre of fade is enough to
 // hide the intersection without making the shallows look thin.
+//
+// **Measured straight down, and it was measured along the refraction before.** Those are the same
+// number only where the bed is flat. At Seyda Neen's shore the terrain runs within a few units of
+// sea level for hundreds of units, so the two planes are very nearly parallel and their crossing
+// inside a single 128-unit facet is a straight line hundreds of units long — while the refracted
+// ray, leaving at forty-three degrees, lands far enough out to find a bed a hundred units down. It
+// reported deep water at a pixel with none, the fade never engaged, and what was left was exactly
+// the hard line this constant exists to prevent. `docs/design.md` §8.101.
 const float SHORE_FADE = 35.0;
 
 // What a refraction ray that hits nothing has travelled through. Longer than the deepest water in
@@ -293,6 +301,20 @@ vec3 water_shade(Surface surface, vec3 incident, uvec2 pixel, out Guides guides)
     bool from_below = incident.z > 0.0;
     vec3 flat_normal = from_below ? vec3(0.0, 0.0, -1.0) : vec3(0.0, 0.0, 1.0);
 
+    // **How much water is under *this pixel*, which is the whole of what the shore is.** Straight
+    // down rather than along anything, and it is worth a ray of its own: the two rays cast below
+    // both leave at an angle, so what they measure is how far *they* travelled, which at a shore is
+    // a question about the slope beyond rather than about the depth here. See `SHORE_FADE`.
+    //
+    // From underneath there is no shore: the distance to the bed says nothing about a surface seen
+    // from below it, and the ray is spared.
+    float shore = 1.0;
+    if (!from_below) {
+        Surface bed = trace(surface.position + flat_normal * SHADOW_BIAS, -flat_normal,
+                            surface.footprint, frame.cone_spread, MASK_SOLID);
+        shore = smoothstep(0.0, SHORE_FADE, bed.hit ? bed.t : WATER_MAX_PATH);
+    }
+
     // The wave normal replaces the quad's flat one. Keyed off world position rather than anything
     // interpolated, so one cell's surface continues into the next without a seam at the boundary.
     float unresolved;
@@ -339,7 +361,11 @@ vec3 water_shade(Surface surface, vec3 incident, uvec2 pixel, out Guides guides)
         reflected = absorbed_by_water(reflected, mirrored);
     }
 
-    vec3 through = refract(incident, n, eta);
+    // **And the bending goes with it.** Water that is not there cannot refract: at the waterline
+    // the ray has to leave straight, or the last pixel of water shows a piece of ground displaced
+    // by a fifth of a radian from the dry pixel beside it — which is a hard line however faint the
+    // surface over it has been made. Straightening it is what makes the two sides meet.
+    vec3 through = normalize(mix(incident, refract(incident, n, eta), shore));
     if (dot(through, through) < 1e-6) {
         // Past the critical angle looking up from underwater, where the surface is a mirror and
         // there is nothing behind it to see.
@@ -354,8 +380,6 @@ vec3 water_shade(Surface surface, vec3 incident, uvec2 pixel, out Guides guides)
                             STREAM_WATER_REFRACT, depth);
     vec3 refracted = from_below ? behind : absorbed_by_water(behind, depth);
 
-    // With no water left between the surface and the ground, this is the ground. Only from above:
-    // seen from under it, `depth` is a distance through air and says nothing about a shore.
-    float shore = from_below ? 1.0 : smoothstep(0.0, SHORE_FADE, depth);
+    // With no water left between the surface and the ground, this is the ground.
     return mix(behind, mix(refracted, reflected, fresnel), shore);
 }
