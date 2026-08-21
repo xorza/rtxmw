@@ -18,7 +18,7 @@ use crate::camera::{Camera, Movement};
 use crate::cli::{Upscaling, WindowOptions};
 use crate::renderer::{Conditions, Renderer};
 use crate::scene_loader::{self, WantedCell};
-use crate::world_clock::WorldClock;
+use crate::world_clock::{ClockFace, WorldClock};
 
 /// What the keys below do, for whoever is looking at the window rather than at this file.
 ///
@@ -28,7 +28,7 @@ const KEYS: &str = concat!(
     "keys: WASD, space and ctrl to fly \u{b7} shift to hurry \u{b7} ",
     "[ ] time speed \u{b7} \\ pause time \u{b7} , . step the hour by half \u{b7} ",
     "; ' cycle the weather this region has \u{b7} k a new bolt \u{b7} l the same one again \u{b7} ",
-    "esc to release the mouse",
+    "p print this spot as arguments \u{b7} esc to release the mouse",
 );
 
 /// Starting resolution — the internal render target from the design's performance budget.
@@ -143,6 +143,107 @@ pub(crate) struct App {
     last_frame: Instant,
     last_title_update: Instant,
     frames_since_title: u32,
+}
+
+/// A place worth profiling, as the two lines `p` writes to standard output.
+///
+/// **A type rather than a pair of `println!`s in the handler**, so what it writes can be asserted
+/// without a window, a device or a cell — the second line is arguments the binary has to be able to
+/// read back, and a format that drifts from the parser is not something an eye catches in a log.
+#[derive(Debug)]
+struct Marker<'a> {
+    /// Where this is, as the cell to open rather than the one the window was opened in.
+    cell: CellId,
+    position: Vec3,
+    forward: Vec3,
+    time: WorldTime,
+    weather: &'a str,
+}
+
+impl<'a> Marker<'a> {
+    /// Where `camera` is standing, given the cell the window was `opened` in.
+    fn new(opened: &CellId, camera: &Camera, time: WorldTime, weather: &'a str) -> Self {
+        let position = camera.position();
+        Self {
+            // **The camera's own square, not the one the window opened in** — the same cell only
+            // until you fly out of it, and a marker naming the wrong one loads the wrong scene.
+            // An interior has no grid position and stays named.
+            cell: match opened {
+                CellId::Interior(name) => CellId::Interior(name.clone()),
+                CellId::Exterior { .. } => CellId::containing(position.x, position.y),
+            },
+            position,
+            forward: camera.forward(),
+            time,
+            weather,
+        }
+    }
+
+    /// How far round the compass the camera faces, in degrees clockwise from north.
+    ///
+    /// **North is +Y and east is +X**, so the arguments come the other way round from the usual
+    /// `atan2`. It is the exact inverse of what a door's stored yaw goes through — `facing_from` in
+    /// `rtxmw_scene`'s `door`, which is `(sin, cos, 0)` where a maths library would give
+    /// `(cos, sin, 0)`.
+    fn bearing(&self) -> f32 {
+        self.forward
+            .x
+            .atan2(self.forward.y)
+            .to_degrees()
+            .rem_euclid(360.0)
+    }
+
+    /// How far above the horizon it looks, in degrees. `forward` is a unit vector, so its Z is the
+    /// sine of the angle outright.
+    fn climb(&self) -> f32 {
+        self.forward.z.asin().to_degrees()
+    }
+}
+
+impl std::fmt::Display for Marker<'_> {
+    /// A line for a person and a line for the binary, in that order.
+    ///
+    /// The first is a comment, so a file of these can be fed to something that skips them. The
+    /// second pastes after `--screenshot out.png` and renders this exact frame: which cell, where
+    /// in it, facing where, at what hour and under what weather — everything that decides what the
+    /// frame costs. What DLSS runs at is deliberately absent, being what a profiling run varies.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(
+            f,
+            "# {} at {:.0}, {:.0}, {:.0} — bearing {:.0}°, climb {:.0}° — {}, {}",
+            self.cell,
+            self.position.x,
+            self.position.y,
+            self.position.z,
+            self.bearing(),
+            self.climb(),
+            ClockFace(self.time),
+            self.weather,
+        )?;
+        // How a cell is *written* rather than how it is shown: `Display` brackets an exterior for a
+        // person to read, and the argument parser takes a bare pair. An interior's name is quoted
+        // because they carry spaces and commas, and a comma unquoted reads as a grid position.
+        match &self.cell {
+            CellId::Interior(name) => write!(f, "{name:?}")?,
+            CellId::Exterior { x, y } => write!(f, "{x},{y}")?,
+        }
+        write!(
+            f,
+            " --at {:.1},{:.1},{:.1} --look {:.4},{:.4},{:.4} --time {:.3} --weather {}",
+            self.position.x,
+            self.position.y,
+            self.position.z,
+            self.forward.x,
+            self.forward.y,
+            self.forward.z,
+            // **The date as well as the clock face, which is what `--time` past 24 hours means.**
+            // Two frames a day apart are lit alike and cost differently, because the moon that is
+            // up has moved on a phase — and the running total is the only thing that says which
+            // day this is.
+            self.time.day() * 24.0,
+            self.weather,
+        )
+    }
 }
 
 /// Which of `count` entries lands `by` places from `standing`, wrapping at both ends.
@@ -412,6 +513,15 @@ impl App {
         self.mouse_captured = captured;
     }
 
+    /// Writes where the camera is standing to standard output — see [`Marker`].
+    fn mark_viewpoint(&self) {
+        let time = self.clock.time();
+        println!(
+            "{}",
+            Marker::new(&self.cell, &self.camera, time, &self.weather.name)
+        );
+    }
+
     fn update_title(&mut self) {
         let Some(window) = &self.window else {
             return;
@@ -605,6 +715,9 @@ impl ApplicationHandler for App {
                             renderer.restrike();
                         }
                     }
+                    // Nothing in the world changes, so the repeat is dropped only to keep a held
+                    // key from filling the list with the same spot thirty times.
+                    KeyCode::KeyP if pressed && !event.repeat => self.mark_viewpoint(),
                     KeyCode::Escape if pressed => {
                         if self.mouse_captured {
                             self.set_capture(false);
@@ -676,6 +789,8 @@ impl ApplicationHandler for App {
 
 #[cfg(test)]
 mod tests {
+    use crate::cli::{Command, ScreenshotOptions};
+
     use super::*;
 
     #[test]
@@ -698,5 +813,79 @@ mod tests {
         // A region with one weather goes nowhere, which beats going out of bounds.
         assert_eq!(stepped(Some(0), 1, 1), 0);
         assert_eq!(stepped(Some(0), -1, 1), 0);
+    }
+
+    /// The second line of a marker is arguments, and this is what says they are still readable.
+    ///
+    /// **Parsed back rather than only compared**, because a string that looks right and a string
+    /// the binary accepts are different claims — the whole point of the line is that it can be
+    /// pasted after `--screenshot`.
+    fn arguments_of(marker: &Marker) -> ScreenshotOptions {
+        let printed = marker.to_string();
+        let (comment, arguments) = printed.split_once('\n').expect("a marker is two lines");
+        assert!(comment.starts_with("# "), "the first line is a comment");
+        // **A size before the cell, which is the shape the line is written to sit in**: the
+        // screenshot command takes both positionally and in that order, so a marker pasted without
+        // one would have its cell read as the size.
+        let mut words = ["rtxmw", "--screenshot", "out.png", "1920x1080"]
+            .map(str::to_owned)
+            .to_vec();
+        // The cell is one word however many spaces its name holds, which is what the quotes on it
+        // are for — a shell would strip them, and this stands in for the shell.
+        let (cell, flags) = match arguments.strip_prefix('"') {
+            Some(quoted) => {
+                let (name, rest) = quoted.split_once('"').expect("a quote is closed");
+                (name.to_owned(), rest)
+            }
+            None => {
+                let (bare, rest) = arguments
+                    .split_once(' ')
+                    .expect("a cell is followed by flags");
+                (bare.to_owned(), rest)
+            }
+        };
+        words.push(cell);
+        words.extend(flags.split_whitespace().map(str::to_owned));
+        match Command::parse_from(&words) {
+            Command::Screenshot(options) => options,
+            other => panic!("a marker should read back as a screenshot, not {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_marked_spot_prints_where_it_is_and_reads_back_as_arguments() {
+        // A 3-4-5 triangle laid on its side: three east and four down over a hypotenuse of five, so
+        // the direction is exactly (0.6, 0, -0.8) and the angles are hand-checkable — due east is a
+        // bearing of 90, and a climb of `asin(-0.8)` is -53.13 degrees.
+        let camera = Camera::looking(Vec3::new(12.3, -45.6, 78.9), Vec3::new(3.0, 0.0, -4.0));
+        // Past a day, which is what says the marker carries the date: 38.25 hours is quarter past
+        // two in the afternoon of the second day, and the moon over it is not the first day's.
+        let indoors = CellId::Interior("Balmora, Guild of Mages".to_owned());
+        let marker = Marker::new(&indoors, &camera, WorldTime::hours(38.25), "rain");
+        assert_eq!(
+            marker.to_string(),
+            "# Balmora, Guild of Mages at 12, -46, 79 — bearing 90°, climb -53° — 14:15, rain\n\
+             \"Balmora, Guild of Mages\" --at 12.3,-45.6,78.9 --look 0.6000,0.0000,-0.8000 \
+             --time 38.250 --weather rain"
+        );
+        let read = arguments_of(&marker);
+        assert_eq!(read.cell, indoors);
+        assert_eq!(read.viewpoint.position, Some(Vec3::new(12.3, -45.6, 78.9)));
+        assert_eq!(read.weather, "rain");
+        assert_eq!(read.time, WorldTime::hours(38.25));
+
+        // **Outdoors the marker names the square the camera is standing in**, which is not the cell
+        // the window opened in once you have flown anywhere: -9000 and 20000 floor to -2 and 2 over
+        // a grid of 8192, where truncation would have said -1 and 2.
+        let flying = Camera::looking(Vec3::new(-9000.0, 20000.0, 512.0), Vec3::new(0.6, 0.8, 0.0));
+        let opened = CellId::Exterior { x: 0, y: 0 };
+        let marker = Marker::new(&opened, &flying, WorldTime::hours(0.0), "clear");
+        assert_eq!(
+            marker.to_string(),
+            "# (-2, 2) at -9000, 20000, 512 — bearing 37°, climb 0° — 00:00, clear\n\
+             -2,2 --at -9000.0,20000.0,512.0 --look 0.6000,0.8000,0.0000 --time 0.000 \
+             --weather clear"
+        );
+        assert_eq!(arguments_of(&marker).cell, CellId::Exterior { x: -2, y: 2 });
     }
 }

@@ -137,6 +137,23 @@ impl WorldClock {
     }
 }
 
+/// An hour of the world's day as a clock reads it, `HH:MM`.
+///
+/// **A type rather than a format string**, because there are two places that want one — the
+/// window's title and a marked spot — and the minute is derived rather than printed: whether the
+/// seconds truncate or round is a decision, and one made twice is two decisions waiting to differ.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ClockFace(pub(crate) WorldTime);
+
+impl std::fmt::Display for ClockFace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let hour = self.0.hour();
+        // Truncated, which is what a clock does: it reads 14:15 for the whole of that minute rather
+        // than rounding up halfway through it.
+        write!(f, "{:02}:{:02}", hour as u32, (hour.fract() * 60.0) as u32)
+    }
+}
+
 impl std::fmt::Display for WorldClock {
     /// As a clock face and a rate, which is what the window's title shows.
     ///
@@ -144,8 +161,7 @@ impl std::fmt::Display for WorldClock {
     /// twice a second on the frame path, and this is the difference between one allocation there
     /// and three.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let hour = self.time().hour();
-        write!(f, "{:02}:{:02}", hour as u32, (hour.fract() * 60.0) as u32)?;
+        write!(f, "{}", ClockFace(self.time()))?;
         match self.paused {
             true => write!(f, " paused"),
             false => write!(f, " {:.0}x", self.speed),
