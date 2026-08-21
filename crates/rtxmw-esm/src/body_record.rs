@@ -7,6 +7,7 @@
 
 use crate::error::Result;
 use crate::esm_reader::Record;
+use crate::part_slot::PartSlot;
 
 /// Which part of a body a `BODY` record is, as its `BYDT` names it.
 ///
@@ -61,44 +62,32 @@ impl BodyPart {
     /// called `Left Hand` and `Right Hand`, so a hand record supplies both sides and a head does
     /// not.
     pub fn is_paired(self) -> bool {
-        !matches!(
-            self,
-            Self::Head | Self::Hair | Self::Neck | Self::Chest | Self::Groin | Self::Tail
-        )
+        self.slots()[1].is_some()
     }
 
-    /// The attachment node this part hangs from, given a side.
+    /// The slot or slots this fills, right before left.
     ///
-    /// These are nodes the base skeleton already has, sitting beside the `Bip01` chain that drives
-    /// them — `Head`, `Chest`, `Left Upper Arm`. Each carries a hidden placeholder of its own that
-    /// the assembled part stands in for.
-    pub fn bone(self, right: bool) -> &'static str {
+    /// **A `BODY` record has no side and a slot does**, so a hand supplies two of them out of one
+    /// mesh. The pairs are the game's own — see [`PartSlot`].
+    pub fn slots(self) -> [Option<PartSlot>; 2] {
+        let one = |slot: u8| [Some(PartSlot(slot)), None];
+        let pair = |right: u8, left: u8| [Some(PartSlot(right)), Some(PartSlot(left))];
         match self {
-            Self::Head => "Head",
-            // Hair sits on the head rather than on a node of its own.
-            Self::Hair => "Head",
-            Self::Neck => "Neck",
-            Self::Chest => "Chest",
-            Self::Groin => "Groin",
-            Self::Tail => "Tail",
-            Self::Hand if right => "Right Hand",
-            Self::Hand => "Left Hand",
-            Self::Wrist if right => "Right Wrist",
-            Self::Wrist => "Left Wrist",
-            Self::Forearm if right => "Right Forearm",
-            Self::Forearm => "Left Forearm",
-            Self::UpperArm if right => "Right Upper Arm",
-            Self::UpperArm => "Left Upper Arm",
-            Self::Foot if right => "Right Foot",
-            Self::Foot => "Left Foot",
-            Self::Ankle if right => "Right Ankle",
-            Self::Ankle => "Left Ankle",
-            Self::Knee if right => "Right Knee",
-            Self::Knee => "Left Knee",
-            Self::UpperLeg if right => "Right Upper Leg",
-            Self::UpperLeg => "Left Upper Leg",
-            Self::Clavicle if right => "Right Clavicle",
-            Self::Clavicle => "Left Clavicle",
+            Self::Head => one(0),
+            Self::Hair => one(1),
+            Self::Neck => one(2),
+            Self::Chest => one(3),
+            Self::Groin => one(4),
+            Self::Tail => one(26),
+            Self::Hand => pair(6, 7),
+            Self::Wrist => pair(8, 9),
+            Self::Forearm => pair(11, 12),
+            Self::UpperArm => pair(13, 14),
+            Self::Foot => pair(15, 16),
+            Self::Ankle => pair(17, 18),
+            Self::Knee => pair(19, 20),
+            Self::UpperLeg => pair(21, 22),
+            Self::Clavicle => pair(23, 24),
         }
     }
 }

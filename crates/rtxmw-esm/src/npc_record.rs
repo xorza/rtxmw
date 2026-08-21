@@ -14,6 +14,9 @@ pub struct NpcRecord {
     /// inheriting from its race.
     pub head: String,
     pub hair: String,
+    /// Everything the record hands them, lower-cased. Most of it is not clothing and none of it
+    /// says what is *worn* — Morrowind decides that when the actor is spawned.
+    pub inventory: Vec<String>,
 }
 
 impl NpcRecord {
@@ -27,6 +30,7 @@ impl NpcRecord {
             female: false,
             head: String::new(),
             hair: String::new(),
+            inventory: Vec::new(),
         };
         for sub in record.subrecords() {
             let sub = sub?;
@@ -35,6 +39,11 @@ impl NpcRecord {
                 b"RNAM" => out.race = sub.as_str().to_lowercase(),
                 b"BNAM" => out.head = sub.as_str().to_lowercase(),
                 b"KNAM" => out.hair = sub.as_str().to_lowercase(),
+                // Thirty-six bytes: how many, then a thirty-two byte id padded with nuls.
+                b"NPCO" if sub.data().len() >= 36 => {
+                    let id = String::from_utf8_lossy(&sub.data()[4..36]);
+                    out.inventory.push(id.trim_end_matches('\0').to_lowercase());
+                }
                 b"FLAG" if sub.data().len() >= 4 => {
                     let flags = u32::from_le_bytes([
                         sub.data()[0],

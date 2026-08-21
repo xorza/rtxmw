@@ -5,7 +5,8 @@ use std::collections::HashMap;
 use glam::{Affine3A, Mat3, Quat, Vec2, Vec3};
 use rtxmw_esm::{
     BodyKind, BodyPart, BodyRecord, CELL_SIZE, Cell, CellId, CellIndex, CellRef, EsmReader,
-    LandRecord, LightRecord, NpcRecord, ObjectRecord, RaceRecord, Record, RecordName, TEXTURE_GRID,
+    LandRecord, LightRecord, NpcRecord, ObjectRecord, PartSlot, RaceRecord, Record, RecordName,
+    TEXTURE_GRID, WearableKind, WearableRecord,
 };
 use rtxmw_nif::NifFile;
 use rtxmw_vfs::Vfs;
@@ -109,6 +110,8 @@ pub struct ModelIndex {
     races: HashMap<String, RaceRecord>,
     /// Every body part the game ships, which a body is chosen out of by name.
     bodies: Vec<BodyRecord>,
+    /// Lower-cased id to what it covers, for the `CLOT` and `ARMO` records.
+    wearables: HashMap<String, WearableRecord>,
 }
 
 impl ModelIndex {
@@ -121,6 +124,7 @@ impl ModelIndex {
         let mut npcs = HashMap::new();
         let mut races = HashMap::new();
         let mut bodies = Vec::new();
+        let mut wearables = HashMap::new();
         for record in esm.records() {
             let record = record?;
             if record.is_deleted() || record.is_ignored() {
@@ -139,6 +143,17 @@ impl ModelIndex {
                         bodies.push(body);
                     }
                     continue;
+                }
+                b"CLOT" | b"ARMO" => {
+                    let kind = match &record.name().0 {
+                        b"ARMO" => WearableKind::Armour,
+                        _ => WearableKind::Clothing,
+                    };
+                    if let Some(item) = WearableRecord::parse(&record, kind)? {
+                        wearables.insert(item.id.clone(), item);
+                    }
+                    // A wearable is also a placeable object, so it falls through to be indexed as
+                    // the thing lying on the floor as well as the thing on a body.
                 }
                 _ => {}
             }
@@ -168,6 +183,7 @@ impl ModelIndex {
             npcs,
             races,
             bodies,
+            wearables,
         })
     }
 
@@ -182,16 +198,18 @@ impl ModelIndex {
         let sex = if npc.female { "f" } else { "m" };
         let prefix = format!("b_n_{}_{sex}_", npc.race);
 
-        let mut parts = Vec::new();
+        // **One piece per slot**, because that is how a body is decided: the skin goes on first and
+        // whatever is worn covers it. Twenty-seven of them, most empty on most people.
+        let mut slots: Vec<Option<&BodyRecord>> = vec![None; PartSlot::COUNT];
         for part in BodyPart::ALL {
-            // The face and the hair are named by the record itself rather than found by race: they
-            // are what one dark elf has and the next does not.
-            let wanted = match part {
+            let skin = match part {
+                // The face and the hair are named by the record itself rather than found by race:
+                // they are what one dark elf has and the next does not.
                 BodyPart::Head => self.body_named(&npc.head),
                 BodyPart::Hair => self.body_named(&npc.hair),
                 // **`.1st` is the arm the player sees down their own sleeve**, not a body part.
-                // Both records match the same prefix and the first-person one is often first in the
-                // file, so a Breton woman was wearing a pair of first-person hands.
+                // Both records match the same prefix and the first-person one is often first in
+                // the file, so a Breton woman was wearing a pair of first-person hands.
                 _ => self.bodies.iter().find(|body| {
                     let id = body.id.to_lowercase();
                     body.kind == BodyKind::Skin
@@ -201,10 +219,36 @@ impl ModelIndex {
                         && !id.ends_with(".1st")
                 }),
             };
-            if let Some(record) = wanted {
-                parts.extend(ActorPart::of(record));
+            let Some(skin) = skin else { continue };
+            for slot in part.slots().into_iter().flatten() {
+                slots[slot.0 as usize] = Some(skin);
             }
         }
+
+        // **Everything the record hands them, clothing first and armour over it.** Morrowind
+        // decides what an actor actually wears when it spawns them, out of a ranking this has no
+        // business reimplementing; what it does have is the list, and dressing them in all of it
+        // puts the last shirt on the body rather than none.
+        let mut worn: Vec<&WearableRecord> = npc
+            .inventory
+            .iter()
+            .filter_map(|id| self.wearables.get(id))
+            .collect();
+        worn.sort_by_key(|item| item.kind);
+        for item in worn {
+            for reference in &item.parts {
+                let Some(record) = self.body_named(reference.worn_by(npc.female)) else {
+                    continue;
+                };
+                slots[reference.slot.0 as usize] = Some(record);
+            }
+        }
+
+        let parts = slots
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, record)| ActorPart::of((*record)?, PartSlot(slot as u8)))
+            .collect();
         Some(ActorPlan {
             // **Beast races have a skeleton of their own** and only one of it: there is no female
             // variant of `base_animkna.nif`, so the women of Argonia are animated as the men are.
@@ -220,8 +264,14 @@ impl ModelIndex {
                 true => race.female_height,
                 false => race.male_height,
             },
-            // What two of these sharing a body looks like: the same race, sex, face and hair.
-            shared_as: format!("{prefix}{}/{}", npc.head, npc.hair),
+            // What two of these sharing a body looks like: everything they are wearing, and the
+            // face and hair under it.
+            shared_as: format!(
+                "{prefix}{}/{}/{}",
+                npc.head,
+                npc.hair,
+                npc.inventory.join("+")
+            ),
         })
     }
 
@@ -1288,6 +1338,7 @@ mod tests {
             npcs: HashMap::new(),
             races: HashMap::new(),
             bodies: Vec::new(),
+            wearables: HashMap::new(),
         }
     }
 

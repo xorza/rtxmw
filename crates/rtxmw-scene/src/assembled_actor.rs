@@ -1,7 +1,7 @@
 //! Building a person out of the dozen files they are stored as.
 
 use glam::{Affine3A, Vec3};
-use rtxmw_esm::{BodyPart, BodyRecord};
+use rtxmw_esm::{BodyRecord, PartSlot};
 use rtxmw_nif::{Block, NifFile};
 use rtxmw_vfs::Vfs;
 
@@ -15,34 +15,24 @@ use crate::static_scene::MeshId;
 pub(crate) struct ActorPart {
     /// Path in the virtual file system.
     pub(crate) model: String,
-    pub(crate) part: BodyPart,
-    /// Which of a paired part this is. Meaningless for a head or a chest.
-    pub(crate) right: bool,
+    /// The node it hangs from.
+    pub(crate) bone: &'static str,
+    /// Whether it is the authored mesh reflected — see [`PartSlot::is_reflected`].
+    pub(crate) reflected: bool,
 }
 
 impl ActorPart {
-    /// The pieces `record` supplies: one for a single part, two for a paired one.
-    pub(crate) fn of(record: &BodyRecord) -> Vec<Self> {
-        let model = format!("meshes/{}", record.model.replace('\\', "/"));
-        match record.part.is_paired() {
-            true => vec![
-                Self {
-                    model: model.clone(),
-                    part: record.part,
-                    right: false,
-                },
-                Self {
-                    model,
-                    part: record.part,
-                    right: true,
-                },
-            ],
-            false => vec![Self {
-                model,
-                part: record.part,
-                right: false,
-            }],
+    /// The piece `record` puts in `slot`, or `None` where it names no model.
+    pub(crate) fn of(record: &BodyRecord, slot: PartSlot) -> Option<Self> {
+        let bone = slot.bone()?;
+        if record.model.is_empty() {
+            return None;
         }
+        Some(Self {
+            model: format!("meshes/{}", record.model.replace('\\', "/")),
+            bone,
+            reflected: slot.is_reflected(),
+        })
     }
 }
 
@@ -100,13 +90,12 @@ impl AssembledActor {
                 continue;
             }
             let base_vertex = mesh.positions.len();
-            let bone = part.part.bone(part.right);
-            let attachment = skeleton.joint_named(&bone.to_lowercase());
+            let attachment = skeleton.joint_named(&part.bone.to_lowercase());
             // **The parts are authored for the right side, and the left is the mirror of it.** One
             // file supplies both arms; what makes one a left arm is a reflection along the bone's
             // own length, applied between the bone and the mesh. OpenMW does the same and by the
             // same test — `components/sceneutil/attach.cpp:166` looks for `Left` in the bone's name.
-            let mirrored = bone.starts_with("Left");
+            let mirrored = part.reflected;
             let attach_bind = match mirrored {
                 true => Affine3A::from_scale(Vec3::new(-1.0, 1.0, 1.0)),
                 false => Affine3A::IDENTITY,
@@ -305,17 +294,30 @@ mod tests {
         // bone's own length — see the note at the attachment above. Measured against the
         // skeleton's own placeholder for the part, an upper arm fits its left socket at 3.87 units
         // mirrored against 4.49 as-is, and its right socket the other way round.
+        // **And they are dressed.** An `NPC_` carries a list of what it was given and nothing that
+        // says which of it is worn, so everything wearable in that list goes on — clothing first
+        // and armour over it. A body with nothing but `meshes/b/` in it is one nobody dressed.
+        let worn = plan
+            .parts
+            .iter()
+            .filter(|part| !part.model.starts_with("meshes/b/"))
+            .count();
+        assert!(
+            worn > 0,
+            "a named townsperson is wearing something; this one has {:?}",
+            plan.parts
+                .iter()
+                .map(|part| &part.model)
+                .collect::<Vec<_>>()
+        );
+
         let reflected = actor
             .rig
             .bones
             .iter()
             .filter(|bone| bone.inverse_bind.matrix3.determinant() < 0.0)
             .count();
-        let left_attachments = plan
-            .parts
-            .iter()
-            .filter(|part| part.part.bone(part.right).starts_with("Left"))
-            .count();
+        let left_attachments = plan.parts.iter().filter(|part| part.reflected).count();
         assert!(
             reflected >= 5,
             "a body has arms and legs; only {reflected} of its bones are reflected"

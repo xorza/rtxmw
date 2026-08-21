@@ -625,10 +625,11 @@ its sync2 stages are what the skinning-to-build and build-to-trace barriers want
 3. **Creatures — done.** §8.93. They were already placed by step 2, because 87 of the 89 models
    animate from their own NIF; what they needed was the text keys that say which part of that
    animation is standing still. `XSCL` and a clip loaded from a `.kf` are still ahead.
-4. **NPCs — the body, done.** §8.94. A skeleton chosen by race and sex, thirteen parts found by the
-   naming convention `BODY` records use instead of a race field, and the face and hair the record
-   names itself. Worn `NPCO` inventory, which overrides the skin it covers, is what is left — and
-   with it the 273 `CREA` records that are humanoid and assembled the same way.
+4. **NPCs — done.** §8.94 for the body, §8.95 for which arm is which, §8.96 for the clothes. A
+   skeleton chosen by race and sex, thirteen parts found by the naming convention `BODY` records use
+   instead of a race field, the face and hair the record names itself, and everything wearable in
+   its inventory over the top. What is left is the 273 `CREA` records that are humanoid and
+   assembled the same way.
 5. **Particles and the rest of the controller family.** Particles belong in the transparency target
    beside precipitation rather than in the acceleration structure — §8.87 already transcribed
    `ashcloud.nif` by hand and the upscaler already composites that layer. `NiUVController` is a
@@ -3566,3 +3567,35 @@ the torso, and the `hand` record and the `chest` record both name it; so a file 
 bone names is added once however many parts point at it and however many sides they ask for. That
 had been adding it twice, which is what made the first assembled bodies look padded — 3,630 vertices
 over 125 bones against the 2,194 over 55 they actually are.
+
+### 8.96 Dressing them is the same twenty-seven slots
+
+The other half of M12's fourth step. A body is decided one slot at a time: the skin goes on first,
+and whatever is worn covers it.
+
+**`INDX` is a different enumeration from `BYDT`.** A `BODY` record says *what a mesh is* — a
+forearm, with no side, supplying both arms — and a part reference on a `CLOT` or `ARMO` record says
+*where a thing goes*, and it names the side: a cuirass names a right pauldron and a left one
+separately. Twenty-seven slots against fifteen mesh parts, and the map between them is one-to-two
+for everything paired. Both tables are the game's own; OpenMW's are at
+`components/esm3/loadarmo.hpp:20` and `apps/openmw/mwrender/npcanimation.cpp:243`, and every bone
+they name is a node `base_anim.nif` already carries.
+
+**Each reference names two body parts, for the two sexes** — and only 50 of the 707 in the master
+carry the second. The rest dress everybody in the same mesh.
+
+**Nothing in the record says what is *worn*.** `NPCO` is 36 bytes of count and id and it lists
+everything the actor was handed: a shirt, a ring, a torch, a bottle, some gold. Morrowind decides
+what goes on the body when it spawns them, out of a ranking of value and protection that this has no
+business reimplementing. So everything wearable in the list goes on, clothing first and armour over
+it, and a townsperson carrying two shirts wears the second — which is wrong in a way nobody will
+ever see, and a great deal less wrong than naked.
+
+A ring or an amulet covers no slot and is dropped at parse: it is worn and not seen.
+
+**What it costs**: Sellus Gravius in the census office is 3 animated placements at 0.13 ms, and the
+Balmora guild's mage went from 231 textures to 255.
+
+**Still not dressed**: the 273 `CREA` records that name a `base_anim` variant. They are humanoid and
+assembled exactly this way, but their parts are found by a naming convention this has not confirmed
+— and guessing at it is how the first-person hands got onto a Breton woman.

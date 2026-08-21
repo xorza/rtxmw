@@ -12,10 +12,12 @@ mod land_texture;
 mod light_record;
 mod npc_record;
 mod object_record;
+mod part_slot;
 mod position;
 mod race_record;
 mod record_name;
 mod region_record;
+mod wearable_record;
 
 pub use crate::body_record::{BodyKind, BodyPart, BodyRecord};
 pub use crate::cell::{CELL_SIZE, Cell, CellAmbient, CellId, CellRefIter};
@@ -29,10 +31,12 @@ pub use crate::land_texture::LandTexture;
 pub use crate::light_record::LightRecord;
 pub use crate::npc_record::NpcRecord;
 pub use crate::object_record::ObjectRecord;
+pub use crate::part_slot::PartSlot;
 pub use crate::position::Position;
 pub use crate::race_record::RaceRecord;
 pub use crate::record_name::RecordName;
 pub use crate::region_record::RegionRecord;
+pub use crate::wearable_record::{PartReference, WearableKind, WearableRecord};
 
 // The gate must match the module's, or the module is `pub` yet unreachable under cfg(test).
 #[cfg(any(test, feature = "internals"))]
