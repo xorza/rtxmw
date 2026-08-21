@@ -895,7 +895,13 @@ fn the_shipped_meshes_wind_their_triangles_to_agree_with_their_normals() {
     // between them most of the shapes the game is built out of.
     for cell in [CellId::Interior(CELL.into()), SHORE] {
         let scene = content.cell(&cell);
-        for mesh in &scene.meshes {
+        // **Shipped meshes only.** A body assembled out of parts is wound *against* its normals on
+        // purpose wherever a part was reflected onto the left side — see `AssembledActor` — and it
+        // is not a file anybody shipped, so it is not what this measures.
+        for (mesh, source) in scene.meshes.iter().zip(&scene.mesh_sources) {
+            if !source.starts_with("meshes/") {
+                continue;
+            }
             for triangle in mesh.indices.as_chunks::<3>().0 {
                 let corner = |at: usize| mesh.positions[triangle[at] as usize];
                 let plane = (corner(1) - corner(0)).cross(corner(2) - corner(0));

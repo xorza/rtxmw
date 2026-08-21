@@ -3528,3 +3528,41 @@ ms to **0.074**, because describing the build once per commit was worth more tha
 
 **Not done here**: worn clothing and armour. An NPC's `NPCO` inventory overrides the skin parts it
 covers, which is why the woman above is in her underwear.
+
+### 8.95 One arm is the other one reflected
+
+Reported from the window: an NPC's limbs on one side turn the wrong way. Two bugs behind it, and
+one of them was not the one being reported.
+
+**Morrowind's body parts are authored for the right side.** One file is both arms — `ActorPart`
+hands the same mesh to `Left Forearm` and to `Right Forearm` — and what makes one of them a left arm
+is a reflection along the bone's own length, applied between the bone and the mesh. OpenMW does
+exactly this and by exactly this test: `components/sceneutil/attach.cpp:166` looks for `Left` in the
+attachment's name and scales that subtree by `(-1, 1, 1)`.
+
+**Measured rather than taken on trust**, because a limb segment is a tube and a wrongly reflected
+one still looks like a tube. The skeleton carries its own placeholder for every part — `Tri Left
+Upper Arm` sits under the node `Left Upper Arm` — so the game's own data says where a part belongs.
+Against it, an upper arm fits its **left** socket at 3.87 units mean nearest-neighbour mirrored
+against 4.49 as-is, and its **right** socket at 3.87 as-is against 4.49 mirrored. The foot and the
+forearm cannot tell the difference at all — 3.95 either way — which is why the arm is what settled
+it.
+
+**A reflection turns a triangle inside out**, and the shading normal is chosen by the triangle's own
+plane. The winding of a reflected part is reversed where it is stored, so the plane comes back out
+the right way once the reflection is applied; the normal needs nothing, because for a matrix that is
+its own inverse and symmetric the plain transform *is* the inverse transpose. The consequence is
+that an assembled body is deliberately wound against its own normals wherever a part went left,
+which is why `the_shipped_meshes_wind_their_triangles_to_agree_with_their_normals` now measures only
+meshes that came out of a file.
+
+**And the second bug, found on the way.** `b_n_breton_f_hand` and `b_n_breton_f_hand.1st` both match
+the naming convention a body is chosen by, and the first-person one is often first in the file — so
+a Breton woman was wearing the pair of arms the player sees down their own sleeve. `.1st` is now
+excluded.
+
+**A skinned file is the whole of what it covers.** `B_N_Dark Elf_F_Skins.nif` holds both hands *and*
+the torso, and the `hand` record and the `chest` record both name it; so a file that binds by its own
+bone names is added once however many parts point at it and however many sides they ask for. That
+had been adding it twice, which is what made the first assembled bodies look padded — 3,630 vertices
+over 125 bones against the 2,194 over 55 they actually are.

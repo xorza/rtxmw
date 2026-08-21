@@ -189,11 +189,16 @@ impl ModelIndex {
             let wanted = match part {
                 BodyPart::Head => self.body_named(&npc.head),
                 BodyPart::Hair => self.body_named(&npc.hair),
+                // **`.1st` is the arm the player sees down their own sleeve**, not a body part.
+                // Both records match the same prefix and the first-person one is often first in the
+                // file, so a Breton woman was wearing a pair of first-person hands.
                 _ => self.bodies.iter().find(|body| {
+                    let id = body.id.to_lowercase();
                     body.kind == BodyKind::Skin
                         && body.part == part
                         && body.female == npc.female
-                        && body.id.to_lowercase().starts_with(&prefix)
+                        && id.starts_with(&prefix)
+                        && !id.ends_with(".1st")
                 }),
             };
             if let Some(record) = wanted {

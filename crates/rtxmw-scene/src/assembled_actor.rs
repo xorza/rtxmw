@@ -1,6 +1,6 @@
 //! Building a person out of the dozen files they are stored as.
 
-use glam::Affine3A;
+use glam::{Affine3A, Vec3};
 use rtxmw_esm::{BodyPart, BodyRecord};
 use rtxmw_nif::{Block, NifFile};
 use rtxmw_vfs::Vfs;
@@ -79,7 +79,15 @@ impl AssembledActor {
         let mut mesh = Mesh::default();
         let mut bones: Vec<Bone> = Vec::new();
         let mut shares: Vec<Vec<Share>> = Vec::new();
+        // **A skinned file is the whole of what it covers.** `B_N_Dark Elf_F_Skins.nif` holds both
+        // hands *and* the torso, and the `hand` record and the `chest` record both name it — so a
+        // file that binds by its own bone names is added once however many parts point at it, and
+        // however many sides they ask for. A rigid file is the opposite: one arm, added twice.
+        let mut skinned: std::collections::HashSet<String> = std::collections::HashSet::new();
         for part in parts {
+            if skinned.contains(&part.model) {
+                continue;
+            }
             let Ok(bytes) = vfs.read(&part.model) else {
                 continue;
             };
@@ -87,12 +95,22 @@ impl AssembledActor {
                 continue;
             };
             let mut spans = Vec::new();
-            let piece = Mesh::from_nif_tracked(&nif, materials, &mut spans);
+            let mut piece = Mesh::from_nif_tracked(&nif, materials, &mut spans);
             if piece.positions.is_empty() {
                 continue;
             }
             let base_vertex = mesh.positions.len();
-            let attachment = skeleton.joint_named(&part.part.bone(part.right).to_lowercase());
+            let bone = part.part.bone(part.right);
+            let attachment = skeleton.joint_named(&bone.to_lowercase());
+            // **The parts are authored for the right side, and the left is the mirror of it.** One
+            // file supplies both arms; what makes one a left arm is a reflection along the bone's
+            // own length, applied between the bone and the mesh. OpenMW does the same and by the
+            // same test — `components/sceneutil/attach.cpp:166` looks for `Left` in the bone's name.
+            let mirrored = bone.starts_with("Left");
+            let attach_bind = match mirrored {
+                true => Affine3A::from_scale(Vec3::new(-1.0, 1.0, 1.0)),
+                false => Affine3A::IDENTITY,
+            };
             let mut bound = Vec::new();
             for span in &spans {
                 bound.clear();
@@ -145,7 +163,7 @@ impl AssembledActor {
                         let bone = bones.len() as u32;
                         bones.push(Bone {
                             joint,
-                            inverse_bind: Affine3A::IDENTITY,
+                            inverse_bind: attach_bind,
                         });
                         for offset in 0..span.vertex_count as usize {
                             let vertex = base_vertex + span.first_vertex as usize + offset;
@@ -153,6 +171,18 @@ impl AssembledActor {
                             shares[vertex].push(Share { bone, weight: 1.0 });
                         }
                     }
+                }
+            }
+            if spans.iter().any(|span| span.skin.index().is_some()) {
+                skinned.insert(part.model.clone());
+            }
+            // **A reflection turns a triangle inside out**, and the shading normal is chosen by the
+            // triangle's own plane — see `Surface::geometric`. Reversing the winding here puts the
+            // plane back where the reflection would have left it, so a mirrored arm is lit as its
+            // front rather than as its back.
+            if mirrored && spans.iter().all(|span| span.skin.is_none()) {
+                for triangle in piece.indices.as_chunks_mut::<3>().0 {
+                    triangle.swap(1, 2);
                 }
             }
             mesh.absorb(&piece);
@@ -270,6 +300,32 @@ mod tests {
             size.x < HEIGHT * 0.7 && size.y < HEIGHT * 0.7,
             "a person is much taller than they are wide; this one measures {size}"
         );
+        // **One arm is the other one reflected.** The parts are authored for the right side and a
+        // single file supplies both, so what makes an arm a left arm is a reflection along the
+        // bone's own length — see the note at the attachment above. Measured against the
+        // skeleton's own placeholder for the part, an upper arm fits its left socket at 3.87 units
+        // mirrored against 4.49 as-is, and its right socket the other way round.
+        let reflected = actor
+            .rig
+            .bones
+            .iter()
+            .filter(|bone| bone.inverse_bind.matrix3.determinant() < 0.0)
+            .count();
+        let left_attachments = plan
+            .parts
+            .iter()
+            .filter(|part| part.part.bone(part.right).starts_with("Left"))
+            .count();
+        assert!(
+            reflected >= 5,
+            "a body has arms and legs; only {reflected} of its bones are reflected"
+        );
+        assert!(
+            reflected <= left_attachments,
+            "{reflected} bones are reflected against {left_attachments} left attachments, so \
+             something on the right was mirrored too"
+        );
+
         // Standing on the skeleton's own origin, not hanging off it.
         assert!(
             lowest.z.abs() < HEIGHT * 0.15,
