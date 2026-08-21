@@ -67,9 +67,10 @@ const float PLUME_GAIN = 0.55;
 // square is the fault the sprites had, one scale up.
 const float PLUME_FOOT = 0.10;
 const float PLUME_HEAD = 0.55;
-// A flame is already tapered to a point by its radius, so it keeps more of its own height than a
-// plume of smoke does before the axial fade takes what is left.
-const float PLUME_HEAD_FLAME = 0.8;
+// A flame's tongues break up where the gas stops burning, which is well short of where a parcel
+// stops travelling — so the head fade takes the top half of the rise and what is left is a rounded
+// crown rather than the long thin spike a later fade leaves.
+const float PLUME_HEAD_FLAME = 0.55;
 
 // Where the radial falloff begins, as a fraction of the plume's radius at that height.
 const float PLUME_CORE = 0.45;
@@ -83,6 +84,13 @@ const float PLUME_CORE = 0.45;
 // waving like a flag nailed at the bottom.
 const float PLUME_WANDER = 0.55;
 const float PLUME_BENDS = 2.5;
+
+// The sine of the half-angle past which a plume is a burst rather than a column.
+//
+// Forty-five degrees. Below it the file is describing something that goes *somewhere* — a flame, a
+// chimney, a vent — and above it something that goes everywhere: `ex_waterfall_mist_01` writes a
+// half-angle of `pi/2` and sprays into a whole hemisphere.
+const float PLUME_BURST = 0.7;
 
 // The shape of a flame, as a fraction of its widest: at the fuel, where its belly sits, at the tip.
 //
@@ -203,23 +211,33 @@ vec4 particle_tint(Emitter emitter, float fraction) {
 // Reads the plume at a world position. `burning` shapes it as a flame rather than as smoke.
 Inside plume_at(Emitter emitter, vec3 world, float time, bool burning) {
     float height = emitter.height;
-    // **Gravity bends the plume rather than tilting it**, which is what a parabola looks like: a
-    // parcel that has risen twice as far has been falling twice as long, so the sideways carry goes
-    // as the square. Taken out of the position before the plume is read, so everything below is
-    // about a straight column.
     vec3 offset = world - emitter.origin;
+
+    // **Gravity bends the plume rather than tilting it**, which is what a parabola looks like: a
+    // parcel twice as far along has been falling twice as long, so the carry goes as the square.
+    // Taken out of the position before the shape is read, so everything below is a straight cone.
+    offset -= emitter.drop * (length(offset) / height);
+
+    // **How far a parcel has got, and the two cases are not a blend.** A narrow plume is directed:
+    // what it has done is *rise*, and it widens with that. A cone past `PLUME_BURST` has no axis
+    // worth speaking of — `ex_waterfall_mist_01` writes a half-angle of `pi/2` and sprays into a
+    // whole hemisphere, so most of what it throws goes sideways or down — and there the distance
+    // from the emitter is what a parcel's life has bought. Measuring a *column* by distance instead
+    // is what widened every base in the game into a flat disc, because a point out to the side of a
+    // flame's foot has travelled as far as one halfway up it.
     float up = dot(offset, emitter.axis);
-    float risen = up / height;
+    bool burst = emitter.flare > PLUME_BURST;
+    float risen = (burst ? length(offset) : up) / height;
     if (risen <= 0.0 || risen >= 1.0) {
         return Inside(0.0, 0.0);
     }
-    offset -= emitter.drop * (risen * risen);
 
     // A teardrop for fire and an opening cone for smoke — see `FLAME_NECK` and `Emitter::flare`.
+    float opening = emitter.foot + risen * height * emitter.flare;
     float radius = burning
-                 ? emitter.foot * mix(FLAME_NECK, 1.0, smoothstep(0.0, FLAME_BELLY, risen))
-                                * mix(1.0, FLAME_TIP, smoothstep(FLAME_BELLY, 1.0, risen))
-                 : emitter.foot + up * emitter.flare;
+                 ? opening * mix(FLAME_NECK, 1.0, smoothstep(0.0, FLAME_BELLY, risen))
+                           * mix(1.0, FLAME_TIP, smoothstep(FLAME_BELLY, 1.0, risen))
+                 : opening;
 
     // A stable pair of axes across the plume. Built from the emitter's own rather than passed,
     // because only the direction it leaves in means anything and the turn about that is arbitrary.
@@ -228,12 +246,12 @@ Inside plume_at(Emitter emitter, vec3 world, float time, bool burning) {
                                                                : vec3(1.0, 0.0, 0.0)));
     vec3 other = cross(emitter.axis, sideways);
 
-    // Where this height's slice of the plume has wandered to, in that cross-section.
+    // Where this slice of the plume has wandered to, in that cross-section.
     float bend = (up - height * time / emitter.lifetime) * (PLUME_BENDS / height);
     vec2 lean = (vec2(plume_noise(vec3(bend, 11.3, 4.1)), plume_noise(vec3(bend, 27.7, 8.9))) - 0.5)
               * (PLUME_WANDER * radius * risen);
-
     vec2 across = vec2(dot(offset, sideways), dot(offset, other)) - lean;
+
     float shape = (1.0 - smoothstep(PLUME_CORE, 1.0, length(across) / radius))
                 * smoothstep(0.0, PLUME_FOOT, risen)
                 * (1.0 - smoothstep(burning ? PLUME_HEAD_FLAME : PLUME_HEAD, 1.0, risen));
@@ -241,10 +259,6 @@ Inside plume_at(Emitter emitter, vec3 world, float time, bool burning) {
         return Inside(risen, 0.0);
     }
 
-    // **The noise rises with the gas**, which is the whole of the animation: subtracting the drift
-    // from the sampled position leaves a field static in the plume's own frame, so the eddies
-    // travel upward at exactly the speed the file says the parcels do. One subtraction, and nothing
-    // is kept between frames.
     // **The noise rises with the gas.** Height over lifetime is the speed the file gives it, and
     // subtracting the distance travelled from the sampled position leaves a field that is static in
     // the plume's own frame — so every eddy climbs at exactly that speed for one subtraction, and
@@ -255,12 +269,12 @@ Inside plume_at(Emitter emitter, vec3 world, float time, bool burning) {
     // around the middle and almost never reach either end, so the erosion below would have almost
     // nothing to bite on. This is what puts the contrast back.
     roil = clamp((roil - PLUME_FLOOR) / (PLUME_CEILING - PLUME_FLOOR), 0.0, 1.0);
+
     // **Eroded rather than dimmed, which is the difference between a flame and a triangle.**
     // Multiplying the shape by the noise leaves the shape's own outline standing and only varies
     // what is inside it, so a tapered plume reads as a smooth cone however much detail is painted
     // within. Subtracting instead makes the noise decide where the plume *ends*: a place the noise
-    // is thin needs the shape to be thick to survive at all, so the edge comes apart into tongues
-    // and the silhouette stops being the shape's.
+    // is thin needs the shape to be thick to survive at all, so the edge comes apart into tongues.
     //
     // Subtracted and not renormalised, which the first attempt did: dividing by the noise again
     // pushes everything the erosion did not remove to full density, and the flame came back as a
@@ -317,6 +331,16 @@ void emitter_along(Emitter emitter, vec3 origin, vec3 direction, float span, uve
     float jitter = unit_pair(hash(uvec4(pixel, emitter.seed, 0x5EEDu))).x;
     bool burning = emitter.additive > 0.0;
     float phase = burning ? 0.0 : plume_phase(dot(direction, -frame.sun_direction));
+    // **Whether the sun reaches this plume at all, asked once for the whole of it.** A puff is lit
+    // by the sun as much as by the sky (§8.102), and taking that unshadowed left Vivec's drains
+    // blazing white in an alcove under a hundred feet of stone. One ray from the middle of the
+    // plume rather than one per step: these are a few metres across and the sun either finds them
+    // or it does not, so a per-step answer would cost thirty times as much to say the same thing.
+    float lit = 0.0;
+    if (!burning) {
+        vec3 middle = emitter.origin + emitter.axis * (0.5 * height);
+        lit = occluded(middle, -frame.sun_direction, RAY_MAX) ? 0.0 : 1.0;
+    }
 
     for (uint i = 0u; i < PLUME_STEPS; ++i) {
         if (through < 0.01) {
@@ -349,7 +373,7 @@ void emitter_along(Emitter emitter, vec3 origin, vec3 direction, float span, uve
             float sunlit = plume_shadow(emitter, at, frame.time, height);
             float powder = 1.0 - exp(-SMOKE_POWDER * inside.density);
             source = over.rgb
-                   * (frame.sun_colour * (INV_PI * phase * sunlit * powder) + frame.ambient);
+                   * (frame.sun_colour * (INV_PI * phase * sunlit * powder * lit) + frame.ambient);
         }
         colour += source * (through * (1.0 - leaving));
         through *= leaving;

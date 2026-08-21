@@ -3969,3 +3969,42 @@ every `e/magic_*` effect is, would come out orange if anything ever placed one; 
 
 Sources for the recipe: Schneider's Nubis cloudscape work, Heckel's write-up of volumetric ray
 marching, and Scratchapixel's blackbody lesson.
+
+### 8.104 A spray is not a plume, and the file says which
+
+§8.103's volume worked on every emitter that goes *somewhere* and on none that goes everywhere.
+Under Vivec's drains the waterfall mesh ended in a hard rectangle hanging in mid-air with nothing
+around it, which is exactly what the mist is there to hide.
+
+**`ex_waterfall_mist_01` writes a half-angle of `pi/2`.** Declination zero plus or minus 1.57, and
+azimuth the same: it sprays into a whole hemisphere. Two things broke on that.
+
+**A tangent of a right angle is twelve hundred.** The plume's opening was `tan(half_angle)`, which
+for a narrow cone is indistinguishable from the sine and for this one is not — the mist opened to a
+couple of thousand units across, fell entirely outside its own bounding sphere, and did not appear
+at all. A **sine** runs to one, so the widest cone the format can state comes out at forty-five
+degrees of opening, which is a spray.
+
+**And a parcel's life buys distance, not height.** A column measures what it has done by how far it
+has *risen*; a hemispherical spray sends most of what it throws sideways or down, where a
+plume measured along its axis has nowhere to put any of it. So the fraction is the travel for a
+burst and the rise for a column, and the file's own half-angle is what decides which — past
+`PLUME_BURST`, forty-five degrees, there is no axis worth speaking of.
+
+**The two are not a blend, which cost a round to learn.** Interpolating between rise and travel by
+the half-angle is tidy and wrong: a point out to the side of a flame's foot has travelled as far as
+one halfway up it, so any weight at all on the travel widens every base in the game into a flat
+disc. The narrow case has to be left exactly alone.
+
+**And the sun has to be asked about.** §8.102 lit a puff by sun and sky and did not shadow it,
+on the argument that `sun_colour` is zero indoors and what is left outdoors is a puff in its own
+building's shadow. Vivec's drains are exactly that: they sit in an alcove under a hundred feet of
+stone and came out blazing white. One ray from the middle of the plume rather than one per step —
+these are metres across, and the sun either finds them or it does not, so a per-step answer would
+cost thirty times as much to say the same thing.
+
+**And the flame's crown.** The head fade ran to four fifths of the rise, which left a long thin
+spike above the belly; a flame's tongues break up where the gas stops *burning*, well short of where
+a parcel stops travelling, so it now takes the top half and what is left is a rounded crown.
+
+Trace at 1920×1080 for the drain view: 2.62 ms.

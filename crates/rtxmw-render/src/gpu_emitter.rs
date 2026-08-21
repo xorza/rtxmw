@@ -4,11 +4,18 @@ use bytemuck::{Pod, Zeroable};
 use glam::Vec3;
 use rtxmw_scene::ParticleEmitter;
 
-/// How far a plume of smoke opens as it rises, at the least — see `PLUME_FLARE` in the shader.
+/// How far a plume opens over its own travel, at the least.
 ///
-/// A vent's declination variation is a tenth of a radian, which over three units of rise is a third
-/// of a unit: narrower than the plume is at its foot. The floor is what gives smoke the shape of a
-/// plume rather than of a column.
+/// A vent's declination variation is a tenth of a radian, which over three units is a third of one:
+/// narrower than the plume is at its foot. The floor is what gives smoke the shape of a plume rather
+/// than of a column.
+///
+/// **A sine and not a tangent, which is not a detail.** The half-angle is the file's own, and six of
+/// the game's emitters write `pi/2` for it — `ex_waterfall_mist_01` sprays into a whole hemisphere.
+/// A tangent of that is twelve hundred, so a plume built on one opened to a couple of thousand units
+/// across, was clipped away entirely by its own bounding sphere, and the mist under Vivec's drains
+/// simply did not appear. A sine runs to one and the widest cone the format can state comes out at
+/// forty-five degrees of opening, which is a spray.
 const LEAST_FLARE: f32 = 0.22;
 
 /// One emitter reduced to the plume it describes, laid out for `scalar` block layout — see
@@ -57,7 +64,7 @@ pub(crate) struct GpuEmitter {
     /// of the temperature of the gas.
     pub(crate) ramp: [[f32; 4]; 3],
     pub(crate) ramp_mid: f32,
-    /// How fast a plume of smoke opens with height, as a tangent.
+    /// How far the plume opens over its own travel, as the sine of the cone's half-angle.
     pub(crate) flare: f32,
     /// One where it burns rather than being lit — which decides both the shape it takes and whether
     /// it emits or scatters.
@@ -96,7 +103,7 @@ impl GpuEmitter {
             colour: emitter.colour.to_array(),
             ramp: emitter.ramp.map(|stop| stop.to_array()),
             ramp_mid: emitter.ramp_mid,
-            flare: emitter.declination_variation.tan().max(LEAST_FLARE),
+            flare: emitter.declination_variation.sin().abs().max(LEAST_FLARE),
             additive: f32::from(u8::from(emitter.additive)),
             seed,
         }

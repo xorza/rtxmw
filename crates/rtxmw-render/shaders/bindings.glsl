@@ -150,7 +150,7 @@ struct Emitter {
     // smoke; a blackbody's own colours for fire.
     vec4 ramp[3];
     float ramp_mid;
-    // How fast a plume of smoke opens with height, as a tangent.
+    // How far the plume opens over its own travel, as the sine of the cone's half-angle.
     float flare;
     // One where it burns rather than being lit.
     float additive;
