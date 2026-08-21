@@ -1,5 +1,7 @@
 //! Building a person out of the dozen files they are stored as.
 
+use std::collections::HashSet;
+
 use glam::{Affine3A, Vec3};
 use rtxmw_esm::{BodyRecord, PartSlot};
 use rtxmw_nif::{Block, NifFile};
@@ -17,6 +19,9 @@ pub(crate) struct ActorPart {
     pub(crate) model: String,
     /// The node it hangs from.
     pub(crate) bone: &'static str,
+    /// What the file calls the shapes of this slot, for a file that holds more than one —
+    /// see [`PartSlot::shape_name`].
+    pub(crate) shape: &'static str,
     /// Whether it is the authored mesh reflected — see [`PartSlot::is_reflected`].
     pub(crate) reflected: bool,
 }
@@ -25,12 +30,14 @@ impl ActorPart {
     /// The piece `record` puts in `slot`, or `None` where it names no model.
     pub(crate) fn of(record: &BodyRecord, slot: PartSlot) -> Option<Self> {
         let bone = slot.bone()?;
+        let shape = slot.shape_name()?;
         if record.model.is_empty() {
             return None;
         }
         Some(Self {
             model: format!("meshes/{}", record.model.replace('\\', "/")),
             bone,
+            shape,
             reflected: slot.is_reflected(),
         })
     }
@@ -69,13 +76,16 @@ impl AssembledActor {
         let mut mesh = Mesh::default();
         let mut bones: Vec<Bone> = Vec::new();
         let mut shares: Vec<Vec<Share>> = Vec::new();
-        // **A skinned file is the whole of what it covers.** `B_N_Dark Elf_F_Skins.nif` holds both
-        // hands *and* the torso, and the `hand` record and the `chest` record both name it — so a
-        // file that binds by its own bone names is added once however many parts point at it, and
-        // however many sides they ask for. A rigid file is the opposite: one arm, added twice.
-        let mut skinned: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // **A skinned file is a whole region of a body, and gives up one slot of itself at a
+        // time.** `B_N_Dark Elf_F_Skins.nif` holds both hands *and* the torso, and the `hand`
+        // record and the `chest` record both name it — so it is read once per slot asked of it and
+        // cut down to that slot on the way in, or a robe that hides the chest would leave the naked
+        // torso showing underneath because the hands dragged it back. Both sides come of the one
+        // read, the shapes being `Tri Left Hand` and `Tri Right Hand` and the slot's name carrying
+        // no side. A rigid file is the opposite: the whole of one arm, added twice and mirrored.
+        let mut taken: HashSet<(&str, &str)> = HashSet::new();
         for part in parts {
-            if skinned.contains(&part.model) {
+            if taken.contains(&(part.model.as_str(), part.shape)) {
                 continue;
             }
             let Ok(bytes) = vfs.read(&part.model) else {
@@ -85,7 +95,7 @@ impl AssembledActor {
                 continue;
             };
             let mut spans = Vec::new();
-            let mut piece = Mesh::from_nif_tracked(&nif, materials, &mut spans);
+            let mut piece = Mesh::from_nif_tracked(&nif, materials, &mut spans, Some(part.shape));
             if piece.positions.is_empty() {
                 continue;
             }
@@ -163,7 +173,7 @@ impl AssembledActor {
                 }
             }
             if spans.iter().any(|span| span.skin.index().is_some()) {
-                skinned.insert(part.model.clone());
+                taken.insert((part.model.as_str(), part.shape));
             }
             // **A reflection turns a triangle inside out**, and the shading normal is chosen by the
             // triangle's own plane — see `Surface::geometric`. Reversing the winding here puts the
@@ -212,6 +222,62 @@ mod tests {
 
     /// How tall a person is in Morrowind's units, which are about 1.4 cm.
     const HEIGHT: f32 = 128.0;
+
+    /// What `B_N_Dark Elf_M_Skins.NIF` holds, counted off its own shapes.
+    ///
+    /// `Tri Chest` at 284 vertices, and three shapes per hand at 132, 28 and 57 — so 434 for the
+    /// pair, and 718 for the whole file.
+    const SKINS: &str = "meshes/b/B_N_Dark Elf_M_Skins.NIF";
+    const CHEST_VERTICES: usize = 284;
+    const HAND_VERTICES: usize = 2 * (132 + 28 + 57);
+
+    /// One part of the skins file, hung where its slot hangs.
+    fn skin_part(bone: &'static str, shape: &'static str, reflected: bool) -> ActorPart {
+        ActorPart {
+            model: SKINS.to_owned(),
+            bone,
+            shape,
+            reflected,
+        }
+    }
+
+    #[test]
+    fn a_skin_file_gives_up_one_slot_at_a_time() {
+        let Some(vfs) = rtxmw_vfs::morrowind_archives() else {
+            eprintln!("skipping: the game is not installed");
+            return;
+        };
+        // The chest first, then the pair of hands, so a slice of this is one case each.
+        let body = [
+            skin_part("Chest", "chest", false),
+            skin_part("Right Hand", "hand", false),
+            skin_part("Left Hand", "hand", true),
+        ];
+
+        // **The file is one mesh and three slots point at it**, so what a slot gets has to be cut
+        // out by name — otherwise a robe that hides the chest leaves the naked torso showing,
+        // because the hands under the sleeves dragged the whole file back in.
+        let vertices = |parts: &[ActorPart]| {
+            let mut materials = MaterialTable::default();
+            AssembledActor::assemble(&vfs, "meshes/base_anim.nif", parts, &mut materials)
+                .expect("the skins file should assemble against the base skeleton")
+                .mesh
+                .positions
+                .len()
+        };
+        assert_eq!(vertices(&body[..1]), CHEST_VERTICES);
+        assert_eq!(vertices(&body[1..]), HAND_VERTICES);
+        assert_eq!(
+            vertices(&body),
+            CHEST_VERTICES + HAND_VERTICES,
+            "the slots partition the file: nothing shared, nothing left over"
+        );
+
+        // **And both hands come of the one read.** The shapes are `Tri Left Hand` and
+        // `Tri Right Hand` and the slot's name carries no side, so the left request finds the file
+        // already taken for `hand` rather than adding a second pair.
+        assert_eq!(vertices(&body[1..2]), HAND_VERTICES);
+    }
 
     #[test]
     fn a_body_assembles_into_a_person_rather_than_a_pile_of_parts() {

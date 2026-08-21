@@ -3632,3 +3632,32 @@ for everything else, and turns each into `((base + 1) << 1) + is_armour`. So a r
 other garment, a skirt at 8 beats an ordinary one, armour at 3 beats clothing at 2, and skin at 1
 loses to all of them. Which item is a robe comes from the first word of `CTDT`, and which is a helmet
 from the first word of `AODT`.
+
+### 8.98 One file is a whole region of a body, and gives up one slot at a time
+
+Hiding the covered parts (§8.97) changed nothing on screen, and the reason is that the slot table
+was never the whole story. **`b_n_dark elf_m_chest` and `b_n_dark elf_m_hand` name the same file.**
+`B_N_Dark Elf_M_Skins.NIF` is one skinned mesh holding `Tri Chest` at 284 vertices beside
+`Tri Left Hand 0`, `Tri Right Hand 2` and four more, 434 for the pair. A robe reserves the chest, so
+the chest slot went dark — and the hands, which no robe hides, pulled the naked torso straight back
+in under it. That is what was showing through the clothes.
+
+**The shapes are named for the slot they belong to, and that is the only thing that says so.** A
+skinned file spells it `Tri Chest`, `Tri Left Hand 0`, `Tri Tail`, `Tri groin`; a *rigid* part names
+its one shape after its own file — `Tri B_N_Dark Elf_M_Wrist`, `B_N_Dark Elf_M_Forearm` — and is the
+whole of what it is, so it takes no filter at all. Which gives the rule: a file that skins anything
+yields only the shapes whose name carries the slot being asked of it, and a file that skins nothing
+is taken entire. The names carry no side — one match supplies both arms, which is exactly why the
+whole file could be read once for however many sides asked, and now is read once per *slot* instead.
+
+Checked against the shipped data rather than assumed: over the 1,671 (model, slot) pairs the three
+masters actually ask for, 324 files are skinned and **every one of them has a skinned shape matching
+its slot**, so nothing can be filtered down to nothing. Nine of those pairs land on files that mix
+skinned and rigid blocks, and the rigid ones are authoring leftovers — `c_m_shirt_extrav_1_c.nif`
+carries a stray pair of trousers, `c_m_robe_extrav_1b.nif` a pair of Imperial boots,
+`c_skirt_extravagant_1.nif` a chest. They go with the filter, which is what stops a robe from being
+worn along with somebody's boots.
+
+The test is the partition itself, hand-counted off the file's own shapes: chest alone is 284
+vertices, the two hand slots together are 434, all three are 718, and the second hand slot adds
+nothing because the first already took the pair. Before the fix every one of those cases was 718.

@@ -116,6 +116,8 @@ struct Walk<'a> {
     nif: &'a NifFile,
     materials: &'a mut MaterialTable,
     spans: &'a mut Vec<GeometrySpan>,
+    /// The body slot being read out of a file that holds several, or `None` to take all of it.
+    slot: Option<&'a str>,
 }
 
 impl Mesh {
@@ -369,19 +371,31 @@ impl Mesh {
     /// The table is shared across the whole scene rather than per model, so the indices in
     /// [`Submesh::material`] are already the ones the GPU will use.
     pub fn from_nif(nif: &NifFile, materials: &mut MaterialTable) -> Self {
-        Self::from_nif_tracked(nif, materials, &mut Vec::new())
+        Self::from_nif_tracked(nif, materials, &mut Vec::new(), None)
     }
 
-    /// As [`Mesh::from_nif`], recording where each geometry block landed.
+    /// As [`Mesh::from_nif`], recording where each geometry block landed, and taking only one body
+    /// slot out of a file that holds several.
     ///
     /// **What binds a rig to the mesh it poses.** Skinning weights are per vertex *of a geometry
     /// block*, and the flattening puts every block's vertices somewhere in one array; without the
     /// spans a rig would have to replay this walk to find them, and two walks that must agree are
     /// two walks that will not.
+    ///
+    /// **And what cuts a body's skin down to the part being asked for.** A file that skins anything
+    /// is a whole region of a body: `B_N_Dark Elf_M_Skins.NIF` holds `Tri Chest` beside
+    /// `Tri Left Hand 0`, and both the chest record and the hand record name it. Given a `slot` —
+    /// [`rtxmw_esm::PartSlot::shape_name`] — such a file gives up only the shapes named for it, and
+    /// its *unskinned* blocks with them: those are authoring leftovers, and `c_m_shirt_extrav_1_c`
+    /// carries a stray pair of trousers that would otherwise be worn along with the shirt.
+    ///
+    /// A file that skins nothing is the whole of one part and is taken entire, however it names its
+    /// shapes — the rigid parts are named after their own file, not after the slot.
     pub(crate) fn from_nif_tracked(
         nif: &NifFile,
         materials: &mut MaterialTable,
         spans: &mut Vec<GeometrySpan>,
+        slot: Option<&str>,
     ) -> Self {
         let mut mesh = Self::default();
         spans.clear();
@@ -389,6 +403,7 @@ impl Mesh {
             nif,
             materials,
             spans,
+            slot: slot.filter(|_| nif.blocks().iter().any(|b| matches!(b, Block::Skin(_)))),
         };
         for &root in nif.roots() {
             mesh.visit(
@@ -482,6 +497,12 @@ impl Mesh {
             }
             Block::Geometry(geometry) => {
                 if is_skippable(&geometry.av.net.name) || geometry.av.is_hidden() {
+                    return;
+                }
+                if walk
+                    .slot
+                    .is_some_and(|slot| !names_slot(&geometry.av.net.name, slot))
+                {
                     return;
                 }
                 let Some(Block::GeometryData(data)) = walk.nif.resolve(geometry.data) else {
@@ -646,6 +667,17 @@ impl Placement {
     fn direction(&self, normal: Vec3) -> Vec3 {
         (self.linear * normal).normalize_or_zero()
     }
+}
+
+/// Whether a shape's name says it belongs to `slot`.
+///
+/// A substring rather than a prefix, and case-insensitive, because that is how the shapes read:
+/// `Tri Left Hand 0` and `Tri Right Hand 2` are both the hand slot, and the robes spell theirs
+/// `Tri chest 0` where the skins spell it `Tri Chest`.
+fn names_slot(name: &str, slot: &str) -> bool {
+    name.as_bytes()
+        .windows(slot.len())
+        .any(|window| window.eq_ignore_ascii_case(slot.as_bytes()))
 }
 
 /// Whether a node's name marks it as never-rendered.

@@ -594,7 +594,7 @@ impl StaticScene {
                     })?;
                     let id = MeshId(self.meshes.len() as u32);
                     let mut spans = Vec::new();
-                    let mesh = Mesh::from_nif_tracked(&nif, &mut self.materials, &mut spans);
+                    let mesh = Mesh::from_nif_tracked(&nif, &mut self.materials, &mut spans, None);
                     // **Before the mesh is moved into the scene**, because a rig is described
                     // against the vertices as the walk left them.
                     if let Some(rig) = Rig::from_nif(&nif, id, mesh.positions.len(), &spans) {

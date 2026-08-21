@@ -644,7 +644,7 @@ mod tests {
         let nif = rtxmw_nif::NifFile::parse(&bytes).expect("it should parse");
         let mut materials = crate::material_table::MaterialTable::default();
         let mut spans = Vec::new();
-        let mesh = Mesh::from_nif_tracked(&nif, &mut materials, &mut spans);
+        let mesh = Mesh::from_nif_tracked(&nif, &mut materials, &mut spans, None);
         let rig = Rig::from_nif(&nif, MeshId(0), mesh.positions.len(), &spans)?;
         Some((mesh, rig))
     }
