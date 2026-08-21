@@ -357,5 +357,8 @@ layout(set = 0, binding = 14, scalar) readonly buffer Frame {
     vec3 flash_ground;
     // How many of `emitters` the resident cells placed — see `particles.glsl`.
     uint emitter_count;
+    // Seconds since the previous frame, which is what a motion vector for something that moves
+    // *within* a surface is measured over — see `slid` in `surface.glsl`.
+    float elapsed;
     Wave waves[WAVE_COUNT];
 } frame;

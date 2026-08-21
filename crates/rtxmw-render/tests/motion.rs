@@ -8,7 +8,8 @@ use ash::vk;
 use glam::{Affine3A, Vec2, Vec3};
 use rtxmw_gpu::{TestGpu, readback};
 use rtxmw_render::SceneRenderer;
-use rtxmw_scene::{CellId, Instance, Material, Mesh, MeshId, StaticScene, Submesh};
+use rtxmw_scene::{CellId, Instance, Material, Mesh, MeshId, StaticScene, Submesh, TextureId};
+use rtxmw_texture::{Texture, TextureFormat};
 
 mod common;
 
@@ -61,11 +62,13 @@ fn steps() -> StaticScene {
 /// One renderer across both, because the previous frame is state it keeps: handing each frame its
 /// own would make every frame the first one, which is exactly the case that reports no motion.
 fn motion_after(eyes: &[Vec3], jitter: bool) -> Vec<f32> {
-    motion_with(eyes, jitter, |_| {})
+    motion_with(&steps(), &[], eyes, jitter, |_| {})
 }
 
 /// As [`motion_after`], calling `between` on the renderer after every frame but the last.
 fn motion_with(
+    scene: &StaticScene,
+    textures: &[Option<Texture>],
     eyes: &[Vec3],
     jitter: bool,
     mut between: impl FnMut(&mut SceneRenderer),
@@ -92,8 +95,8 @@ fn motion_with(
             &mut uploader,
             gpu.physical().limits(),
             CellId::Interior("motion".to_owned()),
-            &steps(),
-            &[],
+            scene,
+            textures,
         )
         .expect("scene should load");
 
@@ -133,7 +136,7 @@ fn forgetting_the_history_makes_the_next_frame_a_first_frame() {
 
     // The same two frames, once remembering and once not.
     let remembered = motion_after(&step, false);
-    let forgotten = motion_with(&step, false, |renderer| {
+    let forgotten = motion_with(&steps(), &[], &step, false, |renderer| {
         assert!(
             renderer.has_history(),
             "a frame that has been rendered leaves history behind"
@@ -232,4 +235,90 @@ fn a_still_camera_reports_no_motion_and_a_stepping_one_reports_it_by_depth() {
     );
     // Straight sideways: a step north tilts nothing.
     assert!(near.y.abs() < 0.01 && far.y.abs() < 0.01);
+}
+
+/// How far the wall below slides its texture each second, and how long a frame of it lasts.
+///
+/// One whole texture a second over a twentieth of a second, which is `MAX_ELAPSED` — the most a
+/// frame's clock is allowed to carry for this.
+const SCROLL: f32 = 1.0;
+const FRAME: f32 = 0.05;
+
+/// How wide the wall is, in world units, across one turn of its texture.
+const WALL: f32 = 400.0;
+
+/// One wall filling the view, with its texture sliding across it.
+fn sliding_wall() -> StaticScene {
+    let mesh = Mesh {
+        positions: vec![
+            Vec3::new(200.0, -0.5 * WALL, -0.5 * WALL),
+            Vec3::new(200.0, 0.5 * WALL, -0.5 * WALL),
+            Vec3::new(200.0, 0.5 * WALL, 0.5 * WALL),
+            Vec3::new(200.0, -0.5 * WALL, 0.5 * WALL),
+        ],
+        normals: vec![Vec3::NEG_X; 4],
+        // `u` runs the wall's width, so a slide along it is a slide across the screen.
+        uvs: vec![Vec2::ZERO, Vec2::X, Vec2::ONE, Vec2::Y],
+        indices: vec![0, 2, 1, 0, 3, 2],
+        submeshes: vec![Submesh {
+            first_index: 0,
+            index_count: 6,
+            material: 0,
+            thin: false,
+        }],
+    };
+    common::scene_of(
+        &[mesh],
+        // **Textured, because an untextured surface has nothing to slide.** The vector below does
+        // not depend on what the picture is, only on there being one.
+        &[Material {
+            base_colour: Some(TextureId(0)),
+            scroll: Vec2::new(SCROLL, 0.0),
+            ..Material::default()
+        }],
+        &[Instance {
+            mesh: MeshId(0),
+            transform: Affine3A::IDENTITY,
+        }],
+        &[],
+        Vec3::ONE,
+    )
+}
+
+#[test]
+fn a_texture_sliding_across_a_still_wall_still_moves() {
+    // **The camera does not move between these two frames**, so every vector here would be exactly
+    // zero if a motion vector described only the geometry. It cannot: what an upscaler reprojects
+    // is what it can see move, and on a sheet with a texture running over it that is the texture.
+    // Told nothing moved, Ray Reconstruction blends a second of frames that each hold the picture
+    // somewhere else — which is Vivec's drains sharpening whenever the camera does and mushing over
+    // the moment it stops.
+    let still = [Vec3::ZERO, Vec3::ZERO];
+    let plain = Some(Texture::from_pixels(
+        TextureFormat::Rgba8,
+        2,
+        2,
+        vec![255; 2 * 2 * 4],
+    ));
+    let motion = motion_with(&sliding_wall(), &[plain], &still, false, |renderer| {
+        renderer.set_time(FRAME);
+    });
+    let middle = at(&motion, SIZE / 2, SIZE / 2);
+
+    // **How far, worked through.** The wall spans 400 units across one turn of its texture, so a
+    // scroll of one a second carries a texel `400 * SCROLL * FRAME` = 20 units along it in a frame.
+    // The view is 90 degrees and the wall stands 200 off, so it spans 400 units across 64 pixels —
+    // an eighth of a pixel per unit, and 20 units is 2.5 of them.
+    let expected = WALL * SCROLL * FRAME * (SIZE as f32 / WALL);
+    assert!(
+        (middle.x.abs() - expected).abs() < 0.4,
+        "a frame of sliding moved the history {} pixels across, not {expected}",
+        middle.x.abs()
+    );
+    // Along the slide and not across it: `u` runs the wall's width, so the reprojection is sideways.
+    assert!(
+        middle.y.abs() < 0.4,
+        "the history moved {} pixels up the screen, which nothing asked it to",
+        middle.y.abs()
+    );
 }

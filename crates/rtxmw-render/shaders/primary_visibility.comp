@@ -41,7 +41,10 @@ vec2 motion_vector(Surface surface, vec3 direction, vec2 ndc, uvec2 size) {
     if (!surface.hit) {
         return vec2(0.0);
     }
-    vec3 was = direction * surface.t + frame.camera_motion;
+    // **And where what is *drawn* on it was**, which on a sheet with a texture sliding across it is
+    // not where the sheet was — see `sliding` in `surface.glsl`. Zero for everything that does not
+    // scroll, so this costs an add.
+    vec3 was = direction * surface.t + frame.camera_motion + surface.slide;
     vec4 before = frame.previous_clip_from_offset * vec4(was, 1.0);
     if (before.w <= 0.0) {
         return vec2(0.0);

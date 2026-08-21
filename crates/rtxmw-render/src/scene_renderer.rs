@@ -22,8 +22,15 @@ use crate::gbuffer::GBuffer;
 use crate::scene_residency::SceneResidency;
 use crate::tonemap::Tonemap;
 use crate::visibility_pass::{
-    FrameConstants, Lighting, Sampling, SceneBindings, Viewpoint, VisibilityPass,
+    Clock, FrameConstants, Lighting, Sampling, SceneBindings, Viewpoint, VisibilityPass,
 };
+
+/// Most a frame's clock may move for the purpose of reprojecting what slides within a surface.
+///
+/// A twentieth of a second, which is a frame at twenty. Past that the window was paused or the hour
+/// was set by hand, and reprojecting a texture by a minute of travel would ask the upscaler for
+/// history from somewhere it has never looked.
+const MAX_ELAPSED: f32 = 0.05;
 
 /// Half-float rather than 8-bit: the trace writes linear radiance that tone mapping consumes at M8,
 /// and an 8-bit intermediate would clip highlights before anything got the chance to.
@@ -190,6 +197,8 @@ pub struct SceneRenderer {
     bounce_samples: u32,
     denoise_passes: u32,
     time: f32,
+    /// How far [`Self::time`] moved when it was last set — see `Clock`.
+    elapsed: f32,
     /// The clock the weather's own events run on, which is the frame's with the speed key left out.
     ///
     /// **A flash is an event, not a rate** — see `WorldClock::weather_seconds`. Driven by [`Self::time`]
@@ -285,6 +294,7 @@ impl SceneRenderer {
             bounce_samples: DEFAULT_BOUNCE_SAMPLES,
             denoise_passes: DEFAULT_PASSES,
             time: 0.0,
+            elapsed: 0.0,
             storm: 0.0,
             lightning_offset: 0.0,
             last_strike: None,
@@ -472,6 +482,11 @@ impl SceneRenderer {
     /// Zero unless something sets it, which is what keeps a screenshot and a test reproducible: the
     /// surface at time zero is one definite shape rather than whenever the frame happened to run.
     pub fn set_time(&mut self, seconds: f32) {
+        // **How far it moved, which is what a motion vector for a scrolling texture is measured
+        // over.** Clamped rather than trusted: a paused window or a jump to a new hour would
+        // otherwise ask the reprojection for a displacement of minutes, and a frame that never sets
+        // the clock at all leaves this at nothing, which is a still picture.
+        self.elapsed = (seconds - self.time).clamp(0.0, MAX_ELAPSED);
         self.time = seconds;
     }
 
@@ -842,8 +857,11 @@ impl SceneRenderer {
             // From the renderer's own target height, so the mip a surface samples follows the
             // resolution it is being traced at.
             FrameConstants::cone_spread_from(projection, self.target.extent().height),
-            self.time,
-            self.storm + self.lightning_offset,
+            Clock {
+                time: self.time,
+                elapsed: self.elapsed,
+                storm: self.storm + self.lightning_offset,
+            },
         )
     }
 

@@ -47,6 +47,28 @@ vec2 slid(Material material, vec2 uv) {
     return uv + material.scroll * frame.time;
 }
 
+// Where the point now showing this texel sat a frame ago, as an offset in world units.
+//
+// **A static sheet with a moving texture has motion vectors of zero, and that is the whole problem.**
+// Ray Reconstruction reprojects a pixel's history by them, so it is told nothing moved and blends a
+// second's worth of frames that each hold the texture somewhere else — the falls under Vivec sharpen
+// the moment the camera moves and mush over again as soon as it stops. What is drawn there *did*
+// move, so that is what the motion vector has to describe.
+//
+// The texel at texture coordinate `c` shows wherever `uv + scroll * t` equals it, so the surface
+// coordinate carrying it moves by `-scroll` a second — and a frame ago it was `+scroll * elapsed`
+// away. The tangents turn that step in texture coordinates into one in world units; where the
+// triangle's uvs are degenerate they come back as zero, which is the right answer for a surface
+// with no texture space to slide in.
+vec3 sliding(Material material, uvec3 verts, mat4x3 to_world) {
+    if (material.scroll == vec2(0.0) || frame.elapsed <= 0.0) {
+        return vec3(0.0);
+    }
+    vec2 step = material.scroll * frame.elapsed;
+    SurfaceTangents tangents = surface_tangents(verts, to_world);
+    return tangents.along_u * step.x + tangents.along_v * step.y;
+}
+
 vec2 interpolate_uv(uvec3 verts, vec3 weights) {
     return attributes[verts.x].uv * weights.x
          + attributes[verts.y].uv * weights.y
@@ -330,6 +352,12 @@ struct Surface {
     // relief in it, so the frame is measurably *less* like the truth for having described the
     // surface in more detail. See `docs/design.md` §8.90.
     vec3 interpolated;
+    // Where the *shading* on this surface was a frame ago, as an offset in world units.
+    //
+    // **What an upscaler reprojects is what it can see move**, and on a sheet with a texture sliding
+    // over it that is the texture rather than the sheet. Zero for everything that does not scroll,
+    // which is all but fifty of the game's files. See `slid` below and `motion_vector`.
+    vec3 slide;
     // The plane the triangle actually lies in, as wound — with no side chosen for it.
     //
     // **Every ray leaving a surface is offset along this and not along `normal`.** A normal comes
@@ -381,6 +409,7 @@ Surface trace(vec3 origin, vec3 direction, float cone_width, float cone_spread, 
     surface.t = 0.0;
     surface.hit = false;
     surface.water = false;
+    surface.slide = vec3(0.0);
     surface.geometric = vec3(0.0, 0.0, 1.0);
     surface.thin = false;
 
@@ -480,6 +509,7 @@ Surface trace(vec3 origin, vec3 direction, float cone_width, float cone_spread, 
     } else if (material.base_colour != NO_TEXTURE) {
         float lod = cone_lod(verts, to_world, direction, surface.footprint,
                              colour_slot(material.base_colour));
+        surface.slide = sliding(material, verts, to_world);
         vec2 uv = slid(material, interpolate_uv(verts, weights));
         surface.albedo *= base_colour(material, uv, lod).rgb;
         if (frame.relief > 0.0) {

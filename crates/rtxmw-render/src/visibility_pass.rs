@@ -162,6 +162,20 @@ impl GpuMoon {
     }
 }
 
+/// The clocks a frame runs on.
+///
+/// **Three, because they answer different questions.** `time` is how far the world has turned,
+/// which a swell and a fog bank and a scrolling texture all ride on; `storm` is how long a thing
+/// that happens takes, and a flash is two hundred milliseconds however fast the day is going; and
+/// `elapsed` is how much of the first went by since the last frame, which is what a motion vector
+/// for something that moves *within* a surface has to be measured over.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct Clock {
+    pub(crate) time: f32,
+    pub(crate) elapsed: f32,
+    pub(crate) storm: f32,
+}
+
 /// What the shader needs to turn a pixel into a ray.
 ///
 /// **A buffer, not push constants.** It was the latter until it reached exactly the 128 bytes
@@ -345,6 +359,8 @@ pub struct FrameConstants {
     /// How many emitters the resident cells place, which is the whole of what a ray needs to walk
     /// them — the emitters themselves are a buffer of their own.
     emitter_count: u32,
+    /// Seconds since the previous frame — see [`Clock`].
+    elapsed: f32,
     waves: [GpuWave; WAVE_COUNT],
 }
 
@@ -383,15 +399,14 @@ impl FrameConstants {
         lighting: Lighting,
         sampling: Sampling,
         cone_spread: f32,
-        time: f32,
-        storm: f32,
+        clock: Clock,
     ) -> Self {
         // **The one place that knows both the clock and where the eye is standing**, which is what a
         // flash needs: `rtxmw_scene` settles the schedule out of the ini and this settles which
         // moment of it the frame has landed in.
         let flash = lighting
             .lightning
-            .flash(storm, now.position, lighting.clouds.altitude);
+            .flash(clock.storm, now.position, lighting.clouds.altitude);
         // No sun is a black one: every term it feeds is a multiplication, so the shader needs no
         // flag to branch on and an interior costs nothing for having no sky.
         let sun = lighting.sun.unwrap_or(Sun {
@@ -425,7 +440,7 @@ impl FrameConstants {
             sun_colour: sun.colour.to_array(),
             bounce_samples: sampling.bounce_samples,
             water_level: lighting.water_level.unwrap_or(f32::NEG_INFINITY),
-            time,
+            time: clock.time,
             sequence: sampling.sequence,
             delight: sampling.delight,
             relief: sampling.relief,
@@ -495,6 +510,7 @@ impl FrameConstants {
             flash_source: flash.source.to_array(),
             flash_ground: flash.ground.to_array(),
             emitter_count: lighting.emitter_count,
+            elapsed: clock.elapsed,
             waves: SeaState::default().waves(),
         }
     }
@@ -925,8 +941,9 @@ mod tests {
         assert_eq!(offset_of!(FrameConstants, flash_source), 636);
         assert_eq!(offset_of!(FrameConstants, flash_ground), 648);
         assert_eq!(offset_of!(FrameConstants, emitter_count), 660);
-        assert_eq!(offset_of!(FrameConstants, waves), 664);
-        assert_eq!(size_of::<FrameConstants>(), 664 + 20 * WAVE_COUNT);
+        assert_eq!(offset_of!(FrameConstants, elapsed), 664);
+        assert_eq!(offset_of!(FrameConstants, waves), 668);
+        assert_eq!(size_of::<FrameConstants>(), 668 + 20 * WAVE_COUNT);
     }
 
     #[test]
@@ -981,8 +998,7 @@ mod tests {
             Lighting::default(),
             Sampling::default(),
             0.0,
-            0.0,
-            0.0,
+            Clock::default(),
         )
     }
 

@@ -55,6 +55,16 @@ const float PLUME_CEILING = 0.72;
 // tenths breaks the edge into tongues and leaves the core alone.
 const float PLUME_EROSION = 0.6;
 
+// How thin the noise makes the *inside* of a plume where it is thinnest.
+//
+// **Erosion alone only works on the edge**, because it is a subtraction and the middle of a plume
+// is far enough above it to survive whatever the noise says. That is right for a flame, whose core
+// really is solid — and wrong for a spray, whose shape has no structure of its own to show: a
+// hemispherical burst passes its radial test everywhere inside itself, so what is left is a smooth
+// ball with a nibbled rim, and Vivec's drains came out as cotton wool. Multiplying as well as
+// subtracting puts billows through the middle of it.
+const float PLUME_GRAIN = 0.3;
+
 // Octaves of noise, and what each is worth against the one before it.
 const uint PLUME_OCTAVES = 3u;
 const float PLUME_LACUNARITY = 2.3;
@@ -279,7 +289,9 @@ Inside plume_at(Emitter emitter, vec3 world, float time, bool burning) {
     // Subtracted and not renormalised, which the first attempt did: dividing by the noise again
     // pushes everything the erosion did not remove to full density, and the flame came back as a
     // ragged *column* with no grade left inside it.
-    return Inside(risen, max(shape - PLUME_EROSION * (1.0 - roil), 0.0));
+    return Inside(risen, max(shape * mix(PLUME_GRAIN, 1.0, roil)
+                                 - PLUME_EROSION * (1.0 - roil),
+                             0.0));
 }
 
 // What is left of the sun by the time it reaches `world` through the plume itself.

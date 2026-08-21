@@ -4045,3 +4045,40 @@ units away that does is `Ex_Vivec_waterfall_01`, and that one now runs. The stat
 game's, not this renderer's.
 
 Trace at 1920×1080 over Vivec's water is unchanged by it — the scroll is one multiply-add.
+
+### 8.106 A motion vector describes what is drawn, not what is there
+
+Reported as "DLSS smooths the drains" — sharp for a moment, mush after a second, sharp again the
+instant the camera moves. **It is not DLSS**, or not only: the same mist and the same falls at
+`--dlss off`, `dlaa`, `quality` and `performance` come out within a hair of each other. Two separate
+faults were hiding behind one complaint.
+
+**The spray was cotton wool of its own making.** A burst's radius test cannot bite — `across` is
+never more than `travelled` and the cone opens at `foot + travelled` — so its shape degenerates to a
+smooth ball, and erosion is a *subtraction* that only reaches the rim. That is right for a flame,
+whose core really is solid, and wrong for a spray, which has no structure of its own to show.
+Multiplying by the noise as well as subtracting puts billows through the middle of it.
+
+**And the falls are a static mesh with a sliding texture**, which is the accumulation artefact
+exactly. Ray Reconstruction reprojects a pixel's history by its motion vector; the sheet does not
+move, so the vector is zero, so it blends a second's worth of frames that each hold the picture
+somewhere else. Moving the camera invalidates the history and it comes back sharp — which is the
+tell, and the thing the report got right.
+
+**So the motion vector has to describe the texture.** What an upscaler reprojects is what it can see
+move, and on a scrolling sheet that is not the sheet. The texel at coordinate `c` shows wherever
+`uv + scroll * t` equals it, so the surface coordinate carrying it travels at `-scroll` and a frame
+ago it was `+scroll * elapsed` away; the surface tangents — already computed for relief — turn that
+step in texture coordinates into one in world units, and the existing reprojection finishes the job.
+An add on a vector that was being built anyway, and zero for everything that does not scroll.
+
+**Which needed a clock the frame did not have.** `time` is how far the world has turned and `storm`
+is how long a thing that happens takes; neither is how long *this frame* was, which is what a
+displacement per second has to be multiplied by. `Clock` now carries the three together, which
+shortens `FrameConstants::new` rather than lengthening it. The new one is clamped to a twentieth of
+a second: past that the window was paused or the hour was set by hand, and reprojecting a texture by
+a minute of travel asks the upscaler for history from somewhere it has never looked.
+
+**The test is that a still camera reports motion.** Two frames from one place, a wall whose texture
+slides, and the vector at the middle pixel has to come out at 3.2 pixels across and none up — where
+a renderer describing only geometry gives exactly zero, which is what it measured before the fix.
