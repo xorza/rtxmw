@@ -10,6 +10,7 @@ use crate::keyframe_data::KeyframeData;
 use crate::nif_file::version;
 use crate::skin_data::SkinData;
 use crate::skin_instance::SkinInstance;
+use crate::text_keys::TextKeys;
 use crate::time_controller::{ControllerKind, TimeController};
 
 /// Bytes a bounding sphere occupies: a centre and a radius.
@@ -414,6 +415,8 @@ pub enum Block {
     SkinData(SkinData),
     /// A named string hung off a node — in a `.kf` file, the name of the node a controller drives.
     StringExtra(String),
+    /// What an animation is called at each moment of it — see [`TextKeys`].
+    TextKeys(TextKeys),
     /// A `.kf` file's root, whose two chains are the whole of the animation it carries.
     Sequence(ObjectNet),
     /// Parsed correctly, but carries nothing a renderer needs.
@@ -776,18 +779,7 @@ impl Block {
             // A `.kf` file's root. Everything it holds hangs off the `ObjectNet` links it carries:
             // the strings naming targets on one, the controllers driving them on the other.
             "NiSequenceStreamHelper" => Self::Sequence(ObjectNet::read(cursor, ver)?),
-            "NiTextKeyExtraData" => {
-                let _next = cursor.link()?;
-                cursor.skip(4)?;
-                let count = cursor.u32()? as usize;
-                for _ in 0..count {
-                    cursor.skip(4)?; // Time.
-                    let _text = cursor.string()?;
-                }
-                Self::Other {
-                    kind: "NiTextKeyExtraData",
-                }
-            }
+            "NiTextKeyExtraData" => Self::TextKeys(TextKeys::read(cursor)?),
             _ => return Ok(None),
         };
         Ok(Some(block))

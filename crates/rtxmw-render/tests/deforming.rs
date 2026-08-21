@@ -132,7 +132,10 @@ fn bend() -> Rig {
             },
         ],
         influences,
-        duration: 2.0,
+        // No named spans: the fixture is one animation and the whole of it, which is what a banner
+        // is too.
+        groups: Vec::new(),
+        playing: 0.0..2.0,
     }
 }
 

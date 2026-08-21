@@ -7,6 +7,7 @@ mod keyframe_data;
 mod nif_file;
 mod skin_data;
 mod skin_instance;
+mod text_keys;
 mod time_controller;
 
 pub use crate::block::{
@@ -21,4 +22,5 @@ pub use crate::keyframe_data::{
 pub use crate::nif_file::{NifFile, VER_MORROWIND, version};
 pub use crate::skin_data::{BoneSkin, SkinData, VertexWeight};
 pub use crate::skin_instance::SkinInstance;
+pub use crate::text_keys::{TextKey, TextKeys};
 pub use crate::time_controller::{ControllerKind, TimeController};

@@ -622,8 +622,9 @@ its sync2 stages are what the skinning-to-build and build-to-trace barriers want
    animation parse, a rig is built from the node graph, a compute pass skins into the placement's
    own vertex region, and the structures over it are built inside the frame. What it does not have
    yet is a clip chosen from anything — a model plays the one animation it carries.
-3. **Creatures.** 432 records, every one with a `MODL` and an `x`-prefixed clip beside it. Real
-   skeletons, real text-key groups, `XSCL`.
+3. **Creatures — done.** §8.93. They were already placed by step 2, because 87 of the 89 models
+   animate from their own NIF; what they needed was the text keys that say which part of that
+   animation is standing still. `XSCL` and a clip loaded from a `.kf` are still ahead.
 4. **NPCs.** No `MODL` on 2,772 of 3,049: a body is assembled from `RNAM`, the female bit, `BNAM`,
    `KNAM` and the 1,125 `BODY` records matched by race, sex and part, with worn `NPCO` overriding.
    New ESM parsing, on machinery steps 2 and 3 already built.
@@ -3439,3 +3440,39 @@ underneath them, which is what an update is for.
 
 **And the counts are what the survey said.** Seyda Neen's shore cell places two animated references
 and Balmora's nine, against 0.34 ms of animation in a frame that traces in 2.4.
+
+### 8.93 A creature's NIF holds everything it can do, in one line
+
+M12's third step, and it turned out to be a smaller thing than the plan expected — with one large
+consequence.
+
+**87 of the 89 creature models animate from their own NIF.** Of them, 80 carry a skin, inline
+keyframes *and* text keys; 7 are node-animated with no skin, like the banners; 2 carry a skin and no
+keys and need their `.kf`. So the `.kf` plumbing the plan put here is not what stood between the
+renderer and a moving cast — step 2's path already placed them. What stood in the way was that a NIF
+holds **every animation a creature has, laid end to end in one channel**, and it was playing all of
+it: an ash ghoul idled, walked, ran, turned, attacked, was knocked down, died, and did it again.
+
+**The boundaries are written as text against the moments they fall on.** 505 files carry
+`NiTextKeyExtraData`, and a key's text is several lines of `group: marker` — `idle: start`,
+`walkforward: loop stop`. The vocabulary across the shipped content: 790 `idle3`, 780
+`weapononehand`, 758 `idle2`, 720 `idle`, 698 `walkforward`, 690 `knockout`, 664 each of
+`runforward`, `turnright` and `turnleft`, down through `attack1..3`, `death1`, `hit1`, `blink`,
+`talk` and `spellcast`. **`soundgen` is not one of them** — at 7,290 lines it is by far the most
+common name in the game, and every one of them is a footfall or a scream rather than a span of
+anything; `sound` is another 494.
+
+**An idle is not spelled one way.** `idle3` outnumbers plain `idle`, and a model carrying only the
+numbered ones is ordinary, so the choice runs `idle`, `idle1`, `idle2`, `idle3` and falls back to the
+model's *first* group rather than to its whole reel. A group with no `loop start` repeats the whole
+of itself.
+
+The measure of it: an ash ghoul declares **22 groups**, and its idle is **2.6 seconds of a 44.7
+second reel**. `rig.rs`'s test is that assertion plus the one that says which span was picked —
+posing the mesh across the chosen span and across `walkforward` and comparing how far it travels,
+which separates standing still from walking away without knowing anything about ash ghouls.
+
+**Not done here**: a clip loaded from a `.kf`. The controllers in one hang off a sequence helper
+rather than off the nodes they drive, and the targets are named by the string chain beside them —
+which is the shape NPCs need, because `base_anim.nif` is a skeleton with no animation in it and
+`xbase_anim.kf` is where the animation went.

@@ -79,6 +79,35 @@ impl Channel {
     }
 }
 
+/// A named span of a model's one long animation.
+///
+/// **A NIF holds every animation a creature has, laid end to end**, and the boundaries are written
+/// as text against the moments they fall on — `idle: start`, `walkforward: loop stop`. Played whole,
+/// a rat idles, walks, turns, attacks, is knocked down and dies, then does it all again.
+#[derive(Debug, Clone)]
+pub struct Group {
+    pub name: String,
+    pub start: f32,
+    pub stop: f32,
+    /// The span that repeats. Equal to `start..stop` where the group declares no loop of its own.
+    pub loop_start: f32,
+    pub loop_stop: f32,
+}
+
+/// Groups whose name is not an animation, in the order the shipped content uses them.
+///
+/// `soundgen` alone accounts for 7,290 of the lines in the game — a footfall, a scream, a roar —
+/// and `sound` for another 494. Both are cues for something that does not exist yet, and neither is
+/// a span of anything.
+const CUES: [&str; 2] = ["soundgen", "sound"];
+
+/// Which group an actor plays when it is doing nothing, in the order they are preferred.
+///
+/// **Not just `idle`.** 790 of the shipped groups are `idle3` and 758 `idle2` against 720 plain
+/// `idle`; a model with only the numbered ones is common, and a creature with none of the three
+/// falls back to whatever its first group is rather than to its whole reel.
+const RESTING: [&str; 4] = ["idle", "idle1", "idle2", "idle3"];
+
 /// A skeleton, the clip that poses it, and the vertices that follow it.
 ///
 /// **One rig per mesh**, because the two are bound to each other: the influences are indices into
@@ -98,8 +127,12 @@ pub struct Rig {
     pub bones: Vec<Bone>,
     /// One per vertex of `mesh`.
     pub influences: Vec<Influence>,
-    /// How long the clip runs before it repeats.
-    pub duration: f32,
+    /// Every named span the model declares, in the order they occur. Empty where it declares none,
+    /// which is what a banner does: one animation, unnamed, and the whole of it.
+    pub groups: Vec<Group>,
+    /// The span being played: the loop of whichever group the model rests in, or the whole clip
+    /// where it declares no groups at all.
+    pub playing: std::ops::Range<f32>,
 }
 
 /// One bone a mesh is skinned to.
@@ -195,6 +228,8 @@ impl Rig {
             .iter()
             .map(Channel::duration)
             .fold(0.0f32, f32::max);
+        let groups = groups_of(nif, duration);
+        let playing = resting(&groups).unwrap_or(0.0..duration);
         Some(Self {
             mesh,
             parents: skeleton.parents,
@@ -202,9 +237,78 @@ impl Rig {
             channels: skeleton.channels,
             bones,
             influences: shares.iter().map(|share| influence_of(share)).collect(),
-            duration,
+            groups,
+            playing,
         })
     }
+}
+
+/// The named spans a model declares, read out of the first text-key block in it.
+///
+/// A key's text is several lines and a line is `group: marker`; the markers that bound a span are
+/// `start`, `stop`, `loop start` and `loop stop`. Anything else on the line — and every line under
+/// a name in [`CUES`] — is for something this is not.
+fn groups_of(nif: &NifFile, duration: f32) -> Vec<Group> {
+    let Some(Block::TextKeys(keys)) = nif
+        .blocks()
+        .iter()
+        .find(|block| matches!(block, Block::TextKeys(_)))
+    else {
+        return Vec::new();
+    };
+    let mut groups: Vec<Group> = Vec::new();
+    for key in &keys.keys {
+        for line in key.text.lines() {
+            let Some((name, marker)) = line.split_once(':') else {
+                continue;
+            };
+            let name = name.trim().to_lowercase();
+            if CUES.contains(&name.as_str()) {
+                continue;
+            }
+            let marker = marker.trim().to_lowercase();
+            let group = match groups.iter_mut().find(|group| group.name == name) {
+                Some(group) => group,
+                None => {
+                    groups.push(Group {
+                        name,
+                        start: key.time,
+                        stop: duration,
+                        loop_start: f32::NAN,
+                        loop_stop: f32::NAN,
+                    });
+                    groups.last_mut().expect("just pushed")
+                }
+            };
+            match marker.as_str() {
+                "start" => group.start = key.time,
+                "stop" => group.stop = key.time,
+                "loop start" => group.loop_start = key.time,
+                "loop stop" => group.loop_stop = key.time,
+                _ => {}
+            }
+        }
+    }
+    // A group that declared no loop repeats the whole of itself, which is what an idle without one
+    // means and what every group without one has to fall back to.
+    for group in &mut groups {
+        if !group.loop_start.is_finite() {
+            group.loop_start = group.start;
+        }
+        if !group.loop_stop.is_finite() {
+            group.loop_stop = group.stop;
+        }
+    }
+    groups
+}
+
+/// The span an actor plays while it is doing nothing, or `None` where there are no groups at all.
+fn resting(groups: &[Group]) -> Option<std::ops::Range<f32>> {
+    let resting = RESTING
+        .iter()
+        .find_map(|name| groups.iter().find(|group| group.name == *name))
+        .or_else(|| groups.first())?;
+    Some(resting.loop_start..resting.loop_stop)
 }
 
 /// One bone's claim on one vertex, before the claims are cut down to [`INFLUENCES`].
@@ -349,12 +453,13 @@ impl Pose {
 }
 
 impl Rig {
-    /// Poses the skeleton at `time`, wrapping to the clip's own length.
+    /// Poses the skeleton at `time`, wrapping within the span being played.
     pub fn pose(&self, time: f32, into: &mut Pose) {
-        let time = if self.duration > 0.0 {
-            time.rem_euclid(self.duration)
+        let span = self.playing.end - self.playing.start;
+        let time = if span > 0.0 {
+            self.playing.start + time.rem_euclid(span)
         } else {
-            0.0
+            self.playing.start
         };
         // Joints are ordered parents-first, so a joint's parent is already composed when it is
         // reached and one pass does the whole skeleton.
@@ -475,6 +580,7 @@ pub fn affine_of(transform: &Transform) -> Affine3A {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mesh::Mesh;
 
     fn quaternion(time: f32, degrees: f32) -> QuaternionKey {
         let half = degrees.to_radians() / 2.0;
@@ -483,6 +589,98 @@ mod tests {
             time,
             value: [half.cos(), 0.0, 0.0, half.sin()],
         }
+    }
+
+    /// The rig of one shipped model, or `None` where the game is not installed.
+    fn shipped(path: &str) -> Option<(Mesh, Rig)> {
+        let vfs = rtxmw_vfs::morrowind_archives()?;
+        let bytes = vfs.read(path).expect("the model should be in the archives");
+        let nif = rtxmw_nif::NifFile::parse(&bytes).expect("it should parse");
+        let mut materials = crate::material_table::MaterialTable::default();
+        let mut spans = Vec::new();
+        let mesh = Mesh::from_nif_tracked(&nif, &mut materials, &mut spans);
+        let rig = Rig::from_nif(&nif, MeshId(0), mesh.positions.len(), &spans)?;
+        Some((mesh, rig))
+    }
+
+    /// How far the posed mesh reaches, sampled across a span.
+    fn travel(mesh: &Mesh, rig: &Rig, span: std::ops::Range<f32>) -> f32 {
+        let mut pose = Pose::default();
+        let mut lowest = Vec3::splat(f32::INFINITY);
+        let mut highest = Vec3::NEG_INFINITY;
+        for step in 0..24 {
+            let along = step as f32 / 24.0;
+            let played = Rig {
+                playing: span.clone(),
+                ..rig.clone()
+            };
+            played.pose(along * (span.end - span.start), &mut pose);
+            for (vertex, influence) in mesh.positions.iter().zip(&rig.influences) {
+                let mut moved = Vec3::ZERO;
+                for slot in 0..INFLUENCES {
+                    let weight = influence.weights[slot];
+                    if weight == 0.0 {
+                        continue;
+                    }
+                    moved += weight
+                        * pose.bones()[influence.bones[slot] as usize].transform_point3(*vertex);
+                }
+                lowest = lowest.min(moved);
+                highest = highest.max(moved);
+            }
+        }
+        (highest - lowest).max_element()
+    }
+
+    #[test]
+    fn a_creature_plays_the_span_it_rests_in_rather_than_everything_it_can_do() {
+        // **A NIF holds every animation a creature has, laid end to end.** Played whole, an
+        // ash ghoul idles, walks, runs, turns, attacks, is knocked down and dies, then does it
+        // again — which is what the text keys are there to stop.
+        let Some((mesh, rig)) = shipped("meshes/r/ashghoul.nif") else {
+            eprintln!("skipping: the game is not installed");
+            return;
+        };
+        for wanted in ["idle", "walkforward", "death1"] {
+            assert!(
+                rig.groups.iter().any(|group| group.name == wanted),
+                "an ash ghoul declares {wanted:?}; it has {:?}",
+                rig.groups.iter().map(|g| &g.name).collect::<Vec<_>>()
+            );
+        }
+        let whole = rig
+            .groups
+            .iter()
+            .map(|group| group.stop)
+            .fold(0.0f32, f32::max);
+        assert!(
+            rig.playing.end - rig.playing.start < whole * 0.2,
+            "the idle is {:.2}s of a {:.2}s reel, which is not a span picked out of it",
+            rig.playing.end - rig.playing.start,
+            whole
+        );
+
+        // **And it is the standing-still one.** A creature that walks away from where it was put
+        // travels much further than one shifting its weight, so the reach of the posed mesh over
+        // the span is what separates the two without knowing anything about ash ghouls.
+        println!(
+            "ash ghoul: {} groups, resting {:.2}..{:.2} of a {whole:.2} second reel",
+            rig.groups.len(),
+            rig.playing.start,
+            rig.playing.end
+        );
+        let resting = travel(&mesh, &rig, rig.playing.clone());
+        let walking = rig
+            .groups
+            .iter()
+            .find(|group| group.name == "walkforward")
+            .map(|group| travel(&mesh, &rig, group.start..group.stop))
+            .expect("it declares walkforward");
+        assert!(
+            resting < walking * 0.9,
+            "resting reaches {resting:.1} units and walking {walking:.1}, so the span chosen is \
+             not the one the creature stands still in"
+        );
     }
 
     #[test]
@@ -557,7 +755,8 @@ mod tests {
                 },
             ],
             influences: Vec::new(),
-            duration: 2.0,
+            groups: Vec::new(),
+            playing: 0.0..2.0,
         }
     }
 
