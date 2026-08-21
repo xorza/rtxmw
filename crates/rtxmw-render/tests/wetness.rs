@@ -11,7 +11,8 @@ use glam::{Affine3A, Vec2, Vec3};
 use rtxmw_gpu::{TestGpu, readback};
 use rtxmw_render::SceneRenderer;
 use rtxmw_scene::{
-    CellId, Instance, Material, Mesh, MeshId, Precipitation, Sky, StaticScene, Submesh, WorldTime,
+    CellId, Falling, Instance, Material, Mesh, MeshId, Precipitation, Sky, StaticScene, Submesh,
+    WorldTime,
 };
 
 mod common;
@@ -104,7 +105,7 @@ fn rain() -> Precipitation {
         diameter: 600.0,
         height: 500.0,
         fall: 4_025.0,
-        snow: false,
+        kind: Falling::Rain,
     }
 }
 
@@ -332,7 +333,7 @@ fn what_the_rain_cannot_reach_stays_dry() {
         diameter: 800.0,
         height: 300.0,
         fall: 345.0,
-        snow: true,
+        kind: Falling::Snow,
     };
     let snowed = film(&ground(0.5, &[]), flakes, OVERHEAD).returned;
     assert_eq!(

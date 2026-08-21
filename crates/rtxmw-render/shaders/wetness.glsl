@@ -175,7 +175,7 @@ const float FILM_THINNEST = 0.35;
 
 // How wet `surface` is, from dry to a film across all of it.
 float wetness(Surface surface, uvec2 pixel) {
-    if (frame.precip_spacing <= 0.0 || frame.precip_snow > 0.0) {
+    if (frame.precip_spacing <= 0.0 || frame.precip_kind > PRECIP_RAIN) {
         return 0.0;
     }
     // How much air is under the surface, which decides whether the rain reaches it at all and how

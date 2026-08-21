@@ -9,7 +9,7 @@ use glam::{Affine3A, Vec2, Vec3};
 use rtxmw_gpu::{TestGpu, readback};
 use rtxmw_render::SceneRenderer;
 use rtxmw_scene::{
-    CellId, Instance, Material, MaterialKind, Mesh, MeshId, StaticScene, Submesh, Sun,
+    CellId, Falling, Instance, Material, MaterialKind, Mesh, MeshId, StaticScene, Submesh, Sun,
 };
 
 mod common;
@@ -711,13 +711,13 @@ fn surface_from(height: f32, precipitation: rtxmw_scene::Precipitation, time: f3
 /// three channels. The *fourth* is a different quantity and does carry them, which is what the far
 /// view at the end of the test reads; it is the ripples as roughness rather than as shape, and only
 /// once they are too small to draw.
-fn raining(snow: bool) -> rtxmw_scene::Precipitation {
+fn raining(kind: Falling) -> rtxmw_scene::Precipitation {
     rtxmw_scene::Precipitation {
         count: 450.0,
         diameter: 2.0,
         height: 500.0,
         fall: 4025.0,
-        snow,
+        kind,
     }
 }
 
@@ -741,7 +741,7 @@ fn rain_rings_the_water_and_snow_lands_on_it_without_a_sound() {
     // so a snowy frame and a dry one are the same frame down to the byte. Both halves of the
     // fixture's claim, and neither of them true by construction.
     let dry = surface_from(60.0, rtxmw_scene::Precipitation::NONE, 1.0);
-    let snowed = surface_from(60.0, raining(true), 1.0);
+    let snowed = surface_from(60.0, raining(Falling::Snow), 1.0);
     assert_eq!(
         count(&apart(&dry, &snowed)),
         0,
@@ -751,7 +751,7 @@ fn rain_rings_the_water_and_snow_lands_on_it_without_a_sound() {
     // **A fair share of the surface at any moment**, which is what rings living half a second on a
     // lattice this fine come to — every cell has an impact, and what varies is whether one is
     // passing under this pixel now.
-    let ringing = apart(&snowed, &surface_from(60.0, raining(false), 1.0));
+    let ringing = apart(&snowed, &surface_from(60.0, raining(Falling::Rain), 1.0));
     let rings = count(&ringing);
     assert!(
         rings > pixels / 20,
@@ -771,8 +771,8 @@ fn rain_rings_the_water_and_snow_lands_on_it_without_a_sound() {
     // the ring front covers a fifth of its own wavelength — pinning the field to one instant and
     // leaving everything else alone drops this from 455 pixels to 97.
     let later = apart(
-        &surface_from(60.0, raining(true), 1.05),
-        &surface_from(60.0, raining(false), 1.05),
+        &surface_from(60.0, raining(Falling::Snow), 1.05),
+        &surface_from(60.0, raining(Falling::Rain), 1.05),
     );
     let moved = ringing
         .iter()
@@ -800,7 +800,10 @@ fn rain_rings_the_water_and_snow_lands_on_it_without_a_sound() {
             centre_texel(uploader, renderer.normal_roughness()).w
         })
     };
-    let (still, rough) = (roughness(raining(true)), roughness(raining(false)));
+    let (still, rough) = (
+        roughness(raining(Falling::Snow)),
+        roughness(raining(Falling::Rain)),
+    );
     assert!(
         rough > still * 1.5,
         "rain should roughen water too distant to ring — {rough} against {still}"

@@ -147,7 +147,7 @@ const float RIPPLE_STEEPNESS = 0.30;
 // what would put a mirror on the far half of a bay in a downpour.
 vec2 ripple_slope(vec2 p, float time, float footprint, out float unresolved) {
     unresolved = 0.0;
-    if (frame.precip_spacing <= 0.0 || frame.precip_snow > 0.0) {
+    if (frame.precip_spacing <= 0.0 || frame.precip_kind > PRECIP_RAIN) {
         return vec2(0.0);
     }
     float detail = resolved(RIPPLE_LENGTH, footprint);

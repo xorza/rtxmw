@@ -132,6 +132,25 @@ const float PRECIP_SPREAD = 35.0;
 // is what makes a flake read as a flake where a drop reads as a smear.
 const float PRECIP_FLAKE = 3.0;
 
+// How much wider than a drop a mote of ash is drawn.
+//
+// **Between the two, because ash is between the two.** A flake is a loose crystal and reads as a
+// dot; a drop is a lens and reads as a streak. Ash is neither — fine enough to hang in the air for
+// as long as the wind holds it, coarse enough that what an eye picks out is a grain rather than a
+// haze. And it is moving: sixteen metres a second across the view puts a mote two and a half times
+// its own width along in a sixtieth of a second, so it comes out short and slanted with no case of
+// its own.
+const float PRECIP_MOTE = 1.6;
+
+// What a mote of ash returns of the light on it, against a flake's crystal.
+//
+// **Ash is rock, and rock is dark.** Snow's albedo is nine tenths and volcanic ash's is nearer a
+// seventh, which is the whole reason a dust storm reads as a brown gloom where a blizzard reads as a
+// white one. Drawn at a flake's brightness the motes came out as pale grains against their own storm
+// — the thing making the sky brown, lit as though it were not.
+const float PRECIP_ASH_LIT = 0.15;
+
+
 // How wide a drawn streak is, in world units.
 //
 // **A drawing width, not the drop's own** — that is `PRECIP_RADIUS`, which still sets how much of
@@ -256,6 +275,10 @@ vec4 precipitation_along(vec3 origin, vec3 direction, float span) {
     if (frame.precip_spacing <= 0.0) {
         return vec4(0.0, 0.0, 0.0, 1.0);
     }
+    // Which of the three, read once: how wide it is drawn and what it does with the light on it are
+    // decided a hundred lines apart, and two copies of the same cut is one more than can be right.
+    bool snowing = frame.precip_kind > PRECIP_RAIN && frame.precip_kind < PRECIP_SNOW;
+    bool ashen = frame.precip_kind > PRECIP_SNOW;
     // **Air only, and under a bay there is none**, which is the same thing `fog_density_at` says
     // about the fog and for a stronger reason: a drop that reached the water stopped being a drop.
     // Nothing in this lattice knows that, so a submerged eye had a downpour hanging in the bay with
@@ -296,7 +319,7 @@ vec4 precipitation_along(vec3 origin, vec3 direction, float span) {
     vec3 drift = frame.precip_fall * frame.time;
     // Wide enough to be seen against the cell it sits in and narrow enough to leave air between one
     // streak and the next — and the cell is solved from it below, not the other way round.
-    float radius = PRECIP_DRAWN * (frame.precip_snow > 0.0 ? PRECIP_FLAKE : 1.0);
+    float radius = PRECIP_DRAWN * (ashen ? PRECIP_MOTE : snowing ? PRECIP_FLAKE : 1.0);
 
     // How far this weather's own drop travels while the shutter is open — and never less than it is
     // drawn across, because below that a shape is not short, it is *pointed the wrong way*. `down`
@@ -385,9 +408,11 @@ vec4 precipitation_along(vec3 origin, vec3 direction, float span) {
     // **What a drop shows is the sky, not a surface.** It is a lens: nearly everything reaching the
     // eye from one is the dome refracted through it. A flake is the other case — loose crystal,
     // which scatters what lands on it in every direction, so it comes out at the ambient rather
-    // than at a slice of the sky.
-    vec3 shown = frame.precip_snow > 0.0
-               ? frame.ambient
+    // than at a slice of the sky. Ash scatters the same way and keeps almost none of it, which is
+    // `PRECIP_ASH_LIT`: the difference between a blizzard and an ashstorm is what the grains are
+    // made of, not how they move.
+    vec3 shown = ashen ? frame.ambient * PRECIP_ASH_LIT
+               : snowing ? frame.ambient
                : sky_lighting(reflect(direction, fall)) * PRECIP_LIT;
     return vec4(shown * covered, through);
 }

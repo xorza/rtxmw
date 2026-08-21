@@ -179,6 +179,13 @@ struct Moon {
     float lunar_lambert;
 };
 
+// Where `precip_kind` is cut, as thresholds rather than values — see `Falling` in `rtxmw-scene`.
+//
+// Here rather than in `precipitation.glsl` because `waves.glsl` and `wetness.glsl` both ask whether
+// it is raining, and both are included before that file is.
+const float PRECIP_RAIN = 0.5;
+const float PRECIP_SNOW = 1.5;
+
 layout(set = 0, binding = 14, scalar) readonly buffer Frame {
     // Clip coordinates to an offset from the eye, in world axes — *not* the inverse
     // view-projection, which would land a world-space point the shader then has to subtract the
@@ -250,12 +257,16 @@ layout(set = 0, binding = 14, scalar) readonly buffer Frame {
     // How deep the layer stands, against clear weather's in still air: the weather's own
     // `Land Fog Depth` and its wind together — see `Sky::fog_lift` in `rtxmw-scene`.
     float fog_lift;
-    // What falls out of the sky: how far apart the streaks are, how far the volume reaches, how
-    // fast and which way they fall, and whether they are flakes rather than drops. Spacing is zero for the six weathers that drop nothing — see
-    // `Precipitation` in `rtxmw-scene`.
+    // What is in the air: how far apart they stand, how far the volume reaches, which of the three
+    // they are, and what the air does with them. Spacing is zero for the five weathers carrying
+    // nothing — see `Precipitation` in `rtxmw-scene`.
+    //
+    // **The kind is ordered so one comparison answers the commonest question.** Rain is nought and
+    // anything above it is not rain, which is what wets a surface and rings water; snow is one and
+    // ash is two, and those two differ in how wide they are drawn and how dark they come out.
     float precip_spacing;
     float precip_reach;
-    float precip_snow;
+    float precip_kind;
     vec3 precip_fall;
     // Masser and Secunda, which the sky draws as spheres and the surfaces are lit by — see `Moon`
     // above and `moon_disc` in `lighting.glsl`. Black and zero-width for a cell with no sky.

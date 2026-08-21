@@ -4,7 +4,7 @@ use ash::vk;
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec2, Vec3};
 use rtxmw_gpu::{Binding, Buffer, BufferMemory, ComputePipeline, Device, Image, Memory};
-use rtxmw_scene::{Clouds, Discharge, Lightning, Moon, Precipitation, Sun, Veil};
+use rtxmw_scene::{Clouds, Discharge, Falling, Lightning, Moon, Precipitation, Sun, Veil};
 
 use crate::acceleration_structure::AccelerationStructure;
 use crate::gbuffer::GBuffer;
@@ -14,13 +14,6 @@ use crate::material_buffers::MaterialBuffers;
 use crate::shaders;
 use crate::texture_array::TextureArray;
 use crate::wave_spectrum::{GpuWave, SeaState, WAVE_COUNT};
-
-/// What a `Wind Speed` of one blows a falling drop sideways at, in world units a second.
-///
-/// `FOG_GALE`'s own figure, which is what makes the rain slant with the same air that carries the
-/// fog: twenty metres a second at seventy units to the metre. A thunderstorm's 0.5 puts its drops
-/// over at ten metres a second against a fall of forty-one, which is the lean a storm has.
-const PRECIP_SLANT: f32 = 1400.0;
 
 /// Everything lighting a cell, which arrives together and goes stale together.
 #[derive(Debug, Clone, Copy)]
@@ -302,7 +295,7 @@ pub struct FrameConstants {
     /// What falls, flattened: [`rtxmw_scene::Precipitation`] and the velocity it falls at.
     precip_spacing: f32,
     precip_reach: f32,
-    precip_snow: f32,
+    precip_kind: f32,
     precip_fall: [f32; 3],
     /// The two moons — see [`GpuMoon`].
     masser: GpuMoon,
@@ -439,16 +432,20 @@ impl FrameConstants {
             fog_lift: lighting.fog_lift,
             precip_spacing: lighting.precipitation.spacing(),
             precip_reach: lighting.precipitation.reach(),
-            precip_snow: f32::from(u8::from(lighting.precipitation.snow)),
-            // **Down, and slanted by the wind that carries the fog**, which is the same air: a
-            // storm's rain comes at you rather than straight down, and the wind vector is already
-            // in world units a second where `Wind Speed` is a dial — see `FOG_GALE`.
-            precip_fall: Vec3::new(
-                lighting.fog_wind.x * PRECIP_SLANT,
-                lighting.fog_wind.y * PRECIP_SLANT,
-                -lighting.precipitation.fall,
-            )
-            .to_array(),
+            // **Ordered so the shader can ask one question of it.** Rain is nought and everything
+            // above it is not rain, which is what wets a surface and rings the water; the two that
+            // follow differ from each other in how they are drawn and lit — see `Falling`.
+            precip_kind: match lighting.precipitation.kind {
+                Falling::Rain => 0.0,
+                Falling::Snow => 1.0,
+                Falling::Ash => 2.0,
+            },
+            // Whatever the air does with it, which is not the same for the three — see
+            // `Precipitation::velocity`.
+            precip_fall: lighting
+                .precipitation
+                .velocity(lighting.fog_wind)
+                .to_array(),
             masser: GpuMoon::new(lighting.masser, lighting.masser_face),
             secunda: GpuMoon::new(lighting.secunda, lighting.secunda_face),
             cloud_altitude: lighting.clouds.altitude,
