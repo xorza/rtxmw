@@ -197,6 +197,65 @@ impl GeometryBuffers {
         Ok(first_slot..self.ranges.len() as u32)
     }
 
+    /// Reserves `copies` blank vertex regions shaped like the mesh in `source`.
+    ///
+    /// **What makes a deforming placement need no new architecture.** A skinned instance cannot
+    /// share its neighbour's vertices — the two are in different poses — so it takes a slice of
+    /// these same buffers of its own, and a mesh slot of its own pointing at it. Every index a
+    /// shader or a build reads is already rebased by `first_vertex`, so nothing downstream can tell
+    /// the difference between a region a cell uploaded and one a compute pass fills.
+    ///
+    /// **Indices and submeshes are shared with the source rather than copied.** A `MeshRange` names
+    /// an index range it does not own, and the indices are mesh-local, so every copy can point at
+    /// the same triangles. The submesh *entries* are duplicated because `first_submesh` is what an
+    /// instance carries as its custom index and each copy needs its own, but they describe the same
+    /// runs of the same materials.
+    ///
+    /// Nothing is uploaded: the regions hold whatever the allocator left there until the first
+    /// deform writes them, which is why the caller must not build an acceleration structure over
+    /// one before then.
+    pub fn reserve_deformed(
+        &mut self,
+        uploader: &mut Uploader,
+        source: u32,
+        copies: u32,
+    ) -> rtxmw_gpu::Result<std::ops::Range<u32>> {
+        let first_slot = self.ranges.len() as u32;
+        let shape = self.ranges[source as usize];
+        let vertices = shape.vertex_count as vk::DeviceSize * copies as vk::DeviceSize;
+        let position_offset = self.vertices as vk::DeviceSize * Self::POSITION_STRIDE;
+        let attribute_offset =
+            self.vertices as vk::DeviceSize * size_of::<VertexAttributes>() as vk::DeviceSize;
+        grow(
+            uploader,
+            &mut self.positions,
+            position_offset,
+            position_offset + vertices * Self::POSITION_STRIDE,
+            "scene positions",
+            build_input_usage(),
+        )?;
+        grow(
+            uploader,
+            &mut self.attributes,
+            attribute_offset,
+            attribute_offset + vertices * size_of::<VertexAttributes>() as vk::DeviceSize,
+            "scene vertex attributes",
+            geometry_usage(),
+        )?;
+
+        let runs = self.submeshes_of(&shape).to_vec();
+        for _ in 0..copies {
+            self.ranges.push(MeshRange {
+                first_vertex: self.vertices,
+                first_submesh: self.submeshes.len() as u32,
+                ..shape
+            });
+            self.submeshes.extend_from_slice(&runs);
+            self.vertices += shape.vertex_count;
+        }
+        Ok(first_slot..self.ranges.len() as u32)
+    }
+
     /// Tightly packed `float3` positions, the vertex stream a build reads.
     pub fn positions(&self) -> &Buffer {
         &self.positions

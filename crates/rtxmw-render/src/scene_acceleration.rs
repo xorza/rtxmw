@@ -17,8 +17,10 @@ use crate::geometry_buffers::GeometryBuffers;
 /// The two levels have different lifetimes and that is the streaming story in one line: bottom
 /// levels are built once per mesh and kept, the top level is rebuilt whenever a cell arrives or
 /// leaves.
-#[derive(Debug)]
 pub struct SceneAcceleration {
+    /// A handle copy, not an owner: the real `Device` outlives this by construction, and the frame
+    /// path records builds without one to hand.
+    loader: ash::khr::acceleration_structure::Device,
     /// One per mesh that had triangles, in mesh order but skipping the empty ones.
     blas: Vec<AccelerationStructure>,
     /// Which entry of `blas` each mesh slot built into, or [`NO_BLAS`] for one with no triangles.
@@ -26,11 +28,27 @@ pub struct SceneAcceleration {
     /// Whether each mesh slot is water, which decides the mask its instances carry.
     is_water: Vec<bool>,
     tlas: AccelerationStructure,
+    /// Scratch the top level is rebuilt through, kept because the frame rebuilds it every time
+    /// anything below it moved and must not allocate to do so.
+    tlas_scratch: Buffer,
     /// Owned so it outlives the top-level build, and because a refit will rewrite it in place.
     instances: Buffer,
     instance_count: u32,
+    /// The bottom levels rebuilt inside the frame, or `None` while nothing moves.
+    deforming: Option<Deforming>,
     /// What the uncompacted structures measured, kept so the saving can be reported.
     uncompacted_blas_bytes: vk::DeviceSize,
+}
+
+// The extension loader is a table of function pointers and implements no `Debug`.
+impl std::fmt::Debug for SceneAcceleration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SceneAcceleration")
+            .field("blas", &self.blas.len())
+            .field("instances", &self.instance_count)
+            .field("deforming", &self.deforming)
+            .finish_non_exhaustive()
+    }
 }
 
 impl SceneAcceleration {
@@ -45,14 +63,17 @@ impl SceneAcceleration {
         limits: RayTracingLimits,
     ) -> rtxmw_gpu::Result<Self> {
         let instances = instance_buffer(uploader, 0)?;
-        let tlas = build_top_level(device, uploader, limits, &instances, 0)?;
+        let built = build_top_level(device, uploader, limits, &instances, 0)?;
         Ok(Self {
+            loader: device.acceleration_structure().clone(),
             blas: Vec::new(),
             by_mesh: Vec::new(),
             is_water: Vec::new(),
-            tlas,
+            tlas: built.structure,
+            tlas_scratch: built.scratch,
             instances,
             instance_count: 0,
+            deforming: None,
             uncompacted_blas_bytes: 0,
         })
     }
@@ -125,14 +146,271 @@ impl SceneAcceleration {
         uploader.upload(&self.instances, instance_bytes_of(&records))?;
 
         self.instance_count = records.len() as u32;
-        self.tlas = build_top_level(
+        let built = build_top_level(
             device,
             uploader,
             limits,
             &self.instances,
             self.instance_count,
         )?;
+        self.tlas = built.structure;
+        self.tlas_scratch = built.scratch;
         Ok(())
+    }
+
+    /// Creates a bottom level for each of the mesh slots in `slots`, to be rebuilt every frame.
+    ///
+    /// **No build happens here**, and the caller owes one before anything references them. The
+    /// regions these describe hold whatever the allocator left there until a deform pass has
+    /// written them — see [`GeometryBuffers::reserve_deformed`] — so a top level built over them
+    /// meanwhile is undefined, which on this hardware is a lost device rather than a wrong
+    /// picture. `SceneResidency::commit` pays that debt with one submission of the same two passes
+    /// a frame uses; §8.91 is what it cost to find out. What this does is reserve the structures,
+    /// at the size the driver says the geometry needs, and the scratch a build will run through.
+    ///
+    /// `refit` chooses between rebuilding the structure every frame and updating it in place.
+    /// Which is better is a measurement rather than a fact — `docs/design.md` M12 — so it is a
+    /// parameter and `tests/deforming.rs` is where the two are compared.
+    pub fn append_deforming(
+        &mut self,
+        uploader: &mut Uploader,
+        limits: RayTracingLimits,
+        geometry: &GeometryBuffers,
+        materials: &[Material],
+        set: Deformable,
+    ) -> rtxmw_gpu::Result<()> {
+        let Deformable { slots, refit } = set;
+        assert!(
+            self.deforming.is_none(),
+            "a second deforming set would need its own scratch; there is one set today"
+        );
+        assert_eq!(
+            self.by_mesh.len() as u32,
+            slots.start,
+            "deforming slots must follow the meshes already registered"
+        );
+        let loader = &self.loader;
+        let described = describe_geometry(geometry, materials, slots.clone());
+
+        let first = self.blas.len() as u32;
+        let mut scratch_offsets = Vec::with_capacity(described.spans.len());
+        let mut scratch_total = 0;
+        for (index, span) in described.spans.iter().enumerate() {
+            let sizes = build_sizes(
+                loader,
+                vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL,
+                refit_flags(refit),
+                &described.geometries[span.start as usize..span.end as usize],
+                &described.primitive_counts[span.start as usize..span.end as usize],
+            );
+            self.blas.push(AccelerationStructure::create(
+                uploader.memory(),
+                loader,
+                "deforming blas",
+                sizes.acceleration_structure_size,
+                vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL,
+            )?);
+            self.by_mesh.push(first + index as u32);
+            self.is_water.push(false);
+            scratch_offsets.push(scratch_total);
+            // The larger of the two: the set can be rebuilt as well as refitted — the first frame
+            // has to be — and a region sized for an update is not enough for a build.
+            scratch_total += align_up(
+                sizes.build_scratch_size.max(sizes.update_scratch_size),
+                limits.min_scratch_offset_alignment as vk::DeviceSize,
+            );
+        }
+        assert_eq!(
+            self.by_mesh.len() as u32,
+            slots.end,
+            "every reserved slot must have got a structure; one that flattened to nothing did not"
+        );
+
+        let scratch = Buffer::with_alignment(
+            uploader.memory(),
+            "deforming blas scratch",
+            scratch_total.max(1),
+            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+            BufferMemory::Device,
+            limits.min_scratch_offset_alignment as vk::DeviceSize,
+        )?;
+        self.deforming = Some(Deforming {
+            slots,
+            first,
+            geometries: described.geometries,
+            ranges: described.ranges,
+            spans: described.spans,
+            scratch,
+            scratch_offsets,
+            refit,
+            built: false,
+        });
+        Ok(())
+    }
+
+    /// Re-derives what the per-frame build reads, after anything that could have moved the buffers.
+    ///
+    /// **A bottom level built once keeps its own copy of the geometry; one rebuilt every frame does
+    /// not.** `GeometryBuffers` reallocates when it grows, so every device address baked into a
+    /// build description goes stale the moment another cell arrives. Called from the commit that
+    /// follows any such change, which is the same place the top level is rebuilt and for the same
+    /// reason.
+    pub fn refresh_deforming(&mut self, geometry: &GeometryBuffers, materials: &[Material]) {
+        let Some(deforming) = &mut self.deforming else {
+            return;
+        };
+        let described = describe_geometry(geometry, materials, deforming.slots.clone());
+        deforming.geometries = described.geometries;
+        deforming.ranges = described.ranges;
+        deforming.spans = described.spans;
+        // A rebuilt buffer is a different source, so an update against the last pose is no longer
+        // meaningful — the next frame builds from scratch whatever mode it is in.
+        deforming.built = false;
+    }
+
+    /// Records a build of every bottom level that moves, over the vertices just written.
+    ///
+    /// **Also what makes the structures valid in the first place.** They are created unbuilt, over
+    /// regions holding whatever the allocator left there, so the load calls this once before it
+    /// builds a top level that would otherwise reference garbage — see `SceneResidency::commit`.
+    ///
+    /// Allocates nothing: every structure, scratch region and description was made at load time,
+    /// which is what `tests/frame_allocations.rs` holds this to.
+    ///
+    /// # Safety
+    /// `command_buffer` must be recording, and whatever writes the deforming vertex regions must
+    /// already be recorded into it.
+    pub unsafe fn record_deforming(
+        &mut self,
+        device: &ash::Device,
+        command_buffer: vk::CommandBuffer,
+    ) {
+        let loader = &self.loader;
+        if let Some(deforming) = &mut self.deforming {
+            // SAFETY: the caller guarantees recording; the vertices are ordered against this by the
+            // barrier below, which the deform pass's writes are on the far side of.
+            unsafe {
+                memory_barrier::scoped(
+                    device,
+                    command_buffer,
+                    vk::PipelineStageFlags2::COMPUTE_SHADER,
+                    vk::AccessFlags2::SHADER_STORAGE_WRITE,
+                    vk::PipelineStageFlags2::ACCELERATION_STRUCTURE_BUILD_KHR,
+                    vk::AccessFlags2::ACCELERATION_STRUCTURE_READ_KHR,
+                )
+            };
+            let update = deforming.refit && deforming.built;
+            let mode = if update {
+                vk::BuildAccelerationStructureModeKHR::UPDATE
+            } else {
+                vk::BuildAccelerationStructureModeKHR::BUILD
+            };
+            let scratch_base = deforming.scratch.device_address();
+            let infos: Vec<vk::AccelerationStructureBuildGeometryInfoKHR<'_>> = deforming
+                .spans
+                .iter()
+                .enumerate()
+                .map(|(index, span)| {
+                    let structure = self.blas[deforming.first as usize + index].raw();
+                    vk::AccelerationStructureBuildGeometryInfoKHR::default()
+                        .ty(vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL)
+                        .flags(refit_flags(deforming.refit))
+                        .mode(mode)
+                        // An update reads the structure it writes: refitting moves the vertices a
+                        // tree already has rather than choosing a tree, which is the whole
+                        // difference between the two modes.
+                        .src_acceleration_structure(if update {
+                            structure
+                        } else {
+                            vk::AccelerationStructureKHR::null()
+                        })
+                        .dst_acceleration_structure(structure)
+                        .geometries(&deforming.geometries[span.start as usize..span.end as usize])
+                        .scratch_data(vk::DeviceOrHostAddressKHR {
+                            device_address: scratch_base + deforming.scratch_offsets[index],
+                        })
+                })
+                .collect();
+            let range_slices: Vec<&[vk::AccelerationStructureBuildRangeInfoKHR]> = deforming
+                .spans
+                .iter()
+                .map(|span| &deforming.ranges[span.start as usize..span.end as usize])
+                .collect();
+            // SAFETY: every structure, scratch region and geometry buffer is alive, and the
+            // descriptions were re-derived at the last commit.
+            unsafe {
+                loader.cmd_build_acceleration_structures(command_buffer, &infos, &range_slices)
+            };
+            deforming.built = true;
+
+            // SAFETY: recording, and this is the dependency a top-level build has on the
+            // structures just written.
+            unsafe {
+                memory_barrier::scoped(
+                    device,
+                    command_buffer,
+                    vk::PipelineStageFlags2::ACCELERATION_STRUCTURE_BUILD_KHR,
+                    vk::AccessFlags2::ACCELERATION_STRUCTURE_WRITE_KHR,
+                    vk::PipelineStageFlags2::ACCELERATION_STRUCTURE_BUILD_KHR,
+                    vk::AccessFlags2::ACCELERATION_STRUCTURE_READ_KHR,
+                )
+            };
+        }
+    }
+
+    /// Rebuilds the top level over whatever the bottom levels have become.
+    ///
+    /// **Necessary whether or not any instance moved**: a top level holds the bounds its bottom
+    /// levels had when it was built, so one of them being rebuilt in place leaves it stale.
+    ///
+    /// # Safety
+    /// `command_buffer` must be recording, and [`SceneAcceleration::record_deforming`] must already
+    /// be recorded into it.
+    pub unsafe fn record_top(&self, device: &ash::Device, command_buffer: vk::CommandBuffer) {
+        let loader = &self.loader;
+        // **Into the structure that is already there**, never a fresh one: the descriptor a pass
+        // binds is written when a cell arrives, and a new handle every frame would mean rewriting
+        // it every frame. The instance buffer has not changed either — what makes this necessary is
+        // the bottom levels underneath it having moved.
+        let data = vk::AccelerationStructureGeometryInstancesDataKHR::default()
+            .array_of_pointers(false)
+            .data(vk::DeviceOrHostAddressConstKHR {
+                device_address: self.instances.device_address(),
+            });
+        let geometry = vk::AccelerationStructureGeometryKHR::default()
+            .geometry_type(vk::GeometryTypeKHR::INSTANCES)
+            .geometry(vk::AccelerationStructureGeometryDataKHR { instances: data })
+            .flags(vk::GeometryFlagsKHR::OPAQUE);
+        let geometries = [geometry];
+        let info = vk::AccelerationStructureBuildGeometryInfoKHR::default()
+            .ty(vk::AccelerationStructureTypeKHR::TOP_LEVEL)
+            .flags(tlas_flags())
+            .mode(vk::BuildAccelerationStructureModeKHR::BUILD)
+            .dst_acceleration_structure(self.tlas.raw())
+            .geometries(&geometries)
+            .scratch_data(vk::DeviceOrHostAddressKHR {
+                device_address: self.tlas_scratch.device_address(),
+            });
+        let range = vk::AccelerationStructureBuildRangeInfoKHR::default()
+            .primitive_count(self.instance_count);
+        // SAFETY: the structure, its scratch and the instance buffer are alive, and the bottom
+        // levels this reads were ordered against it above.
+        unsafe {
+            loader.cmd_build_acceleration_structures(
+                command_buffer,
+                std::slice::from_ref(&info),
+                &[std::slice::from_ref(&range)],
+            );
+            memory_barrier::scoped(
+                device,
+                command_buffer,
+                vk::PipelineStageFlags2::ACCELERATION_STRUCTURE_BUILD_KHR,
+                vk::AccessFlags2::ACCELERATION_STRUCTURE_WRITE_KHR,
+                vk::PipelineStageFlags2::COMPUTE_SHADER,
+                vk::AccessFlags2::ACCELERATION_STRUCTURE_READ_KHR
+                    | vk::AccessFlags2::SHADER_STORAGE_READ,
+            );
+        }
     }
 
     /// The structure a ray query is initialised against.
@@ -176,6 +454,168 @@ const MASK_WATER: u8 = 0x02;
 /// Alignment a top-level build requires of its instance buffer's address.
 const INSTANCE_ADDRESS_ALIGNMENT: vk::DeviceSize = 16;
 
+/// What a set of deforming placements is registered with.
+///
+/// A pair rather than two arguments because they are one decision: which slots move, and what the
+/// frame does with the structures over them.
+#[derive(Debug, Clone)]
+pub struct Deformable {
+    /// The mesh slots reserved for it — see [`GeometryBuffers::reserve_deformed`].
+    pub slots: std::ops::Range<u32>,
+    /// Whether a frame updates its structures in place rather than rebuilding them.
+    pub refit: bool,
+}
+
+/// The bottom levels a frame rebuilds, and everything that rebuild needs.
+///
+/// One set rather than one per cell: the whole point of the per-frame path is that it is a single
+/// build call and a single scratch allocation however many placements are in it.
+#[derive(Debug)]
+struct Deforming {
+    /// Mesh slots these were reserved for, which is also where their descriptions come from.
+    slots: std::ops::Range<u32>,
+    /// Where in `SceneAcceleration::blas` the first of these structures sits; they are contiguous.
+    first: u32,
+    /// Kept in one flat vector rather than one per structure: every build info points into it, so
+    /// it must not move while the infos are alive.
+    geometries: Vec<vk::AccelerationStructureGeometryKHR<'static>>,
+    ranges: Vec<vk::AccelerationStructureBuildRangeInfoKHR>,
+    /// Which slice of `geometries` and `ranges` each structure is built from.
+    spans: Vec<std::ops::Range<u32>>,
+    scratch: Buffer,
+    scratch_offsets: Vec<vk::DeviceSize>,
+    /// Whether a frame updates these in place rather than rebuilding them.
+    refit: bool,
+    /// Whether anything has been built into them yet. An update has to have something to update.
+    built: bool,
+}
+
+/// What a build reads, derived from a run of mesh slots.
+#[derive(Debug)]
+struct Described {
+    geometries: Vec<vk::AccelerationStructureGeometryKHR<'static>>,
+    ranges: Vec<vk::AccelerationStructureBuildRangeInfoKHR>,
+    primitive_counts: Vec<u32>,
+    /// Which slice of the three above each structure is built from.
+    spans: Vec<std::ops::Range<u32>>,
+    /// Mesh index to position in `spans`, with [`NO_BLAS`] where the mesh had no triangles.
+    by_mesh: Vec<u32>,
+}
+
+/// Describes the meshes occupying `slots` as acceleration structure geometry.
+///
+/// Shared by the build that happens once when a cell arrives and the one that happens every frame,
+/// because the two describe the same thing and a second copy of this is a second set of device
+/// addresses to keep in step.
+fn describe_geometry(
+    geometry: &GeometryBuffers,
+    materials: &[Material],
+    slots: std::ops::Range<u32>,
+) -> Described {
+    let positions = geometry.positions().device_address();
+    let indices = geometry.indices().device_address();
+    let building = &geometry.ranges()[slots.start as usize..slots.end as usize];
+    let mut described = Described {
+        geometries: Vec::with_capacity(building.len()),
+        ranges: Vec::with_capacity(building.len()),
+        primitive_counts: Vec::with_capacity(building.len()),
+        spans: Vec::new(),
+        by_mesh: Vec::with_capacity(building.len()),
+    };
+
+    for range in building {
+        if range.submesh_count == 0 {
+            described.by_mesh.push(NO_BLAS);
+            continue;
+        }
+        described.by_mesh.push(described.spans.len() as u32);
+
+        // One geometry per material-uniform run rather than one per mesh. A hit reports which it
+        // landed on as `geometry_index`, and that is the only thing that lets a lantern's glass
+        // shade differently from its metal.
+        let first_geometry = described.geometries.len() as u32;
+        for submesh in geometry.submeshes_of(range) {
+            let triangles = vk::AccelerationStructureGeometryTrianglesDataKHR::default()
+                .vertex_format(vk::Format::R32G32B32_SFLOAT)
+                .vertex_data(vk::DeviceOrHostAddressConstKHR {
+                    device_address: positions,
+                })
+                .vertex_stride(GeometryBuffers::POSITION_STRIDE)
+                // The highest vertex this build will address. Indices are mesh-local and
+                // `first_vertex` is added to them, so the ceiling is where the mesh ends.
+                .max_vertex(range.first_vertex + range.vertex_count - 1)
+                .index_type(vk::IndexType::UINT32)
+                .index_data(vk::DeviceOrHostAddressConstKHR {
+                    device_address: indices,
+                });
+            described.geometries.push(
+                vk::AccelerationStructureGeometryKHR::default()
+                    .geometry_type(vk::GeometryTypeKHR::TRIANGLES)
+                    .geometry(vk::AccelerationStructureGeometryDataKHR { triangles })
+                    .flags(geometry_flags(materials[submesh.material as usize])),
+            );
+            described.ranges.push(
+                vk::AccelerationStructureBuildRangeInfoKHR::default()
+                    .primitive_count(submesh.triangle_count())
+                    // Byte offset into the shared index buffer, against `first_vertex` added to
+                    // each index value.
+                    .primitive_offset(submesh.first_index * size_of::<u32>() as u32)
+                    .first_vertex(range.first_vertex),
+            );
+            described.primitive_counts.push(submesh.triangle_count());
+        }
+        described
+            .spans
+            .push(first_geometry..described.geometries.len() as u32);
+    }
+    described
+}
+
+/// Asks the driver how large a structure and its scratch have to be.
+fn build_sizes(
+    loader: &ash::khr::acceleration_structure::Device,
+    kind: vk::AccelerationStructureTypeKHR,
+    flags: vk::BuildAccelerationStructureFlagsKHR,
+    geometries: &[vk::AccelerationStructureGeometryKHR<'_>],
+    primitive_counts: &[u32],
+) -> vk::AccelerationStructureBuildSizesInfoKHR<'static> {
+    let sizing = vk::AccelerationStructureBuildGeometryInfoKHR::default()
+        .ty(kind)
+        .flags(flags)
+        .mode(vk::BuildAccelerationStructureModeKHR::BUILD)
+        .geometries(geometries);
+    let mut sizes = vk::AccelerationStructureBuildSizesInfoKHR::default();
+    // SAFETY: `sizing` is fully initialised and the counts array matches its geometry count.
+    unsafe {
+        loader.get_acceleration_structure_build_sizes(
+            vk::AccelerationStructureBuildTypeKHR::DEVICE,
+            &sizing,
+            primitive_counts,
+            &mut sizes,
+        )
+    };
+    sizes
+}
+
+/// What a bottom level rebuilt inside the frame is built with.
+///
+/// **`ALLOW_UPDATE` only where updates are actually taken.** It is not free: a structure that has to
+/// stay refittable cannot be organised as freely as one that does not, and these are traversed by
+/// every ray in the frame and built once. `PREFER_FAST_BUILD` for the rebuilding case, because a
+/// structure thrown away at the end of the frame has no traversals to amortise a slow build over —
+/// though which of the two wins overall is what `tests/deforming.rs` measures rather than assumes.
+///
+/// `ALLOW_COMPACTION` is absent from both: compaction costs a second submission and a copy, and
+/// there is nothing to reclaim from a structure that is overwritten sixty times a second.
+fn refit_flags(refit: bool) -> vk::BuildAccelerationStructureFlagsKHR {
+    if refit {
+        vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE
+            | vk::BuildAccelerationStructureFlagsKHR::ALLOW_UPDATE
+    } else {
+        vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_BUILD
+    }
+}
+
 /// Bottom-level structures fresh from a build, before compaction.
 struct BuiltBottomLevel {
     structures: Vec<AccelerationStructure>,
@@ -207,62 +647,13 @@ fn build_bottom_level(
     }
 
     let loader = device.acceleration_structure();
-    let positions = geometry.positions().device_address();
-    let indices = geometry.indices().device_address();
-
-    // Kept in one flat vector rather than one per structure: every build info points into it, so it
-    // must not move while the infos are alive.
-    let mut geometries = Vec::with_capacity(geometry.submeshes().len());
-    let mut ranges = Vec::with_capacity(geometry.submeshes().len());
-    let mut primitive_counts = Vec::with_capacity(geometry.submeshes().len());
-    let building = &geometry.ranges()[slots.start as usize..slots.end as usize];
-    let mut by_mesh = Vec::with_capacity(building.len());
-    // Which slice of `geometries` each structure is built from.
-    let mut geometry_spans: Vec<std::ops::Range<u32>> = Vec::new();
-
-    for range in building {
-        if range.submesh_count == 0 {
-            by_mesh.push(NO_BLAS);
-            continue;
-        }
-        by_mesh.push(geometry_spans.len() as u32);
-
-        // One geometry per material-uniform run rather than one per mesh. A hit reports which it
-        // landed on as `geometry_index`, and that is the only thing that lets a lantern's glass
-        // shade differently from its metal.
-        let first_geometry = geometries.len() as u32;
-        for submesh in geometry.submeshes_of(range) {
-            let triangles = vk::AccelerationStructureGeometryTrianglesDataKHR::default()
-                .vertex_format(vk::Format::R32G32B32_SFLOAT)
-                .vertex_data(vk::DeviceOrHostAddressConstKHR {
-                    device_address: positions,
-                })
-                .vertex_stride(GeometryBuffers::POSITION_STRIDE)
-                // The highest vertex this build will address. Indices are mesh-local and
-                // `first_vertex` is added to them, so the ceiling is where the mesh ends.
-                .max_vertex(range.first_vertex + range.vertex_count - 1)
-                .index_type(vk::IndexType::UINT32)
-                .index_data(vk::DeviceOrHostAddressConstKHR {
-                    device_address: indices,
-                });
-            geometries.push(
-                vk::AccelerationStructureGeometryKHR::default()
-                    .geometry_type(vk::GeometryTypeKHR::TRIANGLES)
-                    .geometry(vk::AccelerationStructureGeometryDataKHR { triangles })
-                    .flags(geometry_flags(materials[submesh.material as usize])),
-            );
-            ranges.push(
-                vk::AccelerationStructureBuildRangeInfoKHR::default()
-                    .primitive_count(submesh.triangle_count())
-                    // Byte offset into the shared index buffer, against `first_vertex` added to
-                    // each index value.
-                    .primitive_offset(submesh.first_index * size_of::<u32>() as u32)
-                    .first_vertex(range.first_vertex),
-            );
-            primitive_counts.push(submesh.triangle_count());
-        }
-        geometry_spans.push(first_geometry..geometries.len() as u32);
-    }
+    let Described {
+        geometries,
+        ranges,
+        primitive_counts,
+        spans: geometry_spans,
+        by_mesh,
+    } = describe_geometry(geometry, materials, slots);
 
     if geometry_spans.is_empty() {
         return Ok(BuiltBottomLevel {
@@ -282,21 +673,13 @@ fn build_bottom_level(
 
     for slice in &geometry_spans {
         let span = slice.start as usize..slice.end as usize;
-        let sizing = vk::AccelerationStructureBuildGeometryInfoKHR::default()
-            .ty(vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL)
-            .flags(blas_flags())
-            .mode(vk::BuildAccelerationStructureModeKHR::BUILD)
-            .geometries(&geometries[span.clone()]);
-        let mut sizes = vk::AccelerationStructureBuildSizesInfoKHR::default();
-        // SAFETY: `sizing` is fully initialised and the counts array matches its geometry count.
-        unsafe {
-            loader.get_acceleration_structure_build_sizes(
-                vk::AccelerationStructureBuildTypeKHR::DEVICE,
-                &sizing,
-                &primitive_counts[span],
-                &mut sizes,
-            )
-        };
+        let sizes = build_sizes(
+            loader,
+            vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL,
+            blas_flags(),
+            &geometries[span.clone()],
+            &primitive_counts[span],
+        );
 
         structures.push(AccelerationStructure::create(
             uploader.memory(),
@@ -538,6 +921,13 @@ fn row_major_transform(transform: &glam::Affine3A) -> vk::TransformMatrixKHR {
     }
 }
 
+/// A top level and the scratch it was built through, which the frame keeps to rebuild it.
+#[derive(Debug)]
+struct BuiltTopLevel {
+    structure: AccelerationStructure,
+    scratch: Buffer,
+}
+
 /// Builds the top level over an already-uploaded instance buffer.
 fn build_top_level(
     device: &Device,
@@ -545,7 +935,7 @@ fn build_top_level(
     limits: RayTracingLimits,
     instances: &Buffer,
     count: u32,
-) -> rtxmw_gpu::Result<AccelerationStructure> {
+) -> rtxmw_gpu::Result<BuiltTopLevel> {
     let loader = device.acceleration_structure();
 
     let data = vk::AccelerationStructureGeometryInstancesDataKHR::default()
@@ -559,21 +949,13 @@ fn build_top_level(
         .flags(vk::GeometryFlagsKHR::OPAQUE);
     let geometries = [geometry];
 
-    let sizing = vk::AccelerationStructureBuildGeometryInfoKHR::default()
-        .ty(vk::AccelerationStructureTypeKHR::TOP_LEVEL)
-        .flags(tlas_flags())
-        .mode(vk::BuildAccelerationStructureModeKHR::BUILD)
-        .geometries(&geometries);
-    let mut sizes = vk::AccelerationStructureBuildSizesInfoKHR::default();
-    // SAFETY: `sizing` is fully initialised and the counts array matches its geometry count.
-    unsafe {
-        loader.get_acceleration_structure_build_sizes(
-            vk::AccelerationStructureBuildTypeKHR::DEVICE,
-            &sizing,
-            &[count],
-            &mut sizes,
-        )
-    };
+    let sizes = build_sizes(
+        loader,
+        vk::AccelerationStructureTypeKHR::TOP_LEVEL,
+        tlas_flags(),
+        &geometries,
+        &[count],
+    );
 
     let tlas = AccelerationStructure::create(
         uploader.memory(),
@@ -614,7 +996,10 @@ fn build_top_level(
         };
     })?;
 
-    Ok(tlas)
+    Ok(BuiltTopLevel {
+        structure: tlas,
+        scratch,
+    })
 }
 
 /// A buffer sized for `count` instance records, aligned to what a top-level build requires.

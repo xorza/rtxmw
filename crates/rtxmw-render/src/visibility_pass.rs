@@ -362,6 +362,11 @@ pub(crate) struct Sampling {
 }
 
 impl FrameConstants {
+    /// Seconds since the engine started, which is what everything in the frame animates against.
+    pub fn seconds(&self) -> f32 {
+        self.time
+    }
+
     /// Builds the block from a camera's matrices.
     ///
     /// `projection` must be the reverse-Z Vulkan projection the shader assumes — it unprojects the

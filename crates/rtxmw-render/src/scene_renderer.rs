@@ -59,6 +59,14 @@ const DEFAULT_DELIGHT: f32 = 1.0;
 /// `relief.glsl` is what it switches off.
 const DEFAULT_RELIEF: f32 = 1.0;
 
+/// Whether the structures over everything that moves are refitted rather than rebuilt.
+///
+/// **Measured, not assumed** — `docs/design.md` M12. Twenty-two placements of 1,682 triangles, the
+/// busiest cell in the game: refitting builds them in 0.108 ms against 0.242, and the frame traces
+/// them in the same 0.085 either way, with no traversal penalty even where the pose has moved a
+/// third of the mesh's own size from the one the tree was built for.
+const DEFAULT_REFIT: bool = true;
+
 /// How long the device spent on each stage of a frame, in milliseconds, and at what size.
 ///
 /// Device time, not wall clock: what the GPU was busy for, which is the number `docs/design.md`
@@ -77,6 +85,9 @@ pub struct FrameTimings {
     pub traced: vk::Extent2D,
     /// What came out, which differs from [`Self::traced`] exactly when an upscaler is attached.
     pub displayed: vk::Extent2D,
+    /// Moving what moves and rebuilding what a ray traverses over it — see
+    /// `SceneResidency::record_animation`. Zero for a frame in which nothing does.
+    pub animate: f32,
     /// The ray traced pass: primary visibility, shadow rays and the diffuse bounce.
     pub trace: f32,
     /// Every à-trous pass together.
@@ -94,11 +105,17 @@ pub struct FrameTimings {
 
 impl FrameTimings {
     /// How many stages a frame is measured in, and so how many timestamps it writes.
-    const STAGES: usize = 6;
+    const STAGES: usize = 7;
 
     /// Everything the device spent on the frame.
     pub fn total(&self) -> f32 {
-        self.trace + self.denoise + self.composite + self.upscale + self.exposure + self.tonemap
+        self.animate
+            + self.trace
+            + self.denoise
+            + self.composite
+            + self.upscale
+            + self.exposure
+            + self.tonemap
     }
 
     /// Reads the durations back in the order [`SceneRenderer::record`] wrote them.
@@ -110,12 +127,13 @@ impl FrameTimings {
         Self {
             traced,
             displayed,
-            trace: durations[0],
-            denoise: durations[1],
-            composite: durations[2],
-            upscale: durations[3],
-            exposure: durations[4],
-            tonemap: durations[5],
+            animate: durations[0],
+            trace: durations[1],
+            denoise: durations[2],
+            composite: durations[3],
+            upscale: durations[4],
+            exposure: durations[5],
+            tonemap: durations[6],
         }
     }
 }
@@ -139,9 +157,15 @@ impl std::fmt::Display for FrameTimings {
         }
         write!(
             f,
-            ": trace {:.2}, denoise {:.2}, composite {:.2}, upscale {:.2}, \
+            ": animate {:.2}, trace {:.2}, denoise {:.2}, composite {:.2}, upscale {:.2}, \
              exposure {:.2}, tonemap {:.2}",
-            self.trace, self.denoise, self.composite, self.upscale, self.exposure, self.tonemap,
+            self.animate,
+            self.trace,
+            self.denoise,
+            self.composite,
+            self.upscale,
+            self.exposure,
+            self.tonemap,
         )
     }
 }
@@ -183,6 +207,9 @@ pub struct SceneRenderer {
     delight: f32,
     /// How far a texture's painted relief tilts the normal. See [`SceneRenderer::set_relief`].
     relief: f32,
+    /// What a residency built later should do with the structures over what moves — see
+    /// [`SceneRenderer::set_refit_deforming`]. Held because the residency is built lazily.
+    pending_refit: bool,
     /// How much of the cell's fog to apply. See [`SceneRenderer::set_fog`].
     fog: f32,
     /// The sky every resident exterior stands under. See [`SceneRenderer::set_sky`].
@@ -257,6 +284,7 @@ impl SceneRenderer {
             jitter: false,
             delight: DEFAULT_DELIGHT,
             relief: DEFAULT_RELIEF,
+            pending_refit: DEFAULT_REFIT,
             fog: 1.0,
             sky: Sky::default(),
             #[cfg(feature = "dlss")]
@@ -348,6 +376,19 @@ impl SceneRenderer {
             "de-lighting runs from none to the whole estimate, not {strength}"
         );
         self.delight = strength;
+    }
+
+    /// Chooses between rebuilding and refitting the structures over everything that moves.
+    ///
+    /// **Set before the scene that moves is loaded**: the choice is baked into the structures when
+    /// they are created, because a refittable one is sized and organised differently. Refitting is
+    /// the default because it measured better on both counts — `docs/design.md` M12 — and this is
+    /// the A/B that says so, kept because the answer is content-dependent.
+    pub fn set_refit_deforming(&mut self, refit: bool) {
+        self.pending_refit = refit;
+        if let Some(scene) = self.scene.as_mut() {
+            scene.set_refit_deforming(refit);
+        }
     }
 
     /// Sets how far a texture's painted relief tilts the normal it is shaded by.
@@ -522,9 +563,10 @@ impl SceneRenderer {
             let residency = self
                 .scene
                 .insert(SceneResidency::new(device, uploader, limits)?);
-            // A fresh residency starts under the default sky; this one is standing under whatever
-            // the caller last set.
+            // A fresh residency starts under the default sky and rebuilding what moves; this one
+            // is standing under whatever the caller last set.
             residency.set_sky(self.sky);
+            residency.set_refit_deforming(self.pending_refit);
         }
         Ok(self.scene.as_mut().expect("just built if it was absent"))
     }
@@ -834,15 +876,24 @@ impl SceneRenderer {
             self.timestamps.reset(command_buffer);
             self.timestamps.write(command_buffer, 0);
 
+            // **Before anything reads the scene**, and skipped entirely where nothing moves: a
+            // frame over static geometry must cost exactly what it did before this existed.
+            if let Some(scene) = self.scene.as_mut()
+                && scene.has_deforming()
+            {
+                scene.record_animation(device, command_buffer, constants.seconds());
+            }
+            self.timestamps.write(command_buffer, 1);
+
             self.pass.record(command_buffer, extent, constants);
             memory_barrier::full(device, command_buffer);
-            self.timestamps.write(command_buffer, 1);
+            self.timestamps.write(command_buffer, 2);
 
             // The filter leaves the lighting back in the G-buffer's first illumination image, which
             // is the one the composite is bound to.
             self.denoiser
                 .record(device, command_buffer, extent, self.denoise_passes);
-            self.timestamps.write(command_buffer, 2);
+            self.timestamps.write(command_buffer, 3);
 
             // **Whether the composite still has to put the rain in**, which is exactly when there
             // is no upscaler: Ray Reconstruction composites `DLSS.TransparencyLayer` itself. Here
@@ -854,7 +905,7 @@ impl SceneRenderer {
             self.composite.record(command_buffer, extent, overlay);
             // The composed frame is what the upscaler reads, so it has to have been written.
             memory_barrier::full(device, command_buffer);
-            self.timestamps.write(command_buffer, 3);
+            self.timestamps.write(command_buffer, 4);
 
             // **Ray Reconstruction stands in for the filter, not beside it** — it denoises,
             // antialiases and upscales in one pass, so the à-trous passes above are set to zero by
@@ -874,7 +925,7 @@ impl SceneRenderer {
                 eprintln!("DLSS did not run: {failed}");
             }
             memory_barrier::full(device, command_buffer);
-            self.timestamps.write(command_buffer, 4);
+            self.timestamps.write(command_buffer, 5);
 
             // The size of the frame the tone curve maps, which is the upscaled one where there is
             // an upscaler. Its *output's* size, because the curve is per pixel and the two are
@@ -897,11 +948,11 @@ impl SceneRenderer {
             };
             self.exposure
                 .record(device, command_buffer, displayed, bias);
-            self.timestamps.write(command_buffer, 5);
+            self.timestamps.write(command_buffer, 6);
 
             self.tonemap.record(command_buffer, displayed);
             memory_barrier::full(device, command_buffer);
-            self.timestamps.write(command_buffer, 6);
+            self.timestamps.write(command_buffer, 7);
 
             for image in [self.target.raw(), self.tonemap.output().raw()] {
                 image_barrier::transition(
@@ -950,15 +1001,16 @@ mod tests {
         // In the order `record` writes them. The array's width is the type's guarantee that a
         // caller cannot hand over a stage count that disagrees with the pool's.
         let timings = FrameTimings::from_durations(
-            [1.0, 2.0, 4.0, 8.0, 16.0, 32.0],
+            [0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0],
             extent(1920, 1080),
             extent(3840, 2160),
         );
+        assert_eq!(timings.animate, 0.5);
         assert_eq!(timings.trace, 1.0);
         assert_eq!(timings.denoise, 2.0);
         assert_eq!(timings.upscale, 8.0);
         assert_eq!(timings.tonemap, 32.0);
-        assert_eq!(timings.total(), 63.0);
+        assert_eq!(timings.total(), 63.5);
     }
 
     #[test]
@@ -968,7 +1020,7 @@ mod tests {
         // 1920x1080` names the output and an upscaler on quality traces at 1280x720. Both sizes are
         // in the line, so there is nothing left to assume about which one a number belongs to.
         let upscaled = FrameTimings::from_durations(
-            [1.0, 0.0, 0.0, 8.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0, 8.0, 0.0, 0.0],
             extent(1280, 720),
             extent(1920, 1080),
         );

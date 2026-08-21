@@ -45,6 +45,22 @@ pub struct Instance {
     pub transform: Affine3A,
 }
 
+/// One placed copy of a mesh whose vertices are rewritten every frame.
+///
+/// **The seam animation arrives through** — `docs/design.md` M12. A deforming placement cannot
+/// share a bottom level with its neighbour the way a static one does, because the two are in
+/// different poses, so it takes a vertex region and an acceleration structure of its own. Everything
+/// downstream of that is the same machinery a static instance uses.
+#[derive(Debug, Clone, Copy)]
+pub struct DeformingInstance {
+    pub instance: Instance,
+    /// How far into its own cycle this placement stands, in seconds.
+    ///
+    /// A row of banners on one wall are the same mesh under the same wind and would otherwise move
+    /// as one body. It becomes the clip's time offset once there are clips.
+    pub phase: f32,
+}
+
 /// Maps an object id to the mesh it draws with.
 ///
 /// Built once per content file: a cell names the records it places, not the models, and the same
@@ -186,6 +202,9 @@ pub struct StaticScene {
     /// of by a file, because a heightmap belongs to exactly one.
     pub mesh_sources: Vec<String>,
     pub instances: Vec<Instance>,
+    /// Placements whose vertices move — see [`DeformingInstance`]. Empty for a cell that has none,
+    /// which today is every cell.
+    pub deforming: Vec<DeformingInstance>,
     /// Every distinct material and texture the cell's meshes name, shared across all of them.
     pub materials: MaterialTable,
     /// Point lights placed in the cell, in world space.

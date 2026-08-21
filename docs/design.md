@@ -549,6 +549,92 @@ deliberately (§8.60, §8.61); shafts are cast for the sun and one moon only, si
 a ray per light per step (§8.43, §8.80); nothing accumulates — no snow on the ground, no ash on ledges;
 and no Purkinje shift or absolute units, which §5.1 blocks rather than this milestone.
 
+### M12 — Animation: actors, controllers and particles — **step 1 done**
+
+§5.4's scope boundary, lifted. Written before any of it was built, because the sizing decides the
+architecture and the sizing is not what the plan assumed — and the first step has since been built
+and measured, which corrected the plan again (§8.91).
+
+**What the content actually holds**, counted across the three masters and every shipped mesh:
+
+| | count |
+|---|---|
+| Animated references placed in cells | **4,066** — 3,043 `NPC_`, 863 `CREA`, 160 `ACTI` with a `.kf` |
+| Busiest single cell | **22** (Rotheran Arena: 18 NPCs, 4 creatures); mean where any are present, 3.2 |
+| Skinned meshes | **556 files**, mean 1,401 vertices and 1,678 triangles; heaviest 22,267 vertices |
+| `.kf` clips | 162, none of which parse today |
+| `NiKeyframeController` | 10,480 blocks in 557 files |
+| `NiParticleSystemController` | 637 in 258 files |
+| `NiGeomMorpherController` | 324 in 273 files |
+| `NiUVController` / `NiVisController` / `NiAlphaController` | 116 / 309 / 188 blocks |
+
+**A worst-case frame therefore deforms about 35,000 vertices and rebuilds about 42,000 triangles of
+bottom level.** Small enough that a full rebuild was expected to be the right answer, and
+`ALLOW_UPDATE` — which a structure traced by every ray and built once should not have to carry —
+expected to cost more than it saved. **Both halves of that were wrong**, and step 1 below is where
+it was measured rather than argued. §1's row still stands as a statement about wgpu; what would
+actually have hurt there is the row below it, TLAS instances marshalled through a CPU `Vec` on every
+build, which for a per-frame top level over a hilltop's worth of statics is the fatal cost.
+
+**One block type stands between the parser and every animation in the game.** All 162 `.kf` files
+fail at block zero on `NiSequenceStreamHelper`, which has no arm; Morrowind blocks carry no size, so
+there is no skipping past it. Everything else is already there — 59 block types are sized exactly,
+including `NiKeyframeData`'s four interpolation modes with their tangents, `NiSkinInstance`'s bone
+links and `NiSkinData`'s per-bone inverse binds and sparse weight lists. The layouts are written
+down; the work is turning `cursor.skip` into a read. `base_anim.nif` is 2.7 MB of which 41 KB is the
+skeleton and skin — the rest is keyframes, which is why the `x`-prefixed sibling exists and why
+OpenMW's rule is to prefer `xfoo.nif` where `xfoo.kf` is present.
+
+**The vertex streams need no new architecture, only a different allocation unit.** A skinned
+instance takes its own slice of the *existing* shared position and attribute buffers — per instance,
+not per mesh — and its own mesh slot pointing at it. `Geometry.first_vertex` already rebases every
+index, so `surface.glsl` is untouched by the whole feature. At 35,000 vertices that is about 1.1 MB,
+and the buffers already carry `STORAGE_BUFFER` usage, so a compute pass can write them. Index data
+can be shared between instances of the same model, since a mesh slot names an index range it does
+not own.
+
+**Skinning runs on the GPU into that slice, double-buffered, because motion vectors need last
+frame's positions.** §8.7's motion vector is built from the camera alone, which is right for a world
+where nothing moves and wrong for the first thing that does. Ray Reconstruction's accumulation is
+what pays for it — §8.90 measured how sharply it responds to a guide that lies — so the previous
+deformed position is part of this from the start, not after.
+
+**Per-frame acceleration structures, in the frame's own command buffer.** Everything today builds
+through `Uploader::submit_and_wait`, allocates its scratch inline, and hands back a *new*
+`AccelerationStructure`; none of those three survive contact with a per-frame path. The top level
+must be built in place so the descriptor written in `VisibilityPass::bind` stays valid, its instance
+buffer persistently mapped with only the animated rows rewritten, and its scratch preallocated at
+cell load. `tests/frame_allocations.rs` already covers `record`, so the zero-allocation budget
+polices this from the first commit. `VK_KHR_ray_tracing_maintenance1` is detected and unused today;
+its sync2 stages are what the skinning-to-build and build-to-trace barriers want.
+
+**The order is smallest-slice-first, with the risk taken before the content.**
+
+1. **A measured spike — done.** Twenty-two placements of 1,682 triangles apiece, the busiest cell
+   in the game, deformed by a compute pass and rebuilt through the whole per-frame path.
+   `tests/deforming.rs` is it, and §8.91 is what it found: **refitting builds in 0.108 ms against
+   rebuilding's 0.242 and traces in the same 0.085 either way**, so it is the default. The
+   architecture the measurement forced is the useful half — per-instance vertex regions in the
+   shared streams, a persistent scratch, a top level rebuilt in place so the descriptor survives,
+   and scoped barriers rather than the load path's full one.
+2. **Banners.** `furn_de_banner_pawn_01.nif` is six nodes, twenty vertices, one skin and three
+   keyframe controllers — the entire pipeline at a scale where every intermediate can be checked by
+   hand, and 160 of them are already placed in the world.
+3. **Creatures.** 432 records, every one with a `MODL` and an `x`-prefixed clip beside it. Real
+   skeletons, real text-key groups, `XSCL`.
+4. **NPCs.** No `MODL` on 2,772 of 3,049: a body is assembled from `RNAM`, the female bit, `BNAM`,
+   `KNAM` and the 1,125 `BODY` records matched by race, sex and part, with worn `NPCO` overriding.
+   New ESM parsing, on machinery steps 2 and 3 already built.
+5. **Particles and the rest of the controller family.** Particles belong in the transparency target
+   beside precipitation rather than in the acceleration structure — §8.87 already transcribed
+   `ashcloud.nif` by hand and the upscaler already composites that layer. `NiUVController` is a
+   material offset, `NiVisController` and `NiAlphaController` are host-side scalars,
+   `NiGeomMorpherController` reuses step 1's deformed slice, and `NiBillboardNode` reuses its
+   per-frame top level.
+
+**Deliberately not in it**: AI, pathing, locomotion and animation blending. An actor stands where
+the cell put it and plays an idle; what this milestone owns is that the world stops being still.
+
 ### What is left, across the milestones
 
 Collected rather than decided here — each is recorded where the work was done:
@@ -559,8 +645,8 @@ Collected rather than decided here — each is recorded where the work was done:
 - **§5.1's other half.** Settled — roughness dropped, replacer packs refused, and the normal map
   synthesised from painted relief built in §8.90. What waits on it is the specular coat §8.89 tried
   early, and the absolute units §8.51–§8.53 each recorded a debt for.
-- **§5.4's scope boundary.** Bind pose only: no animation, no particles, no creatures or NPCs, which is
-  what has kept BLAS refit out of the renderer.
+- **§5.4's scope boundary.** Bind pose only: no animation, no particles, no creatures or NPCs. Planned
+  as M12, which is the last feature block before §5.3 opens.
 - **§5.3's budget.** 44 ms at 3840×2160 against 16.6, knowingly, and not to be opened until the feature
   set is closed. Opacity micromaps, SER and cluster acceleration structures wait there.
 
@@ -669,9 +755,9 @@ forgotten, not so it can be worked on.
 - **Colour management.** sRGB textures, linear working space, tonemap at the end.
 - **Asset cache.** Measured and declined — §8.54.
 - **Debug affordances.** A debug-view selector, shader hot reload, a headless golden-image mode.
-- **Scope boundary for "static".** M0–M8 render the **bind pose only, no particles, no animation**. NIF
-  controllers are parsed but not evaluated; creatures and NPCs are not placed. That is what keeps the
-  missing-BLAS-refit problem out of scope until the renderer is proven.
+- **Scope boundary for "static".** M0–M11 render the **bind pose only, no particles, no animation**. NIF
+  controllers are sized exactly but not evaluated; creatures and NPCs are not placed. That is what kept
+  the per-frame acceleration structure out of the renderer until it was proven — M12 lifts it.
 
 ---
 
@@ -3254,3 +3340,52 @@ which is the cost, and it stays until §5.3 opens.
 
 The measured effect is a 3–6% mean change in radiance on lit surfaces and much more at an edge, off
 a base that was flat everywhere. `--relief 0` is the A/B.
+
+### 8.91 Refit wins, and an unbuilt structure is a lost device
+
+M12's first step, measured. Twenty-two placements of a 900-vertex, 1,682-triangle lattice — the
+count the busiest cell in the game places and the size the mean skinned mesh is — deformed by a
+compute pass into vertex regions of their own and rebuilt inside the frame's own command buffer.
+`tests/deforming.rs`, against the real `SceneRenderer`.
+
+| | build | trace |
+|---|---|---|
+| Rebuild, `PREFER_FAST_BUILD` | **0.242 ms** | 0.085 ms |
+| Refit, `PREFER_FAST_TRACE \| ALLOW_UPDATE` | **0.108 ms** | 0.085 ms |
+| Nothing moving | 0.000 ms | 0.080 ms |
+
+**Both halves of the prediction were wrong.** Refitting is not a marginal saving over a rebuild at
+this scale, it is less than half the cost; and `ALLOW_UPDATE` — which was expected to cost the
+traversal, since these are traced by every ray and built once — costs it nothing measurable. Nor
+does the tree degrade as the pose leaves the one it was built for: at an amplitude of a third of the
+mesh's own size the two trace in 0.087 and 0.088. So refitting is the default, and the switch stays
+because the answer is a property of the content rather than of the hardware.
+
+**A top level over an unbuilt bottom level is a lost device, not a wrong picture.** The deforming
+structures are created unbuilt — their vertex regions hold whatever the allocator left there until
+the first deform writes them — and the commit that follows built a top level referencing them. The
+frames after it were all correct, because each rebuilds both levels in order; what faulted was the
+*next* load, several renderers later, which made it look like exhaustion. It reproduced only with
+`ALLOW_UPDATE` set, which changes the structure size and so the garbage, and that sent an hour into
+the refit path before the bisection landed on a build mode that was never the difference. The load
+now primes them through one submission of the same two passes the frame uses.
+
+**What the shape of the per-frame path had to be.** Nothing here could go through `Uploader`: every
+existing build blocks on a fence, allocates its scratch inline and hands back a *new* structure, and
+all three are wrong sixty times a second. So the top level is built **in place** — the descriptor a
+pass binds is written per cell, and a new handle every frame would mean rewriting it every frame —
+its scratch is allocated once at load, and the barriers are scoped to `ACCELERATION_STRUCTURE_BUILD`
+rather than the load path's `ALL_COMMANDS`. `tests/frame_allocations.rs` covers `record`, so the
+whole path is inside the zero-allocation budget from the first commit, and it is.
+
+**And a deforming placement needed no new architecture.** It takes a slice of the same position and
+attribute buffers a cell uploads into, per instance rather than per mesh, and a mesh slot of its own
+pointing at it; every index is already rebased by `first_vertex`, so `surface.glsl` is untouched by
+the feature. Indices and submesh descriptions are shared with the pose it was cloned from — a
+`MeshRange` names an index range it does not own.
+
+**One fixture bug worth recording, because it looked exactly like a renderer bug.** The lattice was
+wound against the normals it carried, so every hit was shaded as the surface's own back and the
+scene rendered black under a sun that was working perfectly. It cost the same hour again, chasing a
+deformation that was reaching the picture the whole time. `primary_visibility.rs`'s `quad` helper
+has carried the winding fix since M3; a fixture that builds its own geometry has to do the same.

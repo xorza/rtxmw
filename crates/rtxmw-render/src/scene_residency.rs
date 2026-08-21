@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 
+use ash::vk;
 use glam::Vec2;
 use rtxmw_gpu::{Buffer, Device, RayTracingLimits, Uploader};
 use rtxmw_scene::{
@@ -26,11 +27,12 @@ const SECUNDA_FACE: u32 = 1;
 /// And the weather's painted sky sheet, which the cloud layer is cut out of.
 const CLOUD_SHEET: u32 = 2;
 
+use crate::deform_pass::{DeformPass, Placement};
 use crate::geometry_buffers::GeometryBuffers;
 use crate::gpu_light::GpuLight;
 use crate::light_grid::LightGrid;
 use crate::material_buffers::MaterialBuffers;
-use crate::scene_acceleration::SceneAcceleration;
+use crate::scene_acceleration::{Deformable, SceneAcceleration};
 use crate::texture_array::TextureArray;
 use crate::visibility_pass::Lighting;
 
@@ -100,6 +102,11 @@ pub(crate) struct SceneResidency {
     uploaded_textures: u32,
     cells: Vec<ResidentCell>,
     acceleration: SceneAcceleration,
+    /// Rewrites the vertices of everything that moves, ahead of the build over them.
+    deform: DeformPass,
+    /// Whether those structures are refitted every frame rather than rebuilt — see
+    /// [`SceneAcceleration::append_deforming`], and `docs/design.md` M12 for why it is a choice.
+    refit_deforming: bool,
     tables: MaterialBuffers,
     /// Every light every resident cell places, as the shader indexes them.
     lights: Buffer,
@@ -159,6 +166,8 @@ impl SceneResidency {
             uploaded_textures: 0,
             cells: Vec::new(),
             acceleration,
+            deform: DeformPass::new(device)?,
+            refit_deforming: true,
             tables,
             lights,
             light_grid,
@@ -192,7 +201,7 @@ impl SceneResidency {
         let material_remap = self.intern_materials(scene, &texture_remap);
         let mesh_remap = self.append_meshes(device, uploader, limits, scene, &material_remap)?;
 
-        let instances = scene
+        let mut instances: Vec<Instance> = scene
             .instances
             .iter()
             .map(|instance| Instance {
@@ -200,6 +209,10 @@ impl SceneResidency {
                 transform: instance.transform,
             })
             .collect();
+        // **Placed like anything else, once it has a region of its own.** What makes a deforming
+        // instance different is upstream of here — its own slice of the vertex streams and its own
+        // bottom level — and by this point it is a mesh slot and a transform like every other.
+        instances.extend(self.place_deforming(uploader, limits, scene, &mesh_remap)?);
         self.cells.retain(|cell| cell.id != id);
         self.cells.push(ResidentCell {
             id,
@@ -340,8 +353,107 @@ impl SceneResidency {
             .flat_map(|cell| cell.instances.iter())
             .copied()
             .collect();
+        // **Before the top level, because both read addresses the last append may have moved.**
+        // `GeometryBuffers` reallocates as it grows, and a build recorded every frame reads the
+        // live buffer rather than a copy taken when it was described.
+        self.acceleration
+            .refresh_deforming(&self.geometry, self.materials.materials());
+        self.deform.bind(&self.geometry);
+
+        // **And the deforming structures are built once here, before anything references them.**
+        // They are created unbuilt over regions holding whatever the allocator left there, and a
+        // top level over an unbuilt bottom level is undefined — which on this hardware is a lost
+        // device at the next submission rather than a wrong picture.
+        if !self.deform.is_empty() {
+            let (deform, acceleration) = (&self.deform, &mut self.acceleration);
+            uploader.submit_and_wait(|raw, cmd| {
+                // SAFETY: the command buffer is recording, and both passes were just rebound to
+                // the buffers as they are now.
+                unsafe {
+                    deform.record(cmd, 0.0);
+                    acceleration.record_deforming(raw, cmd);
+                }
+            })?;
+        }
         self.acceleration
             .rebuild_top(device, uploader, limits, &self.geometry, &instances)
+    }
+
+    /// Gives every deforming placement in `scene` a vertex region and a structure of its own.
+    ///
+    /// Returns them as ordinary instances naming the slots they were given, which is all the top
+    /// level ever learns about them.
+    fn place_deforming(
+        &mut self,
+        uploader: &mut Uploader,
+        limits: RayTracingLimits,
+        scene: &StaticScene,
+        mesh_remap: &[u32],
+    ) -> rtxmw_gpu::Result<Vec<Instance>> {
+        if scene.deforming.is_empty() {
+            return Ok(Vec::new());
+        }
+        let first_slot = self.geometry.ranges().len() as u32;
+        let mut placements = Vec::with_capacity(scene.deforming.len());
+        let mut placed = Vec::with_capacity(scene.deforming.len());
+        for deforming in &scene.deforming {
+            let source = mesh_remap[deforming.instance.mesh.0 as usize];
+            let slot = self.geometry.reserve_deformed(uploader, source, 1)?.start;
+            placements.push(Placement {
+                source,
+                destination: slot,
+                phase: deforming.phase,
+            });
+            placed.push(Instance {
+                mesh: MeshId(slot),
+                transform: deforming.instance.transform,
+            });
+        }
+        self.deform.place(&self.geometry, &placements);
+        self.acceleration.append_deforming(
+            uploader,
+            limits,
+            &self.geometry,
+            self.materials.materials(),
+            Deformable {
+                slots: first_slot..self.geometry.ranges().len() as u32,
+                refit: self.refit_deforming,
+            },
+        )?;
+        Ok(placed)
+    }
+
+    /// Chooses between rebuilding and refitting the structures over what moves.
+    ///
+    /// Takes effect for placements registered after it, which is why a caller sets it before
+    /// loading anything: the flag is baked into the structures at the size the driver gives them.
+    pub(crate) fn set_refit_deforming(&mut self, refit: bool) {
+        self.refit_deforming = refit;
+    }
+
+    /// Whether anything in the resident set moves, and so whether a frame has this work to do.
+    pub(crate) fn has_deforming(&self) -> bool {
+        !self.deform.is_empty()
+    }
+
+    /// Moves everything that moves, and rebuilds what a ray traverses over it.
+    ///
+    /// # Safety
+    /// `command_buffer` must be recording, and the descriptor sets must have been bound since the
+    /// last commit.
+    pub(crate) unsafe fn record_animation(
+        &mut self,
+        device: &ash::Device,
+        command_buffer: vk::CommandBuffer,
+        time: f32,
+    ) {
+        // SAFETY: the caller guarantees recording, and `commit` rebound both passes to whatever
+        // the buffers are now.
+        unsafe {
+            self.deform.record(command_buffer, time);
+            self.acceleration.record_deforming(device, command_buffer);
+            self.acceleration.record_top(device, command_buffer);
+        }
     }
 
     /// Meshes uploaded, across every cell that has been resident.

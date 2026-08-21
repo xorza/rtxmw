@@ -57,6 +57,7 @@ pub(crate) fn scene_of(
         mesh_sources: (0..meshes.len()).map(|i| format!("fixture:{i}")).collect(),
         meshes: meshes.to_vec(),
         instances: instances.to_vec(),
+        deforming: Vec::new(),
         materials: table,
         lights: lights.to_vec(),
         ambient: Some(Ambient {

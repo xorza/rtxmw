@@ -246,6 +246,37 @@ impl ComputePipeline {
         unsafe { self.device.update_descriptor_sets(&writes, &[]) };
     }
 
+    /// Points a run of bindings starting at `first` at `buffers`, in order.
+    ///
+    /// Whole buffers rather than sub-ranges: every consumer here addresses its own region by an
+    /// index the shader is handed, which is the same thing a dynamic offset would do and one fewer
+    /// piece of state to get wrong.
+    pub fn bind_storage_buffers(&self, first: u32, buffers: &[&crate::buffer::Buffer]) {
+        let infos: Vec<_> = buffers
+            .iter()
+            .map(|buffer| {
+                [vk::DescriptorBufferInfo::default()
+                    .buffer(buffer.raw())
+                    .offset(0)
+                    .range(vk::WHOLE_SIZE)]
+            })
+            .collect();
+        let writes: Vec<_> = infos
+            .iter()
+            .enumerate()
+            .map(|(binding, info)| {
+                vk::WriteDescriptorSet::default()
+                    .dst_set(self.set)
+                    .dst_binding(first + binding as u32)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(info)
+            })
+            .collect();
+        // SAFETY: every write names this pipeline's own set, and the caller rebinds only when the
+        // resources change, never with a dispatch in flight.
+        unsafe { self.device.update_descriptor_sets(&writes, &[]) };
+    }
+
     /// Binds the pipeline and its set, pushes `constants`, and dispatches.
     ///
     /// # Safety
