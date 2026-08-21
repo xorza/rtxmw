@@ -584,9 +584,12 @@ to "looks great", and it is an art-pipeline problem no renderer architecture sol
    assets physically correct.
 
 **Decided: option 4** (built — §8.35). **De-lighting recovers base colour only.** Normal and roughness
-still need option 2 or 3, and since `Material` carries those slots either way, supporting the filename
-conventions is nearly free. The failure mode to watch is over-correction — flat, washed-out output where
-the algorithm removed genuine painted detail — so vanilla stays available as an A/B (§8.37).
+still need option 2 or 3, and `Material` has a slot for neither — every NIF surface resolves to `Diffuse`,
+`specular_albedo` is zero across the whole library because `NiSpecularProperty` is force-disabled at this
+version, and water is the only thing in the world that writes the G-buffer's roughness channel. So the
+material, the shading model and the BRDF grow together; the guides they feed are already in place. The
+failure mode to watch is over-correction — flat, washed-out output where the algorithm removed genuine
+painted detail — so vanilla stays available as an A/B (§8.37).
 
 **And it is the blocker for absolute units.** `DAYLIGHT`, `SKY_STRENGTH` and the night floor are numbers
 tuned to reproduce a screenshot, so nothing keyed to cd/m² — the exposure literature, the moons' real
