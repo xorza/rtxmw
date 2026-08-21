@@ -17,6 +17,7 @@ mod material;
 mod material_table;
 mod mesh;
 mod moon;
+mod particle_emitter;
 mod precipitation;
 mod rig;
 mod sky;
@@ -46,6 +47,7 @@ pub use crate::material::{AlphaMode, Material, MaterialKind, TerrainLayers, Text
 pub use crate::material_table::MaterialTable;
 pub use crate::mesh::{Bounds, Mesh, Submesh};
 pub use crate::moon::Moon;
+pub use crate::particle_emitter::ParticleEmitter;
 pub use crate::precipitation::{Falling, Precipitation};
 pub use crate::rig::{
     Bone, Channel, INFLUENCES, Influence, Keyframe, NO_PARENT, Pose, Rig, affine_of,

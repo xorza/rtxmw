@@ -61,6 +61,17 @@ pub struct FloatKey {
     pub value: f32,
 }
 
+/// One key of a colour channel: linear RGBA at a moment.
+///
+/// **The moment is a fraction of a life, not a second.** Only a particle's colour is keyed this way
+/// and a particle's clock runs from its own birth to its own death, so the same ramp fits a spark
+/// that lives half a second and a plume that lives thirty.
+#[derive(Debug, Clone, Copy)]
+pub struct ColourKey {
+    pub time: f32,
+    pub value: [f32; 4],
+}
+
 /// One channel of an animation: its keys, and how to read between them.
 #[derive(Debug, Clone)]
 pub struct Track<K> {
@@ -84,7 +95,7 @@ impl<K: Keyed> Track<K> {
     ///
     /// **An empty channel omits its interpolation type entirely** — except inside a morph, where it
     /// is always written and may name a type that means nothing with no keys to read between.
-    fn read(cursor: &mut Cursor<'_>, is_morph: bool) -> Result<Self> {
+    pub(crate) fn read(cursor: &mut Cursor<'_>, is_morph: bool) -> Result<Self> {
         let count = cursor.u32()? as usize;
         if count == 0 && !is_morph {
             return Ok(Self::default());
@@ -164,6 +175,17 @@ impl Keyed for VectorKey {
         cursor.vec3()
     }
     fn key(time: f32, value: [f32; 3]) -> Self {
+        Self { time, value }
+    }
+}
+
+impl Keyed for ColourKey {
+    const HAS_TANGENTS: bool = true;
+    type Value = [f32; 4];
+    fn read_value(cursor: &mut Cursor<'_>) -> Result<[f32; 4]> {
+        cursor.color4()
+    }
+    fn key(time: f32, value: [f32; 4]) -> Self {
         Self { time, value }
     }
 }

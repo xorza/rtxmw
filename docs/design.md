@@ -549,7 +549,7 @@ deliberately (§8.60, §8.61); shafts are cast for the sun and one moon only, si
 a ray per light per step (§8.43, §8.80); nothing accumulates — no snow on the ground, no ash on ledges;
 and no Purkinje shift or absolute units, which §5.1 blocks rather than this milestone.
 
-### M12 — Animation: actors, controllers and particles — **step 1 done**
+### M12 — Animation: actors, controllers and particles — **steps 1-5 done**
 
 §5.4's scope boundary, lifted. Written before any of it was built, because the sizing decides the
 architecture and the sizing is not what the plan assumed — and the first step has since been built
@@ -630,12 +630,14 @@ its sync2 stages are what the skinning-to-build and build-to-trace barriers want
    instead of a race field, the face and hair the record names itself, and everything wearable in
    its inventory over the top. What is left is the 273 `CREA` records that are humanoid and
    assembled the same way.
-5. **Particles and the rest of the controller family.** Particles belong in the transparency target
-   beside precipitation rather than in the acceleration structure — §8.87 already transcribed
-   `ashcloud.nif` by hand and the upscaler already composites that layer. `NiUVController` is a
-   material offset, `NiVisController` and `NiAlphaController` are host-side scalars,
-   `NiGeomMorpherController` reuses step 1's deformed slice, and `NiBillboardNode` reuses its
-   per-frame top level.
+5. **Particles — done.** §8.99. 678 emitters across 272 files, 120 of them the candles, torches and
+   braziers every interior is full of, drawn in the transparency layer beside the rain as a closed
+   form in a hash and the clock rather than as a simulation. **The rest of the controller family
+   is not**, and the survey in §8.99 is the argument: `NiGeomMorpherController` is 268 facial
+   morphs that want dialogue, `NiBillboardNode` is spell effects nothing places, and
+   `NiVisController` and `NiAlphaController` want the per-instance clock the rigs already have. The
+   one with placed static content behind it is `NiUVController` — Vivec's waterfalls, the lava, the
+   glowing fences — and it is the next thing here.
 
 **Deliberately not in it**: AI, pathing, locomotion and animation blending. An actor stands where
 the cell put it and plays an idle; what this milestone owns is that the world stops being still.
@@ -3661,3 +3663,75 @@ worn along with somebody's boots.
 The test is the partition itself, hand-counted off the file's own shapes: chest alone is 284
 vertices, the two hand slots together are 434, all three are 718, and the second hand slot adds
 nothing because the first already took the pair. Before the fix every one of those cases was 718.
+
+### 8.99 A flame is a closed form, not a simulation
+
+M12's fifth step. **A particle system carries no triangles at all** — the sprites are the whole of
+the drawing — so there was never anything to put in the acceleration structure even if a few
+thousand sub-pixel quads rebuilt every frame were worth putting there. They go into the transparency
+layer beside the rain, for the three reasons §8.87 already gives: an upscaler composites that layer
+rather than denoising it, coverage arrives as a fraction so a sprite finer than a pixel dims it
+instead of flickering in and out, and the whole thing costs no state.
+
+**Nothing is simulated and nothing is stored.** Slot `i` of an emitter is a closed form in its own
+hash and the clock — where it was born, which way it left, how fast, how long it lives, and a
+constant acceleration on top. That is *exact* rather than approximate, since a stepped simulation of
+a constant acceleration is the same parabola with rounding error accumulated, and it means a frame
+allocates nothing and keeps nothing. The one piece of care it needs is that the hash carries the
+*generation*: a slot is born, lives and is born again, and hashed on the slot alone every rebirth
+leaves in the same direction, which reads as a fountain of identical sparks rather than as a flame.
+
+**One sphere per emitter is the whole spatial structure.** A light is asked for by a shading *point*,
+which the uniform grid answers in a lookup; an emitter is asked for by a whole *ray*, which would
+have to walk that grid cell by cell. There are tens of them in a cell against hundreds of lights and
+each is small — a candle's reaches 4.75 units, which is 5.25 a second for two thirds of one plus half
+a 2.5-wide sprite — so one rejection throws the emitter away for almost every pixel of the frame.
+
+**What the shipped data says, measured rather than assumed.** 678 emitters across 272 files, and 120
+of those files are `light_*`: the candles, torches, lamps, braziers and chandeliers that every
+interior is full of and that until now ended in a bare wick.
+
+| | |
+|---|---|
+| emitters, and where they hang | 678, every one on a `NiParticles*` node's own controller — no orphans |
+| additive against alpha-blended | 474 `SRC_ALPHA, ONE` against 204 over — flames against smoke |
+| capacity | median 30, ninetieth 200, and 7,412 for `ashcloud.nif`, which §8.87 draws as weather |
+| size ramps | `NiParticleGrowFade` on 572 of them |
+| colour ramps | 85, **all three linear keys**, every one of them on something alpha-blended |
+
+Three of those decided the implementation. **The colour ramp is what makes smoke smoke** — an
+additive sprite fades by shrinking, an alpha-blended one has to be told to, and without the ramp a
+fireplace hangs a permanent opaque cloud at head height. Every one of the 85 is exactly three linear
+keys, so three stops and the middle key's own time reproduce it *exactly* rather than resampling it:
+that middle key sits at 0.05, 0.10, 0.15, 0.50 or 0.91 across the shipped files, and anything evenly
+spaced would have thrown the shape away.
+
+**No gain on either branch, deliberately.** The blend the files ask for says exactly how much light
+a sprite adds and no more, so the texel *is* the radiance — a flame comes out sixty times the mean of
+the room it stands in because that is what a flame is, and the exposure downstream decides where that
+lands. A puff of smoke is the same argument with the ramp's own colour standing in for an albedo, the
+way §8.87 gives ash a seventh: what a grain sends back is what the room sent it. An earlier gain of
+six blew every flame to a white square and hid the shape that was already in the texture.
+
+**A block with no size is only proved right by an invariant it did not carry.** The emitter's fields
+are consumed one after another with nothing to resynchronise on, so a parse off by one still produces
+plausible floats. What catches it is that a candle's *capacity* is its birth rate times its lifetime
+— three separate fields agreeing about one physical fact. `light_de_candle_25` writes 22, 34.02 and
+2/3, and 34.02 × 2/3 is 22.7. Individually the ratio runs 0.23 to 2.53 across the tenth and ninetieth
+percentiles, which is authoring headroom; the **median of all 678 is 0.97**, and no arrangement of the
+wrong three fields has that.
+
+**Cost, measured at 1920×1080 as five-run medians.** Seyda Neen's census office, the fullest interior
+found at 55 emitters and 1,131 particles, goes 5.59 → 5.66 ms of trace. Balmora's Guild of Mages, at
+19 emitters, goes 7.10 → 8.66 ms. The larger cell is the cheaper one because the price is not the
+emitter count but how many emitter spheres the view's rays actually cross — recorded here rather than
+worked on, per §5.3.
+
+**What is left of the controller family, and why it is left.** The survey is the argument.
+`NiGeomMorpherController` is on 273 files and 268 of them are `b_*_head_*` — facial morphs, which at
+rest weigh nothing and only move for dialogue this engine does not have. `NiBillboardNode` is on 22
+files, all but one `e/magic_*` — spell effects, which nothing places in a cell. `NiVisController` (42)
+and `NiAlphaController` (51) are creature and spell effects, and want the per-instance clock the rigs
+already have. The one with placed static content behind it is **`NiUVController`** at 50 files: Vivec's
+waterfalls, `in_lava_1024_01`, the glowing fences and the force fields, all of which scroll and none
+of which do here yet.

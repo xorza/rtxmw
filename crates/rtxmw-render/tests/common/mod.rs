@@ -61,6 +61,8 @@ pub(crate) fn scene_of(
         rigs: Vec::new(),
         materials: table,
         lights: lights.to_vec(),
+        // A fixture that wants a flame builds one itself; nothing here emits anything.
+        emitters: Vec::new(),
         ambient: Some(Ambient {
             colour: ambient,
             ..Ambient::default()

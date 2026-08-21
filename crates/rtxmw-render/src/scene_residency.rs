@@ -7,7 +7,8 @@ use glam::Vec2;
 use rtxmw_gpu::{Buffer, Device, RayTracingLimits, Uploader};
 use rtxmw_scene::{
     Ambient, CellId, Clouds, Instance, Light, Lightning, MaterialKind, MaterialTable, Mesh, MeshId,
-    Moon, Precipitation, Sky, SkyTextures, StaticScene, Sun, TerrainLayers, TextureId, Veil,
+    Moon, ParticleEmitter, Precipitation, Sky, SkyTextures, StaticScene, Sun, TerrainLayers,
+    TextureId, Veil,
 };
 use rtxmw_texture::Texture;
 
@@ -28,6 +29,7 @@ const SECUNDA_FACE: u32 = 1;
 const CLOUD_SHEET: u32 = 2;
 
 use crate::geometry_buffers::GeometryBuffers;
+use crate::gpu_emitter::GpuEmitter;
 use crate::gpu_light::GpuLight;
 use crate::light_grid::LightGrid;
 use crate::material_buffers::MaterialBuffers;
@@ -84,6 +86,7 @@ struct ResidentCell {
     /// Instances whose `MeshId` addresses the renderer's mesh slots, not the cell's own numbering.
     instances: Vec<Instance>,
     lights: Vec<Light>,
+    emitters: Vec<ParticleEmitter>,
     /// Placements whose vertices are posed every frame. Held here rather than handed to the
     /// skinning pass, so that evicting the cell stops them costing a frame anything.
     deforming: Vec<ResidentPose>,
@@ -132,6 +135,8 @@ pub(crate) struct SceneResidency {
     lights: Buffer,
     /// Which of those lights reach where, so a shading point walks a handful rather than all.
     light_grid: LightGrid,
+    /// Every flame, vent and plume every resident cell places — see `particles.glsl`.
+    emitters: Buffer,
     lighting: Lighting,
     /// The newest cell's own lighting record, kept because the sky moves and the cell does not.
     record: Option<Ambient>,
@@ -178,6 +183,7 @@ impl SceneResidency {
         let tables = MaterialBuffers::upload(uploader, &geometry, materials.materials())?;
         let lights = Buffer::storage_of(uploader, "scene lights", &[])?;
         let light_grid = LightGrid::build(uploader, &[])?;
+        let emitters = Buffer::storage_of(uploader, "scene emitters", &[])?;
         Ok(Self {
             geometry,
             textures,
@@ -192,6 +198,7 @@ impl SceneResidency {
             tables,
             lights,
             light_grid,
+            emitters,
             lighting: Lighting::default(),
             record: None,
             recorded_sun: None,
@@ -246,6 +253,7 @@ impl SceneResidency {
             id,
             instances,
             lights: scene.lights.clone(),
+            emitters: scene.emitters.clone(),
             deforming,
         });
 
@@ -387,6 +395,22 @@ impl SceneResidency {
         self.lights = Buffer::storage_of(uploader, "scene lights", bytemuck::cast_slice(&table))?;
         self.light_grid = LightGrid::build(uploader, &table)?;
         self.lighting.light_grid = self.light_grid.extent();
+
+        // **No grid over these, and none wanted.** A light is asked for by a shading *point*, which
+        // a uniform grid answers in a lookup; an emitter is asked for by a whole *ray*, which would
+        // have to walk that grid cell by cell. There are tens of them in a cell against hundreds of
+        // lights, and each is a sphere a few units across, so one rejection test per emitter throws
+        // away every one of them for almost every pixel of the frame — see `particles.glsl`.
+        let burning: Vec<GpuEmitter> = self
+            .cells
+            .iter()
+            .flat_map(|cell| cell.emitters.iter())
+            .enumerate()
+            .map(|(seed, emitter)| GpuEmitter::new(emitter, seed as u32))
+            .collect();
+        self.lighting.emitter_count = burning.len() as u32;
+        self.emitters =
+            Buffer::storage_of(uploader, "scene emitters", bytemuck::cast_slice(&burning))?;
 
         // **And the deforming structures are built once here, before anything references them.**
         // They are created unbuilt over regions holding whatever the allocator left there, and a
@@ -543,6 +567,10 @@ impl SceneResidency {
 
     pub(crate) fn lights(&self) -> &Buffer {
         &self.lights
+    }
+
+    pub(crate) fn emitters(&self) -> &Buffer {
+        &self.emitters
     }
 
     pub(crate) fn textures(&self) -> &TextureArray {

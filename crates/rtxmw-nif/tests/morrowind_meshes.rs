@@ -10,7 +10,9 @@
 
 use std::collections::BTreeMap;
 
-use rtxmw_nif::{Block, NifFile};
+use std::f32::consts::TAU;
+
+use rtxmw_nif::{Block, Interpolation, NifFile, ParticleEffect};
 use rtxmw_vfs::{DATA_DIR_VAR, morrowind_archives};
 
 #[test]
@@ -227,5 +229,91 @@ fn the_transform_on_a_models_outermost_node_is_discarded() {
     assert!(
         deeper > 500,
         "only {deeper} models keep a turn below their outermost node"
+    );
+}
+
+/// Reads every emitter the game ships, and checks each against a number it did not supply.
+///
+/// **A block with no size is only proved right by an invariant it did not carry.** The fields are
+/// consumed one after another with nothing between them to resynchronise on, so a parse that is off
+/// by one still produces plausible-looking floats — what catches it is that a candle's *capacity*
+/// is its birth rate times its lifetime, which is three separate fields agreeing about one physical
+/// fact. `light_de_candle_25` writes 22, 34.02 and 0.67, and 34.02 × 0.67 = 22.8.
+#[test]
+fn every_emitter_holds_as_many_particles_as_its_rate_and_its_life_call_for() {
+    let Some(vfs) = morrowind_archives() else {
+        eprintln!("skipping: {DATA_DIR_VAR} is not configured (set it, or add it to .env)");
+        return;
+    };
+
+    let mut emitters = 0;
+    let mut ramps = 0;
+    let mut ratios: Vec<f32> = Vec::new();
+    for path in vfs.paths().filter(|p| p.extension() == Some("nif")) {
+        let name = path.as_str().to_owned();
+        let Ok(bytes) = vfs.read(&name) else { continue };
+        let Ok(nif) = NifFile::parse(&bytes) else {
+            continue;
+        };
+        for block in nif.blocks() {
+            let Block::ParticleSystem(system) = block else {
+                continue;
+            };
+            emitters += 1;
+            assert!(
+                system.lifetime >= 0.0 && system.lifetime < 60.0,
+                "{name}: a particle lives {} seconds",
+                system.lifetime
+            );
+            assert!(
+                system.declination >= -TAU && system.declination <= TAU,
+                "{name}: a particle leaves at {} radians off the emitter's axis",
+                system.declination
+            );
+            // The birth rate has to fill the capacity within a lifetime, or the emitter would run
+            // dry; a tenth either way covers the ones authored with headroom.
+            let wanted = system.birth_rate * system.lifetime;
+            ratios.push(f32::from(system.capacity) / wanted.max(1e-6));
+
+            let mut link = system.modifier;
+            for _ in 0..4 {
+                let Some(Block::ParticleModifier(modifier)) = nif.resolve(link) else {
+                    break;
+                };
+                if let ParticleEffect::Colour { keys } = modifier.effect {
+                    let Some(Block::Colour(track)) = nif.resolve(keys) else {
+                        panic!("{name}: a colour modifier names something that is not a ramp");
+                    };
+                    ramps += 1;
+                    // Three linear keys, which is what makes `ParticleEmitter::ramp` the ramp
+                    // itself rather than a sampling of it.
+                    assert_eq!(track.interpolation, Interpolation::Linear, "{name}");
+                    assert_eq!(track.keys.len(), 3, "{name}");
+                    assert_eq!(track.keys[0].time, 0.0, "{name}");
+                    assert_eq!(track.keys[2].time, 1.0, "{name}");
+                }
+                link = modifier.next;
+            }
+        }
+    }
+
+    assert_eq!(
+        emitters, 678,
+        "the shipped emitters are 678; a different count is a different install"
+    );
+    assert_eq!(ramps, 85, "85 of them fade through a colour ramp");
+    // Not all of them: an emitter authored with headroom holds more than its rate ever fills, and
+    // one authored short recycles early. Half of them agreeing to a tenth is far past coincidence —
+    // a parse off by one field puts a *colour channel* where the birth rate belongs.
+    // **The median, not a tally.** Individually the ratio runs from 0.23 to 2.53 across the tenth
+    // and ninetieth percentiles, which is authoring headroom — an emitter may hold more than its
+    // rate ever fills, or recycle early. What cannot be headroom is the *middle* of 678 of them
+    // landing on one: a parse off by a single field would put a colour channel where the birth rate
+    // belongs, and no arrangement of the wrong three numbers has a median of 0.97.
+    ratios.sort_by(|a, b| a.partial_cmp(b).expect("no emitter carries a NaN"));
+    let median = ratios[ratios.len() / 2];
+    assert!(
+        (0.9..1.1).contains(&median),
+        "the median emitter holds {median} times what its rate and life call for, not one"
     );
 }

@@ -24,6 +24,7 @@
 #include "lightning.glsl"
 #include "wetness.glsl"
 #include "precipitation.glsl"
+#include "particles.glsl"
 
 // Where the surface at `ndc` was on the previous frame's screen, as a displacement in pixels.
 //
@@ -186,8 +187,14 @@ void main() {
 
     vec4 falling = precipitation_along(frame.camera_position, direction,
                                        surface.hit ? surface.t : FOG_REACH);
-    imageStore(transparency_target, ivec2(pixel), vec4(falling.xyz, 1.0 - falling.w));
-    imageStore(transparency_opacity_target, ivec2(pixel), vec4(1.0 - falling.w));
+    // **And what burns, into the same layer.** Two thin media along one ray: their emissions add
+    // and their transmittances multiply, which is exact wherever they do not overlap — and they
+    // very nearly never do, since what emits is indoors or at a forge and what falls is weather.
+    vec4 burning = particles_along(frame.camera_position, direction,
+                                   surface.hit ? surface.t : FOG_REACH);
+    vec4 layer = vec4(falling.xyz + burning.xyz, falling.w * burning.w);
+    imageStore(transparency_target, ivec2(pixel), vec4(layer.xyz, 1.0 - layer.w));
+    imageStore(transparency_opacity_target, ivec2(pixel), vec4(1.0 - layer.w));
 
     imageStore(motion_target, ivec2(pixel), vec4(motion_vector(surface, direction, ndc, size), 0.0, 0.0));
 

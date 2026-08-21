@@ -126,6 +126,15 @@ impl Properties {
         merged
     }
 
+    /// Whether what is drawn here adds to the frame rather than covering it.
+    ///
+    /// Not part of [`Material`], because nothing else in the scene needs it: a NIF's *geometry* is
+    /// sorted and blended the same way whatever its destination factor, and the one thing that
+    /// turns on it is whether a particle is a flame or a puff of smoke.
+    pub(crate) fn adds(&self, nif: &NifFile) -> bool {
+        matches!(nif.resolve(self.alpha), Some(Block::Alpha(alpha)) if alpha.adds())
+    }
+
     /// Turns the links into a material, interning any texture it names.
     pub(crate) fn resolve(&self, nif: &NifFile, table: &mut MaterialTable) -> Material {
         let mut material = Material::default();

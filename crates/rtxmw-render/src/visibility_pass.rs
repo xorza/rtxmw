@@ -22,6 +22,8 @@ pub(crate) struct Lighting {
     pub(crate) ambient: Vec3,
     /// Where the light grid sits, which is how a shading point finds the lights that reach it.
     pub(crate) light_grid: LightGridExtent,
+    /// How many emitters the resident cells place; the emitters themselves are in a buffer.
+    pub(crate) emitter_count: u32,
     /// The sun, for a cell with a sky.
     pub(crate) sun: Option<Sun>,
     /// How often this cell's weather throws a bolt — see [`rtxmw_scene::Lightning`].
@@ -85,6 +87,7 @@ impl Default for Lighting {
             ambient: Vec3::ZERO,
             lightning: Lightning::NONE,
             light_grid: LightGridExtent::default(),
+            emitter_count: 0,
             sun: None,
             water_level: None,
             fog: Vec3::ZERO,
@@ -339,6 +342,9 @@ pub struct FrameConstants {
     flash_seed: u32,
     flash_source: [f32; 3],
     flash_ground: [f32; 3],
+    /// How many emitters the resident cells place, which is the whole of what a ray needs to walk
+    /// them — the emitters themselves are a buffer of their own.
+    emitter_count: u32,
     waves: [GpuWave; WAVE_COUNT],
 }
 
@@ -488,6 +494,7 @@ impl FrameConstants {
             flash_seed: flash.seed,
             flash_source: flash.source.to_array(),
             flash_ground: flash.ground.to_array(),
+            emitter_count: lighting.emitter_count,
             waves: SeaState::default().waves(),
         }
     }
@@ -576,6 +583,7 @@ pub(crate) struct SceneBindings<'a> {
     pub(crate) tables: &'a MaterialBuffers,
     pub(crate) lights: &'a Buffer,
     pub(crate) light_grid: &'a LightGrid,
+    pub(crate) emitters: &'a Buffer,
     pub(crate) textures: &'a TextureArray,
 }
 
@@ -648,11 +656,13 @@ impl VisibilityPass {
                     // `GBuffer::transparency`.
                     Binding::storage_image(17),
                     Binding::storage_image(18),
+                    // The flames, vents and plumes the resident cells place — see `particles.glsl`.
+                    Binding::storage_buffer(19),
                     // Last, because Vulkan allows a variable descriptor count only on a set's final
                     // binding. Adding anything after this one moves it — validation rejects the set
-                    // outright, which is how this was caught, and which is why the two above went
+                    // outright, which is how this was caught, and which is why the three above went
                     // in front of it rather than after.
-                    Binding::variable_samplers(19, max_textures),
+                    Binding::variable_samplers(20, max_textures),
                 ],
                 0,
                 shaders::primary_visibility(),
@@ -709,7 +719,7 @@ impl VisibilityPass {
         let texture_infos = scene.textures.descriptors();
         let texture_write = vk::WriteDescriptorSet::default()
             .dst_set(self.pipeline.set())
-            .dst_binding(19)
+            .dst_binding(20)
             .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
             .image_info(&texture_infos);
 
@@ -749,6 +759,15 @@ impl VisibilityPass {
             .dst_binding(6)
             .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
             .buffer_info(&light_info);
+
+        let emitter_info = [vk::DescriptorBufferInfo::default()
+            .buffer(scene.emitters.raw())
+            .range(vk::WHOLE_SIZE)];
+        let emitter_write = vk::WriteDescriptorSet::default()
+            .dst_set(self.pipeline.set())
+            .dst_binding(19)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(&emitter_info);
 
         let grid_offset_info = [vk::DescriptorBufferInfo::default()
             .buffer(scene.light_grid.offsets().raw())
@@ -798,6 +817,7 @@ impl VisibilityPass {
                     index_write,
                     attribute_write,
                     light_write,
+                    emitter_write,
                     grid_offset_write,
                     grid_index_write,
                     position_write,
@@ -904,8 +924,9 @@ mod tests {
         assert_eq!(offset_of!(FrameConstants, flash_seed), 632);
         assert_eq!(offset_of!(FrameConstants, flash_source), 636);
         assert_eq!(offset_of!(FrameConstants, flash_ground), 648);
-        assert_eq!(offset_of!(FrameConstants, waves), 660);
-        assert_eq!(size_of::<FrameConstants>(), 660 + 20 * WAVE_COUNT);
+        assert_eq!(offset_of!(FrameConstants, emitter_count), 660);
+        assert_eq!(offset_of!(FrameConstants, waves), 664);
+        assert_eq!(size_of::<FrameConstants>(), 664 + 20 * WAVE_COUNT);
     }
 
     #[test]

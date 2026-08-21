@@ -12,6 +12,7 @@ mod skin_pass;
 pub mod dlss;
 mod gbuffer;
 mod geometry_buffers;
+mod gpu_emitter;
 mod gpu_light;
 mod light_grid;
 mod material_buffers;

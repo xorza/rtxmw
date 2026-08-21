@@ -5,6 +5,8 @@ mod cursor;
 mod error;
 mod keyframe_data;
 mod nif_file;
+mod particle_modifier;
+mod particle_system;
 mod skin_data;
 mod skin_instance;
 mod text_keys;
@@ -17,9 +19,11 @@ pub use crate::block::{
 pub use crate::cursor::{Cursor, Link};
 pub use crate::error::{NifError, Result};
 pub use crate::keyframe_data::{
-    FloatKey, Interpolation, Keyed, KeyframeData, QuaternionKey, Track, VectorKey,
+    ColourKey, FloatKey, Interpolation, Keyed, KeyframeData, QuaternionKey, Track, VectorKey,
 };
 pub use crate::nif_file::{NifFile, VER_MORROWIND, version};
+pub use crate::particle_modifier::{Gravity, ParticleEffect, ParticleModifier};
+pub use crate::particle_system::ParticleSystem;
 pub use crate::skin_data::{BoneSkin, SkinData, VertexWeight};
 pub use crate::skin_instance::SkinInstance;
 pub use crate::text_keys::{TextKey, TextKeys};

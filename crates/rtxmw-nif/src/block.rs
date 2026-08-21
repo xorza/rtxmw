@@ -6,8 +6,10 @@
 
 use crate::cursor::{Cursor, Link};
 use crate::error::{NifError, Result};
-use crate::keyframe_data::KeyframeData;
+use crate::keyframe_data::{ColourKey, KeyframeData, Track};
 use crate::nif_file::version;
+use crate::particle_modifier::ParticleModifier;
+use crate::particle_system::ParticleSystem;
 use crate::skin_data::SkinData;
 use crate::skin_instance::SkinInstance;
 use crate::text_keys::TextKeys;
@@ -199,13 +201,6 @@ fn read_key_list(
     Ok(interpolation)
 }
 
-/// The chain link and controller every particle modifier begins with.
-fn read_particle_modifier(cursor: &mut Cursor<'_>) -> Result<()> {
-    cursor.skip(4)?; // Next modifier.
-    cursor.skip(4)?; // Controller.
-    Ok(())
-}
-
 /// A grouping node.
 #[derive(Debug, Clone, Default)]
 pub struct Node {
@@ -386,6 +381,15 @@ impl AlphaProperty {
     pub fn tests(&self) -> bool {
         self.flags & 0x200 != 0
     }
+
+    /// Whether what is drawn *adds* to the frame rather than covering it.
+    ///
+    /// Bits five to eight are the destination factor, and zero there is `ONE` — the frame kept
+    /// whole and the surface piled on top. That is what makes a flame a flame rather than a hole:
+    /// nothing behind it is taken away, so it needs no sorting and no occlusion of its own.
+    pub fn adds(&self) -> bool {
+        self.blends() && (self.flags >> 5) & 0xF == 0
+    }
 }
 
 /// Where a texture's pixels come from.
@@ -413,6 +417,15 @@ pub enum Block {
     Keyframe(KeyframeData),
     Skin(SkinInstance),
     SkinData(SkinData),
+    /// The node a particle system draws through: its transform, and the texture and blend mode
+    /// every particle takes. Carries no triangles — the sprites are the drawing.
+    Particles(Geometry),
+    /// An emitter: a flame, a steam vent, a plume of smoke.
+    ParticleSystem(ParticleSystem),
+    /// One link of an emitter's modifier chain.
+    ParticleModifier(ParticleModifier),
+    /// A colour keyed over a particle's life — see [`ColourKey`].
+    Colour(Track<ColourKey>),
     /// A named string hung off a node — in a `.kf` file, the name of the node a controller drives.
     StringExtra(String),
     /// What an animation is called at each moment of it — see [`TextKeys`].
@@ -628,7 +641,7 @@ impl Block {
                 let av = AvObject::read(cursor, ver)?;
                 let data = cursor.link()?;
                 let skin = cursor.link()?;
-                Self::Geometry(Geometry { av, data, skin })
+                Self::Particles(Geometry { av, data, skin })
             }
             "NiParticlesData" | "NiAutoNormalParticlesData" | "NiRotatingParticlesData" => {
                 let data = GeometryData::read_base(cursor, ver)?;
@@ -663,11 +676,13 @@ impl Block {
                 cursor.skip(count * 5)?;
                 Self::Other { kind: "NiVisData" }
             }
-            "NiPosData" | "NiColorData" => {
-                let width = if kind == "NiPosData" { 12 } else { 16 };
-                read_key_list(cursor, width, true, false)?;
-                Self::Other { kind: "key data" }
+            "NiPosData" => {
+                read_key_list(cursor, 12, true, false)?;
+                Self::Other { kind: "NiPosData" }
             }
+            // Kept rather than sized, because it is what fades a puff of smoke: every one of the
+            // game's alpha-blended emitters carries one and none of its additive ones do.
+            "NiColorData" => Self::Colour(Track::<ColourKey>::read(cursor, false)?),
             "NiMorphData" => {
                 let morphs = cursor.u32()? as usize;
                 let vertices = cursor.u32()? as usize;
@@ -683,28 +698,7 @@ impl Block {
             "NiSkinData" => Self::SkinData(SkinData::read(cursor)?),
             // `NiBSPArrayController` is the same record under a different name.
             "NiParticleSystemController" | "NiBSPArrayController" => {
-                read_time_controller(cursor)?;
-                // Speed, its variation, declination, planar angle and their variations.
-                cursor.skip(4 * 6)?;
-                cursor.skip(12 + 16)?; // Initial normal and colour.
-                cursor.skip(4 * 3)?; // Initial size, emit start and stop.
-                cursor.skip(1)?; // Reset-on-loop flag.
-                cursor.skip(4)?; // Birth rate.
-                cursor.skip(4 * 2)?; // Lifetime and its variation.
-                cursor.skip(2)?; // Emit flags.
-                cursor.skip(12)?; // Emitter dimensions.
-                cursor.skip(4)?; // Emitter node.
-                cursor.skip(2 + 4 + 2 + 4 + 4)?; // Spawn generation, percentage, multiplier, chaos.
-                let particles = cursor.u16()? as usize;
-                cursor.skip(2)?; // Live particle count.
-                // Velocity, rotation axis, age, lifespan, last update, generation, code.
-                cursor.skip(particles * (12 + 12 + 4 + 4 + 4 + 2 + 2))?;
-                cursor.skip(4)?; // Emitter modifier.
-                cursor.skip(4 + 4)?; // Modifier and collider chains.
-                cursor.skip(1)?; // Static target bound flag.
-                Self::Other {
-                    kind: "NiParticleSystemController",
-                }
+                Self::ParticleSystem(ParticleSystem::read(cursor)?)
             }
             "NiPathController" => {
                 read_time_controller(cursor)?;
@@ -730,37 +724,18 @@ impl Block {
                     kind: "NiPixelData",
                 }
             }
-            "NiGravity" => {
-                read_particle_modifier(cursor)?;
-                cursor.skip(4 + 4 + 4)?; // Decay, force, force type.
-                cursor.skip(12 + 12)?; // Position and direction.
-                Self::Other { kind: "NiGravity" }
-            }
+            "NiGravity" => Self::ParticleModifier(ParticleModifier::read_gravity(cursor)?),
             "NiParticleColorModifier" => {
-                read_particle_modifier(cursor)?;
-                cursor.skip(4)?; // Colour data.
-                Self::Other {
-                    kind: "NiParticleColorModifier",
-                }
+                Self::ParticleModifier(ParticleModifier::read_colour(cursor)?)
             }
             "NiParticleGrowFade" => {
-                read_particle_modifier(cursor)?;
-                cursor.skip(4 + 4)?; // Grow and fade times.
-                Self::Other {
-                    kind: "NiParticleGrowFade",
-                }
+                Self::ParticleModifier(ParticleModifier::read_grow_fade(cursor)?)
             }
             "NiParticleRotation" => {
-                read_particle_modifier(cursor)?;
-                cursor.skip(1)?; // Random initial axis flag.
-                cursor.skip(12)?; // Initial axis.
-                cursor.skip(4)?; // Rotation speed.
-                Self::Other {
-                    kind: "NiParticleRotation",
-                }
+                Self::ParticleModifier(ParticleModifier::read_rotation(cursor)?)
             }
             "NiPlanarCollider" => {
-                read_particle_modifier(cursor)?;
+                cursor.skip(4 + 4)?; // The chain link and controller every modifier begins with.
                 cursor.skip(4)?; // Bounce factor.
                 cursor.skip(8)?; // Extents.
                 cursor.skip(12 * 4)?; // Position, X and Y vectors, plane normal.

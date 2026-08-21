@@ -1,6 +1,7 @@
 //! Assembling one cell into meshes and placed instances.
 
 use std::collections::HashMap;
+use std::ops::Range;
 
 use glam::{Affine3A, Mat3, Quat, Vec2, Vec3};
 use rtxmw_esm::{
@@ -17,6 +18,7 @@ use crate::light::{Ambient, Light};
 use crate::material::{self, Material, MaterialKind, TerrainLayers, TextureId};
 use crate::material_table::MaterialTable;
 use crate::mesh::{Bounds, Mesh, TERRAIN_QUADRANTS};
+use crate::particle_emitter::ParticleEmitter;
 use crate::rig::Rig;
 use crate::srgb;
 use crate::sun::Sun;
@@ -64,6 +66,10 @@ struct Interning {
     rigs: HashMap<MeshId, RigId>,
     /// A body's shared key to the rig it assembled to, or `None` where it would not assemble.
     actors: HashMap<String, Option<RigId>>,
+    /// Every emitter every loaded model carries, in that model's own space.
+    emitters: Vec<ParticleEmitter>,
+    /// Which run of those a mesh owns, for the models that emit anything at all.
+    emitter_spans: HashMap<MeshId, Range<u32>>,
 }
 
 /// How to build one person, and what makes two of them the same person to build.
@@ -401,6 +407,8 @@ pub struct StaticScene {
     pub materials: MaterialTable,
     /// Point lights placed in the cell, in world space.
     pub lights: Vec<Light>,
+    /// Every flame, vent and plume the cell places, in world space.
+    pub emitters: Vec<ParticleEmitter>,
     /// The cell's fixed lighting. Absent for a cell that declares none.
     pub ambient: Option<Ambient>,
     /// The sun, for a cell that has a sky. Absent indoors, where there is none.
@@ -595,6 +603,15 @@ impl StaticScene {
                     let id = MeshId(self.meshes.len() as u32);
                     let mut spans = Vec::new();
                     let mesh = Mesh::from_nif_tracked(&nif, &mut self.materials, &mut spans, None);
+                    // **Read once with the mesh and placed per reference**, the way a light is:
+                    // the flame belongs to the model, and a hundred candles in a hall are a hundred
+                    // placements of the one emitter.
+                    let first = seen.emitters.len() as u32;
+                    ParticleEmitter::collect(&nif, &mut self.materials, &mut seen.emitters);
+                    if seen.emitters.len() as u32 != first {
+                        seen.emitter_spans
+                            .insert(id, first..seen.emitters.len() as u32);
+                    }
                     // **Before the mesh is moved into the scene**, because a rig is described
                     // against the vertices as the walk left them.
                     if let Some(rig) = Rig::from_nif(&nif, id, mesh.positions.len(), &spans) {
@@ -620,6 +637,22 @@ impl StaticScene {
                     colour: srgb::to_linear(light.colour),
                     radius: light.radius as f32,
                 });
+            }
+
+            // **What a model emits, placed even where it draws nothing.** A flame is a particle
+            // system and carries no triangles at all, so the mesh under `torchfire.nif` is empty
+            // and the fire is the whole of what the reference is for. Only in a cell drawn in
+            // full, for the reason [`CellDetail`] gives about a lamp a kilometre off.
+            if detail == CellDetail::Full
+                && let Some(span) = seen.emitter_spans.get(&mesh)
+            {
+                let transform = world_transform(&cell_ref);
+                let range = span.start as usize..span.end as usize;
+                self.emitters.extend(
+                    seen.emitters[range]
+                        .iter()
+                        .map(|emitter| emitter.placed(transform)),
+                );
             }
 
             // A mesh with nothing visible — a pure collision proxy, say — places no instance.

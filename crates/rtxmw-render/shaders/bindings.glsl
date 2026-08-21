@@ -128,8 +128,55 @@ layout(set = 0, binding = 16, scalar) readonly buffer LightGridIndices {
 layout(set = 0, binding = 17, rgba16f) uniform writeonly image2D transparency_target;
 layout(set = 0, binding = 18, r16f) uniform writeonly image2D transparency_opacity_target;
 
+// One emitter, as the host builds it — see `GpuEmitter`. Every particle it draws is a closed form
+// in this and the clock; there is no per-particle state anywhere. See `particles.glsl`.
+struct Emitter {
+    vec3 origin;
+    // How far a particle can get from that origin, which is the sphere a ray rejects it by.
+    float reach;
+    // The emitter's own axes in world space, each carrying half the width of the box a particle is
+    // born across along it.
+    vec3 axis_x;
+    float spread_x;
+    vec3 axis_y;
+    float spread_y;
+    vec3 axis_z;
+    float spread_z;
+    vec3 gravity;
+    float speed;
+    float speed_variation;
+    // A polar angle off `axis_z` and an azimuth about it, each with the half-width it varies by.
+    float declination;
+    float declination_variation;
+    float azimuth;
+    float azimuth_variation;
+    vec4 colour;
+    // The tint keyed over a life: at birth, at `ramp_mid`, and at death. Three keys and linear,
+    // which is exactly what every one of the game's colour ramps is.
+    vec4 ramp[3];
+    float ramp_mid;
+    float size;
+    float lifetime;
+    float lifetime_variation;
+    // Seconds to reach full size, and seconds to vanish at the end.
+    float grow;
+    float fade;
+    float spin;
+    uint count;
+    uint material;
+    // One where it adds to the frame rather than covering it, which is the whole of the difference
+    // between a flame and a puff of smoke.
+    float additive;
+    // What separates one emitter's hash stream from the next, so two candles do not flicker as one.
+    uint seed;
+};
+
+layout(set = 0, binding = 19, scalar) readonly buffer Emitters {
+    Emitter emitters[];
+};
+
 // Last, because a variable descriptor count is only allowed on a set's final binding.
-layout(set = 0, binding = 19) uniform sampler2D textures[];
+layout(set = 0, binding = 20) uniform sampler2D textures[];
 
 // Where a texture id's colour lands in the array above.
 //
@@ -318,5 +365,7 @@ layout(set = 0, binding = 14, scalar) readonly buffer Frame {
     uint flash_seed;
     vec3 flash_source;
     vec3 flash_ground;
+    // How many of `emitters` the resident cells placed — see `particles.glsl`.
+    uint emitter_count;
     Wave waves[WAVE_COUNT];
 } frame;

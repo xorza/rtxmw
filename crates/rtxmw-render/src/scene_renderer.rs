@@ -653,6 +653,7 @@ impl SceneRenderer {
                 tables: scene.tables(),
                 lights: scene.lights(),
                 light_grid: scene.light_grid(),
+                emitters: scene.emitters(),
                 textures: scene.textures(),
             },
             &self.target,
