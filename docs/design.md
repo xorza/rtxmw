@@ -556,8 +556,9 @@ Collected rather than decided here — each is recorded where the work was done:
 - **M8's post chain.** Bloom, grading, sharpening, exposure adaptation over time, HDR output.
 - **M10's water.** Shoreline foam — the Jacobian's *sign* is computed and thrown away — and underwater
   shafts (§7.8).
-- **§5.1's other half.** De-lighting recovers base colour only; normal and roughness still want replacer
-  packs or synthesis, and nothing keyed to cd/m² can be applied until it settles.
+- **§5.1's other half.** De-lighting recovers base colour only. Roughness is dropped and replacer packs
+  refused; a normal map synthesised from the painted relief is what remains, and nothing keyed to cd/m²
+  can be applied until it settles.
 - **§5.4's scope boundary.** Bind pose only: no animation, no particles, no creatures or NPCs, which is
   what has kept BLAS refit out of the renderer.
 - **§5.3's budget.** 44 ms at 3840×2160 against 16.6, knowingly, and not to be opened until the feature
@@ -585,13 +586,38 @@ to "looks great", and it is an art-pipeline problem no renderer architecture sol
 4. **De-light the vanilla textures offline.** Research-grade, and the only path that makes *vanilla*
    assets physically correct.
 
-**Decided: option 4** (built — §8.35). **De-lighting recovers base colour only.** Normal and roughness
-still need option 2 or 3, and `Material` has a slot for neither — every NIF surface resolves to `Diffuse`,
-`specular_albedo` is zero across the whole library because `NiSpecularProperty` is force-disabled at this
-version, and water is the only thing in the world that writes the G-buffer's roughness channel. So the
-material, the shading model and the BRDF grow together; the guides they feed are already in place. The
-failure mode to watch is over-correction — flat, washed-out output where the algorithm removed genuine
-painted detail — so vanilla stays available as an A/B (§8.37).
+**Decided: option 4** (built — §8.35), and **option 2 is refused**: a replacer pack is mod compatibility,
+which is the first thing this project says does not rank, and it moves the quality ceiling onto someone
+else's art in a renderer whose premise is vanilla content. The failure mode to watch is over-correction —
+flat, washed-out output where the algorithm removed genuine painted detail — so vanilla stays available as
+an A/B (§8.37).
+
+**De-lighting recovers base colour only, and the two halves of what is left were surveyed apart.** Option
+3 covers a normal map and a roughness map, and the evidence for them runs opposite ways.
+
+**Roughness: dropped.** There is no signal to recover and no data to temper an invention with. Of the
+19,415 `NiMaterialProperty` records across the 7,319 shipped meshes, **19,125 carry a glossiness of zero**;
+12,416 carry a black specular colour and the rest exporter defaults, none of it ever rendered because
+`NiSpecularProperty` is force-disabled at this version. Texture names do not stand in: only **1,020 of
+4,456** carry a material word at all, and the naming is by object and set — `a_bear_pauldron`,
+`amulet_heartfire` — rather than by substance. Nor does the literature offer a way in: every method that
+recovers roughness reliably reads a specular highlight, from Deschaintre's flash-lit capture onward, and a
+painted 256² texture contains none. What is left is invention, and §8.89 is what invention looked like —
+a uniform dielectric floor exceeds the diffuse return of anything below about 2.5% albedo, which is most
+of an interior, and arrives as exactly the wash this section exists to avoid.
+
+**Normals: still open, and the one worth doing.** The signal is really there, because the relief in these
+textures is *painted* — an artist drew the highlight and the shadow along a brick's edge, lit from a
+direction consistent across the texture. Retinex (Land and McCann) gives the discriminator the community
+tools lack: painted relief is achromatic and directionally coherent, while a pigment change carries
+chromaticity and aligns with nothing. That also yields a per-texture confidence — how strongly the
+achromatic gradients agree on one light direction — where the best existing effort for this content sets
+one cautious global strength to "improve every texture and ruin none". And the failure mode is mild: a
+normal map redistributes light rather than adding a floor, so getting it partly wrong lights a wall oddly
+instead of washing it out.
+
+**A coat waits on that map rather than the other way round.** §8.89 tried the specular layer first, over a
+world with a single roughness in it, and a sheen with no variation in it reads as a film over the lens.
 
 **And it is the blocker for absolute units.** `DAYLIGHT`, `SKY_STRENGTH` and the night floor are numbers
 tuned to reproduce a screenshot, so nothing keyed to cd/m² — the exposure literature, the moons' real
@@ -3140,3 +3166,38 @@ history, measures 0.0295 against the à-trous filter's 0.0300** — the two are 
 everything Ray Reconstruction gains over the filter it replaced is temporal. And **Performance, at a
 quarter of the traced pixels, lands level with that filter at full resolution**, which is what §5.3 is
 buying with.
+
+### 8.89 A rough lobe is not the diffuse hemisphere, and the floor is where that shows
+
+§5.1's other half starts by noticing that the specular layer is already written. `filmed` — Lazarov's
+split-sum environment BRDF, a cone-sampled reflection, the `Film{kept, reflected}` energy split and
+the guides Ray Reconstruction reads — is a complete dielectric coat, gated entirely on rain. Making
+every surface wear one is a change of gate, not a new light path. `FILM_ROUGHNESS` even turns out to
+be the substrate's own roughness under another name: *"a millimetre of water over stone is a
+millimetre of water shaped like stone"*, guessed because there was nothing to read it from.
+
+**The gate was load-bearing in a way nothing said.** The reflection is flat-lit — `hit.albedo *
+frame.ambient`, no shadow ray, which is what makes it affordable — and that is sound only because
+`wetness` has already established a clear line to the sky before it ever runs. Run under a lid it
+painted an unshadowed sky onto the underside of stone and doubled what a shaded surface returned.
+
+The repair looked better than the thing it replaced: above a roughness of 0.6 the lobe spans most of
+the hemisphere, so read `gather_indirect` — which traced that hemisphere *with occlusion in it* — and
+the coat costs no ray at all. **It is the wrong hemisphere.** `gather_indirect` is cosine-weighted
+about the *normal*; a specular lobe is centred on the *mirror direction*. Those coincide head on and
+diverge as the view goes grazing — which is exactly where the split-sum's Fresnel is largest, 0.051
+against 0.025. A floor is seen at a grazing angle, faces the brightest part of the room, and is dark
+stone, so it took the maximum Fresnel times the maximum radiance, added flat and uncoloured by its
+own albedo: a pale sheet over the one surface that fills the frame.
+
+Two measurements are worth keeping from it. On M8's own fixtures a black albedo went from 0 to **80**
+and a 2% albedo from 72 to **99** — a dielectric floor of 2.5–5% exceeds the diffuse return of
+anything darker than about 2.5% albedo, which is most of an interior. That is correct physics and it
+is also most of §5.1's washed-out failure mode arriving by the front door. And **the game records no
+roughness to temper it with**: of 19,415 `NiMaterialProperty` records across the shipped meshes,
+19,125 carry a glossiness of **zero**, 12,416 a black specular colour, and the rest exporter
+defaults; only 1,020 of 4,456 texture names carry a material word at all, and those name objects
+rather than substances.
+
+So the coat waits for the derived map. A uniform 4% sheen over a world with one roughness in it has
+no variation to read as material — it reads as a film over the lens, which is what it looked like.
