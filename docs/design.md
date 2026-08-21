@@ -637,8 +637,8 @@ its sync2 stages are what the skinning-to-build and build-to-trace barriers want
    is not**, and the survey in §8.99 is the argument: `NiGeomMorpherController` is 268 facial
    morphs that want dialogue, `NiBillboardNode` is spell effects nothing places, and
    `NiVisController` and `NiAlphaController` want the per-instance clock the rigs already have. The
-   one with placed static content behind it is `NiUVController` — Vivec's waterfalls, the lava, the
-   glowing fences — and it is the next thing here.
+   one with placed static content behind it was `NiUVController` — Vivec's waterfalls, the lava, the
+   glowing fences — and §8.105 does it.
 
 **Deliberately not in it**: AI, pathing, locomotion and animation blending. An actor stands where
 the cell put it and plays an idle; what this milestone owns is that the world stops being still.
@@ -4008,3 +4008,40 @@ spike above the belly; a flame's tongues break up where the gas stops *burning*,
 a parcel stops travelling, so it now takes the top half and what is left is a rounded crown.
 
 Trace at 1920×1080 for the drain view: 2.62 ms.
+
+### 8.105 A scroll is a speed, so carry the speed
+
+`NiUVController` is the last of M12's controller family with placed content behind it, and what it
+drives is not decoration: **Vivec's water and Red Mountain's lava are flat sheets with a texture
+walked across them**. Nothing about the geometry moves. Fifty files carry one, 116 controllers
+between them.
+
+**The renderer carries a rate and no keys at all.** Every offset channel in the game is a two-key
+ramp over a clip that loops, and a ramp *is* a constant speed — so reproducing it needs the speed
+and nothing else: no keys uploaded, no lookup per pixel, and no seam where the clip wraps. `uv +
+scroll * time` at the two places a diffuse surface reads its texture, and one more where an alpha
+cutout tests it.
+
+**It belongs to the material.** Materials are interned by value, so two sheets of the same lava
+running at different rates have to stay two entries — a field on `Material` is what says so without
+anything else being asked, and `in_lava_256` is exactly that case: three layers over one quad at a
+twenty-fourth, a forty-eighth and a diagonal minus-twenty-fourth of the texture a second, which is
+how the original faked depth in something flat.
+
+**Two things the archive test found rather than confirmed.** Every one of the 116 hangs off the
+`NiTriShape` it moves — 111 of them; the other five sit in spell-effect files whose shape was
+deleted and are reachable from nothing. And the offsets are keyed **quadratically**, not linearly,
+which was assumed the other way round until the test said so. It changes nothing — their values are
+two-key ramps and a tangent between two keys of a ramp is the ramp — but the assumption is now
+written down as a measurement.
+
+**What it costs to leave out.** A four-key U channel that returns to where it started is a *wobble*,
+not a scroll, and comes back as no motion at all: Ghostgate's fences shiver side to side in the game
+and stand still here. That is a deliberate loss — a rate cannot carry it — and it is one file family.
+
+**And the spout the whole thing started from does not move.** `Ex_Vivec_waterspout_01`, which is
+what a camera under a canton is looking at, carries no controller in the shipped data; the mesh 565
+units away that does is `Ex_Vivec_waterfall_01`, and that one now runs. The static spout is the
+game's, not this renderer's.
+
+Trace at 1920×1080 over Vivec's water is unchanged by it — the scroll is one multiply-add.

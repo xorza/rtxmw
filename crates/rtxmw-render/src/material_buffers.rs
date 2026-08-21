@@ -80,6 +80,8 @@ pub(crate) struct GpuMaterial {
     /// a texture id has never needed more than sixteen bits — the whole shipped library is under
     /// four thousand. `GpuMaterial::new` asserts that rather than trusting it.
     pub(crate) terrain_layers: [u32; 2],
+    /// How far the texture slides across the surface each second — see [`rtxmw_scene::Material`].
+    pub(crate) scroll: [f32; 2],
 }
 
 /// The four ground textures as two words, sixteen bits each.
@@ -121,6 +123,7 @@ impl GpuMaterial {
                 MaterialKind::Terrain(layers) => pack_layers(layers),
                 _ => [0; 2],
             },
+            scroll: material.scroll.to_array(),
         }
     }
 }
@@ -188,7 +191,7 @@ mod tests {
         // Both are read with a hardcoded stride; a field added without updating the shader would
         // shift every entry after the first.
         assert_eq!(size_of::<GpuGeometry>(), 16);
-        assert_eq!(size_of::<GpuMaterial>(), 48);
+        assert_eq!(size_of::<GpuMaterial>(), 56);
         // The shader spells this out as `0xFFFFFFFFu`; changing it here alone would leave every
         // untextured surface sampling slot zero of the array instead of taking the fallback branch.
         assert_eq!(NO_TEXTURE, 0xFFFF_FFFF);

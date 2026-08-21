@@ -1,6 +1,6 @@
 //! What a surface is made of, as far as vanilla Morrowind describes it.
 
-use glam::Vec3;
+use glam::{Vec2, Vec3};
 use rtxmw_nif::{Block, Link, NifFile};
 
 use crate::material_table::MaterialTable;
@@ -72,6 +72,16 @@ pub struct Material {
     /// Constant opacity from the material property, before any texture alpha.
     pub opacity: f32,
     pub alpha: AlphaMode,
+    /// How far the texture slides across the surface each second, in texture coordinates.
+    ///
+    /// **What makes Vivec's water run and Red Mountain's lava crawl.** Neither is animated
+    /// geometry: both are a flat sheet with a `NiUVController` walking the texture over it, which
+    /// is the whole of how the original engine drew a moving fluid. Zero for everything else.
+    ///
+    /// **It belongs to the material and not beside it**, because materials are interned by value —
+    /// two sheets of the same lava scrolling at different rates have to stay two entries, and a
+    /// field here is what says so without anything else being asked.
+    pub scroll: Vec2,
     /// Which shading model this surface uses, and whatever that model needs of its own. Everything
     /// loaded from a NIF is [`Diffuse`].
     ///
@@ -94,6 +104,7 @@ impl Default for Material {
             emissive: Vec3::ZERO,
             opacity: 1.0,
             alpha: AlphaMode::Opaque,
+            scroll: Vec2::ZERO,
             kind: MaterialKind::Diffuse,
         }
     }

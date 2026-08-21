@@ -35,6 +35,18 @@ vec3 corner_weights(vec2 bary) {
     return vec3(1.0 - bary.x - bary.y, bary.x, bary.y);
 }
 
+// Where a texture has slid to by now.
+//
+// **A rate rather than a keyed curve, which is what the data supports.** Every one of the game's
+// scrolls is a straight ramp over a looping clip, and a straight ramp *is* a constant speed — so
+// reproducing it needs the speed and nothing else: no keys uploaded, no lookup per pixel, and no
+// seam where the clip wraps. See `UvData::scroll`.
+//
+// The clock is zero in a screenshot by design, so a still shows every sheet where it started.
+vec2 slid(Material material, vec2 uv) {
+    return uv + material.scroll * frame.time;
+}
+
 vec2 interpolate_uv(uvec3 verts, vec3 weights) {
     return attributes[verts.x].uv * weights.x
          + attributes[verts.y].uv * weights.y
@@ -238,7 +250,7 @@ bool alpha_passes(uint slot, uint primitive, vec2 bary, mat4x3 to_world, vec3 di
         return true;
     }
     uvec3 verts = triangle_vertices(geom, primitive);
-    vec2 uv = interpolate_uv(verts, corner_weights(bary));
+    vec2 uv = slid(material, interpolate_uv(verts, corner_weights(bary)));
     // **The level the cone can actually resolve.** A mask point-sampled at its finest mip answers
     // for one texel out of the hundreds a distant pixel covers, and a binary test on that is a coin
     // toss per pixel: the fringe of a rug comes out as crawling sparks and a tree as speckle.
@@ -468,7 +480,7 @@ Surface trace(vec3 origin, vec3 direction, float cone_width, float cone_spread, 
     } else if (material.base_colour != NO_TEXTURE) {
         float lod = cone_lod(verts, to_world, direction, surface.footprint,
                              colour_slot(material.base_colour));
-        vec2 uv = interpolate_uv(verts, weights);
+        vec2 uv = slid(material, interpolate_uv(verts, weights));
         surface.albedo *= base_colour(material, uv, lod).rgb;
         if (frame.relief > 0.0) {
             vec2 gradient = relief_gradient(colour_slot(material.base_colour), uv, lod,

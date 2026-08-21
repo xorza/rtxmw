@@ -35,6 +35,11 @@ const QUADS_PER_PATCH: usize = QUADS_PER_TILE / 2;
 /// A vertex position rounded to eighths of a unit, which is how two triangles agree that they meet.
 type EdgeKey = (i32, i32, i32);
 
+/// How far a controller chain is followed before it is called a cycle.
+///
+/// Nothing shipped hangs more than a handful off one node; this is a guard on a malformed file.
+const CONTROLLER_CHAIN: usize = 8;
+
 /// How much a run may enclose, by [`Mesh::run_volume`], and still be a sheet.
 ///
 /// An order of magnitude below a cube, which scores 0.068.
@@ -509,7 +514,8 @@ impl Mesh {
                     return;
                 };
                 let properties = inherited.overridden_by(walk.nif, &geometry.av.properties);
-                let resolved = properties.resolve(walk.nif, walk.materials);
+                let mut resolved = properties.resolve(walk.nif, walk.materials);
+                resolved.scroll = sliding(walk.nif, geometry.av.net.controller);
                 let material = walk.materials.intern(resolved);
                 let placement = parent.then(&geometry.av.transform);
                 let first_vertex = self.positions.len() as u32;
@@ -667,6 +673,30 @@ impl Placement {
     fn direction(&self, normal: Vec3) -> Vec3 {
         (self.linear * normal).normalize_or_zero()
     }
+}
+
+/// How fast a `NiUVController` on this block's chain slides its texture, in coordinates a second.
+///
+/// **Reached from the node rather than through the controller's own target**, which is the rule
+/// every other controller here follows — a target points *back* at what it drives, and following it
+/// instead works for a mesh and breaks for a `.kf` file.
+///
+/// Zero where there is none, which is all but fifty of the game's files.
+fn sliding(nif: &NifFile, controller: Link) -> Vec2 {
+    let mut link = controller;
+    for _ in 0..CONTROLLER_CHAIN {
+        match nif.resolve(link) {
+            Some(Block::UvController(uv)) => {
+                let Some(Block::UvData(data)) = nif.resolve(uv.data) else {
+                    return Vec2::ZERO;
+                };
+                return Vec2::from_array(data.scroll(uv.stop - uv.start));
+            }
+            Some(Block::Controller(other)) => link = other.next,
+            _ => return Vec2::ZERO,
+        }
+    }
+    Vec2::ZERO
 }
 
 /// Whether a shape's name says it belongs to `slot`.

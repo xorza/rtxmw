@@ -39,6 +39,9 @@ struct Material {
     // The four ground textures a `KIND_TERRAIN` surface blends, packed sixteen bits apiece.
     uint terrain_layers0;
     uint terrain_layers1;
+    // How far the texture slides across the surface each second. Zero for all but the fifty files
+    // that carry a `NiUVController` — Vivec's water, Red Mountain's lava, the glowing fences.
+    vec2 scroll;
 };
 
 const uint KIND_DIFFUSE = 0u;

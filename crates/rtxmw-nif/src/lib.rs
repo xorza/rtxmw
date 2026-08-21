@@ -11,6 +11,7 @@ mod skin_data;
 mod skin_instance;
 mod text_keys;
 mod time_controller;
+mod uv_controller;
 
 pub use crate::block::{
     AlphaProperty, AvObject, Block, Geometry, GeometryData, MaterialProperty, Node, ObjectNet,
@@ -28,3 +29,4 @@ pub use crate::skin_data::{BoneSkin, SkinData, VertexWeight};
 pub use crate::skin_instance::SkinInstance;
 pub use crate::text_keys::{TextKey, TextKeys};
 pub use crate::time_controller::{ControllerKind, TimeController};
+pub use crate::uv_controller::{UvController, UvData};

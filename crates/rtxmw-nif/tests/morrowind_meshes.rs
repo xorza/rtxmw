@@ -317,3 +317,92 @@ fn every_emitter_holds_as_many_particles_as_its_rate_and_its_life_call_for() {
         "the median emitter holds {median} times what its rate and life call for, not one"
     );
 }
+
+/// Reads every texture scroll the game ships, and checks the shape the renderer relies on.
+///
+/// **What is being relied on is that a scroll is a *speed*.** The renderer carries a rate and no
+/// keys at all — `UvData::scroll` — and two things have to hold for that: the tiling must never be
+/// keyed, or the texture would change scale over time and no offset could stand in for it; and the
+/// controllers must hang where the mesh walk looks for them. Both are checked here against every
+/// file the game ships rather than assumed.
+///
+/// The offsets are keyed *quadratically* rather than linearly, which was assumed the other way
+/// round until this test said otherwise — but their values are two-key ramps, and a tangent between
+/// two keys of a ramp is the ramp. What is lost is the shiver on Ghostgate's fences, whose four-key
+/// U channel comes back to where it started and so reads as no motion at all.
+#[test]
+fn every_texture_scroll_is_a_line_over_a_looping_clip() {
+    let Some(vfs) = morrowind_archives() else {
+        eprintln!("skipping: {DATA_DIR_VAR} is not configured (set it, or add it to .env)");
+        return;
+    };
+
+    let mut controllers = 0;
+    let mut on_geometry = 0;
+    let mut lava: Vec<[f32; 2]> = Vec::new();
+    for path in vfs.paths().filter(|p| p.extension() == Some("nif")) {
+        let name = path.as_str().to_owned();
+        let Ok(bytes) = vfs.read(&name) else { continue };
+        let Ok(nif) = NifFile::parse(&bytes) else {
+            continue;
+        };
+        for block in nif.blocks() {
+            let Block::UvController(uv) = block else {
+                continue;
+            };
+            controllers += 1;
+            let Some(Block::UvData(data)) = nif.resolve(uv.data) else {
+                panic!("{name}: a uv controller names something that is not uv data");
+            };
+            // **Nothing keys the tiling**, which is what lets a scroll be an offset and nothing
+            // else — a repeat count that moved would change the texture's scale over time and no
+            // rate could stand in for it.
+            assert!(
+                data.tiling_u.keys.is_empty() && data.tiling_v.keys.is_empty(),
+                "{name} keys its tiling, which a rate cannot carry"
+            );
+            if name.ends_with("in_lava_256.nif") {
+                lava.push(data.scroll(uv.stop - uv.start));
+            }
+        }
+
+        // Every one of them hangs off the shape it moves, which is where the walk looks for it.
+        for block in nif.blocks() {
+            let Block::Geometry(geometry) = block else {
+                continue;
+            };
+            let mut link = geometry.av.net.controller;
+            for _ in 0..8 {
+                match nif.resolve(link) {
+                    Some(Block::UvController(_)) => {
+                        on_geometry += 1;
+                        break;
+                    }
+                    Some(Block::Controller(other)) => link = other.next,
+                    _ => break,
+                }
+            }
+        }
+    }
+
+    assert_eq!(
+        controllers, 116,
+        "the shipped texture scrolls are 116; a different count is a different install"
+    );
+    // Five sit on nothing the walk reaches, in files that are all magic effects — a controller left
+    // in a file whose shape was deleted. What matters is that the rest are where they are looked
+    // for, which is on the geometry rather than on a node above it.
+    assert_eq!(on_geometry, 111);
+
+    // **A pool of lava is three sheets crawling at different speeds**, which is how the original
+    // faked depth in something that is one flat quad: two run down at a twenty-fourth and a
+    // forty-eighth of the texture a second, and one runs diagonally back the other way. Every one
+    // is a V channel keyed across the same forty-eight second clip, so these are the file's own
+    // numbers divided by 48 and nothing else.
+    lava.sort_by(|a, b| a.partial_cmp(b).expect("no channel carries a NaN"));
+    let rate = |sixteenths: f32| sixteenths / 48.0;
+    assert_eq!(
+        lava,
+        [[rate(-2.0), rate(-2.0)], [0.0, rate(1.0)], [0.0, rate(2.0)],]
+    );
+}

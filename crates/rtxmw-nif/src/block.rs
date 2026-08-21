@@ -14,6 +14,7 @@ use crate::skin_data::SkinData;
 use crate::skin_instance::SkinInstance;
 use crate::text_keys::TextKeys;
 use crate::time_controller::{ControllerKind, TimeController};
+use crate::uv_controller::{UvController, UvData};
 
 /// Bytes a bounding sphere occupies: a centre and a radius.
 const BOUNDING_SPHERE_BYTES: usize = 16;
@@ -426,6 +427,10 @@ pub enum Block {
     ParticleModifier(ParticleModifier),
     /// A colour keyed over a particle's life — see [`ColourKey`].
     Colour(Track<ColourKey>),
+    /// What slides a texture across the surface it is painted on.
+    UvController(UvController),
+    /// The channels it slides it along.
+    UvData(UvData),
     /// A named string hung off a node — in a `.kf` file, the name of the node a controller drives.
     StringExtra(String),
     /// What an animation is called at each moment of it — see [`TextKeys`].
@@ -586,14 +591,7 @@ impl Block {
                 };
                 Self::Controller(TimeController::read(cursor, controller)?)
             }
-            "NiUVController" => {
-                read_time_controller(cursor)?;
-                cursor.skip(2)?; // UV set.
-                cursor.skip(4)?; // Data block.
-                Self::Other {
-                    kind: "NiUVController",
-                }
-            }
+            "NiUVController" => Self::UvController(UvController::read(cursor)?),
             "NiGeomMorpherController" => {
                 read_time_controller(cursor)?;
                 cursor.skip(4)?; // Data block.
@@ -663,13 +661,8 @@ impl Block {
                     kind: "NiFloatData",
                 }
             }
-            "NiUVData" => {
-                // Four channels: U and V offset, U and V tiling.
-                for _ in 0..4 {
-                    read_key_list(cursor, 4, true, false)?;
-                }
-                Self::Other { kind: "NiUVData" }
-            }
+            // Four channels: U and V offset, U and V tiling.
+            "NiUVData" => Self::UvData(UvData::read(cursor)?),
             "NiVisData" => {
                 // Not a key list: each entry is a time and a one-byte visibility flag.
                 let count = cursor.u32()? as usize;
