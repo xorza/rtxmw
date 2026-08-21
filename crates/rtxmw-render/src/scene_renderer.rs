@@ -606,6 +606,15 @@ impl SceneRenderer {
         self.scene.as_ref().map_or(0, SceneResidency::mesh_count)
     }
 
+    /// How many placements a frame poses, which is what resident cells put in front of the camera.
+    ///
+    /// **Not what has ever been placed.** The vertex regions and the structures over them are
+    /// grow-only like a mesh, but the posing is not: an evicted cell stops being posed, and this is
+    /// the number that says so.
+    pub fn posed_count(&self) -> usize {
+        self.scene.as_ref().map_or(0, SceneResidency::posed_count)
+    }
+
     /// How many instances the top level holds, which is what resident cells actually place.
     pub fn resident_instances(&self) -> u32 {
         self.scene

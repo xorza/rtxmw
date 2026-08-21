@@ -248,7 +248,7 @@ impl Rig {
 /// A key's text is several lines and a line is `group: marker`; the markers that bound a span are
 /// `start`, `stop`, `loop start` and `loop stop`. Anything else on the line — and every line under
 /// a name in [`CUES`] — is for something this is not.
-fn groups_of(nif: &NifFile, duration: f32) -> Vec<Group> {
+pub(crate) fn groups_of(nif: &NifFile, duration: f32) -> Vec<Group> {
     let Some(Block::TextKeys(keys)) = nif
         .blocks()
         .iter()
@@ -303,7 +303,7 @@ fn groups_of(nif: &NifFile, duration: f32) -> Vec<Group> {
 }
 
 /// The span an actor plays while it is doing nothing, or `None` where there are no groups at all.
-fn resting(groups: &[Group]) -> Option<std::ops::Range<f32>> {
+pub(crate) fn resting(groups: &[Group]) -> Option<std::ops::Range<f32>> {
     let resting = RESTING
         .iter()
         .find_map(|name| groups.iter().find(|group| group.name == *name))
@@ -313,9 +313,9 @@ fn resting(groups: &[Group]) -> Option<std::ops::Range<f32>> {
 
 /// One bone's claim on one vertex, before the claims are cut down to [`INFLUENCES`].
 #[derive(Debug, Clone, Copy)]
-struct Share {
-    bone: u32,
-    weight: f32,
+pub(crate) struct Share {
+    pub(crate) bone: u32,
+    pub(crate) weight: f32,
 }
 
 /// The strongest [`INFLUENCES`] claims on a vertex, renormalised to sum to one.
@@ -323,7 +323,7 @@ struct Share {
 /// **Renormalised rather than truncated.** A vertex that loses its fifth share would otherwise be
 /// dragged toward the origin by the weight that went missing, which reads as a dent rather than as
 /// the rounding it is.
-fn influence_of(shares: &[Share]) -> Influence {
+pub(crate) fn influence_of(shares: &[Share]) -> Influence {
     let mut strongest: [Share; INFLUENCES] = [Share {
         bone: 0,
         weight: 0.0,
@@ -349,8 +349,10 @@ fn influence_of(shares: &[Share]) -> Influence {
 
 /// The joints of a model, flattened parents-first out of its node graph.
 #[derive(Debug, Default)]
-struct Skeleton {
+pub(crate) struct Skeleton {
     parents: Vec<u16>,
+    /// What each joint is called, which is the only way a part in another file finds it.
+    names: Vec<String>,
     rest: Vec<Affine3A>,
     /// Each joint in the model's own space at rest, which is what a rigid binding needs.
     world: Vec<Affine3A>,
@@ -361,7 +363,7 @@ struct Skeleton {
 
 impl Skeleton {
     /// Walks `nif` from its roots, in an order that puts every parent before its children.
-    fn of(nif: &NifFile) -> Self {
+    pub(crate) fn of(nif: &NifFile) -> Self {
         let mut skeleton = Self {
             by_block: vec![NO_PARENT; nif.blocks().len()],
             ..Self::default()
@@ -378,6 +380,7 @@ impl Skeleton {
             let joint = skeleton.parents.len() as u16;
             let rest = affine_of(&node.av.transform);
             skeleton.parents.push(parent);
+            skeleton.names.push(node.av.net.name.to_lowercase());
             skeleton.rest.push(rest);
             skeleton.world.push(match parent {
                 NO_PARENT => rest,
@@ -398,6 +401,49 @@ impl Skeleton {
             }
         }
         skeleton
+    }
+
+    /// Which joint carries `name`, matched without regard to case.
+    /// How long the longest channel on it runs.
+    pub(crate) fn duration(&self) -> f32 {
+        self.channels
+            .iter()
+            .map(Channel::duration)
+            .fold(0.0f32, f32::max)
+    }
+
+    /// Whether anything on this skeleton moves.
+    pub(crate) fn is_still(&self) -> bool {
+        self.channels.iter().all(Channel::is_empty)
+    }
+
+    /// The joints, in the order [`Rig`] wants them.
+    pub(crate) fn into_rig(
+        self,
+        mesh: MeshId,
+        bones: Vec<Bone>,
+        influences: Vec<Influence>,
+        groups: Vec<Group>,
+        playing: std::ops::Range<f32>,
+    ) -> Rig {
+        Rig {
+            mesh,
+            parents: self.parents,
+            rest: self.rest,
+            channels: self.channels,
+            bones,
+            influences,
+            groups,
+            playing,
+        }
+    }
+
+    /// Which joint carries `name`, matched without regard to case.
+    pub(crate) fn joint_named(&self, name: &str) -> Option<u16> {
+        self.names
+            .iter()
+            .position(|joint| joint == name)
+            .map(|index| index as u16)
     }
 
     /// Which joint a block is, or for a geometry block, which one it hangs from.

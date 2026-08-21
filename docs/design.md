@@ -625,9 +625,10 @@ its sync2 stages are what the skinning-to-build and build-to-trace barriers want
 3. **Creatures — done.** §8.93. They were already placed by step 2, because 87 of the 89 models
    animate from their own NIF; what they needed was the text keys that say which part of that
    animation is standing still. `XSCL` and a clip loaded from a `.kf` are still ahead.
-4. **NPCs.** No `MODL` on 2,772 of 3,049: a body is assembled from `RNAM`, the female bit, `BNAM`,
-   `KNAM` and the 1,125 `BODY` records matched by race, sex and part, with worn `NPCO` overriding.
-   New ESM parsing, on machinery steps 2 and 3 already built.
+4. **NPCs — the body, done.** §8.94. A skeleton chosen by race and sex, thirteen parts found by the
+   naming convention `BODY` records use instead of a race field, and the face and hair the record
+   names itself. Worn `NPCO` inventory, which overrides the skin it covers, is what is left — and
+   with it the 273 `CREA` records that are humanoid and assembled the same way.
 5. **Particles and the rest of the controller family.** Particles belong in the transparency target
    beside precipitation rather than in the acceleration structure — §8.87 already transcribed
    `ashcloud.nif` by hand and the upscaler already composites that layer. `NiUVController` is a
@@ -3476,3 +3477,54 @@ which separates standing still from walking away without knowing anything about 
 rather than off the nodes they drive, and the targets are named by the string chain beside them —
 which is the shape NPCs need, because `base_anim.nif` is a skeleton with no animation in it and
 `xbase_anim.kf` is where the animation went.
+
+### 8.94 A person is thirteen files and a skeleton
+
+M12's fourth step. **2,772 of the 3,049 `NPC_` records carry no model at all**, and the 277 that do
+name a `base_anim` variant rather than a body — so until now the game's whole human cast was placed
+nowhere and drawn as nothing.
+
+**The skeleton already knows where the parts go.** `base_anim.nif` carries 61 nodes, and beside the
+`Bip01` chain that drives them sit attachment nodes named for the parts themselves — `Head`, `Neck`,
+`Chest`, `Groin`, `Left Hand`, `Left Wrist`, `Left Forearm`, `Left Upper Arm`, `Left Clavicle`,
+`Left Foot`, `Left Knee`, `Left Ankle`, `Left Upper Leg`, and the right of each. Every one carries a
+placeholder geometry — `Tri Head`, `Tri Chest` — so the mapping from a `BODY` record's part index to
+a bone is a lookup rather than a table anyone had to invent.
+
+**And the placeholders are why the shortcut does not exist.** `base_anim.nif`'s geometry carries
+flag 5 — bit zero, hidden — where `base_anim_female.nif`'s carries 4 and simply forgot to. So the
+male base flattens to *nothing*, the female to a body, and "just place the skeleton" was never an
+option. It also means the 273 `CREA` records that name a `base_anim` variant have been placing an
+empty mesh since M2: those are humanoid creatures assembled the same way, and they are still
+invisible until the same treatment reaches them.
+
+**A `BODY` record has no race field.** Its four-byte `BYDT` gives the part (0–14), a flags byte
+whose bit zero is female, and a kind — 533 skin, 331 clothing, 247 armour. Which race a part belongs
+to is in its *id*: `b_n_dark elf_f_forearm`. OpenMW resolves it the same way, because there is
+nothing else to resolve it by. Coverage across the ten races is complete but for two deliberate gaps
+and one accident: **no race has a clavicle skin** (the chest covers it, so a clavicle is only ever
+armour), **only Khajiit and Argonians have a tail**, and Argonian women have no forearm.
+
+**The face and the hair are named by the record.** `BNAM` and `KNAM` are `BODY` ids, and across all
+2,675 `NPC_` records in the master **every one of them resolves** — no head or hair names a record
+that is not there.
+
+**Race decides three things.** Which skeleton — `base_animkna.nif` for Argonians and Khajiit, whose
+women are animated as their men because there is no female variant of it — and a height multiplier
+per sex, which is what makes a Bosmer at 0.90 shorter than a Nord at 1.06 out of one skeleton.
+
+A male Wood Elf comes out as **3,630 vertices over 125 bones, measuring 36 × 26 × 133 units**, which
+is a person. `assembled_actor.rs`'s test is that measurement plus the one underneath it: every
+vertex's weights must sum to one, because a vertex that falls short is dragged toward the origin and
+one that overshoots is thrown away from it, and either reads as a body coming apart.
+
+**Two allocations a frame, both inside `ash`.** Placing actors put the animation path into the
+census office, which is what `tests/frame_allocations.rs` measures — and it went from zero to four
+allocations per frame. Two were descriptions rebuilt every frame, now built once per commit. The
+other two were `ash`'s own: its safe `cmd_build_acceleration_structures` collects the `&[&[..]]` of
+range infos into a `Vec` on every call, so both builds now go through the function pointer with the
+pointer array held as scratch. Zero again — and 31% faster with it, the refit path going from 0.108
+ms to **0.074**, because describing the build once per commit was worth more than the allocation.
+
+**Not done here**: worn clothing and armour. An NPC's `NPCO` inventory overrides the skin parts it
+covers, which is why the woman above is in her underwear.

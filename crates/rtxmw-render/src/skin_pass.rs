@@ -104,6 +104,8 @@ pub(crate) struct SkinPass {
     /// One matrix per bone per placement, rewritten every frame through a mapped pointer.
     bones: Buffer,
     placements: Vec<Posed>,
+    /// Bone matrices across every placement, which is where the next one's start.
+    bone_total: u32,
     /// Scratch the poses are worked out through, so a frame allocates nothing.
     pose: Pose,
 }
@@ -145,6 +147,7 @@ impl SkinPass {
                 BufferMemory::Upload,
             )?,
             placements: Vec::new(),
+            bone_total: 0,
             pose: Pose::default(),
         })
     }
@@ -172,14 +175,18 @@ impl SkinPass {
     }
 
     /// Records what each placement reads from, writes to and is posed by.
-    pub(crate) fn place(
+    ///
+    /// **The whole set, every commit.** A cell that has been evicted stops being posed the moment
+    /// it stops being resident, which is what keeps the per-frame work the size of what is on
+    /// screen rather than of everything that has ever streamed past.
+    pub(crate) fn set_placements(
         &mut self,
         uploader: &mut Uploader,
         geometry: &GeometryBuffers,
         placements: &[Placement],
     ) -> rtxmw_gpu::Result<()> {
         self.placements.clear();
-        self.placements.reserve_exact(placements.len());
+        self.placements.reserve(placements.len());
         let mut bones = 0u32;
         for placement in placements {
             let pose = geometry.ranges()[placement.source as usize];
@@ -204,6 +211,7 @@ impl SkinPass {
             });
             bones += rig.bones.len() as u32;
         }
+        self.bone_total = bones;
         let wanted = vk::DeviceSize::from(bones.max(1)) * size_of::<GpuBone>() as vk::DeviceSize;
         if wanted > self.bones.size() {
             self.bones = Buffer::new(
@@ -228,6 +236,11 @@ impl SkinPass {
                 &self.bones,
             ],
         );
+    }
+
+    /// How many placements a frame poses.
+    pub(crate) fn len(&self) -> usize {
+        self.placements.len()
     }
 
     /// Whether anything has been placed, and so whether a frame has any of this to do.

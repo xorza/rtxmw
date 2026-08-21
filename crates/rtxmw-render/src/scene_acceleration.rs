@@ -158,20 +158,23 @@ impl SceneAcceleration {
         Ok(())
     }
 
-    /// Creates a bottom level for each of the mesh slots in `slots`, to be rebuilt every frame.
+    /// Creates a bottom level for each of the mesh slots in `slots`, for a frame to rebuild.
     ///
     /// **No build happens here**, and the caller owes one before anything references them. The
-    /// regions these describe hold whatever the allocator left there until a deform pass has
+    /// regions these describe hold whatever the allocator left there until a skinning pass has
     /// written them — see [`GeometryBuffers::reserve_deformed`] — so a top level built over them
-    /// meanwhile is undefined, which on this hardware is a lost device rather than a wrong
-    /// picture. `SceneResidency::commit` pays that debt with one submission of the same two passes
-    /// a frame uses; §8.91 is what it cost to find out. What this does is reserve the structures,
-    /// at the size the driver says the geometry needs, and the scratch a build will run through.
+    /// meanwhile is undefined, which on this hardware is a lost device rather than a wrong picture.
+    /// `SceneResidency::commit` pays that debt with one submission of the same two passes a frame
+    /// uses; §8.91 is what it cost to find out.
+    ///
+    /// **Reserving is not activating.** These are an asset like a mesh: created once and kept, so a
+    /// cell that comes back finds its structures where it left them. What a *frame* builds is
+    /// whatever [`SceneAcceleration::activate_deforming`] was last given.
     ///
     /// `refit` chooses between rebuilding the structure every frame and updating it in place.
     /// Which is better is a measurement rather than a fact — `docs/design.md` M12 — so it is a
     /// parameter and `tests/deforming.rs` is where the two are compared.
-    pub fn append_deforming(
+    pub fn reserve_deforming(
         &mut self,
         uploader: &mut Uploader,
         limits: RayTracingLimits,
@@ -212,12 +215,12 @@ impl SceneAcceleration {
 
         if self.deforming.is_none() {
             self.deforming = Some(Deforming {
-                slots: Vec::new(),
+                active: Vec::new(),
                 structures: Vec::new(),
                 geometries: Vec::new(),
                 ranges: Vec::new(),
                 spans: Vec::new(),
-                // Replaced by `resize_scratch` below, once there is something to size it against.
+                // Replaced by `resize_scratch`, once there is something to size it against.
                 scratch: Buffer::with_alignment(
                     uploader.memory(),
                     "deforming blas scratch",
@@ -228,50 +231,56 @@ impl SceneAcceleration {
                     limits.min_scratch_offset_alignment as vk::DeviceSize,
                 )?,
                 scratch_offsets: Vec::new(),
+                infos: Vec::new(),
+                range_pointers: Vec::new(),
                 refit,
                 built: false,
             });
         }
-        let deforming = self
-            .deforming
-            .as_mut()
-            .expect("just inserted if it was absent");
         assert_eq!(
-            deforming.refit, refit,
+            self.deforming
+                .as_ref()
+                .expect("just inserted if it was absent")
+                .refit,
+            refit,
             "the whole set is refitted or none of it is; the structures are sized for the choice"
         );
-        deforming.slots.push(slots);
-        deforming
-            .structures
-            .extend((self.blas.len() - described.spans.len()) as u32..self.blas.len() as u32);
-        deforming.absorb(described);
-        deforming.resize_scratch(uploader, limits, &self.loader)?;
         Ok(())
     }
 
-    /// Re-derives what the per-frame build reads, after anything that could have moved the buffers.
+    /// Says which of the reserved slots a frame is to build, and describes the build.
     ///
-    /// **A bottom level built once keeps its own copy of the geometry; one rebuilt every frame does
-    /// not.** `GeometryBuffers` reallocates when it grows, so every device address baked into a
-    /// build description goes stale the moment another cell arrives. Called from the commit that
-    /// follows any such change, which is the same place the top level is rebuilt and for the same
-    /// reason.
-    pub fn refresh_deforming(&mut self, geometry: &GeometryBuffers, materials: &[Material]) {
+    /// **Called from every commit**, with the slots the resident cells are using right now. A cell
+    /// that has been evicted leaves its structures behind and stops costing a frame anything, which
+    /// is what keeps the per-frame work the size of what is on screen rather than of everything
+    /// that has ever streamed past.
+    pub fn activate_deforming(
+        &mut self,
+        uploader: &mut Uploader,
+        limits: RayTracingLimits,
+        geometry: &GeometryBuffers,
+        materials: &[Material],
+        active: &[u32],
+    ) -> rtxmw_gpu::Result<()> {
         let Some(deforming) = &mut self.deforming else {
-            return;
+            return Ok(());
         };
-        let slots = std::mem::take(&mut deforming.slots);
+        deforming.active.clear();
+        deforming.active.extend_from_slice(active);
+        deforming.structures.clear();
         deforming.geometries.clear();
         deforming.ranges.clear();
         deforming.spans.clear();
-        for range in &slots {
-            let described = describe_geometry(geometry, materials, range.clone());
-            deforming.absorb(described);
+        for &slot in active {
+            deforming.structures.push(self.by_mesh[slot as usize]);
+            deforming.absorb(describe_geometry(geometry, materials, slot..slot + 1));
         }
-        deforming.slots = slots;
-        // A rebuilt buffer is a different source, so an update against the last pose is no longer
-        // meaningful — the next frame builds from scratch whatever mode it is in.
+        deforming.resize_scratch(uploader, limits, &self.loader)?;
+        deforming.describe(&self.blas);
+        // A description rebuilt from scratch has no last pose to update against, whatever mode the
+        // set is in.
         deforming.built = false;
+        Ok(())
     }
 
     /// Records a build of every bottom level that moves, over the vertices just written.
@@ -306,46 +315,31 @@ impl SceneAcceleration {
                 )
             };
             let update = deforming.refit && deforming.built;
-            let mode = if update {
-                vk::BuildAccelerationStructureModeKHR::UPDATE
-            } else {
-                vk::BuildAccelerationStructureModeKHR::BUILD
-            };
-            let scratch_base = deforming.scratch.device_address();
-            let infos: Vec<vk::AccelerationStructureBuildGeometryInfoKHR<'_>> = deforming
-                .spans
-                .iter()
-                .enumerate()
-                .map(|(index, span)| {
-                    let structure = self.blas[deforming.structures[index] as usize].raw();
-                    vk::AccelerationStructureBuildGeometryInfoKHR::default()
-                        .ty(vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL)
-                        .flags(refit_flags(deforming.refit))
-                        .mode(mode)
-                        // An update reads the structure it writes: refitting moves the vertices a
-                        // tree already has rather than choosing a tree, which is the whole
-                        // difference between the two modes.
-                        .src_acceleration_structure(if update {
-                            structure
-                        } else {
-                            vk::AccelerationStructureKHR::null()
-                        })
-                        .dst_acceleration_structure(structure)
-                        .geometries(&deforming.geometries[span.start as usize..span.end as usize])
-                        .scratch_data(vk::DeviceOrHostAddressKHR {
-                            device_address: scratch_base + deforming.scratch_offsets[index],
-                        })
-                })
-                .collect();
-            let range_slices: Vec<&[vk::AccelerationStructureBuildRangeInfoKHR]> = deforming
-                .spans
-                .iter()
-                .map(|span| &deforming.ranges[span.start as usize..span.end as usize])
-                .collect();
-            // SAFETY: every structure, scratch region and geometry buffer is alive, and the
-            // descriptions were re-derived at the last commit.
+            // The only two fields a frame changes: everything else was described at the last
+            // commit, and describing it again is what the allocation budget forbids.
+            for info in &mut deforming.infos {
+                info.mode = match update {
+                    true => vk::BuildAccelerationStructureModeKHR::UPDATE,
+                    false => vk::BuildAccelerationStructureModeKHR::BUILD,
+                };
+                // An update reads the structure it writes: refitting moves the vertices a tree
+                // already has rather than choosing a tree, which is the whole difference between
+                // the two modes.
+                info.src_acceleration_structure = match update {
+                    true => info.dst_acceleration_structure,
+                    false => vk::AccelerationStructureKHR::null(),
+                };
+            }
+            // SAFETY: every structure, scratch region and geometry buffer is alive, the
+            // descriptions were re-derived at the last commit, and the two arrays are the same
+            // length by construction.
             unsafe {
-                loader.cmd_build_acceleration_structures(command_buffer, &infos, &range_slices)
+                (loader.fp().cmd_build_acceleration_structures_khr)(
+                    command_buffer,
+                    deforming.infos.len() as u32,
+                    deforming.infos.as_ptr(),
+                    deforming.range_pointers.as_ptr(),
+                )
             };
             deforming.built = true;
 
@@ -400,13 +394,17 @@ impl SceneAcceleration {
             });
         let range = vk::AccelerationStructureBuildRangeInfoKHR::default()
             .primitive_count(self.instance_count);
+        // The same reason the bottom levels go through the function pointer: `ash`'s wrapper
+        // collects the ranges into a `Vec`, and this is inside the frame.
+        let ranges = [std::ptr::from_ref(&range)];
         // SAFETY: the structure, its scratch and the instance buffer are alive, and the bottom
         // levels this reads were ordered against it above.
         unsafe {
-            loader.cmd_build_acceleration_structures(
+            (loader.fp().cmd_build_acceleration_structures_khr)(
                 command_buffer,
-                std::slice::from_ref(&info),
-                &[std::slice::from_ref(&range)],
+                1,
+                &info,
+                ranges.as_ptr(),
             );
             memory_barrier::scoped(
                 device,
@@ -479,10 +477,8 @@ pub struct Deformable {
 /// build call and a single scratch allocation however many placements are in it.
 #[derive(Debug)]
 struct Deforming {
-    /// The mesh slots each cell reserved, in the order they were registered. One range per cell
-    /// rather than one overall: a cell arriving between two of them appends static meshes, so the
-    /// slots a second cell reserves do not follow the first's.
-    slots: Vec<std::ops::Range<u32>>,
+    /// The reserved slots a frame is currently building, which is what the resident cells use.
+    active: Vec<u32>,
     /// Where in `SceneAcceleration::blas` each of these structures sits, parallel to `spans`.
     structures: Vec<u32>,
     /// Kept in one flat vector rather than one per structure: every build info points into it, so
@@ -493,6 +489,16 @@ struct Deforming {
     spans: Vec<std::ops::Range<u32>>,
     scratch: Buffer,
     scratch_offsets: Vec<vk::DeviceSize>,
+    /// What the per-frame build is described by, rebuilt once per commit so a frame allocates
+    /// nothing to describe it again — see [`Deforming::describe`].
+    infos: Vec<vk::AccelerationStructureBuildGeometryInfoKHR<'static>>,
+    /// One pointer per info, at the run of ranges that info's geometries are built over.
+    ///
+    /// **Pointers rather than slices because `ash` allocates.** Its safe wrapper collects a
+    /// `&[&[..]]` into a `Vec` of pointers on every call, which is a heap allocation inside the
+    /// frame — so this holds what that wrapper would have built and the call goes through the
+    /// function pointer instead.
+    range_pointers: Vec<*const vk::AccelerationStructureBuildRangeInfoKHR>,
     /// Whether a frame updates these in place rather than rebuilding them.
     refit: bool,
     /// Whether anything has been built into them yet. An update has to have something to update.
@@ -511,6 +517,39 @@ impl Deforming {
                 .into_iter()
                 .map(|span| base + span.start..base + span.end),
         );
+    }
+
+    /// Rebuilds what the per-frame build is handed, after anything that could have moved it.
+    ///
+    /// **The two arrays are pointed at rather than borrowed**, which is what lets the descriptions
+    /// outlive the borrow that built them. They point into `geometries` and `ranges`, whose buffers
+    /// only [`Deforming::absorb`] and the clear before it can move — and both are followed by this.
+    /// Nothing reads them in between, and a frame between two commits only patches two scalar
+    /// fields on what this leaves.
+    fn describe(&mut self, blas: &[AccelerationStructure]) {
+        let scratch_base = self.scratch.device_address();
+        self.infos.clear();
+        self.range_pointers.clear();
+        self.infos.reserve_exact(self.spans.len());
+        self.range_pointers.reserve_exact(self.spans.len());
+        for (index, span) in self.spans.iter().enumerate() {
+            let span = span.start as usize..span.end as usize;
+            let geometries = &self.geometries[span.clone()];
+            let mut info = vk::AccelerationStructureBuildGeometryInfoKHR::default()
+                .ty(vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL)
+                .flags(refit_flags(self.refit))
+                .mode(vk::BuildAccelerationStructureModeKHR::BUILD)
+                .dst_acceleration_structure(blas[self.structures[index] as usize].raw())
+                .scratch_data(vk::DeviceOrHostAddressKHR {
+                    device_address: scratch_base + self.scratch_offsets[index],
+                });
+            // Written rather than borrowed through `geometries()`, which would tie the description
+            // to a borrow that ends here — see the note above for why that is safe.
+            info.geometry_count = geometries.len() as u32;
+            info.p_geometries = geometries.as_ptr();
+            self.infos.push(info);
+            self.range_pointers.push(self.ranges[span].as_ptr());
+        }
     }
 
     /// Sizes the one scratch buffer the whole set builds through.

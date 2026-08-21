@@ -405,6 +405,26 @@ impl Mesh {
         mesh
     }
 
+    /// Appends `other` whole, rebasing its indices and runs onto what is already here.
+    ///
+    /// **What an assembled body is built by**: a person is a dozen files, each flattened on its own
+    /// and then stacked into one mesh so the whole of them is one acceleration structure. Material
+    /// ids are already the shared table's, so nothing is remapped.
+    pub(crate) fn absorb(&mut self, other: &Self) {
+        let vertex_base = self.positions.len() as u32;
+        let index_base = self.indices.len() as u32;
+        self.positions.extend_from_slice(&other.positions);
+        self.normals.extend_from_slice(&other.normals);
+        self.uvs.extend_from_slice(&other.uvs);
+        self.indices
+            .extend(other.indices.iter().map(|index| index + vertex_base));
+        self.submeshes
+            .extend(other.submeshes.iter().map(|run| Submesh {
+                first_index: run.first_index + index_base,
+                ..*run
+            }));
+    }
+
     /// Triangles in the flattened mesh.
     pub fn triangle_count(&self) -> usize {
         self.indices.len() / 3

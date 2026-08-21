@@ -64,6 +64,17 @@ use crate::visibility_pass::Lighting;
 /// were looked at.
 const INDOOR_FOG_SCALE: f32 = 0.045;
 
+/// One placement of a rig, as a resident cell holds it.
+#[derive(Debug, Clone, Copy)]
+struct ResidentPose {
+    /// The bind-pose mesh slot it is cloned from.
+    source: u32,
+    /// Which of the skinning pass's rigs poses it.
+    rig: u32,
+    phase: f32,
+    transform: glam::Affine3A,
+}
+
 /// Placements only. Everything a cell *names* — its meshes, its textures, its materials — belongs
 /// to the renderer rather than to the cell, because the cell next door names most of the same
 /// things and uploading them twice is what made a block reload cost eighty milliseconds.
@@ -73,6 +84,9 @@ struct ResidentCell {
     /// Instances whose `MeshId` addresses the renderer's mesh slots, not the cell's own numbering.
     instances: Vec<Instance>,
     lights: Vec<Light>,
+    /// Placements whose vertices are posed every frame. Held here rather than handed to the
+    /// skinning pass, so that evicting the cell stops them costing a frame anything.
+    deforming: Vec<ResidentPose>,
 }
 
 /// Every cell on the device, and the assets they share.
@@ -104,6 +118,12 @@ pub(crate) struct SceneResidency {
     acceleration: SceneAcceleration,
     /// Poses everything that moves, ahead of the build over it.
     skin: SkinPass,
+    /// Vertex regions reserved for posing, by the mesh slot they were cloned from.
+    ///
+    /// **An asset, like a mesh.** A region is a slice of the shared streams and a bottom level over
+    /// it; both are kept, so a cell that comes back finds them rather than reserving more. The pool
+    /// grows to the most placements of one mesh that were ever on screen at once.
+    regions: HashMap<u32, Vec<u32>>,
     /// Whether those structures are refitted every frame rather than rebuilt — see
     /// [`SceneAcceleration::append_deforming`], and `docs/design.md` M12 for why it is a choice.
     refit_deforming: bool,
@@ -167,6 +187,7 @@ impl SceneResidency {
             cells: Vec::new(),
             acceleration,
             skin: SkinPass::new(device, uploader)?,
+            regions: HashMap::new(),
             refit_deforming: true,
             tables,
             lights,
@@ -201,7 +222,7 @@ impl SceneResidency {
         let material_remap = self.intern_materials(scene, &texture_remap);
         let mesh_remap = self.append_meshes(device, uploader, limits, scene, &material_remap)?;
 
-        let mut instances: Vec<Instance> = scene
+        let instances: Vec<Instance> = scene
             .instances
             .iter()
             .map(|instance| Instance {
@@ -209,15 +230,23 @@ impl SceneResidency {
                 transform: instance.transform,
             })
             .collect();
-        // **Placed like anything else, once it has a region of its own.** What makes a deforming
-        // instance different is upstream of here — its own slice of the vertex streams and its own
-        // bottom level — and by this point it is a mesh slot and a transform like every other.
-        instances.extend(self.place_deforming(uploader, limits, scene, &mesh_remap)?);
+        let first_rig = self.skin.add_rigs(uploader, &scene.rigs)?;
+        let deforming = scene
+            .deforming
+            .iter()
+            .map(|placement| ResidentPose {
+                source: mesh_remap[placement.instance.mesh.0 as usize],
+                rig: first_rig + placement.rig.0,
+                phase: placement.phase,
+                transform: placement.instance.transform,
+            })
+            .collect();
         self.cells.retain(|cell| cell.id != id);
         self.cells.push(ResidentCell {
             id,
             instances,
             lights: scene.lights.clone(),
+            deforming,
         });
 
         // The newest cell's, because every exterior cell carries the same sky and a caller loading
@@ -347,18 +376,13 @@ impl SceneResidency {
         self.light_grid = LightGrid::build(uploader, &table)?;
         self.lighting.light_grid = self.light_grid.extent();
 
-        let instances: Vec<Instance> = self
+        let mut instances: Vec<Instance> = self
             .cells
             .iter()
             .flat_map(|cell| cell.instances.iter())
             .copied()
             .collect();
-        // **Before the top level, because both read addresses the last append may have moved.**
-        // `GeometryBuffers` reallocates as it grows, and a build recorded every frame reads the
-        // live buffer rather than a copy taken when it was described.
-        self.acceleration
-            .refresh_deforming(&self.geometry, self.materials.materials());
-        self.skin.bind(&self.geometry);
+        instances.extend(self.pose_resident(uploader, limits)?);
 
         // **And the deforming structures are built once here, before anything references them.**
         // They are created unbuilt over regions holding whatever the allocator left there, and a
@@ -380,49 +404,76 @@ impl SceneResidency {
             .rebuild_top(device, uploader, limits, &self.geometry, &instances)
     }
 
-    /// Gives every deforming placement in `scene` a vertex region and a structure of its own.
+    /// Hands every resident placement a vertex region, and says what a frame is to build.
     ///
-    /// Returns them as ordinary instances naming the slots they were given, which is all the top
-    /// level ever learns about them.
-    fn place_deforming(
+    /// **Everything derived from what is resident is rebuilt here**, because that is what a commit
+    /// is: regions are handed back to the pool and dealt out again, so a cell that has gone stops
+    /// being posed and stops being built. Returns them as ordinary instances naming the slots they
+    /// were given, which is all the top level ever learns about them.
+    fn pose_resident(
         &mut self,
         uploader: &mut Uploader,
         limits: RayTracingLimits,
-        scene: &StaticScene,
-        mesh_remap: &[u32],
     ) -> rtxmw_gpu::Result<Vec<Instance>> {
-        if scene.deforming.is_empty() {
-            return Ok(Vec::new());
-        }
-        let first_slot = self.geometry.ranges().len() as u32;
-        let first_rig = self.skin.add_rigs(uploader, &scene.rigs)?;
-        let mut placements = Vec::with_capacity(scene.deforming.len());
-        let mut placed = Vec::with_capacity(scene.deforming.len());
-        for deforming in &scene.deforming {
-            let source = mesh_remap[deforming.instance.mesh.0 as usize];
-            let slot = self.geometry.reserve_deformed(uploader, source, 1)?.start;
+        // How many of each source mesh's regions have been dealt out this time round.
+        let mut taken: HashMap<u32, usize> = HashMap::new();
+        let mut placements = Vec::new();
+        let mut placed = Vec::new();
+        let mut active = Vec::new();
+        let poses: Vec<ResidentPose> = self
+            .cells
+            .iter()
+            .flat_map(|cell| cell.deforming.iter())
+            .copied()
+            .collect();
+        for pose in &poses {
+            let next = taken.entry(pose.source).or_default();
+            let pool = self.regions.entry(pose.source).or_default();
+            if *next == pool.len() {
+                // One more than the pool has: a region and the structure over it, kept for good.
+                let slot = self
+                    .geometry
+                    .reserve_deformed(uploader, pose.source, 1)?
+                    .start;
+                self.acceleration.reserve_deforming(
+                    uploader,
+                    limits,
+                    &self.geometry,
+                    self.materials.materials(),
+                    Deformable {
+                        slots: slot..slot + 1,
+                        refit: self.refit_deforming,
+                    },
+                )?;
+                self.regions
+                    .get_mut(&pose.source)
+                    .expect("just entered")
+                    .push(slot);
+            }
+            let slot = self.regions[&pose.source][*next];
+            *next += 1;
+            active.push(slot);
             placements.push(Placement {
-                source,
+                source: pose.source,
                 destination: slot,
-                rig: first_rig + deforming.rig.0,
-                phase: deforming.phase,
+                rig: pose.rig,
+                phase: pose.phase,
             });
             placed.push(Instance {
                 mesh: MeshId(slot),
-                transform: deforming.instance.transform,
+                transform: pose.transform,
             });
         }
-        self.skin.place(uploader, &self.geometry, &placements)?;
-        self.acceleration.append_deforming(
+        self.skin
+            .set_placements(uploader, &self.geometry, &placements)?;
+        self.acceleration.activate_deforming(
             uploader,
             limits,
             &self.geometry,
             self.materials.materials(),
-            Deformable {
-                slots: first_slot..self.geometry.ranges().len() as u32,
-                refit: self.refit_deforming,
-            },
+            &active,
         )?;
+        self.skin.bind(&self.geometry);
         Ok(placed)
     }
 
@@ -432,6 +483,11 @@ impl SceneResidency {
     /// loading anything: the flag is baked into the structures at the size the driver gives them.
     pub(crate) fn set_refit_deforming(&mut self, refit: bool) {
         self.refit_deforming = refit;
+    }
+
+    /// How many placements a frame poses.
+    pub(crate) fn posed_count(&self) -> usize {
+        self.skin.len()
     }
 
     /// Whether anything in the resident set moves, and so whether a frame has this work to do.

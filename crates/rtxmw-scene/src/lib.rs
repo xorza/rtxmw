@@ -3,6 +3,7 @@
 //! This is the seam between the format crates and the renderer: nothing below it knows about
 //! Vulkan, and nothing above it knows about ESM records or NIF blocks.
 
+mod assembled_actor;
 mod cell_streamer;
 mod clouds;
 mod door;

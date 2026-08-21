@@ -757,12 +757,31 @@ fn a_distant_cell_keeps_its_objects_and_drops_the_lights_they_carry() {
          in the frame, and none of these reaches it",
         far.lights.len()
     );
+    // **Nothing is posed at a distance.** A body is a skeleton to walk and a bottom level to
+    // rebuild every frame, and one eight cells off is a handful of pixels — the same argument this
+    // test already makes about a lamp a kilometre away.
+    assert!(
+        far.deforming.is_empty(),
+        "a distant cell posed {} placements",
+        far.deforming.len()
+    );
     // The objects stay, and they stay whole: dropping the lights must not drop the lamps casting
-    // them, which would leave a hole in the town rather than an unlit one.
-    assert_eq!(
+    // them, which would leave a hole in the town rather than an unlit one. A banner crosses over
+    // from the posed list to the placed one and the count goes *up*; what is missing at distance is
+    // only the people, who have no model of their own to place.
+    assert!(
+        far.instances.len() >= near.instances.len(),
+        "a distant cell placed {} objects against {} up close, so something with a model of its \
+         own was dropped",
         far.instances.len(),
-        near.instances.len(),
-        "a distant cell placed a different number of objects than the same cell up close"
+        near.instances.len()
+    );
+    let people = near.instances.len() + near.deforming.len() - far.instances.len();
+    assert!(
+        people > 0 && people < near.deforming.len(),
+        "{people} of {} posed placements should be people, who are the only thing a distant cell \
+         leaves out entirely",
+        near.deforming.len()
     );
 }
 

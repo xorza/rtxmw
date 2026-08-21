@@ -4,12 +4,13 @@ use std::collections::HashMap;
 
 use glam::{Affine3A, Mat3, Quat, Vec2, Vec3};
 use rtxmw_esm::{
-    CELL_SIZE, Cell, CellId, CellIndex, CellRef, EsmReader, LandRecord, LightRecord, ObjectRecord,
-    Record, RecordName, TEXTURE_GRID,
+    BodyKind, BodyPart, BodyRecord, CELL_SIZE, Cell, CellId, CellIndex, CellRef, EsmReader,
+    LandRecord, LightRecord, NpcRecord, ObjectRecord, RaceRecord, Record, RecordName, TEXTURE_GRID,
 };
 use rtxmw_nif::NifFile;
 use rtxmw_vfs::Vfs;
 
+use crate::assembled_actor::{ActorPart, AssembledActor};
 use crate::error::{Result, SceneError};
 use crate::light::{Ambient, Light};
 use crate::material::{self, Material, MaterialKind, TerrainLayers, TextureId};
@@ -50,6 +51,30 @@ pub struct Instance {
     pub transform: Affine3A,
 }
 
+/// What a cell's walk has already built, so a second reference to it does not build it again.
+///
+/// **Three caches rather than three arguments**, because they travel together and because an
+/// exterior's walk carries them across several cells at once.
+#[derive(Debug, Default)]
+struct Interning {
+    /// Model path to the mesh slot it was flattened into.
+    paths: HashMap<String, MeshId>,
+    /// Which mesh slots turned out to have a rig, and which.
+    rigs: HashMap<MeshId, RigId>,
+    /// A body's shared key to the rig it assembled to, or `None` where it would not assemble.
+    actors: HashMap<String, Option<RigId>>,
+}
+
+/// How to build one person, and what makes two of them the same person to build.
+#[derive(Debug, Clone)]
+pub struct ActorPlan {
+    pub(crate) skeleton: &'static str,
+    pub(crate) parts: Vec<ActorPart>,
+    pub(crate) height: f32,
+    /// Two actors with the same key assemble to the same body, so it is built once.
+    pub(crate) shared_as: String,
+}
+
 /// One placed copy of a mesh whose vertices are rewritten every frame.
 ///
 /// **The seam animation arrives through** — `docs/design.md` M12. A deforming placement cannot
@@ -78,18 +103,51 @@ pub struct ModelIndex {
     models: HashMap<String, String>,
     /// Lower-cased object id to light data, for the `LIGH` records among them.
     lights: HashMap<String, LightRecord>,
+    /// Lower-cased id to the record, for the `NPC_` records, which carry no model of their own.
+    npcs: HashMap<String, NpcRecord>,
+    /// Lower-cased race id to what it says about the shape of its people.
+    races: HashMap<String, RaceRecord>,
+    /// Every body part the game ships, which a body is chosen out of by name.
+    bodies: Vec<BodyRecord>,
 }
 
 impl ModelIndex {
     /// Scans every placeable record in `esm`.
     pub fn build(esm: &EsmReader<'_>) -> Result<Self> {
         let light_tag = RecordName::new(b"LIGH");
+        let npc_tag = RecordName::new(b"NPC_");
         let mut models = HashMap::new();
         let mut lights = HashMap::new();
+        let mut npcs = HashMap::new();
+        let mut races = HashMap::new();
+        let mut bodies = Vec::new();
         for record in esm.records() {
             let record = record?;
-            if record.is_deleted() || record.is_ignored() || !ObjectRecord::is_placeable(&record) {
+            if record.is_deleted() || record.is_ignored() {
                 continue;
+            }
+            // The three an actor is assembled from, none of which is placeable itself.
+            match &record.name().0 {
+                b"RACE" => {
+                    if let Some(race) = RaceRecord::parse(&record)? {
+                        races.insert(race.id.to_lowercase(), race);
+                    }
+                    continue;
+                }
+                b"BODY" => {
+                    if let Some(body) = BodyRecord::parse(&record)? {
+                        bodies.push(body);
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+            if !ObjectRecord::is_placeable(&record) {
+                continue;
+            }
+            if record.name() == npc_tag {
+                let npc = NpcRecord::parse(&record)?;
+                npcs.insert(npc.id.to_lowercase(), npc);
             }
             let object = ObjectRecord::parse(&record)?;
             let id = object.id.to_lowercase();
@@ -104,7 +162,67 @@ impl ModelIndex {
                 lights.insert(id, light);
             }
         }
-        Ok(Self { models, lights })
+        Ok(Self {
+            models,
+            lights,
+            npcs,
+            races,
+            bodies,
+        })
+    }
+
+    /// How to build the person `object_id` names, or `None` where it names something else.
+    ///
+    /// **The skeleton is chosen by race and sex and the body is chosen by name.** A `BODY` record
+    /// carries no race field; the convention is its id — `b_n_dark elf_f_forearm` — and OpenMW
+    /// resolves it the same way, because there is nothing else to resolve it by.
+    pub fn actor_of(&self, object_id: &str) -> Option<ActorPlan> {
+        let npc = self.npcs.get(&object_id.to_lowercase())?;
+        let race = self.races.get(&npc.race)?;
+        let sex = if npc.female { "f" } else { "m" };
+        let prefix = format!("b_n_{}_{sex}_", npc.race);
+
+        let mut parts = Vec::new();
+        for part in BodyPart::ALL {
+            // The face and the hair are named by the record itself rather than found by race: they
+            // are what one dark elf has and the next does not.
+            let wanted = match part {
+                BodyPart::Head => self.body_named(&npc.head),
+                BodyPart::Hair => self.body_named(&npc.hair),
+                _ => self.bodies.iter().find(|body| {
+                    body.kind == BodyKind::Skin
+                        && body.part == part
+                        && body.female == npc.female
+                        && body.id.to_lowercase().starts_with(&prefix)
+                }),
+            };
+            if let Some(record) = wanted {
+                parts.extend(ActorPart::of(record));
+            }
+        }
+        Some(ActorPlan {
+            // **Beast races have a skeleton of their own** and only one of it: there is no female
+            // variant of `base_animkna.nif`, so the women of Argonia are animated as the men are.
+            skeleton: match (race.beast, npc.female) {
+                (true, _) => "meshes/base_animkna.nif",
+                (false, true) => "meshes/base_anim_female.nif",
+                (false, false) => "meshes/base_anim.nif",
+            },
+            parts,
+            // A multiplier over the whole body, which is what makes a Bosmer shorter than a Nord
+            // out of one skeleton.
+            height: match npc.female {
+                true => race.female_height,
+                false => race.male_height,
+            },
+            // What two of these sharing a body looks like: the same race, sex, face and hair.
+            shared_as: format!("{prefix}{}/{}", npc.head, npc.hair),
+        })
+    }
+
+    /// The body part record `id` names.
+    fn body_named(&self, id: &str) -> Option<&BodyRecord> {
+        self.bodies.iter().find(|body| body.id.to_lowercase() == id)
     }
 
     /// The light data for `object_id`, if the record is a `LIGH`.
@@ -256,9 +374,8 @@ impl StaticScene {
         let cell = Cell::parse(&record)?;
 
         let mut scene = Self::default();
-        let mut by_path = HashMap::new();
-        let mut by_rig = HashMap::new();
-        scene.append_cell(&record, models, vfs, &mut by_path, &mut by_rig, detail)?;
+        let mut seen = Interning::default();
+        scene.append_cell(&record, models, vfs, &mut seen, detail)?;
 
         if cell.is_interior() {
             scene.ambient = cell.ambient.map(Ambient::from_record);
@@ -369,8 +486,7 @@ impl StaticScene {
         record: &Record<'_>,
         models: &ModelIndex,
         vfs: &Vfs,
-        by_path: &mut HashMap<String, MeshId>,
-        by_rig: &mut HashMap<MeshId, RigId>,
+        seen: &mut Interning,
         detail: CellDetail,
     ) -> Result<()> {
         for cell_ref in Cell::references(record) {
@@ -382,12 +498,27 @@ impl StaticScene {
             if cell_ref.deleted || models.is_editor_marker(&cell_ref.object_id) {
                 continue;
             }
+            // **A person has no model to look up.** 2,772 of the 3,049 `NPC_` records carry none:
+            // the body is assembled from a base skeleton and the parts the race, the sex and the
+            // record itself name — see `ModelIndex::actor_of`.
+            //
+            // **And only where the cell is drawn in full.** A body is a dozen files to read and a
+            // skeleton to pose every frame, and one eight cells away is a handful of pixels — the
+            // same argument [`CellDetail`] already makes about a lamp a kilometre off.
+            if models.actor_of(&cell_ref.object_id).is_some() {
+                if detail == CellDetail::Full
+                    && let Some(plan) = models.actor_of(&cell_ref.object_id)
+                {
+                    self.place_actor(&plan, &cell_ref, vfs, &mut seen.actors);
+                }
+                continue;
+            }
             let Some(path) = models.model_of(&cell_ref.object_id) else {
                 self.without_model.push(cell_ref.object_id.clone());
                 continue;
             };
 
-            let mesh = match by_path.get(path) {
+            let mesh = match seen.paths.get(path) {
                 Some(&id) => id,
                 None => {
                     let bytes = vfs.read(path)?;
@@ -402,11 +533,11 @@ impl StaticScene {
                     // against the vertices as the walk left them.
                     if let Some(rig) = Rig::from_nif(&nif, id, mesh.positions.len(), &spans) {
                         self.rigs.push(rig);
-                        by_rig.insert(id, RigId(self.rigs.len() as u32 - 1));
+                        seen.rigs.insert(id, RigId(self.rigs.len() as u32 - 1));
                     }
                     self.meshes.push(mesh);
                     self.mesh_sources.push(path.to_owned());
-                    by_path.insert(path.to_owned(), id);
+                    seen.paths.insert(path.to_owned(), id);
                     id
                 }
             };
@@ -433,7 +564,9 @@ impl StaticScene {
                 mesh,
                 transform: world_transform(&cell_ref),
             };
-            match by_rig.get(&mesh) {
+            // A banner in a cell drawn at distance is placed like anything else, but not posed:
+            // what it costs a frame is out of proportion to a wave nobody can see.
+            match seen.rigs.get(&mesh).filter(|_| detail == CellDetail::Full) {
                 Some(&rig) => self.deforming.push(DeformingInstance {
                     instance,
                     rig,
@@ -445,6 +578,50 @@ impl StaticScene {
             }
         }
         Ok(())
+    }
+
+    /// Assembles the body `plan` describes, or reuses one already built, and places it.
+    ///
+    /// **Cached on what makes two people the same body**: their race, sex, face and hair. A crowd
+    /// is mostly the same handful of bodies wearing different names, and assembling one is a dozen
+    /// files read and flattened.
+    ///
+    /// A body that will not assemble leaves nothing behind rather than failing the cell: the
+    /// shipped data names art that was removed, and a missing person is not a missing cell.
+    fn place_actor(
+        &mut self,
+        plan: &ActorPlan,
+        cell_ref: &CellRef,
+        vfs: &Vfs,
+        by_actor: &mut HashMap<String, Option<RigId>>,
+    ) {
+        let rig = match by_actor.get(&plan.shared_as) {
+            Some(&known) => known,
+            None => {
+                let built =
+                    AssembledActor::assemble(vfs, plan.skeleton, &plan.parts, &mut self.materials)
+                        .filter(|actor| !actor.mesh.is_empty())
+                        .map(|actor| {
+                            let mesh = MeshId(self.meshes.len() as u32);
+                            self.meshes.push(actor.mesh);
+                            self.mesh_sources.push(plan.shared_as.clone());
+                            self.rigs.push(Rig { mesh, ..actor.rig });
+                            RigId(self.rigs.len() as u32 - 1)
+                        });
+                by_actor.insert(plan.shared_as.clone(), built);
+                built
+            }
+        };
+        let Some(rig) = rig else { return };
+        self.deforming.push(DeformingInstance {
+            instance: Instance {
+                mesh: self.rigs[rig.0 as usize].mesh,
+                transform: world_transform(cell_ref)
+                    * Affine3A::from_scale(Vec3::splat(plan.height)),
+            },
+            rig,
+            phase: 0.0,
+        });
     }
 
     /// Triangles across every instance, counting each placement separately.
@@ -1103,6 +1280,9 @@ mod tests {
                 .map(|(id, path)| (id.to_lowercase(), (*path).to_owned()))
                 .collect(),
             lights: HashMap::new(),
+            npcs: HashMap::new(),
+            races: HashMap::new(),
+            bodies: Vec::new(),
         }
     }
 
