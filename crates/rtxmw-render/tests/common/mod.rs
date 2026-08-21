@@ -58,6 +58,7 @@ pub(crate) fn scene_of(
         meshes: meshes.to_vec(),
         instances: instances.to_vec(),
         deforming: Vec::new(),
+        rigs: Vec::new(),
         materials: table,
         lights: lights.to_vec(),
         ambient: Some(Ambient {

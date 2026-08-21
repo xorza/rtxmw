@@ -15,6 +15,7 @@ use crate::light::{Ambient, Light};
 use crate::material::{self, Material, MaterialKind, TerrainLayers, TextureId};
 use crate::material_table::MaterialTable;
 use crate::mesh::{Bounds, Mesh, TERRAIN_QUADRANTS};
+use crate::rig::Rig;
 use crate::srgb;
 use crate::sun::Sun;
 
@@ -37,6 +38,10 @@ const DEFAULT_TERRAIN_TEXTURE: &str = "_land_default.dds";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MeshId(pub u32);
 
+/// Index of a rig within [`StaticScene::rigs`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RigId(pub u32);
+
 /// One placed copy of a mesh.
 #[derive(Debug, Clone, Copy)]
 pub struct Instance {
@@ -54,6 +59,8 @@ pub struct Instance {
 #[derive(Debug, Clone, Copy)]
 pub struct DeformingInstance {
     pub instance: Instance,
+    /// Which of [`StaticScene::rigs`] poses it.
+    pub rig: RigId,
     /// How far into its own cycle this placement stands, in seconds.
     ///
     /// A row of banners on one wall are the same mesh under the same wind and would otherwise move
@@ -202,9 +209,10 @@ pub struct StaticScene {
     /// of by a file, because a heightmap belongs to exactly one.
     pub mesh_sources: Vec<String>,
     pub instances: Vec<Instance>,
-    /// Placements whose vertices move — see [`DeformingInstance`]. Empty for a cell that has none,
-    /// which today is every cell.
+    /// Placements whose vertices move — see [`DeformingInstance`].
     pub deforming: Vec<DeformingInstance>,
+    /// The skeletons those placements are posed through, indexed by [`RigId`].
+    pub rigs: Vec<Rig>,
     /// Every distinct material and texture the cell's meshes name, shared across all of them.
     pub materials: MaterialTable,
     /// Point lights placed in the cell, in world space.
@@ -249,7 +257,8 @@ impl StaticScene {
 
         let mut scene = Self::default();
         let mut by_path = HashMap::new();
-        scene.append_cell(&record, models, vfs, &mut by_path, detail)?;
+        let mut by_rig = HashMap::new();
+        scene.append_cell(&record, models, vfs, &mut by_path, &mut by_rig, detail)?;
 
         if cell.is_interior() {
             scene.ambient = cell.ambient.map(Ambient::from_record);
@@ -361,6 +370,7 @@ impl StaticScene {
         models: &ModelIndex,
         vfs: &Vfs,
         by_path: &mut HashMap<String, MeshId>,
+        by_rig: &mut HashMap<MeshId, RigId>,
         detail: CellDetail,
     ) -> Result<()> {
         for cell_ref in Cell::references(record) {
@@ -386,7 +396,14 @@ impl StaticScene {
                         source,
                     })?;
                     let id = MeshId(self.meshes.len() as u32);
-                    let mesh = Mesh::from_nif(&nif, &mut self.materials);
+                    let mut spans = Vec::new();
+                    let mesh = Mesh::from_nif_tracked(&nif, &mut self.materials, &mut spans);
+                    // **Before the mesh is moved into the scene**, because a rig is described
+                    // against the vertices as the walk left them.
+                    if let Some(rig) = Rig::from_nif(&nif, id, mesh.positions.len(), &spans) {
+                        self.rigs.push(rig);
+                        by_rig.insert(id, RigId(self.rigs.len() as u32 - 1));
+                    }
                     self.meshes.push(mesh);
                     self.mesh_sources.push(path.to_owned());
                     by_path.insert(path.to_owned(), id);
@@ -412,10 +429,20 @@ impl StaticScene {
             if self.meshes[mesh.0 as usize].is_empty() {
                 continue;
             }
-            self.instances.push(Instance {
+            let instance = Instance {
                 mesh,
                 transform: world_transform(&cell_ref),
-            });
+            };
+            match by_rig.get(&mesh) {
+                Some(&rig) => self.deforming.push(DeformingInstance {
+                    instance,
+                    rig,
+                    // Vanilla moves every copy of a banner together, and it looks like weather
+                    // rather than like a fault; a clip offset per placement waits for actors.
+                    phase: 0.0,
+                }),
+                None => self.instances.push(instance),
+            }
         }
         Ok(())
     }

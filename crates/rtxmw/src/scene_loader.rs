@@ -156,10 +156,11 @@ pub(crate) fn cell_named(argument: &str) -> CellId {
 pub(crate) fn describe(cell: &LoadedCell) -> String {
     let missing = cell.missing_textures();
     format!(
-        "{}: {} meshes, {} instances, {} lights, {} textures ({missing} missing)",
+        "{}: {} meshes, {} instances ({} animated), {} lights, {} textures ({missing} missing)",
         cell.id,
         cell.scene.meshes.len(),
-        cell.scene.instances.len(),
+        cell.scene.instances.len() + cell.scene.deforming.len(),
+        cell.scene.deforming.len(),
         cell.scene.lights.len(),
         cell.textures.len(),
     )

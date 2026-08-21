@@ -5,8 +5,8 @@ pub mod shaders;
 mod acceleration_structure;
 mod auto_exposure;
 mod composite;
-mod deform_pass;
 mod denoiser;
+mod skin_pass;
 // The feature requires NVIDIA's NGX SDK on disk; `build.rs` says so if it is not.
 #[cfg(feature = "dlss")]
 pub mod dlss;

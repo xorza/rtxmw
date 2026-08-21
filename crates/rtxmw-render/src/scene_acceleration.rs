@@ -180,45 +180,29 @@ impl SceneAcceleration {
         set: Deformable,
     ) -> rtxmw_gpu::Result<()> {
         let Deformable { slots, refit } = set;
-        assert!(
-            self.deforming.is_none(),
-            "a second deforming set would need its own scratch; there is one set today"
-        );
         assert_eq!(
             self.by_mesh.len() as u32,
             slots.start,
             "deforming slots must follow the meshes already registered"
         );
-        let loader = &self.loader;
         let described = describe_geometry(geometry, materials, slots.clone());
-
-        let first = self.blas.len() as u32;
-        let mut scratch_offsets = Vec::with_capacity(described.spans.len());
-        let mut scratch_total = 0;
-        for (index, span) in described.spans.iter().enumerate() {
+        for span in &described.spans {
             let sizes = build_sizes(
-                loader,
+                &self.loader,
                 vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL,
                 refit_flags(refit),
                 &described.geometries[span.start as usize..span.end as usize],
                 &described.primitive_counts[span.start as usize..span.end as usize],
             );
+            self.by_mesh.push(self.blas.len() as u32);
+            self.is_water.push(false);
             self.blas.push(AccelerationStructure::create(
                 uploader.memory(),
-                loader,
+                &self.loader,
                 "deforming blas",
                 sizes.acceleration_structure_size,
                 vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL,
             )?);
-            self.by_mesh.push(first + index as u32);
-            self.is_water.push(false);
-            scratch_offsets.push(scratch_total);
-            // The larger of the two: the set can be rebuilt as well as refitted — the first frame
-            // has to be — and a region sized for an update is not enough for a build.
-            scratch_total += align_up(
-                sizes.build_scratch_size.max(sizes.update_scratch_size),
-                limits.min_scratch_offset_alignment as vk::DeviceSize,
-            );
         }
         assert_eq!(
             self.by_mesh.len() as u32,
@@ -226,25 +210,42 @@ impl SceneAcceleration {
             "every reserved slot must have got a structure; one that flattened to nothing did not"
         );
 
-        let scratch = Buffer::with_alignment(
-            uploader.memory(),
-            "deforming blas scratch",
-            scratch_total.max(1),
-            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
-            BufferMemory::Device,
-            limits.min_scratch_offset_alignment as vk::DeviceSize,
-        )?;
-        self.deforming = Some(Deforming {
-            slots,
-            first,
-            geometries: described.geometries,
-            ranges: described.ranges,
-            spans: described.spans,
-            scratch,
-            scratch_offsets,
-            refit,
-            built: false,
-        });
+        if self.deforming.is_none() {
+            self.deforming = Some(Deforming {
+                slots: Vec::new(),
+                structures: Vec::new(),
+                geometries: Vec::new(),
+                ranges: Vec::new(),
+                spans: Vec::new(),
+                // Replaced by `resize_scratch` below, once there is something to size it against.
+                scratch: Buffer::with_alignment(
+                    uploader.memory(),
+                    "deforming blas scratch",
+                    1,
+                    vk::BufferUsageFlags::STORAGE_BUFFER
+                        | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+                    BufferMemory::Device,
+                    limits.min_scratch_offset_alignment as vk::DeviceSize,
+                )?,
+                scratch_offsets: Vec::new(),
+                refit,
+                built: false,
+            });
+        }
+        let deforming = self
+            .deforming
+            .as_mut()
+            .expect("just inserted if it was absent");
+        assert_eq!(
+            deforming.refit, refit,
+            "the whole set is refitted or none of it is; the structures are sized for the choice"
+        );
+        deforming.slots.push(slots);
+        deforming
+            .structures
+            .extend((self.blas.len() - described.spans.len()) as u32..self.blas.len() as u32);
+        deforming.absorb(described);
+        deforming.resize_scratch(uploader, limits, &self.loader)?;
         Ok(())
     }
 
@@ -259,10 +260,15 @@ impl SceneAcceleration {
         let Some(deforming) = &mut self.deforming else {
             return;
         };
-        let described = describe_geometry(geometry, materials, deforming.slots.clone());
-        deforming.geometries = described.geometries;
-        deforming.ranges = described.ranges;
-        deforming.spans = described.spans;
+        let slots = std::mem::take(&mut deforming.slots);
+        deforming.geometries.clear();
+        deforming.ranges.clear();
+        deforming.spans.clear();
+        for range in &slots {
+            let described = describe_geometry(geometry, materials, range.clone());
+            deforming.absorb(described);
+        }
+        deforming.slots = slots;
         // A rebuilt buffer is a different source, so an update against the last pose is no longer
         // meaningful — the next frame builds from scratch whatever mode it is in.
         deforming.built = false;
@@ -311,7 +317,7 @@ impl SceneAcceleration {
                 .iter()
                 .enumerate()
                 .map(|(index, span)| {
-                    let structure = self.blas[deforming.first as usize + index].raw();
+                    let structure = self.blas[deforming.structures[index] as usize].raw();
                     vk::AccelerationStructureBuildGeometryInfoKHR::default()
                         .ty(vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL)
                         .flags(refit_flags(deforming.refit))
@@ -385,7 +391,8 @@ impl SceneAcceleration {
         let info = vk::AccelerationStructureBuildGeometryInfoKHR::default()
             .ty(vk::AccelerationStructureTypeKHR::TOP_LEVEL)
             .flags(tlas_flags())
-            .mode(vk::BuildAccelerationStructureModeKHR::BUILD)
+            .mode(vk::BuildAccelerationStructureModeKHR::UPDATE)
+            .src_acceleration_structure(self.tlas.raw())
             .dst_acceleration_structure(self.tlas.raw())
             .geometries(&geometries)
             .scratch_data(vk::DeviceOrHostAddressKHR {
@@ -472,10 +479,12 @@ pub struct Deformable {
 /// build call and a single scratch allocation however many placements are in it.
 #[derive(Debug)]
 struct Deforming {
-    /// Mesh slots these were reserved for, which is also where their descriptions come from.
-    slots: std::ops::Range<u32>,
-    /// Where in `SceneAcceleration::blas` the first of these structures sits; they are contiguous.
-    first: u32,
+    /// The mesh slots each cell reserved, in the order they were registered. One range per cell
+    /// rather than one overall: a cell arriving between two of them appends static meshes, so the
+    /// slots a second cell reserves do not follow the first's.
+    slots: Vec<std::ops::Range<u32>>,
+    /// Where in `SceneAcceleration::blas` each of these structures sits, parallel to `spans`.
+    structures: Vec<u32>,
     /// Kept in one flat vector rather than one per structure: every build info points into it, so
     /// it must not move while the infos are alive.
     geometries: Vec<vk::AccelerationStructureGeometryKHR<'static>>,
@@ -488,6 +497,64 @@ struct Deforming {
     refit: bool,
     /// Whether anything has been built into them yet. An update has to have something to update.
     built: bool,
+}
+
+impl Deforming {
+    /// Appends one batch's descriptions, rebasing its spans onto what is already here.
+    fn absorb(&mut self, described: Described) {
+        let base = self.geometries.len() as u32;
+        self.geometries.extend(described.geometries);
+        self.ranges.extend(described.ranges);
+        self.spans.extend(
+            described
+                .spans
+                .into_iter()
+                .map(|span| base + span.start..base + span.end),
+        );
+    }
+
+    /// Sizes the one scratch buffer the whole set builds through.
+    ///
+    /// Reallocated rather than grown: the offsets are recomputed from the sizes anyway, and a cell
+    /// arriving is not a frame path.
+    fn resize_scratch(
+        &mut self,
+        uploader: &mut Uploader,
+        limits: RayTracingLimits,
+        loader: &ash::khr::acceleration_structure::Device,
+    ) -> rtxmw_gpu::Result<()> {
+        self.scratch_offsets.clear();
+        let mut total = 0;
+        for span in &self.spans {
+            let sizes = build_sizes(
+                loader,
+                vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL,
+                refit_flags(self.refit),
+                &self.geometries[span.start as usize..span.end as usize],
+                // Every geometry's primitive count is on the range info beside it.
+                &self.ranges[span.start as usize..span.end as usize]
+                    .iter()
+                    .map(|range| range.primitive_count)
+                    .collect::<Vec<_>>(),
+            );
+            self.scratch_offsets.push(total);
+            // The larger of the two: the set can be rebuilt as well as refitted — the first frame
+            // has to be — and a region sized for an update is not enough for a build.
+            total += align_up(
+                sizes.build_scratch_size.max(sizes.update_scratch_size),
+                limits.min_scratch_offset_alignment as vk::DeviceSize,
+            );
+        }
+        self.scratch = Buffer::with_alignment(
+            uploader.memory(),
+            "deforming blas scratch",
+            total.max(1),
+            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+            BufferMemory::Device,
+            limits.min_scratch_offset_alignment as vk::DeviceSize,
+        )?;
+        Ok(())
+    }
 }
 
 /// What a build reads, derived from a run of mesh slots.
@@ -798,14 +865,26 @@ fn geometry_flags(material: Material) -> vk::GeometryFlagsKHR {
 
 /// `PREFER_FAST_TRACE` because static scenery is built once and traversed forever; `ALLOW_COMPACTION`
 /// because the driver's conservative first estimate is routinely half again what the result needs.
+///
+/// This is the *static* set's; what moves is built with [`refit_flags`] instead.
 fn blas_flags() -> vk::BuildAccelerationStructureFlagsKHR {
     vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE
         | vk::BuildAccelerationStructureFlagsKHR::ALLOW_COMPACTION
 }
 
-/// Static scenery is traversed far more often than it is built, and nothing refits yet.
+/// Traversed far more often than it is built — and, once anything moves, rebuilt every frame.
+///
+/// **`ALLOW_UPDATE`, because the frame's rebuild is an update in everything but name.** The instance
+/// records do not change between frames; what makes a new build necessary is the bounds of the
+/// bottom levels underneath them, which is the case an update exists for. Over an exterior's worth
+/// of statics that is 0.34 ms against 0.60, and the traversal does not notice — 2.42 ms against
+/// 2.44, inside the run-to-run spread. See `docs/design.md` §8.92.
+///
+/// An update always has a build to update: `SceneAcceleration::new` leaves one and every commit
+/// replaces it, and neither is a frame.
 fn tlas_flags() -> vk::BuildAccelerationStructureFlagsKHR {
     vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE
+        | vk::BuildAccelerationStructureFlagsKHR::ALLOW_UPDATE
 }
 
 /// Copies every structure down to the size measured during its build.
@@ -967,7 +1046,10 @@ fn build_top_level(
     let scratch = Buffer::with_alignment(
         uploader.memory(),
         "tlas build scratch",
-        sizes.build_scratch_size.max(1),
+        sizes
+            .build_scratch_size
+            .max(sizes.update_scratch_size)
+            .max(1),
         vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
         BufferMemory::Device,
         limits.min_scratch_offset_alignment as vk::DeviceSize,

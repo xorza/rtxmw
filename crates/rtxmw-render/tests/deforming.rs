@@ -15,7 +15,8 @@ use glam::{Affine3A, Vec2, Vec3};
 use rtxmw_gpu::{TestGpu, readback};
 use rtxmw_render::SceneRenderer;
 use rtxmw_scene::{
-    CellId, DeformingInstance, Instance, Material, Mesh, MeshId, StaticScene, Submesh, Sun,
+    Bone, CellId, Channel, DeformingInstance, INFLUENCES, Influence, Instance, Material, Mesh,
+    MeshId, NO_PARENT, Rig, RigId, StaticScene, Submesh, Sun,
 };
 
 mod common;
@@ -78,6 +79,63 @@ fn lattice() -> Mesh {
     }
 }
 
+/// A rig that bends the lattice: one joint held still, one that swings, blended across its width.
+///
+/// **A skinned bend rather than a rigid turn**, so the measurement is of the thing the milestone is
+/// about: every vertex reads four influences, blends four matrices and lands somewhere its
+/// neighbour did not.
+fn bend() -> Rig {
+    let turn = |time: f32, degrees: f32| {
+        let half = degrees.to_radians() / 2.0;
+        // Stored `w` first, and about `+Z` — across the lattice's own plane, so the normals turn
+        // with it and the shading has something to see.
+        rtxmw_scene::QuaternionKey {
+            time,
+            value: [half.cos(), 0.0, 0.0, half.sin()],
+        }
+    };
+    let mut influences = Vec::with_capacity((ROWS as usize + 1) * (COLUMNS as usize + 1));
+    for _ in 0..=ROWS {
+        for column in 0..=COLUMNS {
+            let along = column as f32 / COLUMNS as f32;
+            let mut influence = Influence::default();
+            influence.bones[0] = 0;
+            influence.bones[1] = 1;
+            influence.weights[0] = 1.0 - along;
+            influence.weights[1] = along;
+            influences.push(influence);
+        }
+    }
+    assert_eq!(
+        INFLUENCES, 4,
+        "the fixture leaves two slots empty on purpose"
+    );
+    Rig {
+        mesh: MeshId(0),
+        parents: vec![NO_PARENT, NO_PARENT],
+        rest: vec![Affine3A::IDENTITY, Affine3A::IDENTITY],
+        channels: vec![
+            Channel::default(),
+            Channel {
+                rotations: vec![turn(0.0, 0.0), turn(1.0, 40.0), turn(2.0, 0.0)],
+                ..Channel::default()
+            },
+        ],
+        bones: vec![
+            Bone {
+                joint: 0,
+                inverse_bind: Affine3A::IDENTITY,
+            },
+            Bone {
+                joint: 1,
+                inverse_bind: Affine3A::IDENTITY,
+            },
+        ],
+        influences,
+        duration: 2.0,
+    }
+}
+
 /// `PLACEMENTS` copies of it in a grid, every one deforming out of step with its neighbours.
 ///
 /// Lit by a sun rather than by ambient alone, because ambient is what a surface receives regardless
@@ -119,9 +177,11 @@ fn scene(deforming: bool) -> StaticScene {
                 .enumerate()
                 .map(|(index, instance)| DeformingInstance {
                     instance,
+                    rig: RigId(0),
                     phase: index as f32 * 0.37,
                 })
                 .collect();
+            scene.rigs = vec![bend()];
         }
         false => scene.instances = placed,
     }

@@ -48,9 +48,9 @@ pub fn composite() -> &'static [u32] {
     include_spirv!("composite.comp")
 }
 
-/// Rewrites a deforming placement's vertices, ahead of the build over them.
-pub fn deform() -> &'static [u32] {
-    include_spirv!("deform.comp")
+/// Poses a deforming placement's vertices against its skeleton, ahead of the build over them.
+pub fn skin() -> &'static [u32] {
+    include_spirv!("skin.comp")
 }
 
 /// Exposure, tone curve and sRGB encoding, from linear radiance to display bytes.

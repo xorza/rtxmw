@@ -6,10 +6,11 @@
 
 use crate::cursor::{Cursor, Link};
 use crate::error::{NifError, Result};
+use crate::keyframe_data::KeyframeData;
 use crate::nif_file::version;
-
-/// Bytes a stored transform occupies: a 3x3 rotation, a translation and a uniform scale.
-const TRANSFORM_BYTES: usize = 36 + 12 + 4;
+use crate::skin_data::SkinData;
+use crate::skin_instance::SkinInstance;
+use crate::time_controller::{ControllerKind, TimeController};
 
 /// Bytes a bounding sphere occupies: a centre and a radius.
 const BOUNDING_SPHERE_BYTES: usize = 16;
@@ -407,6 +408,14 @@ pub enum Block {
     Material(MaterialProperty),
     Alpha(AlphaProperty),
     SourceTexture(SourceTexture),
+    Controller(TimeController),
+    Keyframe(KeyframeData),
+    Skin(SkinInstance),
+    SkinData(SkinData),
+    /// A named string hung off a node — in a `.kf` file, the name of the node a controller drives.
+    StringExtra(String),
+    /// A `.kf` file's root, whose two chains are the whole of the animation it carries.
+    Sequence(ObjectNet),
     /// Parsed correctly, but carries nothing a renderer needs.
     ///
     /// The name is a `&'static str` rather than nothing: it allocates nothing and it is what makes
@@ -551,9 +560,15 @@ impl Block {
             | "NiFlipController"
             | "NiMaterialColorController"
             | "NiRollController" => {
-                read_time_controller(cursor)?;
-                cursor.skip(4)?; // Data block.
-                Self::Other { kind: "controller" }
+                let controller = match kind {
+                    "NiKeyframeController" => ControllerKind::Keyframe,
+                    "NiVisController" => ControllerKind::Visibility,
+                    "NiAlphaController" => ControllerKind::Alpha,
+                    "NiFlipController" => ControllerKind::Flip,
+                    "NiMaterialColorController" => ControllerKind::MaterialColour,
+                    _ => ControllerKind::Roll,
+                };
+                Self::Controller(TimeController::read(cursor, controller)?)
             }
             "NiUVController" => {
                 read_time_controller(cursor)?;
@@ -571,15 +586,7 @@ impl Block {
                     kind: "NiGeomMorpherController",
                 }
             }
-            "NiSkinInstance" => {
-                cursor.skip(4)?; // Skin data.
-                cursor.skip(4)?; // Skeleton root.
-                let bones = cursor.u32()? as usize;
-                cursor.skip(bones * 4)?;
-                Self::Other {
-                    kind: "NiSkinInstance",
-                }
-            }
+            "NiSkinInstance" => Self::Skin(SkinInstance::read(cursor)?),
             "NiTextureEffect" => {
                 let _av = AvObject::read(cursor, ver)?;
                 // NiDynamicEffect's affected-node list.
@@ -633,21 +640,7 @@ impl Block {
                 }
                 Self::GeometryData(data)
             }
-            "NiKeyframeData" => {
-                // Rotations are quaternions, which carry no tangents.
-                let rotation_interpolation = read_key_list(cursor, 16, false, false)?;
-                if rotation_interpolation == interpolation::XYZ {
-                    cursor.skip(4)?; // Axis order.
-                    for _ in 0..3 {
-                        read_key_list(cursor, 4, true, false)?;
-                    }
-                }
-                read_key_list(cursor, 12, true, false)?; // Translations.
-                read_key_list(cursor, 4, true, false)?; // Scales.
-                Self::Other {
-                    kind: "NiKeyframeData",
-                }
-            }
+            "NiKeyframeData" => Self::Keyframe(KeyframeData::read(cursor)?),
             "NiFloatData" => {
                 read_key_list(cursor, 4, true, false)?;
                 Self::Other {
@@ -684,18 +677,7 @@ impl Block {
                     kind: "NiMorphData",
                 }
             }
-            "NiSkinData" => {
-                cursor.skip(TRANSFORM_BYTES)?; // Overall skin transform.
-                let bones = cursor.u32()? as usize;
-                cursor.skip(4)?; // Skin partition link.
-                for _ in 0..bones {
-                    cursor.skip(TRANSFORM_BYTES)?; // Bone transform.
-                    cursor.skip(BOUNDING_SPHERE_BYTES)?; // Bone bounding sphere.
-                    let weights = cursor.u16()? as usize;
-                    cursor.skip(weights * 6)?; // Vertex index and weight per entry.
-                }
-                Self::Other { kind: "NiSkinData" }
-            }
+            "NiSkinData" => Self::SkinData(SkinData::read(cursor)?),
             // `NiBSPArrayController` is the same record under a different name.
             "NiParticleSystemController" | "NiBSPArrayController" => {
                 read_time_controller(cursor)?;
@@ -785,13 +767,15 @@ impl Block {
                 }
             }
             "NiStringExtraData" => {
+                // The next block in the chain, which nothing follows: a `.kf` file's strings are
+                // walked from the sequence helper's own extra-data link in order.
                 let _next = cursor.link()?;
                 cursor.skip(4)?; // Byte count, recomputed from the string itself.
-                let _value = cursor.string()?;
-                Self::Other {
-                    kind: "NiStringExtraData",
-                }
+                Self::StringExtra(cursor.string()?)
             }
+            // A `.kf` file's root. Everything it holds hangs off the `ObjectNet` links it carries:
+            // the strings naming targets on one, the controllers driving them on the other.
+            "NiSequenceStreamHelper" => Self::Sequence(ObjectNet::read(cursor, ver)?),
             "NiTextKeyExtraData" => {
                 let _next = cursor.link()?;
                 cursor.skip(4)?;

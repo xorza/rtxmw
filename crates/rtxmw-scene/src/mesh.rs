@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use glam::{Mat3, Vec2, Vec3};
+use glam::{Affine3A, Mat3, Vec2, Vec3};
 use rtxmw_esm::{CELL_SIZE, GRID, LandRecord, SPACING, TEXTURE_GRID};
 use rtxmw_nif::{Block, GeometryData, Link, NifFile, Transform};
 
@@ -92,6 +92,30 @@ impl Submesh {
     pub fn triangle_count(&self) -> usize {
         self.index_count as usize / 3
     }
+}
+
+/// Where one geometry block's vertices landed in the flattened mesh.
+///
+/// Recorded only by [`Mesh::from_nif_tracked`], for a caller that has to bind something per block
+/// to a mesh that no longer has blocks in it.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct GeometrySpan {
+    /// The `NiTriShape` or `NiTriStrips` this came from.
+    pub(crate) block: Link,
+    /// Its `NiSkinInstance`, or none where the block is not skinned.
+    pub(crate) skin: Link,
+    pub(crate) first_vertex: u32,
+    pub(crate) vertex_count: u32,
+    /// What was baked into those vertices on the way in.
+    pub(crate) placement: Affine3A,
+}
+
+/// What a walk of the graph carries along with it, so the recursion stays under an argument count.
+#[derive(Debug)]
+struct Walk<'a> {
+    nif: &'a NifFile,
+    materials: &'a mut MaterialTable,
+    spans: &'a mut Vec<GeometrySpan>,
 }
 
 impl Mesh {
@@ -345,14 +369,33 @@ impl Mesh {
     /// The table is shared across the whole scene rather than per model, so the indices in
     /// [`Submesh::material`] are already the ones the GPU will use.
     pub fn from_nif(nif: &NifFile, materials: &mut MaterialTable) -> Self {
+        Self::from_nif_tracked(nif, materials, &mut Vec::new())
+    }
+
+    /// As [`Mesh::from_nif`], recording where each geometry block landed.
+    ///
+    /// **What binds a rig to the mesh it poses.** Skinning weights are per vertex *of a geometry
+    /// block*, and the flattening puts every block's vertices somewhere in one array; without the
+    /// spans a rig would have to replay this walk to find them, and two walks that must agree are
+    /// two walks that will not.
+    pub(crate) fn from_nif_tracked(
+        nif: &NifFile,
+        materials: &mut MaterialTable,
+        spans: &mut Vec<GeometrySpan>,
+    ) -> Self {
         let mut mesh = Self::default();
+        spans.clear();
+        let mut walk = Walk {
+            nif,
+            materials,
+            spans,
+        };
         for &root in nif.roots() {
             mesh.visit(
-                nif,
+                &mut walk,
                 root,
                 Placement::IDENTITY,
                 Properties::default(),
-                materials,
                 0,
             );
         }
@@ -392,18 +435,17 @@ impl Mesh {
     /// block to reference any other, and nothing in it forbids a loop.
     fn visit(
         &mut self,
-        nif: &NifFile,
+        walk: &mut Walk<'_>,
         link: Link,
         parent: Placement,
         inherited: Properties,
-        materials: &mut MaterialTable,
         depth: u32,
     ) {
         const MAX_DEPTH: u32 = 64;
         if depth > MAX_DEPTH {
             return;
         }
-        let Some(block) = nif.resolve(link) else {
+        let Some(block) = walk.nif.resolve(link) else {
             return;
         };
 
@@ -413,22 +455,33 @@ impl Mesh {
                     return;
                 }
                 let here = parent.then(&node.av.transform);
-                let properties = inherited.overridden_by(nif, &node.av.properties);
+                let properties = inherited.overridden_by(walk.nif, &node.av.properties);
                 for &child in &node.children {
-                    self.visit(nif, child, here, properties, materials, depth + 1);
+                    self.visit(walk, child, here, properties, depth + 1);
                 }
             }
             Block::Geometry(geometry) => {
                 if is_skippable(&geometry.av.net.name) || geometry.av.is_hidden() {
                     return;
                 }
-                let Some(Block::GeometryData(data)) = nif.resolve(geometry.data) else {
+                let Some(Block::GeometryData(data)) = walk.nif.resolve(geometry.data) else {
                     return;
                 };
-                let properties = inherited.overridden_by(nif, &geometry.av.properties);
-                let resolved = properties.resolve(nif, materials);
-                let material = materials.intern(resolved);
-                self.append(data, parent.then(&geometry.av.transform), material);
+                let properties = inherited.overridden_by(walk.nif, &geometry.av.properties);
+                let resolved = properties.resolve(walk.nif, walk.materials);
+                let material = walk.materials.intern(resolved);
+                let placement = parent.then(&geometry.av.transform);
+                let first_vertex = self.positions.len() as u32;
+                self.append(data, placement, material);
+                if self.positions.len() as u32 != first_vertex {
+                    walk.spans.push(GeometrySpan {
+                        block: link,
+                        skin: geometry.skin,
+                        first_vertex,
+                        vertex_count: self.positions.len() as u32 - first_vertex,
+                        placement: placement.to_affine(),
+                    });
+                }
             }
             _ => {}
         }
@@ -545,6 +598,11 @@ impl Placement {
         linear: Mat3::IDENTITY,
         translation: Vec3::ZERO,
     };
+
+    /// The same placement as an affine, for a caller that has to invert it.
+    fn to_affine(self) -> Affine3A {
+        Affine3A::from_mat3_translation(self.linear, self.translation)
+    }
 
     /// Composes `local` onto this placement, parent-first.
     fn then(&self, local: &Transform) -> Self {

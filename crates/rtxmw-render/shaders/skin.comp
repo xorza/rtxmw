@@ -1,0 +1,106 @@
+#version 460
+#extension GL_EXT_scalar_block_layout : require
+
+// Poses one placement's vertices against its skeleton, ahead of the build over them.
+//
+// **The vertices a NIF stores are in skin space and are not what the model looks like.** A banner is
+// authored flat in the xy plane and stood upright by its bind transforms; nothing in the game that
+// carries a skeleton is drawn correctly until this has run. `docs/design.md` M12 is the milestone.
+//
+// Source and destination are the same two buffers at different offsets: a deforming placement takes
+// a slice of the shared streams of its own — see `GeometryBuffers::reserve_deformed` — so the bind
+// pose stays where it was uploaded and nothing else in the renderer learns a new address.
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, scalar) buffer Positions {
+    float positions[];
+};
+
+struct Attributes {
+    vec3 normal;
+    vec2 uv;
+};
+
+layout(set = 0, binding = 1, scalar) buffer VertexAttributes {
+    Attributes attributes[];
+};
+
+// Which bones move a vertex and by how much. Four of them, which covers all but two hundredths of
+// one percent of the vertices in the game — see `rtxmw_scene::INFLUENCES`.
+struct Influence {
+    // Four bone indices, a byte apiece: a skin names at most sixty-four bones.
+    uint bones;
+    float weights[4];
+};
+
+layout(set = 0, binding = 2, scalar) readonly buffer Influences {
+    Influence influences[];
+};
+
+// One bone's pose, mesh space to mesh space, as three rows of an affine transform.
+struct BoneMatrix {
+    vec4 rows[3];
+};
+
+layout(set = 0, binding = 3, scalar) readonly buffer Bones {
+    BoneMatrix bones[];
+};
+
+layout(push_constant, scalar) uniform Push {
+    // First vertex of the pose being read, and of the region being written.
+    uint source;
+    uint destination;
+    uint count;
+    // Where this placement's influences and bone matrices start.
+    uint influence_base;
+    uint bone_base;
+} push;
+
+vec3 position_at(uint vertex) {
+    uint base = vertex * 3u;
+    return vec3(positions[base], positions[base + 1u], positions[base + 2u]);
+}
+
+void store_position(uint vertex, vec3 value) {
+    uint base = vertex * 3u;
+    positions[base] = value.x;
+    positions[base + 1u] = value.y;
+    positions[base + 2u] = value.z;
+}
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= push.count) {
+        return;
+    }
+    vec3 pose = position_at(push.source + index);
+    Attributes shading = attributes[push.source + index];
+    Influence influence = influences[push.influence_base + index];
+
+    // **The blend is of the matrices, not of the results.** Blending four transformed positions is
+    // the same thing for a position and not for a normal, and one matrix at the end is three
+    // dot products against a normal instead of twelve.
+    vec4 rows[3] = vec4[3](vec4(0.0), vec4(0.0), vec4(0.0));
+    for (uint slot = 0u; slot < 4u; ++slot) {
+        float weight = influence.weights[slot];
+        if (weight == 0.0) {
+            continue;
+        }
+        BoneMatrix bone = bones[push.bone_base + ((influence.bones >> (slot * 8u)) & 0xFFu)];
+        rows[0] += weight * bone.rows[0];
+        rows[1] += weight * bone.rows[1];
+        rows[2] += weight * bone.rows[2];
+    }
+
+    vec4 point = vec4(pose, 1.0);
+    vec3 moved = vec3(dot(rows[0], point), dot(rows[1], point), dot(rows[2], point));
+    // The linear part alone carries the normal. Morrowind scales uniformly, so the plain matrix is
+    // right here for the same reason it is at a hit — an inverse transpose would only renormalise.
+    vec3 normal = vec3(dot(rows[0].xyz, shading.normal),
+                       dot(rows[1].xyz, shading.normal),
+                       dot(rows[2].xyz, shading.normal));
+
+    store_position(push.destination + index, moved);
+    attributes[push.destination + index] = Attributes(normalize(normal), shading.uv);
+}

@@ -1,8 +1,12 @@
-//! Parses every NIF the game ships.
+//! Parses every NIF the game ships, and every animation beside them.
 //!
 //! This is the M2 done-condition. Blocks in this file version carry no size, so a parser that is
 //! wrong by a single field desyncs and the next block type reads as garbage — over thousands of
 //! meshes that is caught immediately. Skips when the game is not installed.
+//!
+//! A `.kf` is a NIF with a different root, so it goes through the same reader and belongs to the
+//! same assertion: its blocks are the ones a mesh's animation is made of, and a desync in one of
+//! them is exactly as quiet.
 
 use std::collections::BTreeMap;
 
@@ -18,7 +22,7 @@ fn every_shipped_mesh_parses() {
 
     let mut meshes: Vec<String> = vfs
         .paths()
-        .filter(|p| p.extension() == Some("nif"))
+        .filter(|p| matches!(p.extension(), Some("nif" | "kf")))
         .map(|p| p.as_str().to_owned())
         .collect();
     meshes.sort();
@@ -26,6 +30,11 @@ fn every_shipped_mesh_parses() {
         meshes.len() > 5_000,
         "expected thousands, found {}",
         meshes.len()
+    );
+    let clips = meshes.iter().filter(|p| p.ends_with(".kf")).count();
+    assert_eq!(
+        clips, 162,
+        "the shipped animations are 162 files; a different count is a different install"
     );
 
     let mut parsed = 0usize;

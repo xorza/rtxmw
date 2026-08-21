@@ -617,9 +617,11 @@ its sync2 stages are what the skinning-to-build and build-to-trace barriers want
    architecture the measurement forced is the useful half — per-instance vertex regions in the
    shared streams, a persistent scratch, a top level rebuilt in place so the descriptor survives,
    and scoped barriers rather than the load path's full one.
-2. **Banners.** `furn_de_banner_pawn_01.nif` is six nodes, twenty vertices, one skin and three
-   keyframe controllers — the entire pipeline at a scale where every intermediate can be checked by
-   hand, and 160 of them are already placed in the world.
+2. **Banners — done.** §8.92. `furn_de_banner_pawn_01.nif` is six nodes, twenty vertices, one skin
+   and three keyframe controllers, and the whole path behind it is now real: `.kf` and inline
+   animation parse, a rig is built from the node graph, a compute pass skins into the placement's
+   own vertex region, and the structures over it are built inside the frame. What it does not have
+   yet is a clip chosen from anything — a model plays the one animation it carries.
 3. **Creatures.** 432 records, every one with a `MODL` and an `x`-prefixed clip beside it. Real
    skeletons, real text-key groups, `XSCL`.
 4. **NPCs.** No `MODL` on 2,772 of 3,049: a body is assembled from `RNAM`, the female bit, `BNAM`,
@@ -3389,3 +3391,51 @@ wound against the normals it carried, so every hit was shaded as the surface's o
 scene rendered black under a sun that was working perfectly. It cost the same hour again, chasing a
 deformation that was reaching the picture the whole time. `primary_visibility.rs`'s `quad` helper
 has carried the winding fix since M3; a fixture that builds its own geometry has to do the same.
+
+### 8.92 The animation the format already carried
+
+M12's second step. One block type stood between the parser and every animation in the game, and
+everything behind it was already being read for its width and thrown away — so the work was turning
+`cursor.skip` into a read, and then working out what the numbers meant.
+
+**All 7,481 shipped files now parse**, the 7,319 meshes and the 162 `.kf` clips together. `.kf` is a
+NIF with `NiSequenceStreamHelper` at its root and nothing else new in it, which is why one arm
+unlocked all of them. Retained beside it: keyframe channels, skin instances and their bind
+transforms and weights, the controller header, and named string extra data.
+
+**Three measurements decided the rest of the design.**
+
+- **Linear, and the file may say what it likes.** Of 3.44 million rotation keys, **97.9% are linear**
+  already; of 692,327 translations, 95.1%. What is left is quadratic or TCB, whose tangents this
+  drops. Scale is the exception — 4,224 of its 4,391 keys are quadratic — and 4,391 keys is the whole
+  game. **No channel anywhere is `XYZ`**, so the per-axis rotation path is parsed and never taken.
+- **Four influences per vertex.** 390,381 vertices follow one bone, 72,629 two, 20,834 three, 3,602
+  four and **107 follow five** — two hundredths of one percent, which lose their smallest share to a
+  renormalisation. A fifth slot for them would cost every vertex in the world a fifth of its weight
+  data. A skin names at most 64 bones, so an index is a byte and four of them are one word.
+- **The bind pose is only in `NiSkinData`.** Across all 556 skinned files there is *no* composition
+  of the node rest transforms with the inverse binds that comes out the identity — not `world·inv`,
+  not `inv·world`, with or without the skin transform or the skeleton root. A NIF's node transforms
+  are whatever pose the file was saved in. So a rig is posed as `worldPose(bone) · inverse_bind` and
+  the rest transforms are only what a joint with no channel falls back to.
+
+**A skinned mesh does not look like itself until this runs.** `furn_de_banner_pawn_01.nif` stores its
+twenty vertices flat in the xy plane at z of zero; the bind transforms stand it upright in xz,
+hanging from a root bone at z=63. Six joints, three of them bones, a four-second clip. Every banner
+and every sail in the game has been drawn lying flat since M2 and nobody noticed, because a flat
+thing seen from the side is a line.
+
+**Rigid pieces are bound as one-bone skins.** A model with a skeleton can hold geometry with no skin
+on it, and binding that to the node it hangs from — with that node's own rest transform undone — is
+the same arithmetic as a skinned vertex with a single full-weight bone. One path, no special case at
+the shader.
+
+**The top level is *updated* per frame, where the bottom levels are rebuilt.** §8.91 measured refit
+winning below and expected it to lose above, because a top level is the structure every ray enters.
+It does not: over an exterior's worth of statics an update is **0.34 ms against 0.60**, and the
+traversal cannot tell — **2.42 ms against 2.44**, inside the run-to-run spread. The instance records
+never change between frames; what makes a new build necessary is the bounds of the bottom levels
+underneath them, which is what an update is for.
+
+**And the counts are what the survey said.** Seyda Neen's shore cell places two animated references
+and Balmora's nine, against 0.34 ms of animation in a frame that traces in 2.4.

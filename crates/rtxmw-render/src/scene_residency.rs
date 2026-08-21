@@ -27,12 +27,12 @@ const SECUNDA_FACE: u32 = 1;
 /// And the weather's painted sky sheet, which the cloud layer is cut out of.
 const CLOUD_SHEET: u32 = 2;
 
-use crate::deform_pass::{DeformPass, Placement};
 use crate::geometry_buffers::GeometryBuffers;
 use crate::gpu_light::GpuLight;
 use crate::light_grid::LightGrid;
 use crate::material_buffers::MaterialBuffers;
 use crate::scene_acceleration::{Deformable, SceneAcceleration};
+use crate::skin_pass::{Placement, SkinPass};
 use crate::texture_array::TextureArray;
 use crate::visibility_pass::Lighting;
 
@@ -102,8 +102,8 @@ pub(crate) struct SceneResidency {
     uploaded_textures: u32,
     cells: Vec<ResidentCell>,
     acceleration: SceneAcceleration,
-    /// Rewrites the vertices of everything that moves, ahead of the build over them.
-    deform: DeformPass,
+    /// Poses everything that moves, ahead of the build over it.
+    skin: SkinPass,
     /// Whether those structures are refitted every frame rather than rebuilt — see
     /// [`SceneAcceleration::append_deforming`], and `docs/design.md` M12 for why it is a choice.
     refit_deforming: bool,
@@ -166,7 +166,7 @@ impl SceneResidency {
             uploaded_textures: 0,
             cells: Vec::new(),
             acceleration,
-            deform: DeformPass::new(device)?,
+            skin: SkinPass::new(device, uploader)?,
             refit_deforming: true,
             tables,
             lights,
@@ -358,19 +358,20 @@ impl SceneResidency {
         // live buffer rather than a copy taken when it was described.
         self.acceleration
             .refresh_deforming(&self.geometry, self.materials.materials());
-        self.deform.bind(&self.geometry);
+        self.skin.bind(&self.geometry);
 
         // **And the deforming structures are built once here, before anything references them.**
         // They are created unbuilt over regions holding whatever the allocator left there, and a
         // top level over an unbuilt bottom level is undefined — which on this hardware is a lost
         // device at the next submission rather than a wrong picture.
-        if !self.deform.is_empty() {
-            let (deform, acceleration) = (&self.deform, &mut self.acceleration);
+        if !self.skin.is_empty() {
+            self.skin.pose(0.0);
+            let (skin, acceleration) = (&self.skin, &mut self.acceleration);
             uploader.submit_and_wait(|raw, cmd| {
                 // SAFETY: the command buffer is recording, and both passes were just rebound to
                 // the buffers as they are now.
                 unsafe {
-                    deform.record(cmd, 0.0);
+                    skin.record(cmd);
                     acceleration.record_deforming(raw, cmd);
                 }
             })?;
@@ -394,6 +395,7 @@ impl SceneResidency {
             return Ok(Vec::new());
         }
         let first_slot = self.geometry.ranges().len() as u32;
+        let first_rig = self.skin.add_rigs(uploader, &scene.rigs)?;
         let mut placements = Vec::with_capacity(scene.deforming.len());
         let mut placed = Vec::with_capacity(scene.deforming.len());
         for deforming in &scene.deforming {
@@ -402,6 +404,7 @@ impl SceneResidency {
             placements.push(Placement {
                 source,
                 destination: slot,
+                rig: first_rig + deforming.rig.0,
                 phase: deforming.phase,
             });
             placed.push(Instance {
@@ -409,7 +412,7 @@ impl SceneResidency {
                 transform: deforming.instance.transform,
             });
         }
-        self.deform.place(&self.geometry, &placements);
+        self.skin.place(uploader, &self.geometry, &placements)?;
         self.acceleration.append_deforming(
             uploader,
             limits,
@@ -433,7 +436,7 @@ impl SceneResidency {
 
     /// Whether anything in the resident set moves, and so whether a frame has this work to do.
     pub(crate) fn has_deforming(&self) -> bool {
-        !self.deform.is_empty()
+        !self.skin.is_empty()
     }
 
     /// Moves everything that moves, and rebuilds what a ray traverses over it.
@@ -447,10 +450,11 @@ impl SceneResidency {
         command_buffer: vk::CommandBuffer,
         time: f32,
     ) {
+        self.skin.pose(time);
         // SAFETY: the caller guarantees recording, and `commit` rebound both passes to whatever
         // the buffers are now.
         unsafe {
-            self.deform.record(command_buffer, time);
+            self.skin.record(command_buffer);
             self.acceleration.record_deforming(device, command_buffer);
             self.acceleration.record_top(device, command_buffer);
         }
